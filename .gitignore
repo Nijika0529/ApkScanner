@@ -1,0 +1,14 @@
+.data/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+probe/.gradle/
+probe/app/build/
+config/auth-flow.json
+.DS_Store

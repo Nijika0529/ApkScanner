@@ -1,0 +1,255 @@
+from __future__ import annotations
+
+import html
+import json
+from typing import Any
+
+from sqlalchemy import case, select
+from sqlalchemy.orm import Session
+
+from .models import CoverageItem, EntryPoint, Evidence, Finding, InvestigationTask, Scan
+
+
+class ReportBuilder:
+    def build(self, session: Session, scan: Scan) -> dict[str, Any]:
+        entries = list(
+            session.scalars(
+                select(EntryPoint).where(EntryPoint.scan_id == scan.id).order_by(EntryPoint.kind, EntryPoint.name)
+            )
+        )
+        findings = list(
+            session.scalars(
+                select(Finding)
+                .where(Finding.scan_id == scan.id)
+                .order_by(
+                    case(
+                        (Finding.severity == "critical", 0),
+                        (Finding.severity == "high", 1),
+                        (Finding.severity == "medium", 2),
+                        (Finding.severity == "low", 3),
+                        else_=4,
+                    ),
+                    Finding.created_at,
+                )
+            )
+        )
+        tasks = list(
+            session.scalars(
+                select(InvestigationTask)
+                .where(InvestigationTask.scan_id == scan.id)
+                .order_by(InvestigationTask.priority.desc())
+            )
+        )
+        coverage = list(
+            session.scalars(
+                select(CoverageItem)
+                .where(CoverageItem.scan_id == scan.id)
+                .order_by(CoverageItem.domain, CoverageItem.control_id)
+            )
+        )
+        evidence = list(
+            session.scalars(
+                select(Evidence)
+                .where(Evidence.scan_id == scan.id)
+                .order_by(Evidence.created_at, Evidence.id)
+            )
+        )
+        return {
+            "schema_version": "1.0",
+            "scan": {
+                "id": scan.id,
+                "status": scan.status,
+                "filename": scan.filename,
+                "artifact_sha256": scan.artifact_sha256,
+                "package_name": scan.package_name,
+                "version_name": scan.version_name,
+                "version_code": scan.version_code,
+                "min_sdk": scan.min_sdk,
+                "target_sdk": scan.target_sdk,
+                "signing": scan.signing,
+                "tool_versions": scan.tool_versions,
+                "stats": scan.stats,
+                "preliminary_at": scan.preliminary_at.isoformat() if scan.preliminary_at else None,
+                "completed_at": scan.completed_at.isoformat() if scan.completed_at else None,
+                "limitations": [
+                    "APK-only analysis; source code and backend authorization are not available.",
+                    "Dynamic baseline is Android 16 only.",
+                    "Only one authenticated account profile is supported.",
+                    "Cloud-device cleanup uses pm clear and cannot restore a full snapshot.",
+                ],
+            },
+            "entry_points": [self._entry(item) for item in entries],
+            "findings": [self._finding(item) for item in findings],
+            "tasks": [self._task(item) for item in tasks],
+            "coverage": [self._coverage(item) for item in coverage],
+            "evidence": [self._evidence(item) for item in evidence],
+        }
+
+    @staticmethod
+    def _entry(item: EntryPoint) -> dict[str, Any]:
+        return {
+            "id": item.id,
+            "kind": item.kind,
+            "name": item.name,
+            "owner_component": item.owner_component,
+            "exported": item.exported,
+            "exported_reason": item.exported_reason,
+            "permission": item.permission,
+            "permission_protection": item.permission_protection,
+            "intent_filters": item.intent_filters,
+            "deep_links": item.deep_links,
+            "metadata": item.metadata_json,
+        }
+
+    @staticmethod
+    def _finding(item: Finding) -> dict[str, Any]:
+        return {
+            "id": item.id,
+            "rule_id": item.rule_id,
+            "source": item.source,
+            "title": item.title,
+            "description": item.description,
+            "remediation": item.remediation,
+            "masvs": item.masvs,
+            "cwe": item.cwe,
+            "severity": item.severity,
+            "confidence": item.confidence,
+            "status": item.status,
+            "entry_point_ids": item.entry_point_ids,
+            "locations": item.locations,
+            "evidence_ids": item.evidence_ids,
+            "metadata": item.metadata_json,
+            "review_note": item.review_note,
+        }
+
+    @staticmethod
+    def _task(item: InvestigationTask) -> dict[str, Any]:
+        return {
+            "id": item.id,
+            "type": item.task_type,
+            "status": item.status,
+            "priority": item.priority,
+            "target_entry_ids": item.target_entry_ids,
+            "hypotheses": item.hypotheses,
+            "result": item.result,
+            "thread_id": item.thread_id,
+            "attempts": item.attempts,
+            "error": item.error,
+        }
+
+    @staticmethod
+    def _coverage(item: CoverageItem) -> dict[str, Any]:
+        return {
+            "id": item.id,
+            "control_id": item.control_id,
+            "domain": item.domain,
+            "title": item.title,
+            "status": item.status,
+            "stages": item.stages,
+            "gap_reason": item.gap_reason,
+            "entry_point_id": item.entry_point_id,
+        }
+
+    @staticmethod
+    def _evidence(item: Evidence) -> dict[str, Any]:
+        return {
+            "id": item.id,
+            "task_id": item.task_id,
+            "kind": item.kind,
+            "sha256": item.sha256,
+            "command": item.command,
+            "exit_code": item.exit_code,
+            "summary": item.summary,
+            "metadata": item.metadata_json,
+            "created_at": item.created_at.isoformat(),
+        }
+
+    def sarif(self, report: dict[str, Any]) -> dict[str, Any]:
+        findings = report["findings"]
+        rules: dict[str, dict[str, Any]] = {}
+        results: list[dict[str, Any]] = []
+        level_map = {
+            "critical": "error",
+            "high": "error",
+            "medium": "warning",
+            "low": "note",
+            "info": "note",
+        }
+        for finding in findings:
+            rule_id = finding["rule_id"]
+            rules.setdefault(
+                rule_id,
+                {
+                    "id": rule_id,
+                    "shortDescription": {"text": finding["title"]},
+                    "help": {"text": finding["remediation"]},
+                    "properties": {
+                        "masvs": finding["masvs"],
+                        "cwe": finding["cwe"],
+                        "confidence": finding["confidence"],
+                    },
+                },
+            )
+            locations = []
+            for location in finding["locations"]:
+                path = location.get("path", "AndroidManifest.xml")
+                region = {}
+                if location.get("line"):
+                    region["startLine"] = location["line"]
+                physical = {"artifactLocation": {"uri": path}}
+                if region:
+                    physical["region"] = region
+                locations.append({"physicalLocation": physical})
+            results.append(
+                {
+                    "ruleId": rule_id,
+                    "level": level_map.get(finding["severity"], "warning"),
+                    "message": {"text": finding["description"]},
+                    "locations": locations,
+                    "properties": {
+                        "status": finding["status"],
+                        "evidenceIds": finding["evidence_ids"],
+                    },
+                }
+            )
+        return {
+            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [
+                {
+                    "tool": {
+                        "driver": {
+                            "name": "APK Scanner",
+                            "version": "0.1.0",
+                            "informationUri": "https://mas.owasp.org/",
+                            "rules": list(rules.values()),
+                        }
+                    },
+                    "results": results,
+                }
+            ],
+        }
+
+    def html(self, report: dict[str, Any]) -> str:
+        scan = report["scan"]
+        finding_rows = "".join(
+            "<tr>"
+            f"<td>{html.escape(item['severity'])}</td>"
+            f"<td>{html.escape(item['status'])}</td>"
+            f"<td>{html.escape(item['title'])}</td>"
+            f"<td>{html.escape(item['masvs'])}</td>"
+            "</tr>"
+            for item in report["findings"]
+        )
+        limitations = "".join(f"<li>{html.escape(item)}</li>" for item in scan["limitations"])
+        return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>APK Scanner Report</title>
+<style>body{{font:14px system-ui;max-width:1100px;margin:40px auto;color:#17202a}}
+table{{border-collapse:collapse;width:100%}}th,td{{padding:10px;border:1px solid #d9e2ec;text-align:left}}
+th{{background:#eef4f7}}code{{background:#eef4f7;padding:2px 5px}}</style></head>
+<body><h1>APK 安全扫描报告</h1><p><strong>{html.escape(scan['package_name'] or scan['filename'])}</strong>
+ · {html.escape(scan['status'])} · <code>{scan['artifact_sha256']}</code></p>
+<h2>Finding</h2><table><thead><tr><th>Severity</th><th>Status</th><th>Title</th><th>MASVS</th></tr></thead>
+<tbody>{finding_rows}</tbody></table><h2>限制</h2><ul>{limitations}</ul>
+<script type="application/json" id="report-data">{html.escape(json.dumps(report, ensure_ascii=False))}</script>
+</body></html>"""

@@ -1,0 +1,105 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+@dataclass(frozen=True, slots=True)
+class Settings:
+    data_dir: Path
+    database_url: str
+    max_upload_bytes: int = 512 * 1024 * 1024
+    max_zip_entries: int = 100_000
+    max_uncompressed_bytes: int = 2 * 1024 * 1024 * 1024
+    max_compression_ratio: int = 200
+    tool_timeout_seconds: int = 600
+    preliminary_after_seconds: int = 4 * 60 * 60
+    scan_deadline_seconds: int = 24 * 60 * 60
+    task_timeout_seconds: int = 20 * 60
+    task_max_attempts: int = 2
+    codex_enabled: bool = False
+    codex_worker_model: str = "gpt-5.6-terra"
+    codex_bin: str | None = None
+    codex_isolation: str = "docker"
+    codex_docker_image: str = "apk-scanner-worker:0.1.0"
+    codex_auth_file: Path | None = None
+    adb_serial: str | None = None
+    probe_apk_path: Path | None = None
+    device_android_version: str = "16"
+    device_android_api: int = 36
+    auth_flow_path: Path | None = None
+    frida_device: str | None = None
+    frida_host: str | None = None
+    frida_capture_seconds: int = 20
+    mobsf_url: str | None = None
+    mobsf_api_key: str | None = None
+    mobsf_timeout_seconds: int = 900
+    frontend_dist: Path | None = None
+
+    @classmethod
+    def from_env(cls) -> Settings:
+        data_dir = Path(os.getenv("APKSCANNER_DATA_DIR", ".data")).resolve()
+        database_url = os.getenv(
+            "APKSCANNER_DATABASE_URL", f"sqlite:///{data_dir / 'apkscanner.db'}"
+        )
+        frontend = os.getenv("APKSCANNER_FRONTEND_DIST")
+        return cls(
+            data_dir=data_dir,
+            database_url=database_url,
+            max_upload_bytes=int(os.getenv("APKSCANNER_MAX_UPLOAD_BYTES", 512 * 1024 * 1024)),
+            tool_timeout_seconds=int(os.getenv("APKSCANNER_TOOL_TIMEOUT", 600)),
+            preliminary_after_seconds=int(os.getenv("APKSCANNER_PRELIMINARY_AFTER", 14_400)),
+            scan_deadline_seconds=int(os.getenv("APKSCANNER_SCAN_DEADLINE", 86_400)),
+            task_timeout_seconds=int(os.getenv("APKSCANNER_TASK_TIMEOUT", 1_200)),
+            task_max_attempts=int(os.getenv("APKSCANNER_TASK_MAX_ATTEMPTS", 2)),
+            codex_enabled=_env_bool("APKSCANNER_CODEX_ENABLED"),
+            codex_worker_model=os.getenv("APKSCANNER_CODEX_WORKER_MODEL", "gpt-5.6-terra"),
+            codex_bin=os.getenv("APKSCANNER_CODEX_BIN"),
+            codex_isolation=os.getenv("APKSCANNER_CODEX_ISOLATION", "docker").lower(),
+            codex_docker_image=os.getenv(
+                "APKSCANNER_CODEX_DOCKER_IMAGE", "apk-scanner-worker:0.1.0"
+            ),
+            codex_auth_file=(
+                Path(os.environ["APKSCANNER_CODEX_AUTH_FILE"]).resolve()
+                if os.getenv("APKSCANNER_CODEX_AUTH_FILE")
+                else None
+            ),
+            adb_serial=os.getenv("APKSCANNER_ADB_SERIAL"),
+            probe_apk_path=(
+                Path(os.environ["APKSCANNER_PROBE_APK"]).resolve()
+                if os.getenv("APKSCANNER_PROBE_APK")
+                else None
+            ),
+            device_android_version=os.getenv("APKSCANNER_ANDROID_VERSION", "16"),
+            device_android_api=int(os.getenv("APKSCANNER_ANDROID_API", 36)),
+            auth_flow_path=(
+                Path(os.environ["APKSCANNER_AUTH_FLOW"]).resolve()
+                if os.getenv("APKSCANNER_AUTH_FLOW")
+                else None
+            ),
+            frida_device=os.getenv("APKSCANNER_FRIDA_DEVICE"),
+            frida_host=os.getenv("APKSCANNER_FRIDA_HOST"),
+            frida_capture_seconds=int(os.getenv("APKSCANNER_FRIDA_CAPTURE_SECONDS", 20)),
+            mobsf_url=os.getenv("APKSCANNER_MOBSF_URL"),
+            mobsf_api_key=os.getenv("APKSCANNER_MOBSF_API_KEY"),
+            mobsf_timeout_seconds=int(os.getenv("APKSCANNER_MOBSF_TIMEOUT", 900)),
+            frontend_dist=Path(frontend).resolve() if frontend else None,
+        )
+
+    def ensure_directories(self) -> None:
+        for path in (
+            self.data_dir,
+            self.data_dir / "artifacts",
+            self.data_dir / "workspaces",
+            self.data_dir / "evidence",
+            self.data_dir / "reports",
+        ):
+            path.mkdir(parents=True, exist_ok=True)

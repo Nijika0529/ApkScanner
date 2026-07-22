@@ -1,0 +1,10 @@
+.data
+.git
+.pytest_cache
+.ruff_cache
+frontend/node_modules
+frontend/dist
+probe/.gradle
+probe/app/build
+__pycache__
+*.apk

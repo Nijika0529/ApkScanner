@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "profile": "default-single-account",
+  "package": "com.example.application",
+  "steps": [
+    { "action": "start" },
+    { "action": "wait", "seconds": 2 },
+    { "action": "tap", "x": 520, "y": 840 },
+    { "action": "text", "secret": "username" },
+    { "action": "tap", "x": 520, "y": 980 },
+    { "action": "text", "secret": "password" },
+    { "action": "keyevent", "keycode": 66 },
+    { "action": "wait", "seconds": 3 },
+    { "action": "assert_text", "value": "Account" }
+  ]
+}

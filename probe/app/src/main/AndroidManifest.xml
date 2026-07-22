@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application
+        android:allowBackup="false"
+        android:debuggable="false"
+        android:label="APK Scanner Probe"
+        android:supportsRtl="false"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <!-- Intentionally exported. Install this APK only on dedicated security-test devices. -->
+        <receiver
+            android:name=".ProbeReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.apkscanner.probe.EXECUTE" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

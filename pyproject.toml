@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "apk-scanner"
+version = "0.1.0"
+description = "Evidence-first Android APK security scanning and Codex investigation control plane"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "defusedxml>=0.7.1,<1",
+  "fastapi>=0.122,<1",
+  "httpx>=0.28,<1",
+  "keyring>=25.6,<26",
+  "openai-codex==0.144.4",
+  "pydantic>=2.12,<3",
+  "python-multipart>=0.0.20,<1",
+  "PyYAML>=6.0,<7",
+  "sqlalchemy>=2.0.45,<3",
+  "uvicorn[standard]>=0.38,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.2,<2",
+  "ruff>=0.14,<1",
+]
+
+[project.scripts]
+apk-scanner = "apkscanner.cli:main"
+scanctl = "apkscanner.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend/apkscanner"]
+
+[tool.pytest.ini_options]
+pythonpath = ["backend"]
+testpaths = ["backend/tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = [
+  # FastAPI intentionally constructs dependency markers in function defaults.
+  "B008",
+  # Security prompts and generated report markup are clearer when kept intact.
+  "E501",
+]
