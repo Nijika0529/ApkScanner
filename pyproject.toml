@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "apk-scanner"
 version = "0.1.0"
-description = "Evidence-first Android APK security scanning and Codex investigation control plane"
+description = "Evidence-first Android APK security scanning and pluggable AI investigation control plane"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

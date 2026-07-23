@@ -59,7 +59,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="APK Scanner",
         version="0.1.0",
-        description="Evidence-first APK security scanning and Codex investigation control plane",
+        description="Evidence-first APK security scanning and pluggable AI investigation control plane",
         lifespan=lifespan,
     )
     app.state.settings = app_settings

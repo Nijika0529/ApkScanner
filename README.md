@@ -1,7 +1,7 @@
 # APK Scanner
 
 Evidence-first Android APK security scanning with deterministic attack-surface coverage, remote
-ADB validation, and optional Codex investigations.
+ADB validation, and optional Codex or OpenCode + DeepSeek investigations.
 
 The v1 product is a single-user, localhost-only Web application. It accepts one installable APK,
 builds a versioned security IR, enumerates all Android component and deep-link entry points, records
@@ -22,6 +22,8 @@ finding without platform evidence IDs.
 - Optional MobSF upload/report normalization with explicit degraded coverage when absent.
 - Official `openai-codex==0.144.4` integration with strict JSON Schema, fresh threads, no subagent
   fan-out, one platform-mediated follow-up test round, and evidence-backed result downgrades.
+- Pinned `@opencode-ai/sdk`/OpenCode `1.18.4` integration for DeepSeek, with fresh sessions,
+  schema-validated output, all executable agent tools denied, and an isolated one-shot bridge.
 - Optional per-task Docker workers with read-only scan mounts and resource/capability limits.
 - Responsive React review console, human Finding decisions, live events, JSON/HTML/SARIF exports.
 
@@ -53,9 +55,12 @@ Open `http://127.0.0.1:8000`. For separate frontend development, run `npm run de
 Run a foreground scan without the Web UI:
 
 ```bash
-scanctl scan /absolute/path/to/application.apk
+scanctl scan /absolute/path/to/application.apk --investigator configured
 scanctl capabilities
 ```
+
+The Web upload dialog and CLI can pin each scan to `codex`, `opencode`, or `none`; `configured`
+resolves the service default when the scan is created and is persisted with that scan.
 
 ## Dynamic device configuration
 
@@ -120,6 +125,50 @@ pinned SDK; the bundled matching runtime is the default.
 `APKSCANNER_CODEX_ISOLATION=host` is an explicit fallback for a personally controlled machine. It
 does not provide the worker filesystem boundary and should not be the team-deployment default.
 
+## OpenCode + DeepSeek configuration
+
+OpenCode is also opt-in and Docker is the default. The integration pins the SDK and CLI together at
+`1.18.4`; it uses DeepSeek's built-in provider and defaults to `deepseek-v4-pro`.
+
+```bash
+docker build \
+  -f Dockerfile.opencode-worker \
+  -t apk-scanner-opencode-worker:0.1.0 \
+  .
+
+export DEEPSEEK_API_KEY=...
+export APKSCANNER_INVESTIGATOR_BACKEND=opencode
+export APKSCANNER_OPENCODE_ISOLATION=docker
+export APKSCANNER_OPENCODE_ENABLED=true
+scanctl capabilities --deep
+```
+
+For a personally controlled host fallback, install the pinned worker dependencies and select host
+isolation:
+
+```bash
+npm ci --prefix opencode-worker
+export DEEPSEEK_API_KEY=...
+export APKSCANNER_OPENCODE_ISOLATION=host
+export APKSCANNER_OPENCODE_ENABLED=true
+export APKSCANNER_INVESTIGATOR_BACKEND=opencode
+scanctl capabilities --deep
+```
+
+The host worker creates a private temporary HOME/XDG tree and an authenticated loopback OpenCode
+server for each invocation. In both modes, OpenCode receives only the platform-generated task JSON:
+filesystem, shell, web, MCP, and subagent tools are denied. Its sole callable tool is OpenCode's
+internal `StructuredOutput` result collector; requested Android tests are validated and executed by
+the Python control plane.
+
+Set `APKSCANNER_OPENCODE_MODEL=deepseek-v4-flash` to prefer the lower-cost model. An enterprise
+DeepSeek-compatible gateway can be selected with `APKSCANNER_DEEPSEEK_BASE_URL`; remote gateways
+must use HTTPS, while plain HTTP is accepted only on loopback. Credentials, query parameters, and
+fragments in that URL are rejected, and the API key remains in `DEEPSEEK_API_KEY`.
+
+The implementation rationale, protocol, security controls, and upgrade checklist are documented in
+[`docs/opencode-deepseek.zh-CN.md`](docs/opencode-deepseek.zh-CN.md).
+
 To add MobSF breadth:
 
 ```bash
@@ -139,11 +188,20 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_AUTH_FLOW` | unset | Non-secret login replay JSON |
 | `APKSCANNER_FRIDA_DEVICE` | ADB serial | Frida device identifier |
 | `APKSCANNER_FRIDA_HOST` | unset | Remote frida-server endpoint |
+| `APKSCANNER_INVESTIGATOR_BACKEND` | `codex` | Default: `codex`, `opencode`, or `none` |
 | `APKSCANNER_CODEX_ENABLED` | `false` | Dispatch Codex investigations |
 | `APKSCANNER_CODEX_ISOLATION` | `docker` | `docker` or explicit `host` fallback |
 | `APKSCANNER_CODEX_DOCKER_IMAGE` | `apk-scanner-worker:0.1.0` | Worker image |
 | `APKSCANNER_CODEX_AUTH_FILE` | unset | Auth file mounted only into the worker |
 | `APKSCANNER_CODEX_BIN` | bundled SDK runtime | Explicit tested Codex binary override |
+| `APKSCANNER_OPENCODE_ENABLED` | `false` | Allow OpenCode + DeepSeek investigations |
+| `APKSCANNER_OPENCODE_MODEL` | `deepseek-v4-pro` | DeepSeek model ID |
+| `APKSCANNER_OPENCODE_ISOLATION` | `docker` | `docker` or explicit `host` fallback |
+| `APKSCANNER_OPENCODE_DOCKER_IMAGE` | `apk-scanner-opencode-worker:0.1.0` | Worker image |
+| `APKSCANNER_OPENCODE_NODE_BIN` | `node` on PATH | Host-mode Node.js override |
+| `APKSCANNER_OPENCODE_WORKER_DIR` | repository `opencode-worker/` | Host worker directory |
+| `APKSCANNER_DEEPSEEK_BASE_URL` | DeepSeek default | Optional trusted HTTP(S) gateway |
+| `DEEPSEEK_API_KEY` | unset | DeepSeek credential passed only to the selected worker |
 | `APKSCANNER_MOBSF_URL` / `APKSCANNER_MOBSF_API_KEY` | unset | Optional MobSF API |
 | `APKSCANNER_ANDROID_VERSION` | `16` | Reported dynamic baseline |
 | `APKSCANNER_ANDROID_API` | `36` | Required cloud-device API level |
@@ -157,6 +215,7 @@ export APKSCANNER_MOBSF_API_KEY=...
 pytest
 ruff check backend
 cd frontend && npm run lint && npm run build
+cd ../opencode-worker && npm run check && npm test
 ```
 
 The test corpus uses synthetic APK-shaped ZIPs with safe/vulnerable manifest controls. Add signed
@@ -173,5 +232,9 @@ The server binds to `127.0.0.1` and rejects untrusted Host headers.
 - No source code or server authorization context is available; AUTH and PRIVACY remain partial.
 - v1 covers one APK, one Android 16 baseline, one authenticated role, and `pm clear` rather than a
   full device snapshot.
-- Docker confines the default Agent filesystem view, but its network is intentionally broad enough
-  for Codex, a remote device, and the test backend. Restrict egress before a team deployment.
+- The Codex Docker worker has a read-only scan mount. The OpenCode worker receives task JSON only
+  and has no scan-workspace mount; all executable OpenCode tools are denied.
+- Agent containers still have outbound networking for their selected model provider. Restrict each
+  worker's egress to the approved provider/gateway before a team deployment.
+- DeepSeek receives the bounded task context and evidence summaries. Confirm company data handling,
+  retention, region, and gateway policy before enabling it for production APKs.

@@ -142,6 +142,8 @@ class Capability(BaseModel):
 class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
     version: str
+    default_investigator: Literal["codex", "opencode", "none"] = "codex"
+    enabled_investigators: list[Literal["codex", "opencode"]] = Field(default_factory=list)
     capabilities: list[Capability]
 
 
@@ -156,6 +158,8 @@ class AgentRequestedTest(BaseModel):
 
 
 class AgentInvestigationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     schema_version: Literal["1.0"] = "1.0"
     summary: str
     result: Literal[
@@ -175,4 +179,41 @@ class AgentInvestigationResult(BaseModel):
     requested_tests: list[AgentRequestedTest] = Field(max_length=12)
 
 
-AGENT_RESULT_JSON_SCHEMA = AgentInvestigationResult.model_json_schema()
+def _inline_local_json_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:
+    """Inline Pydantic's local definitions for provider-compatible tool schemas."""
+    definitions = schema.pop("$defs", {})
+
+    def inline(value: Any, stack: tuple[str, ...] = ()) -> Any:
+        if isinstance(value, list):
+            return [inline(item, stack) for item in value]
+        if not isinstance(value, dict):
+            return value
+
+        ref = value.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/$defs/"):
+            name = ref.removeprefix("#/$defs/")
+            if name not in definitions:
+                raise ValueError(f"unknown local JSON Schema reference: {ref}")
+            if name in stack:
+                raise ValueError(f"recursive JSON Schema reference is unsupported: {ref}")
+            merged = {
+                **definitions[name],
+                **{key: item for key, item in value.items() if key != "$ref"},
+            }
+            return inline(merged, (*stack, name))
+
+        return {
+            key: inline(item, stack)
+            for key, item in value.items()
+            if key not in {"$defs", "$schema"}
+        }
+
+    result = inline(schema)
+    if not isinstance(result, dict):
+        raise TypeError("root JSON Schema must be an object")
+    return result
+
+
+AGENT_RESULT_JSON_SCHEMA = _inline_local_json_schema_refs(
+    AgentInvestigationResult.model_json_schema()
+)

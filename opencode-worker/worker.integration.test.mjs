@@ -1,0 +1,187 @@
+import assert from "node:assert/strict"
+import { createServer } from "node:http"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { delimiter, join, resolve } from "node:path"
+import { spawn } from "node:child_process"
+import test from "node:test"
+
+const expected = { answer: "bounded result" }
+
+test("worker uses OpenCode structured output with only the internal result tool", async () => {
+  const requests = []
+  const api = createServer(async (request, response) => {
+    const body = await readJSON(request)
+    requests.push({ url: request.url, body })
+
+    response.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    })
+    response.write(
+      event({
+        id: "chatcmpl-test",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: body.model,
+        choices: [
+          {
+            index: 0,
+            delta: {
+              role: "assistant",
+              tool_calls: [
+                {
+                  index: 0,
+                  id: "call-structured",
+                  type: "function",
+                  function: {
+                    name: "StructuredOutput",
+                    arguments: JSON.stringify(expected),
+                  },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      }),
+    )
+    response.write(
+      event({
+        id: "chatcmpl-test",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: body.model,
+        choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+        usage: {
+          prompt_tokens: 12,
+          completion_tokens: 4,
+          total_tokens: 16,
+        },
+      }),
+    )
+    response.end("data: [DONE]\n\n")
+  })
+  await listen(api)
+  const address = api.address()
+  assert(address && typeof address !== "string")
+
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-opencode-test-"))
+  try {
+    const completed = await runWorker(root, {
+      schema_version: "1.0",
+      action: "investigate",
+      prompt: "Return the bounded structured result.",
+      developer_instructions: "Use no external tools. Return only structured JSON.",
+      model: "deepseek-v4-pro",
+      base_url: `http://127.0.0.1:${address.port}`,
+      output_schema: {
+        type: "object",
+        properties: { answer: { type: "string" } },
+        required: ["answer"],
+        additionalProperties: false,
+      },
+      timeout_ms: 10_000,
+    })
+    assert.equal(
+      completed.code,
+      0,
+      `${completed.stderr}\nrequests=${JSON.stringify(
+        requests.slice(0, 5).map((item) => ({
+          url: item.url,
+          model: item.body.model,
+          tool_choice: item.body.tool_choice,
+          tools: item.body.tools?.map((tool) => tool.function?.name),
+          message_count: item.body.messages?.length,
+        })),
+        null,
+        2,
+      )}`,
+    )
+    const result = JSON.parse(completed.stdout)
+    assert.deepEqual(result.result, expected)
+    assert.equal(result.usage.provider, "deepseek")
+    assert.equal(result.usage.model, "deepseek-v4-pro")
+    assert.equal(requests.length, 1)
+    assert.equal(requests[0].url, "/chat/completions")
+    assert.equal(requests[0].body.model, "deepseek-v4-pro")
+    assert.equal(requests[0].body.tool_choice, "required")
+    assert.deepEqual(
+      requests[0].body.tools.map((item) => item.function.name),
+      ["StructuredOutput"],
+    )
+  } finally {
+    api.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+function runWorker(root, payload) {
+  return new Promise((resolvePromise, reject) => {
+    const worker = spawn(process.execPath, [resolve("worker.mjs")], {
+      cwd: root,
+      env: {
+        PATH: `${resolve("node_modules/.bin")}${delimiter}${process.env.PATH ?? ""}`,
+        HOME: join(root, "home"),
+        XDG_DATA_HOME: join(root, "data"),
+        XDG_CONFIG_HOME: join(root, "config"),
+        XDG_CACHE_HOME: join(root, "cache"),
+        XDG_STATE_HOME: join(root, "state"),
+        DEEPSEEK_API_KEY: "integration-test-only",
+        OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+        OPENCODE_DISABLE_CLAUDE_CODE: "1",
+        OPENCODE_DISABLE_MODELS_FETCH: "1",
+        OPENCODE_DISABLE_AUTOUPDATE: "1",
+        OPENCODE_PURE: "1",
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+    let stdout = ""
+    let stderr = ""
+    const timeout = setTimeout(() => {
+      worker.kill("SIGKILL")
+      reject(new Error("OpenCode integration worker timed out"))
+    }, 20_000)
+    worker.stdout.setEncoding("utf8")
+    worker.stderr.setEncoding("utf8")
+    worker.stdout.on("data", (chunk) => {
+      stdout += chunk
+    })
+    worker.stderr.on("data", (chunk) => {
+      stderr += chunk
+    })
+    worker.once("error", reject)
+    worker.once("close", (code) => {
+      clearTimeout(timeout)
+      resolvePromise({ code, stdout, stderr })
+    })
+    worker.stdin.end(JSON.stringify(payload))
+  })
+}
+
+function readJSON(request) {
+  return new Promise((resolvePromise, reject) => {
+    const chunks = []
+    request.on("data", (chunk) => chunks.push(chunk))
+    request.once("error", reject)
+    request.once("end", () => {
+      try {
+        resolvePromise(JSON.parse(Buffer.concat(chunks).toString("utf8")))
+      } catch (error) {
+        reject(error)
+      }
+    })
+  })
+}
+
+function listen(server) {
+  return new Promise((resolvePromise, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", resolvePromise)
+  })
+}
+
+function event(value) {
+  return `data: ${JSON.stringify(value)}\n\n`
+}

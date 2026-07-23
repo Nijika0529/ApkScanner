@@ -12,3 +12,5 @@ probe/.gradle/
 probe/app/build/
 config/auth-flow.json
 .DS_Store
+opencode
+opencode-worker/node_modules/

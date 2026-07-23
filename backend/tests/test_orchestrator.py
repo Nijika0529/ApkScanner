@@ -24,13 +24,16 @@ def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(setting
             filename="fixture.apk",
             artifact_sha256=hashlib.sha256(target.read_bytes()).hexdigest(),
             artifact_path=str(target),
-            stats={},
+            stats={"investigator": "none"},
         )
         session.add(scan)
         session.commit()
         scan_id = scan.id
 
     orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    assert orchestrator.resolve_investigator() == "codex"
+    assert orchestrator.resolve_investigator("opencode") == "opencode"
+    assert orchestrator.resolve_investigator("none") == "none"
     orchestrator._run_sync(scan_id)
 
     with database.session_factory() as session:
@@ -38,6 +41,7 @@ def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(setting
         assert scan is not None
         assert scan.status == "final"
         assert scan.package_name == "com.example.vulnerable"
+        assert scan.stats["investigator"] == "none"
         assert len(list(session.scalars(select(EntryPoint).where(EntryPoint.scan_id == scan_id)))) == 8
         assert len(list(session.scalars(select(Finding).where(Finding.scan_id == scan_id)))) >= 5
         tasks = list(session.scalars(select(InvestigationTask).where(InvestigationTask.scan_id == scan_id)))
