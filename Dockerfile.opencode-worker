@@ -1,0 +1,24 @@
+FROM node:22-bookworm-slim
+
+ENV NODE_ENV=production \
+    OPENCODE_DISABLE_PROJECT_CONFIG=1 \
+    OPENCODE_DISABLE_CLAUDE_CODE=1 \
+    OPENCODE_DISABLE_MODELS_FETCH=1 \
+    OPENCODE_DISABLE_AUTOUPDATE=1 \
+    OPENCODE_PURE=1
+
+LABEL io.apkscanner.version="0.1.0" \
+      io.apkscanner.opencode-sdk-version="1.18.4" \
+      io.apkscanner.opencode-version="1.18.4"
+
+WORKDIR /opt/apkscanner-opencode
+COPY opencode-worker/package.json opencode-worker/package-lock.json ./
+RUN npm ci --omit=dev \
+    && npm cache clean --force \
+    && mkdir /sandbox \
+    && chown node:node /sandbox
+COPY opencode-worker/worker.mjs ./
+
+USER node
+WORKDIR /sandbox
+ENTRYPOINT ["node", "/opt/apkscanner-opencode/worker.mjs"]

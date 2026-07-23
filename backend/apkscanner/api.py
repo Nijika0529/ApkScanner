@@ -4,7 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from sqlalchemy import case, desc, select
 from sqlalchemy.orm import Session
@@ -70,6 +70,15 @@ def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> Health
             detail=codex.get("detail"),
         )
     )
+    opencode = orchestrator.opencode.capability(deep=False)
+    capabilities.append(
+        Capability(
+            name="opencode_deepseek",
+            available=bool(opencode.get("available")),
+            version=opencode.get("version"),
+            detail=opencode.get("detail"),
+        )
+    )
     device = orchestrator.device.capability()
     capabilities.append(
         Capability(
@@ -104,17 +113,31 @@ def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> Health
             detail=auth.get("detail"),
         )
     )
-    return HealthResponse(version=__version__, capabilities=capabilities)
+    return HealthResponse(
+        version=__version__,
+        default_investigator=orchestrator.resolve_investigator(),
+        enabled_investigators=[
+            name
+            for name in ("codex", "opencode")
+            if orchestrator.settings.investigator_enabled(name)
+        ],
+        capabilities=capabilities,
+    )
 
 
 @router.post("/scans", response_model=ScanSummary, status_code=202)
 async def create_scan(
     request: Request,
     apk: UploadFile = File(...),
+    investigator: str = Form("configured"),
     session: Session = Depends(get_session),
     store: ArtifactStore = Depends(get_store),
     orchestrator: ScanOrchestrator = Depends(get_orchestrator),
 ) -> Scan:
+    try:
+        resolved_investigator = orchestrator.resolve_investigator(investigator)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     filename = Path(apk.filename or "upload.apk").name
     if not filename.lower().endswith(".apk"):
         raise HTTPException(415, "Only a single installable .apk is supported in v1")
@@ -127,7 +150,10 @@ async def create_scan(
         filename=filename,
         artifact_sha256=sha256,
         artifact_path=str(artifact_path),
-        stats={"upload_bytes": size},
+        stats={
+            "upload_bytes": size,
+            "investigator": resolved_investigator,
+        },
     )
     session.add(scan)
     session.commit()

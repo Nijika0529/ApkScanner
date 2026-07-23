@@ -4,6 +4,7 @@ import type {
   Finding,
   Health,
   InvestigationTask,
+  InvestigatorChoice,
   Scan,
   ScanEvent,
 } from "./types"
@@ -28,9 +29,10 @@ export const api = {
   coverage: (id: string) => request<CoverageItem[]>(`/api/v1/scans/${id}/coverage`),
   tasks: (id: string) => request<InvestigationTask[]>(`/api/v1/scans/${id}/tasks`),
   events: (id: string) => request<ScanEvent[]>(`/api/v1/scans/${id}/events`),
-  upload: async (file: File) => {
+  upload: async (file: File, investigator: InvestigatorChoice = "configured") => {
     const form = new FormData()
     form.append("apk", file)
+    form.append("investigator", investigator)
     return request<Scan>("/api/v1/scans", { method: "POST", body: form })
   },
   review: (findingId: string, status: "accepted" | "false_positive" | "candidate", note: string) =>

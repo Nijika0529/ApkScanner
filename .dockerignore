@@ -4,6 +4,8 @@
 .ruff_cache
 frontend/node_modules
 frontend/dist
+opencode
+opencode-worker/node_modules
 probe/.gradle
 probe/app/build
 __pycache__

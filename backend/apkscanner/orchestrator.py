@@ -22,6 +22,7 @@ from .evidence import EvidenceRecorder
 from .instrumentation import FridaAdapter
 from .mobsf import MobSFAdapter
 from .models import CoverageItem, EntryPoint, Evidence, Finding, InvestigationTask, Scan
+from .opencode_runner import OpenCodeInvestigator
 from .planner import InvestigationPlanner
 from .repository import add_event, now
 from .rules import BuiltinRuleEngine
@@ -43,8 +44,23 @@ class ScanOrchestrator:
         self.frida = FridaAdapter(settings, self.runner)
         self.mobsf = MobSFAdapter(settings)
         self.codex = CodexInvestigator(settings)
+        self.opencode = OpenCodeInvestigator(settings)
+        self.investigators = {
+            "codex": self.codex,
+            "opencode": self.opencode,
+        }
         self._running: set[str] = set()
         self._running_lock = asyncio.Lock()
+
+    def resolve_investigator(self, requested: str = "configured") -> str:
+        backend = (
+            self.settings.investigator_backend
+            if requested.strip().lower() == "configured"
+            else requested.strip().lower()
+        )
+        if backend not in {*self.investigators, "none"}:
+            raise ValueError("investigator must be configured, codex, opencode, or none")
+        return backend
 
     async def submit(self, scan_id: str) -> None:
         async with self._running_lock:
@@ -129,6 +145,7 @@ class ScanOrchestrator:
                 "mobsf": self.mobsf.capability(),
             }
             scan.stats = {
+                **scan.stats,
                 **result.file_inventory,
                 "workspace": str(result.workspace),
                 "static_finding_count": len(findings),
@@ -354,6 +371,9 @@ class ScanOrchestrator:
             entries = list(
                 session.scalars(select(EntryPoint).where(EntryPoint.id.in_(task.target_entry_ids)))
             )
+            agent_backend = self.resolve_investigator(
+                str(scan.stats.get("investigator", "configured"))
+            )
             task.status = TaskStatus.RUNNING.value
             task.attempts += 1
             task.started_at = now()
@@ -363,7 +383,7 @@ class ScanOrchestrator:
                 scan_id,
                 "task.started",
                 f"Investigation started for {len(entries)} entry point(s)",
-                {"task_id": task.id},
+                {"task_id": task.id, "agent_backend": agent_backend},
             )
             session.commit()
 
@@ -384,6 +404,8 @@ class ScanOrchestrator:
         agent_error = None
         executed_agent_tests: list[dict[str, Any]] = []
         package_name = scan.package_name
+        investigator = self.investigators.get(agent_backend)
+        agent_enabled = self.settings.investigator_enabled(agent_backend)
 
         def invoke_agent(
             *,
@@ -391,16 +413,20 @@ class ScanOrchestrator:
             timeout_cap: int | None = None,
             executed_tests: list[dict[str, Any]] | None = None,
         ):  # noqa: ANN202
-            if not self.settings.codex_enabled:
-                return None, "Codex investigation is disabled"
+            if investigator is None:
+                return None, "AI investigation is disabled for this scan"
+            if not agent_enabled:
+                return None, f"{agent_backend} investigation is disabled"
             remaining = budget.remaining()
             if timeout_cap is not None:
                 remaining = min(remaining, timeout_cap)
             if remaining <= 0:
-                return None, "task time budget exhausted before Codex dispatch"
-            capability = self.codex.capability(deep=True)
+                return None, "task time budget exhausted before AI dispatch"
+            capability = investigator.capability(deep=True)
             if not capability.get("available"):
-                return None, capability.get("detail", "Codex capability probe failed")
+                return None, capability.get(
+                    "detail", f"{agent_backend} capability probe failed"
+                )
             try:
                 self._materialize_agent_evidence(
                     scan_id,
@@ -409,7 +435,7 @@ class ScanOrchestrator:
                     evidence_summaries,
                 )
                 return (
-                    self.codex.investigate(
+                    investigator.investigate(
                         scan=scan,
                         task=task,
                         entries=entries,
@@ -617,7 +643,8 @@ class ScanOrchestrator:
                                     )
                             else:
                                 coverage_gaps.append(
-                                    f"Final Codex evaluation failed; retained first-pass result: {final_error}"
+                                    "Final AI evaluation failed; retained first-pass result: "
+                                    f"{final_error}"
                                 )
                 except Exception as exc:
                     coverage_gaps.append(f"Dynamic investigation failed safely: {exc}")
@@ -655,6 +682,7 @@ class ScanOrchestrator:
                 task.result = {
                     **payload,
                     "result": result_value,
+                    "agent_backend": agent_backend,
                     "usage": agent_result.usage,
                     "platform_context": {
                         "device": device_capability,
@@ -668,14 +696,24 @@ class ScanOrchestrator:
                     if result_value == FindingStatus.NOT_REPRODUCED.value
                     else TaskStatus.COMPLETED.value
                 )
-                self._supersede_prior_agent_findings(session, task, result_value)
-                self._persist_agent_finding(session, scan, task, entries, result_value)
+                self._supersede_prior_agent_findings(
+                    session, task, result_value, agent_backend
+                )
+                self._persist_agent_finding(
+                    session,
+                    scan,
+                    task,
+                    entries,
+                    result_value,
+                    agent_backend,
+                )
             elif budget.expired:
                 task.status = TaskStatus.TIMED_OUT.value
                 task.error = agent_error or "task time budget exhausted"
                 task.result = {
                     "deterministic_evidence": evidence_summaries,
                     "coverage_gaps": coverage_gaps,
+                    "agent_backend": agent_backend,
                 }
             elif stages["device_attempted"]:
                 task.status = TaskStatus.INCONCLUSIVE.value
@@ -684,15 +722,17 @@ class ScanOrchestrator:
                     "deterministic_evidence": evidence_summaries,
                     "coverage_gaps": [
                         *coverage_gaps,
-                        "Codex semantic investigation was disabled or unavailable.",
+                        f"{agent_backend} semantic investigation was disabled or unavailable.",
                     ],
+                    "agent_backend": agent_backend,
                 }
             else:
                 task.status = TaskStatus.BLOCKED_DEVICE.value
                 task.error = agent_error or str(device_capability.get("detail"))
                 task.result = {
                     "coverage_gaps": coverage_gaps,
-                    "static_agent_attempted": self.settings.codex_enabled,
+                    "static_agent_attempted": agent_enabled,
+                    "agent_backend": agent_backend,
                 }
             task.completed_at = now()
             self._update_entry_coverage(
@@ -708,7 +748,11 @@ class ScanOrchestrator:
                 scan_id,
                 "task.completed",
                 f"Investigation finished with status {task.status}",
-                {"task_id": task.id, "status": task.status},
+                {
+                    "task_id": task.id,
+                    "status": task.status,
+                    "agent_backend": agent_backend,
+                },
             )
             session.commit()
 
@@ -1032,14 +1076,17 @@ class ScanOrchestrator:
 
     @staticmethod
     def _supersede_prior_agent_findings(
-        session, task: InvestigationTask, result_value: str
+        session,
+        task: InvestigationTask,
+        result_value: str,
+        agent_backend: str,
     ) -> None:  # noqa: ANN001
         current_key = f"agent:{task.id}:{result_value}"
         findings = list(
             session.scalars(
                 select(Finding).where(
                     Finding.scan_id == task.scan_id,
-                    Finding.source == "codex",
+                    Finding.source.in_(["codex", "opencode"]),
                     Finding.dedupe_key.like(f"agent:{task.id}:%"),
                     Finding.dedupe_key != current_key,
                 )
@@ -1051,6 +1098,7 @@ class ScanOrchestrator:
                 **finding.metadata_json,
                 "superseded_by_turn": task.turn_id,
                 "superseded_result": result_value,
+                "superseded_by_backend": agent_backend,
             }
 
     @staticmethod
@@ -1060,6 +1108,7 @@ class ScanOrchestrator:
         task: InvestigationTask,
         entries: list[EntryPoint],
         result_value: str,
+        agent_backend: str,
     ) -> None:
         if result_value in {FindingStatus.NOT_REPRODUCED.value, FindingStatus.INCONCLUSIVE.value}:
             return
@@ -1077,7 +1126,7 @@ class ScanOrchestrator:
                 scan_id=scan.id,
                 dedupe_key=dedupe,
                 rule_id="AGENT-ENTRY-INVESTIGATION",
-                source="codex",
+                source=agent_backend,
                 title=f"Agent investigation: {entries[0].name if entries else task.id}",
                 description=payload.get("summary", "Agent investigation result"),
                 remediation="Review the affected handler and enforce validation and caller authorization.",
@@ -1087,10 +1136,15 @@ class ScanOrchestrator:
                 status=result_value,
                 entry_point_ids=task.target_entry_ids,
                 evidence_ids=evidence_ids,
-                metadata_json={"task_id": task.id, "coverage_gaps": payload.get("coverage_gaps", [])},
+                metadata_json={
+                    "task_id": task.id,
+                    "agent_backend": agent_backend,
+                    "coverage_gaps": payload.get("coverage_gaps", []),
+                },
             )
             session.add(finding)
         else:
+            finding.source = agent_backend
             finding.description = payload.get("summary", "Agent investigation result")
             finding.severity = payload.get("severity_proposal", "medium")
             finding.confidence = payload.get("confidence", "medium")
@@ -1098,6 +1152,7 @@ class ScanOrchestrator:
             finding.evidence_ids = evidence_ids
             finding.metadata_json = {
                 "task_id": task.id,
+                "agent_backend": agent_backend,
                 "coverage_gaps": payload.get("coverage_gaps", []),
             }
 

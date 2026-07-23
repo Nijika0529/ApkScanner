@@ -25,12 +25,20 @@ class Settings:
     scan_deadline_seconds: int = 24 * 60 * 60
     task_timeout_seconds: int = 20 * 60
     task_max_attempts: int = 2
+    investigator_backend: str = "codex"
     codex_enabled: bool = False
     codex_worker_model: str = "gpt-5.6-terra"
     codex_bin: str | None = None
     codex_isolation: str = "docker"
     codex_docker_image: str = "apk-scanner-worker:0.1.0"
     codex_auth_file: Path | None = None
+    opencode_enabled: bool = False
+    opencode_model: str = "deepseek-v4-pro"
+    opencode_node_bin: str | None = None
+    opencode_worker_dir: Path | None = None
+    opencode_isolation: str = "docker"
+    opencode_docker_image: str = "apk-scanner-opencode-worker:0.1.0"
+    deepseek_base_url: str | None = None
     adb_serial: str | None = None
     probe_apk_path: Path | None = None
     device_android_version: str = "16"
@@ -60,6 +68,9 @@ class Settings:
             scan_deadline_seconds=int(os.getenv("APKSCANNER_SCAN_DEADLINE", 86_400)),
             task_timeout_seconds=int(os.getenv("APKSCANNER_TASK_TIMEOUT", 1_200)),
             task_max_attempts=int(os.getenv("APKSCANNER_TASK_MAX_ATTEMPTS", 2)),
+            investigator_backend=os.getenv(
+                "APKSCANNER_INVESTIGATOR_BACKEND", "codex"
+            ).lower(),
             codex_enabled=_env_bool("APKSCANNER_CODEX_ENABLED"),
             codex_worker_model=os.getenv("APKSCANNER_CODEX_WORKER_MODEL", "gpt-5.6-terra"),
             codex_bin=os.getenv("APKSCANNER_CODEX_BIN"),
@@ -72,6 +83,24 @@ class Settings:
                 if os.getenv("APKSCANNER_CODEX_AUTH_FILE")
                 else None
             ),
+            opencode_enabled=_env_bool("APKSCANNER_OPENCODE_ENABLED"),
+            opencode_model=os.getenv(
+                "APKSCANNER_OPENCODE_MODEL", "deepseek-v4-pro"
+            ),
+            opencode_node_bin=os.getenv("APKSCANNER_OPENCODE_NODE_BIN"),
+            opencode_worker_dir=(
+                Path(os.environ["APKSCANNER_OPENCODE_WORKER_DIR"]).resolve()
+                if os.getenv("APKSCANNER_OPENCODE_WORKER_DIR")
+                else None
+            ),
+            opencode_isolation=os.getenv(
+                "APKSCANNER_OPENCODE_ISOLATION", "docker"
+            ).lower(),
+            opencode_docker_image=os.getenv(
+                "APKSCANNER_OPENCODE_DOCKER_IMAGE",
+                "apk-scanner-opencode-worker:0.1.0",
+            ),
+            deepseek_base_url=os.getenv("APKSCANNER_DEEPSEEK_BASE_URL"),
             adb_serial=os.getenv("APKSCANNER_ADB_SERIAL"),
             probe_apk_path=(
                 Path(os.environ["APKSCANNER_PROBE_APK"]).resolve()
@@ -93,6 +122,13 @@ class Settings:
             mobsf_timeout_seconds=int(os.getenv("APKSCANNER_MOBSF_TIMEOUT", 900)),
             frontend_dist=Path(frontend).resolve() if frontend else None,
         )
+
+    def investigator_enabled(self, backend: str) -> bool:
+        if backend == "codex":
+            return self.codex_enabled
+        if backend == "opencode":
+            return self.opencode_enabled
+        return False
 
     def ensure_directories(self) -> None:
         for path in (

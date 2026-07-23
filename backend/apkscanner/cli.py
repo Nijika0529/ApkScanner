@@ -52,6 +52,7 @@ def _import_apk(source: Path, settings: Settings) -> tuple[str, Path, int]:
 
 def scan_command(args: argparse.Namespace) -> int:
     settings, database, _store, orchestrator = _runtime()
+    investigator = orchestrator.resolve_investigator(args.investigator)
     source = Path(args.apk).resolve()
     sha256, target, size = _import_apk(source, settings)
     with database.session_factory() as session:
@@ -59,7 +60,11 @@ def scan_command(args: argparse.Namespace) -> int:
             filename=source.name,
             artifact_sha256=sha256,
             artifact_path=str(target),
-            stats={"upload_bytes": size, "source": "cli"},
+            stats={
+                "upload_bytes": size,
+                "source": "cli",
+                "investigator": investigator,
+            },
         )
         session.add(scan)
         session.commit()
@@ -76,8 +81,15 @@ def scan_command(args: argparse.Namespace) -> int:
 def capabilities_command(args: argparse.Namespace) -> int:
     _settings, _database, _store, orchestrator = _runtime()
     payload = {
+        "default_investigator": orchestrator.resolve_investigator(),
+        "enabled_investigators": [
+            name
+            for name in ("codex", "opencode")
+            if orchestrator.settings.investigator_enabled(name)
+        ],
         "tools": discover_tools(orchestrator.runner),
         "codex": orchestrator.codex.capability(deep=args.deep),
+        "opencode": orchestrator.opencode.capability(deep=args.deep),
         "device": orchestrator.device.capability(),
         "authentication": orchestrator.device.auth_capability(),
         "frida": orchestrator.frida.capability(deep=args.deep),
@@ -201,9 +213,19 @@ def build_parser() -> argparse.ArgumentParser:
     serve.set_defaults(handler=serve_command)
     scan = subparsers.add_parser("scan", help="Run a foreground APK scan")
     scan.add_argument("apk")
+    scan.add_argument(
+        "--investigator",
+        choices=("configured", "codex", "opencode", "none"),
+        default="configured",
+        help="AI investigator backend for this scan",
+    )
     scan.set_defaults(handler=scan_command)
     capabilities = subparsers.add_parser("capabilities", help="Inspect scanner capabilities")
-    capabilities.add_argument("--deep", action="store_true", help="Probe Codex account/models")
+    capabilities.add_argument(
+        "--deep",
+        action="store_true",
+        help="Probe configured AI provider accounts and models",
+    )
     capabilities.set_defaults(handler=capabilities_command)
     context = subparsers.add_parser("context", help="Print a task's bounded investigation context")
     context.add_argument("--task-id", required=True)

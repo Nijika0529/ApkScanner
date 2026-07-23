@@ -114,5 +114,9 @@ export interface Capability {
 export interface Health {
   status: "ok"
   version: string
+  default_investigator: "codex" | "opencode" | "none"
+  enabled_investigators: Array<"codex" | "opencode">
   capabilities: Capability[]
 }
+
+export type InvestigatorChoice = "configured" | "codex" | "opencode" | "none"

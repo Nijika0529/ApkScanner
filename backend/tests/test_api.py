@@ -19,3 +19,17 @@ def test_local_api_requires_console_marker_for_mutations(settings) -> None:  # n
             files={"apk": ("sample.txt", b"not-an-apk", "application/octet-stream")},
         )
         assert accepted_request.status_code == 415
+        invalid_investigator = client.post(
+            "/api/v1/scans",
+            headers={"X-APKScanner-Request": "console"},
+            files={"apk": ("sample.apk", b"not-an-apk", "application/octet-stream")},
+            data={"investigator": "unknown"},
+        )
+        assert invalid_investigator.status_code == 422
+
+        health = client.get("/api/v1/health").json()
+        assert health["default_investigator"] == "codex"
+        assert {item["name"] for item in health["capabilities"]} >= {
+            "codex",
+            "opencode_deepseek",
+        }

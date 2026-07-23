@@ -17,17 +17,17 @@ flowchart LR
     E --> F[登录流程回放]
     F --> G[Authenticated 黑盒]
     E --> H[Frida 旁路观察]
-    G --> I[Codex 第一阶段判断]
+    G --> I[选定 Agent 第一阶段判断]
     H --> I
     I --> J{需要补充测试?}
     J -- 是 --> K[平台校验范围并执行最多 12 个用例]
-    K --> L[Codex 最终判断]
+    K --> L[选定 Agent 最终判断]
     J -- 否 --> L
     L --> M[Evidence ID 与结论级别校验]
     M --> N[Web / JSON / HTML / SARIF + 人工复核]
 ```
 
-平台而不是 Codex 负责 fan-out。一个导出组件对应一个任务；同一 handler 的 Deep Links 合并成一个任务。Agent 不能创建子 Agent，也不能直接把自己的文字当作复现证据。第一阶段最多提出 12 个受限测试：只能使用当前任务的入口 ID；Deep Link 和 Provider URI 必须保持 Manifest 声明的 scheme、host/authority 和 port；额外参数有数量、键名、类型和长度上限。平台执行后再进行一次最终判断。
+平台而不是 Codex/OpenCode 负责 fan-out。一个导出组件对应一个任务；同一 handler 的 Deep Links 合并成一个任务。Agent 不能创建子 Agent，也不能直接把自己的文字当作复现证据。第一阶段最多提出 12 个受限测试：只能使用当前任务的入口 ID；Deep Link 和 Provider URI 必须保持 Manifest 声明的 scheme、host/authority 和 port；额外参数有数量、键名、类型和长度上限。平台执行后再进行一次最终判断。每次扫描在创建时固化 `codex`、`opencode` 或 `none`，服务默认值的后续变更不会让同一扫描混用模型后端。
 
 静态阶段结束即发布 preliminary report，并继续动态任务。外部工具、MobSF 请求和每个任务都有超时；超过 4 小时 preliminary 目标或 24 小时整单预算会写入事件及 coverage gap。
 
@@ -38,11 +38,13 @@ flowchart LR
 | 本地控制面 | SQLite、APK、workspace、evidence | FastAPI 仅监听 loopback；变更 API 需要自定义请求头；内容寻址文件拒绝 symlink/摘要冲突 |
 | Codex Docker worker | 当前 scan workspace、显式 Codex auth、网络 | 每任务新容器、只读 bind mount、只读 rootfs、丢弃 capabilities、PID/CPU/内存限制；默认模式 |
 | Codex host worker | 本机与网络 | 仅作为显式 `host` 降级模式；个人受控环境使用 |
+| OpenCode + DeepSeek Docker worker | 平台生成的 task JSON、DeepSeek API | 不挂载 scan workspace；只读 rootfs、临时 HOME、丢弃 capabilities；禁用文件/Shell/Web/MCP/子 Agent，仅允许内部 StructuredOutput 工具 |
+| OpenCode + DeepSeek host worker | 平台生成的 task JSON、DeepSeek API | 每次调用使用临时 HOME/XDG 与带随机 Basic Auth 的 loopback server；仍仅适合个人受控环境 |
 | 云真机 | 目标 APK、Probe APK、测试账号 | 固定 Android 16/API 36；串行 lease；任务前后 `pm clear`；不声称完整快照复位 |
 | Probe APK | 以普通 App UID 调用目标入口 | 只接受最初发送者为 shell/root 的调度；仍只允许安装在专用测试设备 |
 | MobSF | 上传 APK并返回广度扫描报告 | 可选、显式 URL/API Key；失败不阻断内置基线，但标为 tool gap |
 
-APK、反编译代码、资源、日志、网页和工具输出都属于不可信数据。Codex developer instructions 明确禁止服从这些内容中的指令。Docker worker把宿主暴露面缩小到单个 workspace；网络仍应只用于企业 Codex、云真机及专用测试后端。
+APK、反编译代码、资源、日志、网页和工具输出都属于不可信数据。两个 Agent 后端的 developer instructions 都明确禁止服从这些内容中的指令。Codex Docker worker 只有只读 workspace；OpenCode worker 连 workspace 都不挂载，只接收控制面整理后的 JSON。云真机操作始终由 Python 平台校验后执行，Agent 不持有 ADB 能力。模型网络出口应分别限制到企业 Codex 或获批的 DeepSeek/代理端点。
 
 ## Security IR
 
@@ -78,6 +80,6 @@ Agent 声称但不属于本 scan/task 的 Evidence ID 会被删除。需要证�
 
 - 用公司真实签名 APK 建立回归语料和误报基线。
 - 在目标云真机供应商上编译/安装 Probe APK并跑 API 36 集成测试。
-- 构建并验证 Docker worker 镜像、企业 Codex 登录方式和网络出口策略。
+- 构建并验证两个 Docker worker 镜像、企业 Codex/DeepSeek 凭据方式和各自网络出口策略。
 - 为每个 App 维护稳定的登录流程和 `assert_text` 成功标志。
 - 根据发布风险决定人工 gate；当前产品刻意不自动 gate。
