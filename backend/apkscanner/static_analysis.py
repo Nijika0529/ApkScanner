@@ -52,7 +52,7 @@ class ApkInspector:
             )
             tool_results["apktool"] = self._serialize_result(result)
             candidate = decoded_dir / "AndroidManifest.xml"
-            if result.exit_code == 0 and candidate.exists():
+            if candidate.exists():
                 manifest_path = candidate
                 searchable_roots.append(decoded_dir)
 
