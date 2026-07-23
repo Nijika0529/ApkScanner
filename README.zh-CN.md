@@ -1,0 +1,251 @@
+# APK Scanner
+
+以证据为导向的 Android APK 安全扫描控制面，提供确定性攻击面覆盖、远程 ADB 验证和可选的 Codex AI 调查。
+
+v1 产品是一个单用户、仅限本机（localhost）的 Web 应用。它接收一个可安装的 APK，构建带版本号的 Security IR（安全中间表示），枚举所有 Android 组件入口和 Deep Link，记录覆盖缺口，并分派有边界的调查任务。Agent 输出在缺乏平台证据 ID 的情况下永远不会成为"已复现"的发现。
+
+## 已实现功能
+
+- APK 大小/ZIP 安全检查、SHA-256 内容寻址、签名与包元数据。
+- Manifest 生效状态下的 Activity、Service、Receiver、Provider、权限和 Deep Link 分析。
+- 正确处理 Intent Filter 中分离的 `<data>` 属性的笛卡尔积展开。
+- 内置面向 MASVS 的 Manifest、代码模式、归档文件、原生库和加固规则。
+- Apktool 基线分析，支持可选的 JADX 增强和显式的降级覆盖状态。
+- 持久化的 SQLite Scan/Task/Finding/Evidence/Coverage/Event 模型。
+- 远程 ADB 适配器、串行设备租约、普通 App UID 的 Probe APK 协议、日志证据、访客/认证回放、`pm clear` 清理和 App Link 状态检查/重置。
+- 有限范围的 Frida 旁路追踪（URI/Query 脱敏），带独立的 instrumented 判定。
+- 可选的 MobSF 上传/报告归一化，缺失时显式标注降级覆盖。
+- 官方 `openai-codex==0.144.4` 集成：严格 JSON Schema、全新线程、无子 Agent fan-out、一轮平台介导的补充测试、证据支撑的结果降级。
+- 可选的每任务 Docker Worker，带只读扫描挂载和资源/能力限制。
+- 响应式 React 审核控制台、人工 Finding 判定、实时事件、JSON/HTML/SARIF 导出。
+
+详细的控制流程、信任边界、Security IR 和判定规则参见 [`docs/architecture.zh-CN.md`](docs/architecture.zh-CN.md)。
+
+## 本地搭建
+
+推荐 Python 3.12+ 和 Node 22+。最小的有用静态工具集为 `aapt2`、`apksigner` 和 `apktool`；`jadx` 可选但能改善代码检索。
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install -e '.[dev]'
+
+cd frontend
+npm install
+npm run build
+cd ..
+
+export APKSCANNER_FRONTEND_DIST="$PWD/frontend/dist"
+scanctl serve
+```
+
+打开 `http://127.0.0.1:8000`。如需独立前端开发，在 `frontend/` 中运行 `npm run dev`，Vite 会将 `/api` 代理到 8000 端口。
+
+无需 Web UI 执行前台扫描：
+
+```bash
+scanctl scan /absolute/path/to/application.apk
+scanctl capabilities
+```
+
+## 动态设备配置
+
+配置已在本地 ADB 服务器中记录的远程 Android 16 ADB 序列号或端点：
+
+```bash
+adb connect cloud-device.example:5555
+export APKSCANNER_ADB_SERIAL=cloud-device.example:5555
+```
+
+在 Android SDK 36 工作站上构建 [`probe/`](probe/) 中的故意导出辅助程序，仅安装在专用测试设备上，并配置其路径：
+
+```bash
+export APKSCANNER_PROBE_APK="$PWD/probe/app/build/outputs/apk/debug/app-debug.apk"
+```
+
+没有 ADB 或 Probe APK 时，扫描仍会完成，并显式标注动态覆盖为 blocked。`adb shell` 成功会保留为独立身份，永远不会被视为等同于普通第三方应用。
+
+使用非敏感的 JSON 流程和操作系统密钥环引用配置单账号登录回放：
+
+```bash
+cp config/auth-flow.example.json config/auth-flow.json
+export APKSCANNER_AUTH_FLOW="$PWD/config/auth-flow.json"
+scanctl auth-set-secret username
+scanctl auth-set-secret password
+scanctl auth-status
+```
+
+最后的 `assert_text` 步骤是强制性的，以免将已接受的输入事件误认为成功登录。ADB 文本输入仅接受 shell 安全的测试凭据字符集，输入命令在持久化前已被脱敏。目标 UI 证据仍可能包含测试账号数据，必须作为敏感数据处理。
+
+Frida 配置——设置 Frida 设备 ID（或远程 frida-server 端点）：
+
+```bash
+export APKSCANNER_FRIDA_DEVICE=cloud-device-id
+# 或: export APKSCANNER_FRIDA_HOST=frida.example.test:27042
+```
+
+## Codex 配置
+
+Codex 是可选功能。Docker 是安全的默认隔离模式。构建固定版本的 Worker，提供显式的 Codex 认证文件或 `OPENAI_API_KEY`，然后启用调查：
+
+```bash
+docker build -f Dockerfile.worker -t apk-scanner-worker:0.1.0 .
+export APKSCANNER_CODEX_AUTH_FILE=/absolute/path/to/codex/auth.json
+export APKSCANNER_CODEX_ISOLATION=docker
+export APKSCANNER_CODEX_ENABLED=true
+scanctl capabilities --deep
+```
+
+入口 Worker 默认为 `gpt-5.6-terra` / medium 复杂度。集成为每任务启动全新线程，设置 `agents.max_threads=1`，使用严格的结果 Schema，并拒绝不支持的 SDK 版本。除非你明确测试过外部 CLI 与固定 SDK 的兼容性，否则不要设置 `APKSCANNER_CODEX_BIN`；默认使用内置的匹配运行时。
+
+`APKSCANNER_CODEX_ISOLATION=host` 是供个人受控机器使用的显式降级模式。它不提供 Worker 文件系统边界，不应作为团队部署的默认配置。
+
+添加 MobSF 广度扫描：
+
+```bash
+export APKSCANNER_MOBSF_URL=https://mobsf.internal.example
+export APKSCANNER_MOBSF_API_KEY=...
+```
+
+## 执行流水线
+
+```
+APK 上传
+  → ZIP 安全检查、SHA-256 寻址
+  → Apktool 反编译 + JADX 反编译（可选）
+  → Manifest 解析：枚举 Activity、Service、Receiver、Provider、Deep Link
+  → 内置规则引擎：17+ 条面向 MASVS 的发现
+  → 可选 MobSF 广度静态扫描
+  → 发布 preliminary 报告
+  → InvestigationPlanner 创建任务（每个导出组件一个，每个 Deep Link handler 一个）
+  → 对每个任务：
+      → 按优先级排队
+      → 如配置 ADB：安装 APK、安装 Probe APK、pm clear、启动 Frida（可选）
+      → 访客探测：对每个入口通过 adb shell 和 Probe APK 广播分发
+      → 认证探测：通过 ADB 输入事件回放登录流程，然后重新探测
+      → 收集 Frida 观察结果
+      → Codex 第一阶段（test_planning）：AI 分析证据，最多请求 12 个限定补充测试
+      → 平台验证并执行 Agent 请求的测试
+      → Codex 第二阶段（final_evaluation）：AI 做出最终判定
+      → 证据校验：平台检查引用的 Evidence ID 是否存在，降级无效声明
+      → 持久化带 Agent 判定的发现
+      → 清理：pm clear、App Link 重置
+  → 生成最终报告
+```
+
+## 判定与证据规则
+
+| 判定 | 平台最低要求 |
+| --- | --- |
+| `supported_static` | 至少引用一个 `static.*` Evidence ID |
+| `reproduced_blackbox` | 同一随机 request ID 的 Probe APK 调用 + Probe 结果日志，且 Probe 返回 success |
+| `observed_instrumented` | Frida 成功加载且至少产生一个非 hook-error 的观察事件 |
+| `not_reproduced` | 同一 request ID 的普通 App UID 尝试 + 结果日志存在；仅描述已执行的测试用例，不证明全局安全 |
+| `inconclusive` | 证据不足、工具缺失、预算耗尽或前置条件失败 |
+
+Agent 声称的、不属于当前 Scan/Task 的 Evidence ID 会被移除。需要特定证据的判定在不满足条件时会自动降级为 `inconclusive`。重试时，旧的 Agent Finding 不删除，但会被标记为已被新 turn 取代并降级。
+
+## 环境变量
+
+| 变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `APKSCANNER_DATA_DIR` | `.data` | SQLite、工作区、APK、证据、报告存储目录 |
+| `APKSCANNER_DATABASE_URL` | Data 目录中的 SQLite | SQLAlchemy 数据库 URL |
+| `APKSCANNER_FRONTEND_DIST` | 未设置 | FastAPI 提供的前端构建产物目录 |
+| `APKSCANNER_ADB_SERIAL` | 未设置 | 远程云真机 ADB 序列号 |
+| `APKSCANNER_PROBE_APK` | 未设置 | 已构建的 Probe APK 路径 |
+| `APKSCANNER_AUTH_FLOW` | 未设置 | 非敏感的登录回放 JSON |
+| `APKSCANNER_FRIDA_DEVICE` | ADB 序列号 | Frida 设备标识 |
+| `APKSCANNER_FRIDA_HOST` | 未设置 | 远程 frida-server 端点 |
+| `APKSCANNER_CODEX_ENABLED` | `false` | 是否分派 Codex 调查 |
+| `APKSCANNER_CODEX_ISOLATION` | `docker` | `docker` 或显式 `host` 降级 |
+| `APKSCANNER_CODEX_DOCKER_IMAGE` | `apk-scanner-worker:0.1.0` | Worker 镜像名称 |
+| `APKSCANNER_CODEX_AUTH_FILE` | 未设置 | 仅挂载到 Worker 中的认证文件 |
+| `APKSCANNER_CODEX_BIN` | 内置 SDK 运行时 | 显式测试过的 Codex 二进制覆盖 |
+| `APKSCANNER_MOBSF_URL` / `APKSCANNER_MOBSF_API_KEY` | 未设置 | 可选 MobSF API |
+| `APKSCANNER_ANDROID_VERSION` | `16` | 报告的动态基线 Android 版本 |
+| `APKSCANNER_ANDROID_API` | `36` | 要求的云真机 API Level |
+| `APKSCANNER_MAX_UPLOAD_BYTES` | 512 MiB | 上传大小限制 |
+| `APKSCANNER_TASK_TIMEOUT` | 1200 s | 每个调查任务的时间预算 |
+| `APKSCANNER_TASK_MAX_ATTEMPTS` | 2 | 重试次数预算 |
+
+## 验证
+
+```bash
+pytest
+ruff check backend
+cd frontend && npm run lint && npm run build
+```
+
+测试语料库使用合成 APK 形 ZIP 文件，包含安全/有漏洞的 Manifest 控制项。在将其作为发布门禁之前，请添加签名夹具 APK 和真实的 Android 16 设备测试。
+
+变更 API 调用需要 `X-APKScanner-Request: console` 请求头，Web 控制台会自动添加。服务器绑定 `127.0.0.1` 并拒绝不受信任的 Host 头。
+
+## 安全边界
+
+- 仅限已授权的公司 APK 和专用测试后端。
+- APK 代码、资源、字符串、日志和网页内容均为不可信的 prompt 数据。
+- Probe APK 是故意危险的工具，必须永远不保留在员工/生产设备上。
+- 无源码或服务端权限上下文可用；AUTH 和 PRIVACY 覆盖为部分覆盖。
+- v1 覆盖范围：单 APK、Android 16 基线、单一认证角色、`pm clear`（而非完整设备快照）。
+- Docker 限制默认 Agent 文件系统视图，但其网络为 Codex、远程设备和测试后端保留了足够的访问范围。团队部署前需限制出口策略。
+
+## 项目结构
+
+```
+ApkScanner/
+  README.md / README.zh-CN.md       # 项目说明
+  pyproject.toml                     # Python 项目配置
+  Dockerfile.worker                  # Codex Worker Docker 镜像
+  docs/
+    architecture.zh-CN.md            # 架构与判定模型文档
+  config/
+    auth-flow.example.json           # 登录回放配置示例
+  backend/
+    apkscanner/                      # Python 主包
+      main.py                        # FastAPI 应用工厂
+      cli.py                         # 命令行入口 (scanctl)
+      api.py                         # REST API 路由
+      config.py                      # 环境变量配置
+      db.py / models.py              # SQLAlchemy 数据库与 ORM
+      schemas.py / enums.py          # Pydantic Schema 与枚举
+      orchestrator.py                # 核心流水线控制器
+      static_analysis.py             # APK 静态分析（ZIP/签名/反编译）
+      manifest.py                    # AndroidManifest 解析
+      rules.py                       # 内置规则引擎（17+ 规则）
+      planner.py                     # 调查任务规划器
+      tools.py                       # 外部工具调用封装
+      device.py                      # ADB 远程设备适配器
+      codex_runner.py                # Codex AI 调查集成
+      codex_worker.py                # Docker Worker 入口
+      instrumentation.py             # Frida 旁路追踪适配器
+      mobsf.py                       # MobSF 广度扫描集成
+      auth.py                        # 认证流程与凭据管理
+      evidence.py / artifacts.py     # 证据记录与内容寻址存储
+      reports.py                     # 报告生成（JSON/HTML/SARIF）
+    tests/                           # pytest 测试套件
+  frontend/                          # React + TypeScript + Vite + Tailwind 控制台
+    src/
+      App.tsx                        # 单页应用
+      types.ts / api.ts / lib.ts     # 类型、API 客户端、工具函数
+      components/ui.tsx              # UI 组件
+  probe/                             # Android Probe APK（Java）
+    app/src/main/
+      AndroidManifest.xml            # 故意导出的 BroadcastReceiver
+      java/.../ProbeReceiver.java    # 跨应用调用执行器
+```
+
+## 扩展方式
+
+- **广度引擎**：在 `MobSFAdapter` 或新的静态 Adapter 中归一化为 `FindingDraft`，同时增加引擎覆盖。
+- **漏洞类型**：在 `InvestigationPlanner` 中增加 Task 类型/假设，在平台请求校验器中增加对应的最小安全动作集。
+- **设备供应商**：保持 `prepare → reset/authenticate/probe → cleanup` 和 Evidence 输出契约，替换 ADB 租约实现。
+- **新判定级别**：先定义所需的不可伪造 Evidence 条件，再扩展 Agent Schema 和报告层，不能仅改 prompt。
+
+## 上线前仍需完成
+
+- 用公司真实签名 APK 建立回归语料和误报基线。
+- 在目标云真机供应商上编译/安装 Probe APK 并跑 API 36 集成测试。
+- 构建并验证 Docker Worker 镜像、企业 Codex 登录方式和网络出口策略。
+- 为每个 App 维护稳定的登录流程和 `assert_text` 成功标志。
+- 根据发布风险决定人工 gate；当前产品刻意不自动 gate。

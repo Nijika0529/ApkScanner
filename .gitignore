@@ -12,3 +12,4 @@ probe/.gradle/
 probe/app/build/
 config/auth-flow.json
 .DS_Store
+frontend/package-lock.json
