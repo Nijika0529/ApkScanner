@@ -73,7 +73,7 @@ sequenceDiagram
             W->>O: exact validation errors + correction prompt
         end
     end
-    W-->>P: stdout: one JSON object
+    W-->>P: stdout NDJSON: event* + terminal result
     W->>O: session.delete + server.close
 ```
 
@@ -81,7 +81,7 @@ bridge 不参与任务规划、证据判定或设备操作。Python 仍然负责
 
 1. 静态工具覆盖面和入口枚举；
 2. 生成每个入口的任务与证据摘要；
-3. 校验 Agent 提出的最多 12 个测试；
+3. 在每个自适应轮次校验 Agent 提出的受限测试（默认每轮最多接受 4 个）；
 4. 在云真机上执行允许的 Probe/ADB/Frida 操作；
 5. 验证 Evidence ID，并把不满足条件的结论降级。
 
@@ -97,6 +97,8 @@ OpenCode 本身是 coding agent，默认会暴露读文件、Shell、编辑、We
 - 设置 `OPENCODE_PURE=1`，禁用外部插件；禁用 project config、Claude 配置、模型目录
   自动刷新和自动升级。
 - 每次调用使用新 session、新 OpenCode server 和临时 HOME/XDG 数据目录。
+- worker 在发送 prompt 前订阅 `event.subscribe()` SSE，并把会话状态、步骤、响应、
+  重试、校验和错误归一化为 NDJSON 事件；Python 按 `task_id` 写入实时扫描时间线。
 - loopback server 使用随机端口与随机 Basic Auth；进程超时后终止整个进程组。
 - Docker 模式使用只读 rootfs、无 capabilities、`no-new-privileges`、PID/CPU/内存限制
   和临时 HOME。
@@ -134,7 +136,7 @@ Web 上传框和 CLI 的 `--investigator` 可以为单个扫描选择：
 每次调用的审计记录会写明 `output_mode`。Pro 的 `output_transport.model_calls` 还会保存
 每一轮实际 prompt、原始文本响应、解析错误、Schema 校验错误、是否被接受和单轮 usage；
 即使 3 次都失败，这些内容也进入 `agent.error` 的不可变 Evidence。API Key 和隐藏思考
-内容不进入审计。
+内容不进入审计。规范化 SDK 关键事件另存为 `agent.events` Evidence。
 
 ## 验证与升级
 
@@ -155,7 +157,8 @@ scanctl capabilities --deep
 1. Flash 请求只暴露 `StructuredOutput` 且使用 `tool_choice: required`；
 2. Pro 的所有请求都没有 `tools` 和 `tool_choice`；
 3. Pro 首次返回不合格 JSON 时，Ajv 拒绝结果并通过同一 session 下发可审计纠正提示；
-4. 通过本地 Schema 校验后，两个通道归一化为相同的 worker 响应。
+4. worker 在两种模式下都输出可增量消费的事件 envelope 和唯一 terminal result；
+5. 通过本地 Schema 校验后，两个通道归一化为相同的 worker 响应。
 
 升级时必须：
 

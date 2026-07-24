@@ -75,17 +75,26 @@ async function investigate(client, payload) {
     "session.create",
   )
   sessionID = session.id
+  emitRuntimeEvent("model.session.started", "OpenCode SDK 会话已建立", {
+    session_id: sessionID,
+  })
+  const eventPump = await startEventPump(client)
   try {
     if (outputModeForModel(payload.model) === OUTPUT_MODE_PROMPTED_JSON) {
       return await investigatePromptedJson(client, payload)
     }
     return await investigateStructuredOutput(client, payload)
   } finally {
+    await eventPump.stop()
     await client.session.delete({ path: { id: sessionID } }).catch(() => undefined)
   }
 }
 
 async function investigateStructuredOutput(client, payload) {
+  emitRuntimeEvent("model.turn.started", "OpenCode 开始生成结构化判断", {
+    attempt: 1,
+    output_mode: OUTPUT_MODE_STRUCTURED_TOOL,
+  })
   const response = await prompt(client, payload, payload.prompt, {
     type: "json_schema",
     schema: payload.output_schema,
@@ -94,6 +103,10 @@ async function investigateStructuredOutput(client, payload) {
   if (response.info?.error) {
     throw new Error(`OpenCode model error: ${formatError(response.info.error)}`)
   }
+  emitRuntimeEvent("model.response.received", "OpenCode 已返回模型响应", {
+    attempt: 1,
+    turn_id: response.info?.id ?? null,
+  })
   const result =
     response.info?.structured ??
     response.info?.structured_output ??
@@ -101,6 +114,10 @@ async function investigateStructuredOutput(client, payload) {
   if (!result || typeof result !== "object" || Array.isArray(result)) {
     throw new Error("OpenCode returned no structured investigation result")
   }
+  emitRuntimeEvent("model.output.validated", "OpenCode 结构化输出已通过校验", {
+    attempt: 1,
+    turn_id: response.info?.id ?? null,
+  })
   return {
     schema_version: "1.0",
     thread_id: sessionID,
@@ -136,9 +153,17 @@ async function investigatePromptedJson(client, payload) {
   let promptText = payload.prompt
 
   for (let index = 0; index <= PROMPTED_JSON_RETRY_COUNT; index += 1) {
+    emitRuntimeEvent("model.turn.started", "DeepSeek Pro 开始生成纯文本 JSON", {
+      attempt: index + 1,
+      output_mode: OUTPUT_MODE_PROMPTED_JSON,
+    })
     const response = await prompt(client, payload, promptText, { type: "text" })
     responses.push(response)
     const text = responseText(response.parts ?? [])
+    emitRuntimeEvent("model.response.received", "DeepSeek Pro 已返回模型响应", {
+      attempt: index + 1,
+      turn_id: response.info?.id ?? null,
+    })
     if (response.info?.error) {
       calls.push(
         modelCallAudit({
@@ -188,6 +213,11 @@ async function investigatePromptedJson(client, payload) {
       }),
     )
     if (valid) {
+      emitRuntimeEvent("model.output.validated", "DeepSeek Pro 输出已通过 Ajv 校验", {
+        attempt: index + 1,
+        turn_id: response.info?.id ?? null,
+        validator: "ajv@8.20.0",
+      })
       return {
         schema_version: "1.0",
         thread_id: sessionID,
@@ -197,6 +227,12 @@ async function investigatePromptedJson(client, payload) {
         output_transport: promptedJsonTransport(calls),
       }
     }
+    emitRuntimeEvent("model.validation.failed", "DeepSeek Pro 输出未通过本地 JSON 校验", {
+      attempt: index + 1,
+      turn_id: response.info?.id ?? null,
+      parse_error: parseError,
+      validation_error_count: validationErrors.length,
+    })
     promptText = correctionPrompt(parseError, validationErrors)
   }
 
@@ -227,6 +263,144 @@ function prompt(client, payload, promptText, format) {
       },
     })
     .then((response) => unwrap(response, "session.prompt"))
+}
+
+async function startEventPump(client) {
+  const controller = new AbortController()
+  const subscription = await client.event.subscribe({ signal: controller.signal })
+  const seen = new Set()
+  const done = (async () => {
+    try {
+      for await (const event of subscription.stream) {
+        const normalized = normalizeOpenCodeEvent(event, seen)
+        if (normalized) {
+          emitRuntimeEvent(
+            normalized.event_type,
+            normalized.message,
+            normalized.data,
+          )
+        }
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        emitRuntimeEvent("model.event_stream.failed", "OpenCode 事件流异常中止", {
+          error: formatError(error).slice(0, 1000),
+        })
+      }
+    }
+  })()
+  return {
+    async stop() {
+      controller.abort()
+      await done.catch(() => undefined)
+    },
+  }
+}
+
+function normalizeOpenCodeEvent(event, seen) {
+  if (!event || typeof event !== "object") return null
+  const properties = event.properties ?? {}
+  const part = properties.part
+  const eventSessionID =
+    properties.sessionID ??
+    part?.sessionID ??
+    properties.info?.sessionID
+  if (eventSessionID && eventSessionID !== sessionID) return null
+
+  if (event.type === "session.status") {
+    const status = properties.status?.type ?? "unknown"
+    return {
+      event_type: "model.session.status",
+      message: `OpenCode 会话状态：${status}`,
+      data: { session_id: sessionID, status },
+    }
+  }
+  if (event.type === "session.idle") {
+    return {
+      event_type: "model.session.idle",
+      message: "OpenCode 会话已进入空闲状态",
+      data: { session_id: sessionID },
+    }
+  }
+  if (event.type === "session.error") {
+    return {
+      event_type: "model.error",
+      message: "OpenCode 会话报告运行错误",
+      data: { session_id: sessionID, error: formatError(properties.error).slice(0, 1000) },
+    }
+  }
+  if (event.type !== "message.part.updated" || !part) return null
+
+  if (part.type === "step-start") {
+    return once(seen, `step-start:${part.id}`, {
+      event_type: "model.step.started",
+      message: "OpenCode 开始新的模型步骤",
+      data: { session_id: sessionID, message_id: part.messageID, part_id: part.id },
+    })
+  }
+  if (part.type === "step-finish") {
+    return once(seen, `step-finish:${part.id}`, {
+      event_type: "model.step.completed",
+      message: "OpenCode 模型步骤已完成",
+      data: {
+        session_id: sessionID,
+        message_id: part.messageID,
+        part_id: part.id,
+        reason: part.reason,
+        tokens: part.tokens,
+        cost: part.cost,
+      },
+    })
+  }
+  if (part.type === "reasoning") {
+    return once(seen, `reasoning:${part.id}`, {
+      event_type: "model.reasoning.started",
+      message: "OpenCode 正在整理验证思路",
+      data: { session_id: sessionID, message_id: part.messageID, part_id: part.id },
+    })
+  }
+  if (part.type === "text") {
+    return once(seen, `text:${part.id}`, {
+      event_type: "model.response.started",
+      message: "OpenCode 正在生成结构化判断",
+      data: { session_id: sessionID, message_id: part.messageID, part_id: part.id },
+    })
+  }
+  if (part.type === "retry") {
+    return once(seen, `retry:${part.id}:${part.attempt}`, {
+      event_type: "model.retry.started",
+      message: "OpenCode 正在重试模型调用",
+      data: {
+        session_id: sessionID,
+        message_id: part.messageID,
+        attempt: part.attempt,
+      },
+    })
+  }
+  if (part.type === "tool") {
+    const status = part.state?.status ?? "unknown"
+    return once(seen, `tool:${part.id}:${status}`, {
+      event_type: status === "running" ? "model.tool.started" : "model.tool.completed",
+      message:
+        status === "running"
+          ? `OpenCode 开始执行 ${part.tool}`
+          : `OpenCode 工具 ${part.tool} 状态：${status}`,
+      data: {
+        session_id: sessionID,
+        message_id: part.messageID,
+        part_id: part.id,
+        tool: part.tool,
+        status,
+      },
+    })
+  }
+  return null
+}
+
+function once(seen, key, value) {
+  if (seen.has(key)) return null
+  seen.add(key)
+  return value
 }
 
 function promptedJsonFailure(payload, response, responses, calls, type, message) {
@@ -390,7 +564,7 @@ function unwrap(response, label) {
 function formatError(value) {
   if (typeof value === "string") return value
   if (value?.message) return String(value.message)
-  return JSON.stringify(value)
+  return JSON.stringify(value) ?? String(value ?? "unknown error")
 }
 
 function outputModeForModel(model) {
@@ -527,10 +701,27 @@ for (const name of ["SIGINT", "SIGTERM"]) {
 }
 
 main()
-  .then((result) => stdout.write(JSON.stringify(result)))
+  .then((result) => emitRecord({ type: "result", result }))
   .catch((error) => {
     const secret = process.env.DEEPSEEK_API_KEY
     const message = error instanceof Error ? error.stack ?? error.message : String(error)
     stderr.write(secret ? message.replaceAll(secret, "[redacted]") : message)
     process.exitCode = 1
   })
+
+function emitRuntimeEvent(eventType, message, data = {}) {
+  emitRecord({
+    type: "event",
+    event: {
+      event_type: eventType,
+      message,
+      data,
+    },
+  })
+}
+
+function emitRecord(value) {
+  const secret = process.env.DEEPSEEK_API_KEY
+  const serialized = JSON.stringify(value)
+  stdout.write(`${secret ? serialized.replaceAll(secret, "[redacted]") : serialized}\n`)
+}

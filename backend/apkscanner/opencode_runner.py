@@ -8,15 +8,18 @@ import signal
 import subprocess
 import tempfile
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .agent_events import AgentEventCallback
 from .agent_prompt import developer_instructions, investigation_prompt
 from .config import Settings
 from .models import EntryPoint, InvestigationTask, Scan
 from .schemas import AGENT_RESULT_JSON_SCHEMA, AgentInvestigationResult
+from .worker_protocol import WorkerTimeoutError, consume_worker_process
 
 OPENCODE_SDK_VERSION = "1.18.4"
 OPENCODE_CLI_VERSION = "1.18.4"
@@ -182,6 +185,7 @@ class OpenCodeInvestigator:
         evidence: list[dict[str, Any]],
         platform_context: dict[str, Any] | None = None,
         timeout_seconds: int | None = None,
+        event_callback: AgentEventCallback | None = None,
     ) -> OpenCodeRunResult:
         if not workspace.is_dir():
             raise ValueError("scan workspace is unavailable")
@@ -210,7 +214,14 @@ class OpenCodeInvestigator:
             "output_schema": AGENT_RESULT_JSON_SCHEMA,
             "timeout_ms": max(1, timeout) * 1000,
         }
-        response = self._invoke(payload, timeout_seconds=timeout + 15)
+        if event_callback is None:
+            response = self._invoke(payload, timeout_seconds=timeout + 15)
+        else:
+            response = self._invoke(
+                payload,
+                timeout_seconds=timeout + 15,
+                event_callback=event_callback,
+            )
         if response.get("error"):
             error = response["error"]
             message = (
@@ -351,6 +362,7 @@ class OpenCodeInvestigator:
                     (
                         '{{ index .Config.Labels "io.apkscanner.opencode-sdk-version" }}'
                         '|{{ index .Config.Labels "io.apkscanner.opencode-version" }}'
+                        '|{{ index .Config.Labels "io.apkscanner.worker-protocol" }}'
                     ),
                     image,
                 ],
@@ -368,7 +380,7 @@ class OpenCodeInvestigator:
                 "available": False,
                 "detail": f"build the OpenCode worker image first: {image}",
             }
-        expected = f"{OPENCODE_SDK_VERSION}|{OPENCODE_CLI_VERSION}"
+        expected = f"{OPENCODE_SDK_VERSION}|{OPENCODE_CLI_VERSION}|2"
         if inspected.stdout.strip() != expected:
             return {
                 **capability,
@@ -389,13 +401,31 @@ class OpenCodeInvestigator:
         version = value.get("version")
         return str(version) if version else None
 
-    def _invoke(self, payload: dict[str, Any], *, timeout_seconds: int) -> dict[str, Any]:
+    def _invoke(
+        self,
+        payload: dict[str, Any],
+        *,
+        timeout_seconds: int,
+        event_callback: AgentEventCallback | None = None,
+    ) -> dict[str, Any]:
         if self.settings.opencode_isolation == "docker":
-            return self._invoke_docker(payload, timeout_seconds=timeout_seconds)
-        return self._invoke_host(payload, timeout_seconds=timeout_seconds)
+            return self._invoke_docker(
+                payload,
+                timeout_seconds=timeout_seconds,
+                event_callback=event_callback,
+            )
+        return self._invoke_host(
+            payload,
+            timeout_seconds=timeout_seconds,
+            event_callback=event_callback,
+        )
 
     def _invoke_host(
-        self, payload: dict[str, Any], *, timeout_seconds: int
+        self,
+        payload: dict[str, Any],
+        *,
+        timeout_seconds: int,
+        event_callback: AgentEventCallback | None,
     ) -> dict[str, Any]:
         node = self.settings.opencode_node_bin or shutil.which("node")
         if node is None:
@@ -415,20 +445,20 @@ class OpenCodeInvestigator:
                 start_new_session=True,
             )
             try:
-                stdout, stderr = process.communicate(
-                    json.dumps(payload, ensure_ascii=False),
-                    timeout=timeout_seconds,
+                response, _stderr = consume_worker_process(
+                    process,
+                    payload=payload,
+                    timeout_seconds=timeout_seconds,
+                    event_callback=event_callback,
+                    on_timeout=lambda: self._kill_process_group(process),
                 )
-            except subprocess.TimeoutExpired as exc:
-                self._kill_process_group(process)
-                process.communicate()
+            except WorkerTimeoutError as exc:
                 raise TimeoutError(
                     f"OpenCode investigation exceeded {timeout_seconds} seconds"
                 ) from exc
-        if process.returncode != 0:
-            detail = stderr.strip()[-3000:] or "worker returned no diagnostic"
-            raise RuntimeError(f"OpenCode worker failed: {detail}")
-        return self._parse_worker_response(stdout)
+            except RuntimeError as exc:
+                raise RuntimeError(f"OpenCode worker failed: {exc}") from exc
+        return response
 
     def _worker_environment(self, root: Path) -> dict[str, str]:
         allowed = {
@@ -469,7 +499,11 @@ class OpenCodeInvestigator:
         return env
 
     def _invoke_docker(
-        self, payload: dict[str, Any], *, timeout_seconds: int
+        self,
+        payload: dict[str, Any],
+        *,
+        timeout_seconds: int,
+        event_callback: AgentEventCallback | None,
     ) -> dict[str, Any]:
         executable = shutil.which("docker")
         if executable is None:
@@ -521,16 +555,17 @@ class OpenCodeInvestigator:
             if os.getenv(name):
                 command.extend(["--env", name])
         command.append(self.settings.opencode_docker_image)
-        try:
-            completed = subprocess.run(
-                command,
-                input=json.dumps(payload, ensure_ascii=False),
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+
+        def stop_container() -> None:
+            self._kill_process_group(process)
             subprocess.run(
                 [executable, "rm", "-f", container_name],
                 stdin=subprocess.DEVNULL,
@@ -538,29 +573,54 @@ class OpenCodeInvestigator:
                 timeout=20,
                 check=False,
             )
+
+        try:
+            response, _stderr = consume_worker_process(
+                process,
+                payload=payload,
+                timeout_seconds=timeout_seconds,
+                event_callback=event_callback,
+                on_timeout=stop_container,
+            )
+        except WorkerTimeoutError as exc:
             raise TimeoutError(
                 f"containerized OpenCode investigation exceeded {timeout_seconds} seconds"
             ) from exc
-        if completed.returncode != 0:
-            detail = completed.stderr.strip()[-3000:] or "worker returned no diagnostic"
-            raise RuntimeError(f"containerized OpenCode worker failed: {detail}")
-        return self._parse_worker_response(completed.stdout)
+        except RuntimeError as exc:
+            raise RuntimeError(f"containerized OpenCode worker failed: {exc}") from exc
+        return response
 
     @staticmethod
     def _kill_process_group(process: subprocess.Popen[str]) -> None:
         if process.poll() is not None:
             return
         if os.name == "posix":
-            os.killpg(process.pid, signal.SIGKILL)
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
             return
         process.kill()
 
     @staticmethod
     def _parse_worker_response(stdout: str) -> dict[str, Any]:
-        try:
-            value = json.loads(stdout)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("OpenCode worker returned invalid JSON") from exc
-        if not isinstance(value, dict):
-            raise RuntimeError("OpenCode worker returned a non-object response")
-        return value
+        result: dict[str, Any] | None = None
+        for raw in stdout.splitlines() or [stdout]:
+            if not raw.strip():
+                continue
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("OpenCode worker returned invalid JSON") from exc
+            if not isinstance(value, dict):
+                raise RuntimeError("OpenCode worker returned a non-object response")
+            if value.get("type") == "event":
+                continue
+            if value.get("type") == "result":
+                candidate = value.get("result")
+                if not isinstance(candidate, dict):
+                    raise RuntimeError("OpenCode worker returned an invalid result envelope")
+                result = candidate
+            else:
+                result = value
+        if result is None:
+            raise RuntimeError("OpenCode worker returned no result")
+        return result

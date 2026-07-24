@@ -358,7 +358,12 @@ async def stream_events(
             for event in events:
                 cursor = event.id
                 payload = EventOut.model_validate(event).model_dump(mode="json")
-                yield f"id: {event.id}\nevent: {event.event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                stream_event = (
+                    "exploration.update"
+                    if event.event_type.startswith("exploration.")
+                    else event.event_type
+                )
+                yield f"id: {event.id}\nevent: {stream_event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
             if scan and scan.status in {ScanStatus.FINAL.value, ScanStatus.FAILED.value} and not events:
                 yield "event: end\ndata: {}\n\n"
                 break

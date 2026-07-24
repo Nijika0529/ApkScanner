@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from sqlalchemy import select
 
+from .agent_events import AgentRuntimeEvent
 from .agent_prompt import developer_instructions, investigation_prompt
 from .artifacts import ArtifactStore
 from .codex_runner import CodexInvestigator
@@ -70,6 +71,30 @@ class ScanOrchestrator:
         if backend not in {*self.investigators, "none"}:
             raise ValueError("investigator must be configured, codex, opencode, or none")
         return backend
+
+    def _record_exploration_event(
+        self,
+        scan_id: str,
+        task_id: str,
+        event_type: str,
+        message: str,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        normalized_type = (
+            event_type if event_type.startswith("exploration.") else f"exploration.{event_type}"
+        )
+        with self.database.session_factory() as session:
+            add_event(
+                session,
+                scan_id,
+                normalized_type,
+                message,
+                {
+                    "task_id": task_id,
+                    **(data or {}),
+                },
+            )
+            session.commit()
 
     async def submit(self, scan_id: str) -> None:
         async with self._running_lock:
@@ -394,6 +419,31 @@ class ScanOrchestrator:
                 f"Investigation started for {len(entries)} entry point(s)",
                 {"task_id": task.id, "agent_backend": agent_backend},
             )
+            add_event(
+                session,
+                scan_id,
+                "exploration.started",
+                (
+                    f"AI 探索任务已启动：{len(entries)} 个入口"
+                    if agent_backend != "none"
+                    else f"确定性入口验证任务已启动：{len(entries)} 个入口"
+                ),
+                {
+                    "task_id": task.id,
+                    "source": "platform",
+                    "run_id": f"{task.id}:attempt:{task.attempts}",
+                    "agent_backend": agent_backend,
+                    "model": (
+                        self.settings.codex_worker_model
+                        if agent_backend == "codex"
+                        else self.settings.opencode_model
+                        if agent_backend == "opencode"
+                        else None
+                    ),
+                    "entry_point_ids": list(task.target_entry_ids),
+                    "hypotheses": list(task.hypotheses),
+                },
+            )
             session.commit()
 
         budget = TimeBudget.from_seconds(timeout_seconds or self.settings.task_timeout_seconds)
@@ -421,8 +471,10 @@ class ScanOrchestrator:
             phase: str,
             timeout_cap: int | None = None,
             executed_tests: list[dict[str, Any]] | None = None,
+            round_index: int = 0,
         ):  # noqa: ANN202
             audit_id: str | None = None
+            runtime_events: list[dict[str, Any]] = []
             if investigator is None:
                 return None, "AI investigation is disabled for this scan"
             if not agent_enabled:
@@ -446,13 +498,35 @@ class ScanOrchestrator:
                 )
                 platform_context = {
                     "phase": phase,
+                    "round_index": round_index,
                     "device": device_capability,
                     "authentication": auth_capability,
                     "frida": frida_capability,
                     "coverage_gaps": coverage_gaps,
                     "executed_agent_tests": executed_tests or [],
-                    "further_test_rounds_available": phase == "test_planning",
+                    "further_test_rounds_available": (
+                        phase != "final_evaluation"
+                        and round_index < self.settings.agent_max_rounds
+                    ),
+                    "exploration_limits": {
+                        "max_rounds": self.settings.agent_max_rounds,
+                        "tests_per_round": self.settings.agent_tests_per_round,
+                    },
                 }
+                self._record_exploration_event(
+                    scan_id,
+                    task_id,
+                    "context.loaded",
+                    "静态结果、入口信息与现有证据已装载",
+                    {
+                        "source": "platform",
+                        "phase": phase,
+                        "round_index": round_index,
+                        "evidence_count": len(evidence_summaries),
+                        "executed_test_count": len(executed_tests or []),
+                        "agent_backend": agent_backend,
+                    },
+                )
                 audit_id = self._record_agent_request(
                     scan=scan,
                     task=task,
@@ -463,6 +537,42 @@ class ScanOrchestrator:
                     phase=phase,
                     capability=capability,
                 )
+
+                def on_runtime_event(event: AgentRuntimeEvent) -> None:
+                    record = {
+                        "sequence": len(runtime_events) + 1,
+                        "event_type": event.event_type,
+                        "message": event.message,
+                        "data": event.data,
+                        "created_at": datetime.now(UTC).isoformat(),
+                    }
+                    runtime_events.append(record)
+                    self._record_exploration_event(
+                        scan_id,
+                        task_id,
+                        event.event_type,
+                        event.message,
+                        {
+                            "source": "sdk",
+                            "phase": phase,
+                            "round_index": round_index,
+                            "agent_backend": agent_backend,
+                            **event.data,
+                        },
+                    )
+
+                self._record_exploration_event(
+                    scan_id,
+                    task_id,
+                    "model.dispatched",
+                    f"任务已下发到 {agent_backend} SDK",
+                    {
+                        "source": "platform",
+                        "phase": phase,
+                        "round_index": round_index,
+                        "agent_backend": agent_backend,
+                    },
+                )
                 result = investigator.investigate(
                     scan=scan,
                     task=task,
@@ -471,6 +581,7 @@ class ScanOrchestrator:
                     evidence=evidence_summaries,
                     platform_context=platform_context,
                     timeout_seconds=remaining,
+                    event_callback=on_runtime_event,
                 )
                 self._record_agent_response(
                     scan_id=scan_id,
@@ -481,8 +592,74 @@ class ScanOrchestrator:
                     attempt=task.attempts,
                     result=result,
                 )
+                self._record_agent_runtime_events(
+                    scan_id=scan_id,
+                    task_id=task_id,
+                    audit_id=audit_id,
+                    backend=agent_backend,
+                    phase=phase,
+                    attempt=task.attempts,
+                    events=runtime_events,
+                )
+                self._record_exploration_event(
+                    scan_id,
+                    task_id,
+                    "model.completed",
+                    f"{agent_backend} SDK 已返回本轮结构化结果",
+                    {
+                        "source": "platform",
+                        "phase": phase,
+                        "round_index": round_index,
+                        "agent_backend": agent_backend,
+                        "thread_id": result.thread_id,
+                        "turn_id": result.turn_id,
+                        "requested_test_count": len(result.result.requested_tests),
+                    },
+                )
+                for hypothesis in result.result.hypotheses_tested[:12]:
+                    self._record_exploration_event(
+                        scan_id,
+                        task_id,
+                        "hypothesis.recorded",
+                        "AI 已记录一项被验证的安全假设",
+                        {
+                            "source": "model",
+                            "phase": phase,
+                            "round_index": round_index,
+                            "agent_backend": agent_backend,
+                            "hypothesis": hypothesis,
+                        },
+                    )
+                for request in result.result.requested_tests[
+                    : self.settings.agent_tests_per_round
+                ]:
+                    self._record_exploration_event(
+                        scan_id,
+                        task_id,
+                        "action.proposed",
+                        "AI 申请执行一项受控入口测试",
+                        {
+                            "source": "model",
+                            "phase": phase,
+                            "round_index": round_index,
+                            "agent_backend": agent_backend,
+                            "entry_point_id": request.entry_point_id,
+                            "state": request.state,
+                            "rationale_summary": request.rationale,
+                        },
+                    )
                 return result, None
             except Exception as exc:
+                if audit_id is not None and runtime_events:
+                    self._record_agent_runtime_events(
+                        scan_id=scan_id,
+                        task_id=task_id,
+                        audit_id=audit_id,
+                        backend=agent_backend,
+                        phase=phase,
+                        attempt=task.attempts,
+                        events=runtime_events,
+                    )
                 if audit_id is not None:
                     self._record_agent_error(
                         scan_id=scan_id,
@@ -493,6 +670,19 @@ class ScanOrchestrator:
                         attempt=task.attempts,
                         error=exc,
                     )
+                self._record_exploration_event(
+                    scan_id,
+                    task_id,
+                    "model.failed",
+                    f"{agent_backend} SDK 本轮调用失败",
+                    {
+                        "source": "platform",
+                        "phase": phase,
+                        "round_index": round_index,
+                        "agent_backend": agent_backend,
+                        "error": str(exc)[:2000],
+                    },
+                )
                 return None, str(exc)
 
         device_ready = bool(
@@ -638,33 +828,77 @@ class ScanOrchestrator:
                                 )
                     phase_one_cap = max(1, budget.remaining() // 2)
                     agent_result, agent_error = invoke_agent(
-                        phase="test_planning", timeout_cap=phase_one_cap
+                        phase="test_planning",
+                        timeout_cap=phase_one_cap,
+                        round_index=0,
                     )
-                    if agent_result and agent_result.result.requested_tests and prepared:
-                        planning_turn_id = agent_result.turn_id
+                    completed_rounds = 0
+                    while (
+                        agent_result
+                        and agent_result.result.requested_tests
+                        and prepared
+                        and completed_rounds < self.settings.agent_max_rounds
+                        and not budget.expired
+                    ):
+                        planning_result = agent_result
+                        planning_turn_id = planning_result.turn_id
                         submitted_tests = [
                             item.model_dump(mode="json")
-                            for item in agent_result.result.requested_tests
+                            for item in planning_result.result.requested_tests
                         ]
                         requested, request_gaps = self._validate_requested_tests(
-                            agent_result.result.requested_tests,
+                            planning_result.result.requested_tests,
                             entries,
                             auth_available=bool(auth_capability.get("available")),
+                            limit=self.settings.agent_tests_per_round,
                         )
                         coverage_gaps.extend(request_gaps)
-                        execution_gaps: list[str] = []
-                        if requested and not budget.expired:
-                            executed_agent_tests, execution_gaps, requested_observed = (
-                                self._execute_requested_tests(
-                                    scan_id=scan_id,
-                                    task_id=task_id,
-                                    package_name=package_name,
-                                    entries=entries,
-                                    requests=requested,
-                                    budget=budget,
-                                    evidence_summaries=evidence_summaries,
-                                )
+                        for accepted in requested:
+                            self._record_exploration_event(
+                                scan_id,
+                                task_id,
+                                "action.accepted",
+                                "平台已接受 AI 申请的受控入口测试",
+                                {
+                                    "source": "platform",
+                                    "round_index": completed_rounds,
+                                    "entry_point_id": accepted.entry_point_id,
+                                    "state": accepted.state,
+                                    "rationale_summary": accepted.rationale,
+                                },
                             )
+                        if request_gaps or len(requested) < len(submitted_tests):
+                            self._record_exploration_event(
+                                scan_id,
+                                task_id,
+                                "action.rejected",
+                                "部分 AI 测试申请被平台边界策略拒绝或截断",
+                                {
+                                    "source": "platform",
+                                    "round_index": completed_rounds,
+                                    "submitted_count": len(submitted_tests),
+                                    "accepted_count": len(requested),
+                                    "gaps": request_gaps,
+                                },
+                            )
+
+                        execution_gaps: list[str] = []
+                        executed_this_round: list[dict[str, Any]] = []
+                        if requested and not budget.expired:
+                            (
+                                executed_this_round,
+                                execution_gaps,
+                                requested_observed,
+                            ) = self._execute_requested_tests(
+                                scan_id=scan_id,
+                                task_id=task_id,
+                                package_name=package_name,
+                                entries=entries,
+                                requests=requested,
+                                budget=budget,
+                                evidence_summaries=evidence_summaries,
+                            )
+                            executed_agent_tests.extend(executed_this_round)
                             coverage_gaps.extend(execution_gaps)
                             stages["instrumented_attempted"] = (
                                 stages["instrumented_attempted"]
@@ -673,28 +907,12 @@ class ScanOrchestrator:
                             stages["instrumented_observed"] = (
                                 stages["instrumented_observed"] or requested_observed
                             )
-                            final_result, final_error = invoke_agent(
-                                phase="final_evaluation",
-                                executed_tests=executed_agent_tests,
-                            )
-                            if final_result is not None:
-                                agent_result = final_result
-                                agent_error = None
-                                if final_result.result.requested_tests:
-                                    coverage_gaps.append(
-                                        "Additional agent-requested tests were not executed because "
-                                        "the platform permits one bounded follow-up round per task."
-                                    )
-                            else:
-                                coverage_gaps.append(
-                                    "Final AI evaluation failed; retained first-pass result: "
-                                    f"{final_error}"
-                                )
                         elif requested:
                             execution_gaps.append(
                                 "Task budget expired before accepted AI-requested tests ran."
                             )
                             coverage_gaps.extend(execution_gaps)
+
                         self._record_agent_test_validation(
                             task_id=task_id,
                             turn_id=planning_turn_id,
@@ -702,9 +920,59 @@ class ScanOrchestrator:
                             accepted=[
                                 item.model_dump(mode="json") for item in requested
                             ],
-                            executed=executed_agent_tests,
+                            executed=executed_this_round,
                             gaps=[*request_gaps, *execution_gaps],
                         )
+                        completed_rounds += 1
+                        if (
+                            not executed_this_round
+                            or budget.expired
+                            or completed_rounds >= self.settings.agent_max_rounds
+                        ):
+                            break
+                        next_result, next_error = invoke_agent(
+                            phase="exploration_round",
+                            timeout_cap=max(1, budget.remaining() // 2),
+                            executed_tests=executed_agent_tests,
+                            round_index=completed_rounds,
+                        )
+                        if next_result is None:
+                            coverage_gaps.append(
+                                "Adaptive AI exploration round failed; retained prior result: "
+                                f"{next_error}"
+                            )
+                            break
+                        agent_result = next_result
+                        agent_error = None
+
+                    if (
+                        agent_result
+                        and agent_result.result.requested_tests
+                        and completed_rounds >= self.settings.agent_max_rounds
+                    ):
+                        coverage_gaps.append(
+                            "Further AI-requested tests were not executed because the configured "
+                            "adaptive exploration round limit was reached."
+                        )
+                    if executed_agent_tests and not budget.expired:
+                        final_result, final_error = invoke_agent(
+                            phase="final_evaluation",
+                            executed_tests=executed_agent_tests,
+                            round_index=completed_rounds,
+                        )
+                        if final_result is not None:
+                            agent_result = final_result
+                            agent_error = None
+                            if final_result.result.requested_tests:
+                                coverage_gaps.append(
+                                    "Final evaluation requested additional tests, but final turns "
+                                    "cannot schedule new device actions."
+                                )
+                        else:
+                            coverage_gaps.append(
+                                "Final AI evaluation failed; retained the latest exploration result: "
+                                f"{final_error}"
+                            )
                 except Exception as exc:
                     coverage_gaps.append(f"Dynamic investigation failed safely: {exc}")
                     if agent_result is None:
@@ -765,6 +1033,22 @@ class ScanOrchestrator:
                         "executed_agent_tests": executed_agent_tests,
                     },
                 }
+                add_event(
+                    session,
+                    scan_id,
+                    "exploration.conclusion.recorded",
+                    f"平台已确认 AI 结论：{result_value}",
+                    {
+                        "task_id": task.id,
+                        "source": "platform",
+                        "agent_backend": agent_backend,
+                        "thread_id": agent_result.thread_id,
+                        "turn_id": agent_result.turn_id,
+                        "result": result_value,
+                        "confidence": payload.get("confidence"),
+                        "evidence_ids": payload.get("evidence_ids", []),
+                    },
+                )
                 task.status = (
                     TaskStatus.NOT_REPRODUCED.value
                     if result_value == FindingStatus.NOT_REPRODUCED.value
@@ -828,6 +1112,19 @@ class ScanOrchestrator:
                     "agent_backend": agent_backend,
                 },
             )
+            add_event(
+                session,
+                scan_id,
+                "exploration.completed",
+                f"入口探索任务结束：{task.status}",
+                {
+                    "task_id": task.id,
+                    "source": "platform",
+                    "status": task.status,
+                    "agent_backend": agent_backend,
+                    "evidence_count": len(evidence_summaries),
+                },
+            )
             session.commit()
 
     @staticmethod
@@ -836,12 +1133,13 @@ class ScanOrchestrator:
         entries: list[EntryPoint],
         *,
         auth_available: bool,
+        limit: int = 12,
     ) -> tuple[list[AgentRequestedTest], list[str]]:
         entries_by_id = {entry.id: entry for entry in entries}
         accepted: list[AgentRequestedTest] = []
         gaps: list[str] = []
         seen: set[str] = set()
-        for request in requests[:12]:
+        for request in requests[:limit]:
             entry = entries_by_id.get(request.entry_point_id)
             reason = None
             if entry is None:
@@ -873,6 +1171,11 @@ class ScanOrchestrator:
                 continue
             seen.add(signature)
             accepted.append(request)
+        if len(requests) > limit:
+            gaps.append(
+                f"Rejected {len(requests) - limit} agent-requested test(s) above the "
+                f"per-round limit of {limit}."
+            )
         return accepted, gaps
 
     @staticmethod
@@ -959,6 +1262,19 @@ class ScanOrchestrator:
                         gaps.append("Task budget expired before all agent-requested tests ran.")
                         break
                     before = len(evidence_summaries)
+                    self._record_exploration_event(
+                        scan_id,
+                        task_id,
+                        "action.started",
+                        f"开始执行 AI 申请的 {state} 状态入口测试",
+                        {
+                            "source": "platform",
+                            "test_case_id": test_case_id,
+                            "entry_point_id": request.entry_point_id,
+                            "state": state,
+                            "rationale_summary": request.rationale,
+                        },
+                    )
                     probe = self.device.probe(
                         entries_by_id[request.entry_point_id],
                         package_name,
@@ -982,6 +1298,19 @@ class ScanOrchestrator:
                             "request": request.model_dump(mode="json"),
                             "evidence_ids": evidence_ids,
                         }
+                    )
+                    self._record_exploration_event(
+                        scan_id,
+                        task_id,
+                        "action.completed",
+                        f"AI 申请的入口测试已完成，生成 {len(evidence_ids)} 条证据",
+                        {
+                            "source": "platform",
+                            "test_case_id": test_case_id,
+                            "entry_point_id": request.entry_point_id,
+                            "state": state,
+                            "evidence_ids": evidence_ids,
+                        },
                     )
             finally:
                 if frida_session is not None:
@@ -1158,6 +1487,49 @@ class ScanOrchestrator:
                 kind="agent.response",
                 value=response,
                 summary=f"{backend} {phase} structured response",
+                metadata=metadata,
+            )
+            session.commit()
+
+    def _record_agent_runtime_events(
+        self,
+        *,
+        scan_id: str,
+        task_id: str,
+        audit_id: str,
+        backend: str,
+        phase: str,
+        attempt: int,
+        events: list[dict[str, Any]],
+    ) -> None:
+        metadata = {
+            "audit_id": audit_id,
+            "backend": backend,
+            "provider": "openai" if backend == "codex" else "deepseek",
+            "model": (
+                self.settings.codex_worker_model
+                if backend == "codex"
+                else self.settings.opencode_model
+            ),
+            "isolation": (
+                self.settings.codex_isolation
+                if backend == "codex"
+                else self.settings.opencode_isolation
+            ),
+            "phase": phase,
+            "attempt": attempt,
+        }
+        with self.database.session_factory() as session:
+            self.evidence.json(
+                session,
+                scan_id=scan_id,
+                task_id=task_id,
+                kind="agent.events",
+                value={
+                    "schema_version": "1.0",
+                    "events": events,
+                },
+                summary=f"{backend} {phase} normalized runtime events",
                 metadata=metadata,
             )
             session.commit()
@@ -1380,6 +1752,22 @@ class ScanOrchestrator:
                 )
                 if summaries is not None:
                     summaries.append(self._evidence_summary(item))
+                add_event(
+                    session,
+                    scan_id,
+                    "exploration.evidence.created",
+                    f"已生成验证证据：{kind}",
+                    {
+                        "task_id": task_id,
+                        "source": "platform",
+                        "evidence_id": item.id,
+                        "evidence_kind": kind,
+                        "exit_code": item.exit_code,
+                        "summary": item.summary,
+                        "test_case_id": metadata.get("test_case_id"),
+                        "request_id": metadata.get("request_id"),
+                    },
+                )
             session.commit()
 
     @staticmethod

@@ -99,7 +99,7 @@ test("flash uses OpenCode structured output with only the internal result tool",
         2,
       )}`,
     )
-    const result = JSON.parse(completed.stdout)
+    const { result, events } = parseWorkerOutput(completed.stdout)
     assert.deepEqual(result.result, expected)
     assert.equal(result.usage.provider, "deepseek")
     assert.equal(result.usage.model, "deepseek-v4-flash")
@@ -113,6 +113,8 @@ test("flash uses OpenCode structured output with only the internal result tool",
       requests[0].body.tools.map((item) => item.function.name),
       ["StructuredOutput"],
     )
+    assert.ok(events.some((item) => item.event_type === "model.session.started"))
+    assert.ok(events.some((item) => item.event_type === "model.output.validated"))
   } finally {
     api.close()
     await rm(root, { recursive: true, force: true })
@@ -189,7 +191,7 @@ test("pro omits tool_choice and retries text JSON through local schema validatio
       0,
       `${completed.stderr}\nrequests=${JSON.stringify(requests, null, 2)}`,
     )
-    const result = JSON.parse(completed.stdout)
+    const { result, events } = parseWorkerOutput(completed.stdout)
     assert.deepEqual(result.result, expected)
     assert.equal(result.usage.provider, "deepseek")
     assert.equal(result.usage.model, "deepseek-v4-pro")
@@ -217,6 +219,8 @@ test("pro omits tool_choice and retries text JSON through local schema validatio
       JSON.stringify(requests[1].body.messages),
       /VALIDATION_ERRORS_JSON/,
     )
+    assert.ok(events.some((item) => item.event_type === "model.validation.failed"))
+    assert.ok(events.some((item) => item.event_type === "model.output.validated"))
   } finally {
     api.close()
     await rm(root, { recursive: true, force: true })
@@ -290,4 +294,16 @@ function listen(server) {
 
 function event(value) {
   return `data: ${JSON.stringify(value)}\n\n`
+}
+
+function parseWorkerOutput(output) {
+  let result
+  const events = []
+  for (const line of output.trim().split("\n")) {
+    const value = JSON.parse(line)
+    if (value.type === "event") events.push(value.event)
+    if (value.type === "result") result = value.result
+  }
+  assert.ok(result, "worker did not emit a result envelope")
+  return { result, events }
 }

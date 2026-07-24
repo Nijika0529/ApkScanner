@@ -17,17 +17,21 @@ flowchart LR
     E --> F[登录流程回放]
     F --> G[Authenticated 黑盒]
     E --> H[Frida 旁路观察]
-    G --> I[选定 Agent 第一阶段判断]
+    G --> I[选定 Agent 提出下一组测试]
     H --> I
     I --> J{需要补充测试?}
-    J -- 是 --> K[平台校验范围并执行最多 12 个用例]
-    K --> L[选定 Agent 最终判断]
+    J -- 是 --> K[平台校验并执行本轮最多 4 个用例]
+    K --> R{仍有轮次与预算?}
+    R -- 是 --> I
+    R -- 否 --> L[选定 Agent 最终判断]
     J -- 否 --> L
     L --> M[Evidence ID 与结论级别校验]
     M --> N[Web / JSON / HTML / SARIF + 人工复核]
 ```
 
-平台而不是 Codex/OpenCode 负责 fan-out。一个导出组件对应一个任务；同一 handler 的 Deep Links 合并成一个任务。Agent 不能创建子 Agent，也不能直接把自己的文字当作复现证据。第一阶段最多提出 12 个受限测试：只能使用当前任务的入口 ID；Deep Link 和 Provider URI 必须保持 Manifest 声明的 scheme、host/authority 和 port；额外参数有数量、键名、类型和长度上限。平台执行后再进行一次最终判断。每次扫描在创建时固化 `codex`、`opencode` 或 `none`，服务默认值的后续变更不会让同一扫描混用模型后端。
+平台而不是 Codex/OpenCode 负责 fan-out。一个导出组件对应一个任务；同一 handler 的 Deep Links 合并成一个任务。Agent 不能创建子 Agent，也不能直接把自己的文字当作复现证据。默认最多进行 3 个自适应测试轮次、每轮接受 4 个受限测试：只能使用当前任务的入口 ID；Deep Link 和 Provider URI 必须保持 Manifest 声明的 scheme、host/authority 和 port；额外参数有数量、键名、类型和长度上限。每轮证据都会回灌下一次判断，最终再执行禁止申请新动作的证据总结。轮次和单轮测试数可在 1–5 / 1–12 的安全范围内配置。每次扫描在创建时固化 `codex`、`opencode` 或 `none`，服务默认值的后续变更不会让同一扫描混用模型后端。
+
+一个任务以 `task_id + attempt` 作为平台逻辑探索运行。为保持一次性 worker 的隔离边界，目前每次物理模型调用使用新的 Codex thread 或 OpenCode session；下一轮会重新装载完整的静态上下文、累计 Evidence 和已执行测试，因此不会依赖供应商侧隐藏状态。Web 将这些物理调用统一聚合到同一个任务时间线。
 
 静态阶段结束即发布 preliminary report，并继续动态任务。外部工具、MobSF 请求和每个任务都有超时；超过 4 小时 preliminary 目标或 24 小时整单预算会写入事件及 coverage gap。
 
@@ -36,8 +40,8 @@ flowchart LR
 | 区域 | 可访问内容 | 约束 |
 | --- | --- | --- |
 | 本地控制面 | SQLite、APK、workspace、evidence | FastAPI 仅监听 loopback；变更 API 需要自定义请求头；内容寻址文件拒绝 symlink/摘要冲突 |
-| Codex Docker worker | 当前 scan workspace、显式 Codex auth、网络 | 每任务新容器、只读 bind mount、只读 rootfs、丢弃 capabilities、PID/CPU/内存限制；默认模式 |
-| Codex host worker | 本机与网络 | 仅作为显式 `host` 降级模式；个人受控环境使用 |
+| Codex Docker worker | 当前 scan workspace、显式 Codex auth、模型网络 | 每次调用新容器、只读 bind mount/SDK sandbox/rootfs、无 ADB 参数、丢弃 capabilities、PID/CPU/内存限制；默认模式 |
+| Codex host worker | 只读 workspace 与模型网络 | 仅作为显式 `host` 降级模式；developer instructions 禁止 ADB/目标网络请求，设备动作仍走平台 |
 | OpenCode + DeepSeek Docker worker | 平台生成的 task JSON、DeepSeek API | 不挂载 scan workspace；只读 rootfs、临时 HOME、丢弃 capabilities；禁用文件/Shell/Web/MCP/子 Agent；V4 Pro 无工具并省略 `tool_choice`，Flash 仅允许内部 StructuredOutput |
 | OpenCode + DeepSeek host worker | 平台生成的 task JSON、DeepSeek API | 每次调用使用临时 HOME/XDG 与带随机 Basic Auth 的 loopback server；仍仅适合个人受控环境 |
 | 云真机 | 目标 APK、Probe APK、测试账号 | 固定 Android 16/API 36；串行 lease；任务前后 `pm clear`；不声称完整快照复位 |
@@ -75,18 +79,23 @@ Agent 声称但不属于本 scan/task 的 Evidence ID 会被删除。需要证�
 
 1. `agent.request`：后端、provider、模型、SDK、隔离方式、developer instructions、精确
    prompt、输出 JSON Schema 和工具边界；
-2. `agent.response`：thread/turn、平台收到的结构化原始输出和 token/费用 usage；
-3. `agent.test_validation`：Agent 申请的测试、平台接受/拒绝的测试、拒绝原因、实际执行
+2. `agent.events`：SDK 会话、turn/step、输出校验、工具生命周期、错误等规范化关键事件；
+3. `agent.response`：thread/turn、平台收到的结构化原始输出和 token/费用 usage；
+4. `agent.test_validation`：Agent 申请的测试、平台接受/拒绝的测试、拒绝原因、实际执行
    用例及其 Evidence ID；
-4. `agent.validation`：模型声称的结论和 Evidence ID、平台接受/拒绝的 Evidence ID、是否
+5. `agent.validation`：模型声称的结论和 Evidence ID、平台接受/拒绝的 Evidence ID、是否
    降级以及最终落库结果；
-5. `agent.error`：已发起但失败的模型调用错误。
+6. `agent.error`：已发起但失败的模型调用错误。
 
 OpenCode 审计还记录实际输出通道。`deepseek-v4-pro` 保持思考模式，但使用无工具的
 `format=text`：prompt 携带精确 JSON Schema，worker 用 Ajv 本地校验，失败后最多进行
 2 次同 session 纠正；每轮 prompt、原始文本、校验错误和 usage 都写入审计。
 `deepseek-v4-flash` 继续使用 OpenCode 的内部 StructuredOutput 工具。这样 Pro 请求不会
 携带与思考模式冲突的 `tool_choice`，两个通道最终仍进入相同的平台证据校验。
+
+Codex 的 app-server notification 与 OpenCode 的 `event.subscribe()` SSE 会先归一化为
+`exploration.*` 平台事件。Web 只展示假设、阶段、动作、证据和结论等关键事件，不展示或
+持久化隐藏思维链；模型必须通过结构化字段提供可审计的简短理由。
 
 这些记录不包含模型 API Key。每份内容在写入时计算 SHA-256，Web 的“AI 审计”页和 JSON
 报告展示同一份内容及摘要；读取时再次校验文件路径与 SHA-256，损坏或篡改会显示为完整性

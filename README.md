@@ -16,17 +16,19 @@ finding without platform evidence IDs.
 - Built-in MASVS-oriented manifest, code-pattern, archive, native-library, and hardening rules.
 - Apktool baseline with optional JADX enhancement and explicit degraded-coverage states.
 - Persistent SQLite scan/task/finding/evidence/coverage/event models.
-- Tamper-evident AI audit trail for exact prompts, structured outputs, test-policy decisions,
-  evidence downgrades, provider/model identity, thread/turn IDs, and usage.
+- Tamper-evident AI audit trail for exact prompts, normalized SDK runtime events, structured
+  outputs, test-policy decisions, evidence downgrades, provider/model identity, thread/turn IDs,
+  and usage.
 - Remote ADB adapter, serialized device lease, ordinary-app-UID Probe APK protocol, log evidence,
   guest/authenticated replay, `pm clear` cleanup, and App Link state inspection/reset.
 - Bounded Frida side-channel tracing with URI/query redaction and a distinct instrumented verdict.
 - Optional MobSF upload/report normalization with explicit degraded coverage when absent.
-- Official `openai-codex==0.144.4` integration with strict JSON Schema, fresh threads, no subagent
-  fan-out, one platform-mediated follow-up test round, and evidence-backed result downgrades.
+- Official `openai-codex==0.144.4` integration with strict JSON Schema, streamed turn/item events,
+  read-only workspace inspection, no subagent fan-out, bounded adaptive platform-mediated test
+  rounds, and evidence-backed result downgrades.
 - Pinned `@opencode-ai/sdk`/OpenCode `1.18.4` integration for DeepSeek, with fresh sessions,
   tool-free/Ajv-validated V4 Pro JSON, native StructuredOutput for V4 Flash, all executable agent
-  tools denied, and an isolated one-shot bridge.
+  tools denied, SSE runtime-event forwarding, and an isolated one-shot bridge.
 - Optional per-task Docker workers with read-only scan mounts and resource/capability limits.
 - Responsive React review console, human Finding decisions, live events, JSON/HTML/SARIF exports.
 - Light review console with confirmed deletion of completed scans and shared-artifact-safe cleanup.
@@ -214,6 +216,8 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_MAX_UPLOAD_BYTES` | 512 MiB | Intake limit |
 | `APKSCANNER_TASK_TIMEOUT` | 1200 s | Per-investigation budget |
 | `APKSCANNER_TASK_MAX_ATTEMPTS` | 2 | Retry budget |
+| `APKSCANNER_AGENT_MAX_ROUNDS` | 3 | Maximum adaptive AI/device rounds per task (1–5) |
+| `APKSCANNER_AGENT_TESTS_PER_ROUND` | 4 | Maximum accepted AI-requested tests per round (1–12) |
 
 ## Verification
 

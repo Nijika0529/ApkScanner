@@ -9,7 +9,8 @@ ENV NODE_ENV=production \
 
 LABEL io.apkscanner.version="0.1.0" \
       io.apkscanner.opencode-sdk-version="1.18.4" \
-      io.apkscanner.opencode-version="1.18.4"
+      io.apkscanner.opencode-version="1.18.4" \
+      io.apkscanner.worker-protocol="2"
 
 WORKDIR /opt/apkscanner-opencode
 COPY opencode-worker/package.json opencode-worker/package-lock.json ./

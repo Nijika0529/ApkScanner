@@ -6,6 +6,7 @@ import shutil
 from dataclasses import replace
 from types import SimpleNamespace
 
+from apkscanner.agent_events import AgentRuntimeEvent
 from apkscanner.artifacts import ArtifactStore
 from apkscanner.db import Database
 from apkscanner.models import (
@@ -15,6 +16,7 @@ from apkscanner.models import (
     Finding,
     InvestigationTask,
     Scan,
+    ScanEvent,
 )
 from apkscanner.orchestrator import ScanOrchestrator
 from apkscanner.reports import ReportBuilder
@@ -101,6 +103,13 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
         def investigate(**kwargs):  # noqa: ANN003, ANN205
             task = kwargs["task"]
             evidence = kwargs["evidence"]
+            kwargs["event_callback"](
+                AgentRuntimeEvent(
+                    event_type="model.turn.started",
+                    message="Fake SDK turn started",
+                    data={"turn_id": f"turn-{task.id}"},
+                )
+            )
             return SimpleNamespace(
                 thread_id=f"thread-{task.id}",
                 turn_id=f"turn-{task.id}",
@@ -133,16 +142,31 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
             session.scalars(
                 select(Evidence).where(
                     Evidence.scan_id == scan_id,
-                    Evidence.kind.in_(
-                        {"agent.request", "agent.response", "agent.validation"}
-                    ),
+                        Evidence.kind.in_(
+                            {
+                                "agent.request",
+                                "agent.events",
+                                "agent.response",
+                                "agent.validation",
+                            }
+                        ),
+                    )
+                )
+            )
+        exploration_events = list(
+            session.scalars(
+                select(ScanEvent).where(
+                    ScanEvent.scan_id == scan_id,
+                    ScanEvent.event_type == "exploration.model.turn.started",
                 )
             )
         )
     assert tasks
-    assert len(audit_evidence) == len(tasks) * 3
+    assert len(audit_evidence) == len(tasks) * 4
     assert {item.kind for item in audit_evidence} == {
         "agent.request",
+        "agent.events",
         "agent.response",
         "agent.validation",
     }
+    assert len(exploration_events) == len(tasks)

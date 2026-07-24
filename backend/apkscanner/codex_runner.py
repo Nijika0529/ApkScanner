@@ -9,14 +9,21 @@ import subprocess
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .agent_events import (
+    AgentEventCallback,
+    emit_agent_event,
+    normalize_codex_notification,
+)
 from .agent_prompt import developer_instructions, investigation_prompt
 from .config import Settings
 from .models import EntryPoint, InvestigationTask, Scan
 from .schemas import AGENT_RESULT_JSON_SCHEMA, AgentInvestigationResult
+from .worker_protocol import WorkerTimeoutError, consume_worker_process
 
 
 @dataclass(slots=True)
@@ -75,6 +82,7 @@ class CodexInvestigator:
         evidence: list[dict[str, Any]],
         platform_context: dict[str, Any] | None = None,
         timeout_seconds: int | None = None,
+        event_callback: AgentEventCallback | None = None,
     ) -> CodexRunResult:
         from openai_codex import ApprovalMode, Sandbox
         from openai_codex.generated.v2_all import ReasoningEffort
@@ -93,6 +101,7 @@ class CodexInvestigator:
                 task_id=task.id,
                 workspace=workspace,
                 timeout_seconds=timeout_seconds,
+                event_callback=event_callback,
             )
         with self._client() as codex:
             thread = codex.thread_start(
@@ -101,8 +110,14 @@ class CodexInvestigator:
                 developer_instructions=developer_instructions(direct_tool_access=True),
                 ephemeral=False,
                 model=self.settings.codex_worker_model,
-                sandbox=Sandbox.full_access,
+                sandbox=Sandbox.read_only,
                 service_name="apk-scanner",
+            )
+            emit_agent_event(
+                event_callback,
+                "model.session.started",
+                "Codex SDK 会话已建立",
+                {"thread_id": thread.id},
             )
             handle = thread.turn(
                 prompt,
@@ -111,10 +126,24 @@ class CodexInvestigator:
                 effort=ReasoningEffort.medium,
                 model=self.settings.codex_worker_model,
                 output_schema=AGENT_RESULT_JSON_SCHEMA,
-                sandbox=Sandbox.full_access,
+                sandbox=Sandbox.read_only,
             )
+
+            def consume_turn():  # noqa: ANN202
+                from openai_codex.api import _collect_turn_result
+
+                def stream():  # noqa: ANN202
+                    for notification in handle.stream():
+                        event = normalize_codex_notification(notification)
+                        if event is not None and event_callback is not None:
+                            with suppress(Exception):
+                                event_callback(event)
+                        yield notification
+
+                return _collect_turn_result(stream(), turn_id=handle.id)
+
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="codex-investigation")
-            future = executor.submit(handle.run)
+            future = executor.submit(consume_turn)
             try:
                 turn = future.result(timeout=timeout_seconds)
             except FutureTimeoutError as exc:
@@ -128,6 +157,12 @@ class CodexInvestigator:
             else:
                 executor.shutdown(wait=False, cancel_futures=True)
             parsed = self._parse_response(turn.final_response)
+            emit_agent_event(
+                event_callback,
+                "model.output.validated",
+                "Codex 结构化输出已通过本地校验",
+                {"turn_id": turn.id},
+            )
             usage = turn.usage.model_dump(mode="json") if turn.usage else {}
             return CodexRunResult(
                 thread_id=thread.id,
@@ -158,7 +193,10 @@ class CodexInvestigator:
                     "image",
                     "inspect",
                     "--format",
-                    '{{ index .Config.Labels "io.apkscanner.sdk-version" }}',
+                    (
+                        '{{ index .Config.Labels "io.apkscanner.sdk-version" }}'
+                        '|{{ index .Config.Labels "io.apkscanner.worker-protocol" }}'
+                    ),
                     image,
                 ],
                 stdin=subprocess.DEVNULL,
@@ -175,7 +213,7 @@ class CodexInvestigator:
                 "available": False,
                 "detail": f"build the worker image first: {image}",
             }
-        if inspected.stdout.strip() != "0.144.4":
+        if inspected.stdout.strip() != "0.144.4|2":
             return {
                 **capability,
                 "available": False,
@@ -203,6 +241,7 @@ class CodexInvestigator:
         task_id: str,
         workspace: Path,
         timeout_seconds: int | None,
+        event_callback: AgentEventCallback | None,
     ) -> CodexRunResult:
         capability = self._docker_capability(
             {
@@ -258,12 +297,6 @@ class CodexInvestigator:
             )
         if os.getenv("OPENAI_API_KEY"):
             command.extend(["--env", "OPENAI_API_KEY"])
-        if self.settings.adb_serial and re.fullmatch(
-            r"[A-Za-z0-9_.:-]+", self.settings.adb_serial
-        ):
-            command.extend(
-                ["--env", f"APKSCANNER_ADB_SERIAL={self.settings.adb_serial}"]
-            )
         command.append(self.settings.codex_docker_image)
         payload = {
             "schema_version": "1.0",
@@ -272,16 +305,17 @@ class CodexInvestigator:
             "model": self.settings.codex_worker_model,
             "output_schema": AGENT_RESULT_JSON_SCHEMA,
         }
-        try:
-            completed = subprocess.run(
-                command,
-                input=json.dumps(payload, ensure_ascii=False),
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds or self.settings.task_timeout_seconds,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+
+        def stop_container() -> None:
+            self._kill_process_group(process)
             subprocess.run(
                 [executable, "rm", "-f", container_name],
                 stdin=subprocess.DEVNULL,
@@ -289,22 +323,37 @@ class CodexInvestigator:
                 timeout=20,
                 check=False,
             )
+
+        try:
+            result, _stderr = consume_worker_process(
+                process,
+                payload=payload,
+                timeout_seconds=timeout_seconds or self.settings.task_timeout_seconds,
+                event_callback=event_callback,
+                on_timeout=stop_container,
+            )
+        except WorkerTimeoutError as exc:
             raise TimeoutError(
                 f"containerized Codex investigation exceeded {timeout_seconds} seconds"
             ) from exc
-        if completed.returncode != 0:
-            detail = completed.stderr.strip()[-2000:] or "worker returned no diagnostic"
-            raise RuntimeError(f"containerized Codex worker failed: {detail}")
-        try:
-            result = json.loads(completed.stdout)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("containerized Codex worker returned invalid JSON") from exc
+        except RuntimeError as exc:
+            raise RuntimeError(f"containerized Codex worker failed: {exc}") from exc
         return CodexRunResult(
             thread_id=str(result["thread_id"]),
             turn_id=str(result["turn_id"]),
             result=AgentInvestigationResult.model_validate(result["result"]),
             usage=result.get("usage") or {},
         )
+
+    @staticmethod
+    def _kill_process_group(process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        if os.name == "posix":
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, 9)
+            return
+        process.kill()
 
     def _client(self):  # noqa: ANN202
         from openai_codex import Codex, CodexConfig

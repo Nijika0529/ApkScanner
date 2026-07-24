@@ -12,6 +12,7 @@ from .models import Evidence
 AGENT_AUDIT_KINDS = {
     "agent.request",
     "agent.response",
+    "agent.events",
     "agent.error",
     "agent.test_validation",
     "agent.validation",
