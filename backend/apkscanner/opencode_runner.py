@@ -21,6 +21,78 @@ from .schemas import AGENT_RESULT_JSON_SCHEMA, AgentInvestigationResult
 OPENCODE_SDK_VERSION = "1.18.4"
 OPENCODE_CLI_VERSION = "1.18.4"
 OPENCODE_PROVIDER = "deepseek"
+OPENCODE_OUTPUT_MODE_PROMPTED_JSON = "prompted_json"
+OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL = "structured_output_tool"
+
+
+def opencode_output_mode(model: str) -> str:
+    normalized = model.strip().lower()
+    if re.fullmatch(r"deepseek-v4-pro(?:[-._].*)?", normalized):
+        return OPENCODE_OUTPUT_MODE_PROMPTED_JSON
+    return OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
+
+
+def opencode_prompt_for_model(
+    prompt: str,
+    *,
+    model: str,
+    output_schema: dict[str, Any],
+) -> str:
+    if opencode_output_mode(model) != OPENCODE_OUTPUT_MODE_PROMPTED_JSON:
+        return prompt
+    example = _json_schema_example(output_schema)
+    return (
+        f"{prompt}\n\n"
+        "DEEPSEEK_THINKING_OUTPUT_ADAPTER:\n"
+        "Return exactly one JSON object as plain text. Do not use Markdown fences, "
+        "commentary, or tool calls. The object must validate against OUTPUT_JSON_SCHEMA. "
+        "All required keys must be present and no undeclared top-level keys are allowed.\n\n"
+        "OUTPUT_JSON_SCHEMA:\n"
+        f"{json.dumps(output_schema, ensure_ascii=False, indent=2)}\n\n"
+        "MINIMAL_JSON_EXAMPLE:\n"
+        f"{json.dumps(example, ensure_ascii=False, indent=2)}"
+    )
+
+
+def _json_schema_example(schema: dict[str, Any]) -> Any:
+    if "const" in schema:
+        return schema["const"]
+    if "default" in schema:
+        return schema["default"]
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        return enum[0]
+    variants = schema.get("anyOf") or schema.get("oneOf")
+    if isinstance(variants, list):
+        candidate = next(
+            (
+                item
+                for item in variants
+                if isinstance(item, dict) and item.get("type") != "null"
+            ),
+            variants[0] if variants else {},
+        )
+        return _json_schema_example(candidate) if isinstance(candidate, dict) else None
+    schema_type = schema.get("type")
+    if schema_type == "object":
+        properties = schema.get("properties")
+        required = schema.get("required")
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            return {}
+        return {
+            key: _json_schema_example(properties[key])
+            for key in required
+            if key in properties and isinstance(properties[key], dict)
+        }
+    if schema_type == "array":
+        return []
+    if schema_type == "string":
+        return "string"
+    if schema_type in {"integer", "number"}:
+        return 0
+    if schema_type == "boolean":
+        return False
+    return None
 
 
 @dataclass(slots=True)
@@ -29,6 +101,13 @@ class OpenCodeRunResult:
     turn_id: str
     result: AgentInvestigationResult
     usage: dict[str, Any]
+    output_transport: dict[str, Any]
+
+
+class OpenCodeInvestigationError(RuntimeError):
+    def __init__(self, message: str, *, audit_details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.audit_details = audit_details or {}
 
 
 class OpenCodeInvestigator:
@@ -48,6 +127,7 @@ class OpenCodeInvestigator:
             "provider": OPENCODE_PROVIDER,
             "model": self.settings.opencode_model,
             "isolation": self.settings.opencode_isolation,
+            "output_mode": opencode_output_mode(self.settings.opencode_model),
         }
         detail = self._configuration_error()
         if detail:
@@ -74,6 +154,12 @@ class OpenCodeInvestigator:
             models = [str(item) for item in probe.get("models", [])]
             capability["server_version"] = str(probe.get("server_version", ""))
             capability["models"] = models
+            capability["output_mode"] = str(
+                probe.get(
+                    "output_mode",
+                    opencode_output_mode(self.settings.opencode_model),
+                )
+            )
             if self.settings.opencode_model not in models:
                 capability["available"] = False
                 capability["detail"] = (
@@ -106,13 +192,17 @@ class OpenCodeInvestigator:
         payload = {
             "schema_version": "1.0",
             "action": "investigate",
-            "prompt": investigation_prompt(
-                scan,
-                task,
-                entries,
-                evidence,
-                platform_context or {},
-                direct_tool_access=False,
+            "prompt": opencode_prompt_for_model(
+                investigation_prompt(
+                    scan,
+                    task,
+                    entries,
+                    evidence,
+                    platform_context or {},
+                    direct_tool_access=False,
+                ),
+                model=self.settings.opencode_model,
+                output_schema=AGENT_RESULT_JSON_SCHEMA,
             ),
             "developer_instructions": developer_instructions(direct_tool_access=False),
             "model": self.settings.opencode_model,
@@ -121,11 +211,29 @@ class OpenCodeInvestigator:
             "timeout_ms": max(1, timeout) * 1000,
         }
         response = self._invoke(payload, timeout_seconds=timeout + 15)
+        if response.get("error"):
+            error = response["error"]
+            message = (
+                str(error.get("message", "OpenCode investigation failed"))
+                if isinstance(error, dict)
+                else str(error)
+            )
+            raise OpenCodeInvestigationError(
+                message,
+                audit_details={
+                    "worker_error": error,
+                    "output_transport": response.get("output_transport") or {},
+                    "thread_id": response.get("thread_id"),
+                    "turn_id": response.get("turn_id"),
+                    "usage": response.get("usage") or {},
+                },
+            )
         return OpenCodeRunResult(
             thread_id=str(response["thread_id"]),
             turn_id=str(response["turn_id"]),
             result=AgentInvestigationResult.model_validate(response["result"]),
             usage=dict(response.get("usage") or {}),
+            output_transport=dict(response.get("output_transport") or {}),
         )
 
     def _configuration_error(self) -> str | None:

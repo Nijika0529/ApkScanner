@@ -104,6 +104,41 @@ export interface ScanEvent {
   created_at: string
 }
 
+export interface AgentAuditArtifact {
+  evidence_id: string
+  sha256: string
+  content: unknown
+  created_at: string
+}
+
+export interface AgentAudit {
+  id: string
+  scan_id: string
+  task_id: string | null
+  attempt: number
+  phase: string
+  backend: string
+  provider: string
+  model: string
+  isolation: string
+  status: "running" | "completed" | "failed"
+  thread_id: string | null
+  turn_id: string | null
+  usage: Record<string, unknown>
+  artifacts: Record<string, AgentAuditArtifact>
+  integrity: "verified" | "failed"
+  integrity_errors: string[]
+  started_at: string
+  completed_at: string | null
+}
+
+export interface ScanDeleteResult {
+  id: string
+  deleted: true
+  files_removed: number
+  cleanup_warnings: string[]
+}
+
 export interface Capability {
   name: string
   available: boolean

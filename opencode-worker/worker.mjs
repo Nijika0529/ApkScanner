@@ -2,10 +2,14 @@ import { randomBytes } from "node:crypto"
 import { createServer } from "node:net"
 import { stdin, stderr, stdout } from "node:process"
 import { createOpencodeClient, createOpencodeServer } from "@opencode-ai/sdk"
+import Ajv from "ajv"
 
 const MAX_INPUT_BYTES = 32 * 1024 * 1024
 const PROVIDER_ID = "deepseek"
 const OPENCODE_VERSION = "1.18.4"
+const OUTPUT_MODE_PROMPTED_JSON = "prompted_json"
+const OUTPUT_MODE_STRUCTURED_TOOL = "structured_output_tool"
+const PROMPTED_JSON_RETRY_COUNT = 2
 
 let server
 let sessionID
@@ -38,7 +42,7 @@ async function main() {
       },
     })
     if (payload.action === "capability") {
-      return await capability(client)
+      return await capability(client, payload)
     }
     return await investigate(client, payload)
   } finally {
@@ -47,7 +51,7 @@ async function main() {
   }
 }
 
-async function capability(client) {
+async function capability(client, payload) {
   unwrap(await client.config.get(), "config.get")
   const configured = unwrap(await client.config.providers(), "config.providers")
   const provider = configured.providers?.find((item) => item.id === PROVIDER_ID)
@@ -59,6 +63,7 @@ async function capability(client) {
     server_version: OPENCODE_VERSION,
     provider: PROVIDER_ID,
     models: Object.keys(provider.models ?? {}).sort(),
+    output_mode: outputModeForModel(payload.model),
   }
 }
 
@@ -71,56 +76,189 @@ async function investigate(client, payload) {
   )
   sessionID = session.id
   try {
-    const response = unwrap(
-      await client.session.prompt({
-        path: { id: sessionID },
-        body: {
-          agent: "apkscanner",
-          model: {
-            providerID: PROVIDER_ID,
-            modelID: payload.model,
-          },
-          system: payload.developer_instructions,
-          format: {
-            type: "json_schema",
-            schema: payload.output_schema,
-            retryCount: 2,
-          },
-          parts: [{ type: "text", text: payload.prompt }],
-        },
-      }),
-      "session.prompt",
-    )
-    if (response.info?.error) {
-      throw new Error(`OpenCode model error: ${formatError(response.info.error)}`)
+    if (outputModeForModel(payload.model) === OUTPUT_MODE_PROMPTED_JSON) {
+      return await investigatePromptedJson(client, payload)
     }
-    const result =
-      response.info?.structured ??
-      response.info?.structured_output ??
-      parseTextFallback(response.parts ?? [])
-    if (!result || typeof result !== "object" || Array.isArray(result)) {
-      throw new Error("OpenCode returned no structured investigation result")
-    }
-    return {
-      schema_version: "1.0",
-      thread_id: sessionID,
-      turn_id: response.info?.id ?? randomBytes(16).toString("hex"),
-      result,
-      usage: {
-        tokens: response.info?.tokens ?? {},
-        cost: response.info?.cost ?? 0,
-        finish: response.info?.finish ?? null,
-        provider: response.info?.providerID ?? PROVIDER_ID,
-        model: response.info?.modelID ?? payload.model,
-      },
-    }
+    return await investigateStructuredOutput(client, payload)
   } finally {
     await client.session.delete({ path: { id: sessionID } }).catch(() => undefined)
   }
 }
 
+async function investigateStructuredOutput(client, payload) {
+  const response = await prompt(client, payload, payload.prompt, {
+    type: "json_schema",
+    schema: payload.output_schema,
+    retryCount: 2,
+  })
+  if (response.info?.error) {
+    throw new Error(`OpenCode model error: ${formatError(response.info.error)}`)
+  }
+  const result =
+    response.info?.structured ??
+    response.info?.structured_output ??
+    parseTextJson(responseText(response.parts ?? [])).value
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    throw new Error("OpenCode returned no structured investigation result")
+  }
+  return {
+    schema_version: "1.0",
+    thread_id: sessionID,
+    turn_id: response.info?.id ?? randomBytes(16).toString("hex"),
+    result,
+    usage: aggregateUsage([response], payload),
+    output_transport: {
+      mode: OUTPUT_MODE_STRUCTURED_TOOL,
+      format: "json_schema",
+      tool_choice: "required",
+      tools: ["StructuredOutput"],
+      schema_validator: "opencode",
+      retry_count: 2,
+      model_calls: [
+        modelCallAudit({
+          attempt: 1,
+          promptText: payload.prompt,
+          response,
+          responseTextValue: responseText(response.parts ?? []),
+          parseError: null,
+          validationErrors: [],
+          accepted: true,
+        }),
+      ],
+    },
+  }
+}
+
+async function investigatePromptedJson(client, payload) {
+  const validate = new Ajv({ allErrors: true, strict: false }).compile(payload.output_schema)
+  const calls = []
+  const responses = []
+  let promptText = payload.prompt
+
+  for (let index = 0; index <= PROMPTED_JSON_RETRY_COUNT; index += 1) {
+    const response = await prompt(client, payload, promptText, { type: "text" })
+    responses.push(response)
+    const text = responseText(response.parts ?? [])
+    if (response.info?.error) {
+      calls.push(
+        modelCallAudit({
+          attempt: index + 1,
+          promptText,
+          response,
+          responseTextValue: text,
+          parseError: null,
+          validationErrors: [],
+          accepted: false,
+        }),
+      )
+      return promptedJsonFailure(
+        payload,
+        response,
+        responses,
+        calls,
+        "provider_error",
+        `OpenCode model error: ${formatError(response.info.error)}`,
+      )
+    }
+
+    const parsed = parseTextJson(text)
+    const parsedObject =
+      parsed.error === null &&
+      parsed.value !== null &&
+      typeof parsed.value === "object" &&
+      !Array.isArray(parsed.value)
+    const schemaValid = parsedObject ? validate(parsed.value) : false
+    const valid = parsedObject && schemaValid
+    const validationErrors =
+      parsedObject && !schemaValid ? normalizeValidationErrors(validate.errors) : []
+    const parseError =
+      parsed.error ??
+      (parsed.value === null || typeof parsed.value !== "object" || Array.isArray(parsed.value)
+        ? "top-level JSON value must be an object"
+        : null)
+    calls.push(
+      modelCallAudit({
+        attempt: index + 1,
+        promptText,
+        response,
+        responseTextValue: text,
+        parseError,
+        validationErrors,
+        accepted: Boolean(valid),
+      }),
+    )
+    if (valid) {
+      return {
+        schema_version: "1.0",
+        thread_id: sessionID,
+        turn_id: response.info?.id ?? randomBytes(16).toString("hex"),
+        result: parsed.value,
+        usage: aggregateUsage(responses, payload),
+        output_transport: promptedJsonTransport(calls),
+      }
+    }
+    promptText = correctionPrompt(parseError, validationErrors)
+  }
+
+  const response = responses.at(-1)
+  return promptedJsonFailure(
+    payload,
+    response,
+    responses,
+    calls,
+    "schema_validation_error",
+    `DeepSeek text output did not satisfy the JSON schema after ${calls.length} attempts`,
+  )
+}
+
+function prompt(client, payload, promptText, format) {
+  return client.session
+    .prompt({
+      path: { id: sessionID },
+      body: {
+        agent: "apkscanner",
+        model: {
+          providerID: PROVIDER_ID,
+          modelID: payload.model,
+        },
+        system: payload.developer_instructions,
+        format,
+        parts: [{ type: "text", text: promptText }],
+      },
+    })
+    .then((response) => unwrap(response, "session.prompt"))
+}
+
+function promptedJsonFailure(payload, response, responses, calls, type, message) {
+  return {
+    schema_version: "1.0",
+    thread_id: sessionID,
+    turn_id: response?.info?.id ?? randomBytes(16).toString("hex"),
+    error: { type, message },
+    usage: aggregateUsage(responses, payload),
+    output_transport: promptedJsonTransport(calls),
+  }
+}
+
+function promptedJsonTransport(calls) {
+  return {
+    mode: OUTPUT_MODE_PROMPTED_JSON,
+    format: "text",
+    tool_choice: "omitted",
+    tools: [],
+    schema_validator: "ajv@8.20.0",
+    retry_count: PROMPTED_JSON_RETRY_COUNT,
+    model_calls: calls,
+  }
+}
+
 function buildConfig(payload) {
   const model = `${PROVIDER_ID}/${payload.model}`
+  const structuredOutput =
+    outputModeForModel(payload.model) === OUTPUT_MODE_STRUCTURED_TOOL
+  const permission = structuredOutput
+    ? { "*": "deny", StructuredOutput: "allow" }
+    : { "*": "deny" }
   return {
     model,
     small_model: model,
@@ -133,14 +271,14 @@ function buildConfig(payload) {
     mcp: {},
     instructions: [],
     tools: { "*": false },
-    permission: { "*": "deny", StructuredOutput: "allow" },
+    permission,
     agent: {
       apkscanner: {
         mode: "primary",
         model,
         prompt: payload.developer_instructions,
         steps: 4,
-        permission: { "*": "deny", StructuredOutput: "allow" },
+        permission,
       },
     },
     ...(payload.base_url
@@ -255,18 +393,110 @@ function formatError(value) {
   return JSON.stringify(value)
 }
 
-function parseTextFallback(parts) {
-  const text = parts
+function outputModeForModel(model) {
+  return /^deepseek-v4-pro(?:$|[-._])/.test(model.trim().toLowerCase())
+    ? OUTPUT_MODE_PROMPTED_JSON
+    : OUTPUT_MODE_STRUCTURED_TOOL
+}
+
+function responseText(parts) {
+  return parts
     .filter((part) => part.type === "text" && typeof part.text === "string")
     .map((part) => part.text)
     .join("\n")
     .trim()
+}
+
+function parseTextJson(text) {
   const match = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/)
   try {
-    return JSON.parse(match?.[1] ?? text)
-  } catch {
-    return undefined
+    return { value: JSON.parse(match?.[1] ?? text), error: null }
+  } catch (error) {
+    return {
+      value: undefined,
+      error: error instanceof Error ? error.message : "response is not valid JSON",
+    }
   }
+}
+
+function normalizeValidationErrors(errors) {
+  return (errors ?? []).map((error) => ({
+    instance_path: error.instancePath,
+    schema_path: error.schemaPath,
+    keyword: error.keyword,
+    params: error.params,
+    message: error.message ?? "schema validation failed",
+  }))
+}
+
+function correctionPrompt(parseError, validationErrors) {
+  const problems = {
+    parse_error: parseError,
+    schema_errors: validationErrors,
+  }
+  return (
+    "Your previous answer was rejected by the local JSON Schema validator. " +
+    "Return one corrected JSON object only, without Markdown, commentary, or tool calls.\n\n" +
+    `VALIDATION_ERRORS_JSON:\n${JSON.stringify(problems, null, 2)}`
+  )
+}
+
+function modelCallAudit({
+  attempt,
+  promptText,
+  response,
+  responseTextValue,
+  parseError,
+  validationErrors,
+  accepted,
+}) {
+  return {
+    attempt,
+    turn_id: response.info?.id ?? null,
+    prompt: promptText,
+    response_text: responseTextValue,
+    parse_error: parseError,
+    validation_errors: validationErrors,
+    accepted,
+    usage: {
+      tokens: response.info?.tokens ?? {},
+      cost: response.info?.cost ?? 0,
+      finish: response.info?.finish ?? null,
+    },
+  }
+}
+
+function aggregateUsage(responses, payload) {
+  const final = responses.at(-1)
+  return {
+    tokens: responses.reduce(
+      (total, response) => mergeNumericObjects(total, response.info?.tokens ?? {}),
+      {},
+    ),
+    cost: responses.reduce((total, response) => total + (response.info?.cost ?? 0), 0),
+    finish: final?.info?.finish ?? null,
+    provider: final?.info?.providerID ?? PROVIDER_ID,
+    model: final?.info?.modelID ?? payload.model,
+    calls: responses.length,
+  }
+}
+
+function mergeNumericObjects(left, right) {
+  const output = { ...left }
+  for (const [key, value] of Object.entries(right)) {
+    if (typeof value === "number") {
+      output[key] = (typeof output[key] === "number" ? output[key] : 0) + value
+      continue
+    }
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const existing =
+        output[key] && typeof output[key] === "object" && !Array.isArray(output[key])
+          ? output[key]
+          : {}
+      output[key] = mergeNumericObjects(existing, value)
+    }
+  }
+  return output
 }
 
 function reservePort() {

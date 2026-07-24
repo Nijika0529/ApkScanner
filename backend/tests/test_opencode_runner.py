@@ -5,11 +5,17 @@ import shutil
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
 from apkscanner.models import EntryPoint, InvestigationTask, Scan
 from apkscanner.opencode_runner import (
     OPENCODE_CLI_VERSION,
+    OPENCODE_OUTPUT_MODE_PROMPTED_JSON,
+    OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
     OPENCODE_SDK_VERSION,
+    OpenCodeInvestigationError,
     OpenCodeInvestigator,
+    opencode_output_mode,
+    opencode_prompt_for_model,
 )
 
 
@@ -58,6 +64,7 @@ def test_host_capability_requires_key_and_pinned_packages(
     assert available["available"] is True
     assert available["provider"] == "deepseek"
     assert available["model"] == "deepseek-v4-pro"
+    assert available["output_mode"] == OPENCODE_OUTPUT_MODE_PROMPTED_JSON
 
     package = worker / "node_modules" / "@opencode-ai" / "sdk" / "package.json"
     package.write_text(json.dumps({"version": "0.0.0"}), encoding="utf-8")
@@ -102,6 +109,40 @@ def test_worker_response_must_be_a_json_object() -> None:
     assert OpenCodeInvestigator._parse_worker_response('{"ok": true}') == {"ok": True}
 
 
+def test_output_mode_keeps_pro_toolless_and_flash_structured() -> None:
+    assert opencode_output_mode("deepseek-v4-pro") == OPENCODE_OUTPUT_MODE_PROMPTED_JSON
+    assert (
+        opencode_output_mode("deepseek-v4-pro-202607")
+        == OPENCODE_OUTPUT_MODE_PROMPTED_JSON
+    )
+    assert (
+        opencode_output_mode("deepseek-v4-flash")
+        == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
+    )
+    prompt = opencode_prompt_for_model(
+        "base prompt",
+        model="deepseek-v4-pro",
+        output_schema={
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        },
+    )
+    assert prompt.startswith("base prompt")
+    assert "DEEPSEEK_THINKING_OUTPUT_ADAPTER" in prompt
+    assert "OUTPUT_JSON_SCHEMA" in prompt
+    assert '"answer": "string"' in prompt
+    assert (
+        opencode_prompt_for_model(
+            "base prompt",
+            model="deepseek-v4-flash",
+            output_schema={"type": "object"},
+        )
+        == "base prompt"
+    )
+
+
 def test_investigate_builds_a_toolless_prompt_and_validates_result(
     settings, tmp_path, monkeypatch
 ) -> None:  # noqa: ANN001
@@ -118,6 +159,8 @@ def test_investigate_builds_a_toolless_prompt_and_validates_result(
         assert payload["action"] == "investigate"
         assert payload["model"] == "deepseek-v4-pro"
         assert "cannot inspect files or execute commands directly" in payload["prompt"]
+        assert "DEEPSEEK_THINKING_OUTPUT_ADAPTER" in payload["prompt"]
+        assert "OUTPUT_JSON_SCHEMA" in payload["prompt"]
         assert payload["output_schema"]["title"] == "AgentInvestigationResult"
         assert payload["output_schema"]["additionalProperties"] is False
         serialized_schema = json.dumps(payload["output_schema"])
@@ -177,3 +220,34 @@ def test_investigate_builds_a_toolless_prompt_and_validates_result(
     assert result.thread_id == "session-test"
     assert result.turn_id == "message-test"
     assert result.result.result == "inconclusive"
+
+    monkeypatch.setattr(
+        investigator,
+        "_invoke",
+        lambda *_args, **_kwargs: {
+            "thread_id": "session-failed",
+            "turn_id": "message-failed",
+            "error": {
+                "type": "schema_validation_error",
+                "message": "output did not satisfy schema",
+            },
+            "usage": {"calls": 3},
+            "output_transport": {
+                "mode": "prompted_json",
+                "model_calls": [{"attempt": 1, "accepted": False}],
+            },
+        },
+    )
+    with pytest.raises(OpenCodeInvestigationError) as raised:
+        investigator.investigate(
+            scan=scan,
+            task=task,
+            entries=[entry],
+            workspace=workspace,
+            evidence=[],
+        )
+    assert raised.value.audit_details["usage"] == {"calls": 3}
+    assert (
+        raised.value.audit_details["output_transport"]["model_calls"][0]["accepted"]
+        is False
+    )

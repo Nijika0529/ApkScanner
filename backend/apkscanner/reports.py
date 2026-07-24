@@ -11,7 +11,13 @@ from .models import CoverageItem, EntryPoint, Evidence, Finding, InvestigationTa
 
 
 class ReportBuilder:
-    def build(self, session: Session, scan: Scan) -> dict[str, Any]:
+    def build(
+        self,
+        session: Session,
+        scan: Scan,
+        *,
+        agent_audits: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         entries = list(
             session.scalars(
                 select(EntryPoint).where(EntryPoint.scan_id == scan.id).order_by(EntryPoint.kind, EntryPoint.name)
@@ -81,6 +87,7 @@ class ReportBuilder:
             "entry_points": [self._entry(item) for item in entries],
             "findings": [self._finding(item) for item in findings],
             "tasks": [self._task(item) for item in tasks],
+            "agent_audits": agent_audits or [],
             "coverage": [self._coverage(item) for item in coverage],
             "evidence": [self._evidence(item) for item in evidence],
         }
@@ -133,6 +140,7 @@ class ReportBuilder:
             "hypotheses": item.hypotheses,
             "result": item.result,
             "thread_id": item.thread_id,
+            "turn_id": item.turn_id,
             "attempts": item.attempts,
             "error": item.error,
         }
@@ -241,7 +249,24 @@ class ReportBuilder:
             "</tr>"
             for item in report["findings"]
         )
+        audit_rows = "".join(
+            "<tr>"
+            f"<td>{html.escape(item['phase'])}</td>"
+            f"<td>{html.escape(item['backend'])}</td>"
+            f"<td>{html.escape(item['model'])}</td>"
+            f"<td>{html.escape(item['status'])}</td>"
+            f"<td>{html.escape(item['integrity'])}</td>"
+            f"<td><code>{html.escape(item['turn_id'] or '—')}</code></td>"
+            "</tr>"
+            for item in report["agent_audits"]
+        )
         limitations = "".join(f"<li>{html.escape(item)}</li>" for item in scan["limitations"])
+        report_json = (
+            json.dumps(report, ensure_ascii=False)
+            .replace("&", "\\u0026")
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+        )
         return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>APK Scanner Report</title>
 <style>body{{font:14px system-ui;max-width:1100px;margin:40px auto;color:#17202a}}
@@ -250,6 +275,10 @@ th{{background:#eef4f7}}code{{background:#eef4f7;padding:2px 5px}}</style></head
 <body><h1>APK 安全扫描报告</h1><p><strong>{html.escape(scan['package_name'] or scan['filename'])}</strong>
  · {html.escape(scan['status'])} · <code>{scan['artifact_sha256']}</code></p>
 <h2>Finding</h2><table><thead><tr><th>Severity</th><th>Status</th><th>Title</th><th>MASVS</th></tr></thead>
-<tbody>{finding_rows}</tbody></table><h2>限制</h2><ul>{limitations}</ul>
-<script type="application/json" id="report-data">{html.escape(json.dumps(report, ensure_ascii=False))}</script>
+<tbody>{finding_rows}</tbody></table>
+<h2>AI 审计</h2><table><thead><tr><th>Phase</th><th>Backend</th><th>Model</th><th>Status</th>
+<th>Integrity</th><th>Turn</th></tr></thead><tbody>{audit_rows}</tbody></table>
+<p>精确输入、结构化输出和平台校验内容保存在下方 <code>report-data</code> JSON 中。</p>
+<h2>限制</h2><ul>{limitations}</ul>
+<script type="application/json" id="report-data">{report_json}</script>
 </body></html>"""

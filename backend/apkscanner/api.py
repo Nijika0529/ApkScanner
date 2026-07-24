@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
@@ -10,6 +11,7 @@ from sqlalchemy import case, desc, select
 from sqlalchemy.orm import Session
 
 from . import __version__
+from .agent_audit import build_agent_audits
 from .artifacts import ArtifactStore, ArtifactTooLargeError
 from .db import Database
 from .enums import ScanStatus, TaskStatus
@@ -17,6 +19,7 @@ from .models import CoverageItem, EntryPoint, Evidence, Finding, InvestigationTa
 from .orchestrator import ScanOrchestrator
 from .reports import ReportBuilder
 from .schemas import (
+    AgentAuditOut,
     Capability,
     CoverageItemOut,
     EntryPointOut,
@@ -26,6 +29,7 @@ from .schemas import (
     FindingReview,
     HealthResponse,
     InvestigationTaskOut,
+    ScanDeleteResult,
     ScanDetail,
     ScanSummary,
 )
@@ -180,6 +184,80 @@ def get_scan(scan_id: str, session: Session = Depends(get_session)) -> Scan:
     return scan
 
 
+@router.delete("/scans/{scan_id}", response_model=ScanDeleteResult)
+def delete_scan(
+    scan_id: str,
+    session: Session = Depends(get_session),
+    store: ArtifactStore = Depends(get_store),
+) -> ScanDeleteResult:
+    scan = session.get(Scan, scan_id)
+    if scan is None:
+        raise HTTPException(404, "Scan not found")
+    if scan.status not in {ScanStatus.FINAL.value, ScanStatus.FAILED.value}:
+        raise HTTPException(409, "A running or queued scan cannot be deleted")
+
+    artifact = (scan.artifact_path, scan.artifact_sha256)
+    evidence = list(
+        session.execute(
+            select(Evidence.path, Evidence.sha256).where(Evidence.scan_id == scan_id)
+        )
+    )
+    evidence_by_path = {str(path): str(sha256) for path, sha256 in evidence}
+    shared_evidence_paths: set[str] = set()
+    evidence_paths = list(evidence_by_path)
+    for start in range(0, len(evidence_paths), 500):
+        chunk = evidence_paths[start : start + 500]
+        shared_evidence_paths.update(
+            str(path)
+            for path in session.scalars(
+                select(Evidence.path).where(
+                    Evidence.scan_id != scan_id,
+                    Evidence.path.in_(chunk),
+                )
+            )
+        )
+    artifact_is_shared = (
+        session.scalar(
+            select(Scan.id)
+            .where(
+                Scan.id != scan_id,
+                Scan.artifact_path == scan.artifact_path,
+            )
+            .limit(1)
+        )
+        is not None
+    )
+
+    session.delete(scan)
+    session.commit()
+
+    removed = 0
+    warnings: list[str] = []
+    if not artifact_is_shared:
+        try:
+            removed += int(
+                store.delete_content_addressed("artifacts", artifact[0], artifact[1])
+            )
+        except (OSError, ValueError) as exc:
+            warnings.append(f"APK artifact cleanup failed: {exc}")
+    for path, sha256 in evidence_by_path.items():
+        if path in shared_evidence_paths:
+            continue
+        try:
+            removed += int(store.delete_content_addressed("evidence", path, sha256))
+        except (OSError, ValueError) as exc:
+            warnings.append(f"Evidence cleanup failed for {Path(path).name}: {exc}")
+    try:
+        removed += int(store.delete_scan_workspace(scan_id))
+    except (OSError, ValueError) as exc:
+        warnings.append(f"Workspace cleanup failed: {exc}")
+    return ScanDeleteResult(
+        id=scan_id,
+        files_removed=removed,
+        cleanup_warnings=warnings,
+    )
+
+
 @router.get("/scans/{scan_id}/entries", response_model=list[EntryPointOut])
 def list_entries(scan_id: str, session: Session = Depends(get_session)) -> list[EntryPoint]:
     return list(
@@ -220,6 +298,17 @@ def list_tasks(scan_id: str, session: Session = Depends(get_session)) -> list[In
             .order_by(InvestigationTask.priority.desc(), InvestigationTask.created_at)
         )
     )
+
+
+@router.get("/scans/{scan_id}/agent-audits", response_model=list[AgentAuditOut])
+def list_agent_audits(
+    scan_id: str,
+    session: Session = Depends(get_session),
+    store: ArtifactStore = Depends(get_store),
+) -> list[dict[str, Any]]:
+    if session.get(Scan, scan_id) is None:
+        raise HTTPException(404, "Scan not found")
+    return build_agent_audits(session, store, scan_id)
 
 
 @router.get("/scans/{scan_id}/coverage", response_model=list[CoverageItemOut])
@@ -310,6 +399,11 @@ async def retry_task(
         raise HTTPException(409, "Task retry budget is exhausted")
     task.status = TaskStatus.QUEUED.value
     task.error = None
+    scan = session.get(Scan, task.scan_id)
+    if scan is None:
+        raise HTTPException(404, "Scan not found")
+    scan.status = ScanStatus.INVESTIGATING.value
+    scan.completed_at = None
     session.commit()
     background = asyncio.create_task(orchestrator.submit(task.scan_id), name=f"retry-{task.id}")
     request.app.state.background_tasks.add(background)
@@ -334,10 +428,12 @@ def download_evidence(
     evidence = session.get(Evidence, evidence_id)
     if evidence is None:
         raise HTTPException(404, "Evidence not found")
-    path = Path(evidence.path).resolve()
-    evidence_root = (store.settings.data_dir / "evidence").resolve()
-    if not path.is_relative_to(evidence_root) or not path.is_file():
-        raise HTTPException(404, "Evidence artifact is unavailable")
+    try:
+        path = store.verify_content_addressed(
+            "evidence", evidence.path, evidence.sha256
+        )
+    except (OSError, ValueError) as exc:
+        raise HTTPException(409, f"Evidence integrity check failed: {exc}") from exc
     return FileResponse(path, filename=path.name, media_type="application/octet-stream")
 
 
@@ -346,11 +442,16 @@ def export_report(
     scan_id: str,
     report_format: str,
     session: Session = Depends(get_session),
+    store: ArtifactStore = Depends(get_store),
 ):  # noqa: ANN201
     scan = session.get(Scan, scan_id)
     if scan is None:
         raise HTTPException(404, "Scan not found")
-    report = reports.build(session, scan)
+    report = reports.build(
+        session,
+        scan,
+        agent_audits=build_agent_audits(session, store, scan_id),
+    )
     if report_format == "json":
         return JSONResponse(report)
     if report_format == "sarif":

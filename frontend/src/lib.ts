@@ -24,6 +24,7 @@ export function statusLabel(status: string) {
     queued: "等待中",
     static_running: "静态扫描",
     investigating: "入口探索",
+    running: "调用中",
     preliminary_ready: "阶段报告",
     final: "已完成",
     failed: "失败",

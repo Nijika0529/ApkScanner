@@ -38,7 +38,7 @@ flowchart LR
 | 本地控制面 | SQLite、APK、workspace、evidence | FastAPI 仅监听 loopback；变更 API 需要自定义请求头；内容寻址文件拒绝 symlink/摘要冲突 |
 | Codex Docker worker | 当前 scan workspace、显式 Codex auth、网络 | 每任务新容器、只读 bind mount、只读 rootfs、丢弃 capabilities、PID/CPU/内存限制；默认模式 |
 | Codex host worker | 本机与网络 | 仅作为显式 `host` 降级模式；个人受控环境使用 |
-| OpenCode + DeepSeek Docker worker | 平台生成的 task JSON、DeepSeek API | 不挂载 scan workspace；只读 rootfs、临时 HOME、丢弃 capabilities；禁用文件/Shell/Web/MCP/子 Agent，仅允许内部 StructuredOutput 工具 |
+| OpenCode + DeepSeek Docker worker | 平台生成的 task JSON、DeepSeek API | 不挂载 scan workspace；只读 rootfs、临时 HOME、丢弃 capabilities；禁用文件/Shell/Web/MCP/子 Agent；V4 Pro 无工具并省略 `tool_choice`，Flash 仅允许内部 StructuredOutput |
 | OpenCode + DeepSeek host worker | 平台生成的 task JSON、DeepSeek API | 每次调用使用临时 HOME/XDG 与带随机 Basic Auth 的 loopback server；仍仅适合个人受控环境 |
 | 云真机 | 目标 APK、Probe APK、测试账号 | 固定 Android 16/API 36；串行 lease；任务前后 `pm clear`；不声称完整快照复位 |
 | Probe APK | 以普通 App UID 调用目标入口 | 只接受最初发送者为 shell/root 的调度；仍只允许安装在专用测试设备 |
@@ -68,6 +68,37 @@ APK、反编译代码、资源、日志、网页和工具输出都属于不可�
 | `inconclusive` | 证据不足、工具缺失、预算耗尽或前置条件失败 |
 
 Agent 声称但不属于本 scan/task 的 Evidence ID 会被删除。需要证据的结论不满足条件时自动降级为 `inconclusive`。重试产生不同结果时，旧 Agent Finding 不删除，但会标记为已被新 turn 取代且降级为 inconclusive。
+
+## AI 内容审计
+
+每次实际模型调用都会形成独立 `audit_id`，并按调用阶段写入内容寻址的不可变 Evidence：
+
+1. `agent.request`：后端、provider、模型、SDK、隔离方式、developer instructions、精确
+   prompt、输出 JSON Schema 和工具边界；
+2. `agent.response`：thread/turn、平台收到的结构化原始输出和 token/费用 usage；
+3. `agent.test_validation`：Agent 申请的测试、平台接受/拒绝的测试、拒绝原因、实际执行
+   用例及其 Evidence ID；
+4. `agent.validation`：模型声称的结论和 Evidence ID、平台接受/拒绝的 Evidence ID、是否
+   降级以及最终落库结果；
+5. `agent.error`：已发起但失败的模型调用错误。
+
+OpenCode 审计还记录实际输出通道。`deepseek-v4-pro` 保持思考模式，但使用无工具的
+`format=text`：prompt 携带精确 JSON Schema，worker 用 Ajv 本地校验，失败后最多进行
+2 次同 session 纠正；每轮 prompt、原始文本、校验错误和 usage 都写入审计。
+`deepseek-v4-flash` 继续使用 OpenCode 的内部 StructuredOutput 工具。这样 Pro 请求不会
+携带与思考模式冲突的 `tool_choice`，两个通道最终仍进入相同的平台证据校验。
+
+这些记录不包含模型 API Key。每份内容在写入时计算 SHA-256，Web 的“AI 审计”页和 JSON
+报告展示同一份内容及摘要；读取时再次校验文件路径与 SHA-256，损坏或篡改会显示为完整性
+异常。没有实际调用 AI 的任务不会伪造审计记录。
+
+## 扫描删除
+
+Web 只允许删除已经 `final` 或 `failed` 的扫描；任务进入重试队列时会先把扫描恢复为
+`investigating`，避免删除与后台执行发生竞态。删除操作需要二次确认，会级联删除数据库
+中的入口、任务、Finding、Coverage、事件和 Evidence，并删除该扫描独占的 APK、Evidence
+文件及 workspace。内容寻址文件如果仍被其他扫描引用则保留，避免删除重复上传 APK 所
+共享的数据。
 
 ## 扩展方式
 

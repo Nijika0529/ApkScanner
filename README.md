@@ -16,6 +16,8 @@ finding without platform evidence IDs.
 - Built-in MASVS-oriented manifest, code-pattern, archive, native-library, and hardening rules.
 - Apktool baseline with optional JADX enhancement and explicit degraded-coverage states.
 - Persistent SQLite scan/task/finding/evidence/coverage/event models.
+- Tamper-evident AI audit trail for exact prompts, structured outputs, test-policy decisions,
+  evidence downgrades, provider/model identity, thread/turn IDs, and usage.
 - Remote ADB adapter, serialized device lease, ordinary-app-UID Probe APK protocol, log evidence,
   guest/authenticated replay, `pm clear` cleanup, and App Link state inspection/reset.
 - Bounded Frida side-channel tracing with URI/query redaction and a distinct instrumented verdict.
@@ -23,9 +25,11 @@ finding without platform evidence IDs.
 - Official `openai-codex==0.144.4` integration with strict JSON Schema, fresh threads, no subagent
   fan-out, one platform-mediated follow-up test round, and evidence-backed result downgrades.
 - Pinned `@opencode-ai/sdk`/OpenCode `1.18.4` integration for DeepSeek, with fresh sessions,
-  schema-validated output, all executable agent tools denied, and an isolated one-shot bridge.
+  tool-free/Ajv-validated V4 Pro JSON, native StructuredOutput for V4 Flash, all executable agent
+  tools denied, and an isolated one-shot bridge.
 - Optional per-task Docker workers with read-only scan mounts and resource/capability limits.
 - Responsive React review console, human Finding decisions, live events, JSON/HTML/SARIF exports.
+- Light review console with confirmed deletion of completed scans and shared-artifact-safe cleanup.
 
 The detailed control flow, trust boundaries, IR, and verdict rules are in
 [`docs/architecture.zh-CN.md`](docs/architecture.zh-CN.md).
@@ -157,8 +161,10 @@ scanctl capabilities --deep
 
 The host worker creates a private temporary HOME/XDG tree and an authenticated loopback OpenCode
 server for each invocation. In both modes, OpenCode receives only the platform-generated task JSON:
-filesystem, shell, web, MCP, and subagent tools are denied. Its sole callable tool is OpenCode's
-internal `StructuredOutput` result collector; requested Android tests are validated and executed by
+filesystem, shell, web, MCP, and subagent tools are denied. `deepseek-v4-pro` uses OpenCode text
+output with no tools and no `tool_choice`; the worker validates JSON locally with Ajv and can issue
+two auditable correction turns in the same session. `deepseek-v4-flash` uses OpenCode's internal
+`StructuredOutput` result collector. Requested Android tests are always validated and executed by
 the Python control plane.
 
 Set `APKSCANNER_OPENCODE_MODEL=deepseek-v4-flash` to prefer the lower-cost model. An enterprise
