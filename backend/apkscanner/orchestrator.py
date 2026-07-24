@@ -4,7 +4,11 @@ import asyncio
 import json
 import re
 import shutil
+import threading
+import uuid
 from collections import defaultdict
+from contextlib import suppress
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -12,6 +16,8 @@ from urllib.parse import urlsplit
 
 from sqlalchemy import select
 
+from .agent_events import AgentCancelledError, AgentRuntimeEvent
+from .agent_prompt import developer_instructions, investigation_prompt
 from .artifacts import ArtifactStore
 from .codex_runner import CodexInvestigator
 from .config import Settings
@@ -22,13 +28,20 @@ from .evidence import EvidenceRecorder
 from .instrumentation import FridaAdapter
 from .mobsf import MobSFAdapter
 from .models import CoverageItem, EntryPoint, Evidence, Finding, InvestigationTask, Scan
-from .opencode_runner import OpenCodeInvestigator
+from .opencode_runner import (
+    AJV_VERSION,
+    OPENCODE_OUTPUT_MODE_PROMPTED_JSON,
+    OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
+    OpenCodeInvestigator,
+    opencode_output_mode,
+    opencode_prompt_for_model,
+)
 from .planner import InvestigationPlanner
 from .repository import add_event, now
 from .rules import BuiltinRuleEngine
-from .schemas import AgentRequestedTest
+from .schemas import AGENT_RESULT_JSON_SCHEMA, AgentRequestedTest
 from .static_analysis import ApkInspector
-from .tools import TimeBudget, ToolRunner
+from .tools import CommandResult, TimeBudget, ToolRunner
 
 
 class ScanOrchestrator:
@@ -51,6 +64,8 @@ class ScanOrchestrator:
         }
         self._running: set[str] = set()
         self._running_lock = asyncio.Lock()
+        self._task_cancellations: dict[str, threading.Event] = {}
+        self._task_cancellations_lock = threading.Lock()
 
     def resolve_investigator(self, requested: str = "configured") -> str:
         backend = (
@@ -61,6 +76,30 @@ class ScanOrchestrator:
         if backend not in {*self.investigators, "none"}:
             raise ValueError("investigator must be configured, codex, opencode, or none")
         return backend
+
+    def _record_exploration_event(
+        self,
+        scan_id: str,
+        task_id: str,
+        event_type: str,
+        message: str,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        normalized_type = (
+            event_type if event_type.startswith("exploration.") else f"exploration.{event_type}"
+        )
+        with self.database.session_factory() as session:
+            add_event(
+                session,
+                scan_id,
+                normalized_type,
+                message,
+                {
+                    "task_id": task_id,
+                    **(data or {}),
+                },
+            )
+            session.commit()
 
     async def submit(self, scan_id: str) -> None:
         async with self._running_lock:
@@ -150,9 +189,27 @@ class ScanOrchestrator:
                 "workspace": str(result.workspace),
                 "static_finding_count": len(findings),
                 "preliminary_deadline": preliminary_deadline.isoformat(),
+                "decompilation": {
+                    key: value
+                    for key, value in result.decompilation.items()
+                    if key != "failed_classes"
+                },
             }
             entries: list[EntryPoint] = []
             for parsed in result.manifest.entries:
+                code_context = result.code_index.get(
+                    parsed.owner_component or parsed.name,
+                    {},
+                )
+                public_anchors = [
+                    {
+                        key: value
+                        for key, value in anchor.items()
+                        if key != "content"
+                    }
+                    for anchor in code_context.get("anchors", [])
+                    if isinstance(anchor, dict)
+                ]
                 entry = EntryPoint(
                     scan_id=scan.id,
                     kind=parsed.kind,
@@ -164,7 +221,25 @@ class ScanOrchestrator:
                     permission_protection=parsed.permission_protection,
                     intent_filters=parsed.intent_filters,
                     deep_links=parsed.deep_links,
-                    metadata_json=parsed.metadata,
+                    code_anchors=public_anchors,
+                    metadata_json={
+                        **parsed.metadata,
+                        "decompilation": {
+                            "status": code_context.get("status", "source_not_found"),
+                            "target_in_jadx_failure_list": bool(
+                                code_context.get("target_in_jadx_failure_list")
+                            ),
+                            "target_source_has_decompiler_errors": bool(
+                                code_context.get(
+                                    "target_source_has_decompiler_errors"
+                                )
+                            ),
+                            "global_status": code_context.get(
+                                "global_decompilation_status",
+                                result.decompilation.get("status"),
+                            ),
+                        },
+                    },
                 )
                 session.add(entry)
                 entries.append(entry)
@@ -251,13 +326,25 @@ class ScanOrchestrator:
                     )
                 )
             for tool, payload in result.tool_results.items():
+                metadata = (
+                    {
+                        key: value
+                        for key, value in dict(
+                            payload.get("decompilation") or {}
+                        ).items()
+                        if key != "failed_classes"
+                    }
+                    if tool == "jadx"
+                    else None
+                )
                 self.evidence.json(
                     session,
                     scan_id=scan.id,
                     task_id=None,
                     kind=f"static.{tool}",
                     value=payload,
-                    summary=f"{tool} exited with {payload['exit_code']}",
+                    summary=self._static_tool_evidence_summary(tool, payload),
+                    metadata=metadata,
                 )
             if mobsf_result is not None:
                 self.evidence.json(
@@ -363,11 +450,51 @@ class ScanOrchestrator:
                 return
             self._run_task(scan_id, task.id, min(self.settings.task_timeout_seconds, remaining))
 
-    def _run_task(self, scan_id: str, task_id: str, timeout_seconds: int | None = None) -> None:
+    def request_task_cancellation(self, task_id: str) -> bool:
+        with self._task_cancellations_lock:
+            event = self._task_cancellations.get(task_id)
+            if event is None:
+                return False
+            event.set()
+            return True
+
+    def _run_task(
+        self,
+        scan_id: str,
+        task_id: str,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        cancel_event = threading.Event()
+        with self._task_cancellations_lock:
+            self._task_cancellations[task_id] = cancel_event
+        try:
+            self._run_task_impl(
+                scan_id,
+                task_id,
+                timeout_seconds,
+                cancel_event=cancel_event,
+            )
+        except AgentCancelledError:
+            self._mark_task_canceled(scan_id, task_id)
+        finally:
+            with self._task_cancellations_lock:
+                if self._task_cancellations.get(task_id) is cancel_event:
+                    self._task_cancellations.pop(task_id, None)
+
+    def _run_task_impl(
+        self,
+        scan_id: str,
+        task_id: str,
+        timeout_seconds: int | None = None,
+        *,
+        cancel_event: threading.Event,
+    ) -> None:
         with self.database.session_factory() as session:
             scan = session.get(Scan, scan_id)
             task = session.get(InvestigationTask, task_id)
             assert scan is not None and task is not None
+            if task.status != TaskStatus.QUEUED.value:
+                return
             entries = list(
                 session.scalars(select(EntryPoint).where(EntryPoint.id.in_(task.target_entry_ids)))
             )
@@ -385,10 +512,37 @@ class ScanOrchestrator:
                 f"Investigation started for {len(entries)} entry point(s)",
                 {"task_id": task.id, "agent_backend": agent_backend},
             )
+            add_event(
+                session,
+                scan_id,
+                "exploration.started",
+                (
+                    f"AI 探索任务已启动：{len(entries)} 个入口"
+                    if agent_backend != "none"
+                    else f"确定性入口验证任务已启动：{len(entries)} 个入口"
+                ),
+                {
+                    "task_id": task.id,
+                    "source": "platform",
+                    "run_id": f"{task.id}:attempt:{task.attempts}",
+                    "agent_backend": agent_backend,
+                    "model": (
+                        self.settings.codex_worker_model
+                        if agent_backend == "codex"
+                        else self.settings.opencode_model
+                        if agent_backend == "opencode"
+                        else None
+                    ),
+                    "entry_point_ids": list(task.target_entry_ids),
+                    "hypotheses": list(task.hypotheses),
+                },
+            )
             session.commit()
 
+        self._raise_if_cancelled(cancel_event)
         budget = TimeBudget.from_seconds(timeout_seconds or self.settings.task_timeout_seconds)
         evidence_summaries = self._static_evidence_summaries(scan_id)
+        target_code_context = self._target_code_context(scan_id, entries)
         coverage_gaps: list[str] = []
         stages: dict[str, Any] = {
             "device_attempted": False,
@@ -412,7 +566,11 @@ class ScanOrchestrator:
             phase: str,
             timeout_cap: int | None = None,
             executed_tests: list[dict[str, Any]] | None = None,
+            round_index: int = 0,
         ):  # noqa: ANN202
+            audit_id: str | None = None
+            runtime_events: list[dict[str, Any]] = []
+            self._raise_if_cancelled(cancel_event)
             if investigator is None:
                 return None, "AI investigation is disabled for this scan"
             if not agent_enabled:
@@ -423,6 +581,7 @@ class ScanOrchestrator:
             if remaining <= 0:
                 return None, "task time budget exhausted before AI dispatch"
             capability = investigator.capability(deep=True)
+            self._raise_if_cancelled(cancel_event)
             if not capability.get("available"):
                 return None, capability.get(
                     "detail", f"{agent_backend} capability probe failed"
@@ -434,27 +593,234 @@ class ScanOrchestrator:
                     task.attempts,
                     evidence_summaries,
                 )
-                return (
-                    investigator.investigate(
-                        scan=scan,
-                        task=task,
-                        entries=entries,
-                        workspace=self.settings.data_dir / "workspaces" / scan_id,
-                        evidence=evidence_summaries,
-                        platform_context={
-                            "phase": phase,
-                            "device": device_capability,
-                            "authentication": auth_capability,
-                            "frida": frida_capability,
-                            "coverage_gaps": coverage_gaps,
-                            "executed_agent_tests": executed_tests or [],
-                            "further_test_rounds_available": phase == "test_planning",
-                        },
-                        timeout_seconds=remaining,
+                platform_context = {
+                    "phase": phase,
+                    "round_index": round_index,
+                    "device": device_capability,
+                    "authentication": auth_capability,
+                    "frida": frida_capability,
+                    "coverage_gaps": coverage_gaps,
+                    "target_code_context": target_code_context,
+                    "executed_agent_tests": executed_tests or [],
+                    "further_test_rounds_available": (
+                        phase != "final_evaluation"
+                        and round_index < self.settings.agent_max_rounds
                     ),
-                    None,
+                    "exploration_limits": {
+                        "max_rounds": self.settings.agent_max_rounds,
+                        "tests_per_round": self.settings.agent_tests_per_round,
+                    },
+                }
+                self._record_exploration_event(
+                    scan_id,
+                    task_id,
+                    "context.loaded",
+                    "静态结果、入口信息与现有证据已装载",
+                    {
+                        "source": "platform",
+                        "phase": phase,
+                        "round_index": round_index,
+                        "evidence_count": len(evidence_summaries),
+                        "target_code_statuses": [
+                            item.get("status")
+                            for item in target_code_context.get("components", [])
+                        ],
+                        "executed_test_count": len(executed_tests or []),
+                        "agent_backend": agent_backend,
+                    },
                 )
+                audit_id = self._record_agent_request(
+                    scan=scan,
+                    task=task,
+                    entries=entries,
+                    evidence=evidence_summaries,
+                    platform_context=platform_context,
+                    backend=agent_backend,
+                    phase=phase,
+                    capability=capability,
+                )
+
+                def on_runtime_event(event: AgentRuntimeEvent) -> None:
+                    record = {
+                        "sequence": len(runtime_events) + 1,
+                        "event_type": event.event_type,
+                        "message": event.message,
+                        "data": event.data,
+                        "created_at": datetime.now(UTC).isoformat(),
+                    }
+                    runtime_events.append(record)
+                    self._record_exploration_event(
+                        scan_id,
+                        task_id,
+                        event.event_type,
+                        event.message,
+                        {
+                            "source": "sdk",
+                            "phase": phase,
+                            "round_index": round_index,
+                            "agent_backend": agent_backend,
+                            **event.data,
+                        },
+                    )
+
+                self._record_exploration_event(
+                    scan_id,
+                    task_id,
+                    "model.dispatched",
+                    f"任务已下发到 {agent_backend} SDK",
+                    {
+                        "source": "platform",
+                        "phase": phase,
+                        "round_index": round_index,
+                        "agent_backend": agent_backend,
+                    },
+                )
+                result = investigator.investigate(
+                    scan=scan,
+                    task=task,
+                    entries=entries,
+                    workspace=self.settings.data_dir / "workspaces" / scan_id,
+                    evidence=evidence_summaries,
+                    platform_context=platform_context,
+                    timeout_seconds=remaining,
+                    event_callback=on_runtime_event,
+                    cancel_event=cancel_event,
+                )
+                self._raise_if_cancelled(cancel_event)
+                self._record_agent_response(
+                    scan_id=scan_id,
+                    task_id=task_id,
+                    audit_id=audit_id,
+                    backend=agent_backend,
+                    phase=phase,
+                    attempt=task.attempts,
+                    result=result,
+                )
+                self._record_agent_runtime_events(
+                    scan_id=scan_id,
+                    task_id=task_id,
+                    audit_id=audit_id,
+                    backend=agent_backend,
+                    phase=phase,
+                    attempt=task.attempts,
+                    events=runtime_events,
+                )
+                self._record_exploration_event(
+                    scan_id,
+                    task_id,
+                    "model.completed",
+                    f"{agent_backend} SDK 已返回本轮结构化结果",
+                    {
+                        "source": "platform",
+                        "phase": phase,
+                        "round_index": round_index,
+                        "agent_backend": agent_backend,
+                        "thread_id": result.thread_id,
+                        "turn_id": result.turn_id,
+                        "requested_test_count": len(result.result.requested_tests),
+                    },
+                )
+                for hypothesis in result.result.hypotheses_tested[:12]:
+                    self._record_exploration_event(
+                        scan_id,
+                        task_id,
+                        "hypothesis.recorded",
+                        "AI 已记录一项被验证的安全假设",
+                        {
+                            "source": "model",
+                            "phase": phase,
+                            "round_index": round_index,
+                            "agent_backend": agent_backend,
+                            "hypothesis": hypothesis,
+                        },
+                    )
+                for request in result.result.requested_tests[
+                    : self.settings.agent_tests_per_round
+                ]:
+                    self._record_exploration_event(
+                        scan_id,
+                        task_id,
+                        "action.proposed",
+                        "AI 申请执行一项受控入口测试",
+                        {
+                            "source": "model",
+                            "phase": phase,
+                            "round_index": round_index,
+                            "agent_backend": agent_backend,
+                            "entry_point_id": request.entry_point_id,
+                            "state": request.state,
+                            "rationale_summary": request.rationale,
+                        },
+                    )
+                return result, None
+            except AgentCancelledError as exc:
+                if audit_id is not None and runtime_events:
+                    self._record_agent_runtime_events(
+                        scan_id=scan_id,
+                        task_id=task_id,
+                        audit_id=audit_id,
+                        backend=agent_backend,
+                        phase=phase,
+                        attempt=task.attempts,
+                        events=runtime_events,
+                    )
+                if audit_id is not None:
+                    self._record_agent_cancellation(
+                        scan_id=scan_id,
+                        task_id=task_id,
+                        audit_id=audit_id,
+                        backend=agent_backend,
+                        phase=phase,
+                        attempt=task.attempts,
+                        error=exc,
+                    )
+                self._record_exploration_event(
+                    scan_id,
+                    task_id,
+                    "model.cancelled",
+                    f"{agent_backend} SDK 本轮调用已由用户停止",
+                    {
+                        "source": "platform",
+                        "phase": phase,
+                        "round_index": round_index,
+                        "agent_backend": agent_backend,
+                    },
+                )
+                raise
             except Exception as exc:
+                if audit_id is not None and runtime_events:
+                    self._record_agent_runtime_events(
+                        scan_id=scan_id,
+                        task_id=task_id,
+                        audit_id=audit_id,
+                        backend=agent_backend,
+                        phase=phase,
+                        attempt=task.attempts,
+                        events=runtime_events,
+                    )
+                if audit_id is not None:
+                    self._record_agent_error(
+                        scan_id=scan_id,
+                        task_id=task_id,
+                        audit_id=audit_id,
+                        backend=agent_backend,
+                        phase=phase,
+                        attempt=task.attempts,
+                        error=exc,
+                    )
+                self._record_exploration_event(
+                    scan_id,
+                    task_id,
+                    "model.failed",
+                    f"{agent_backend} SDK 本轮调用失败",
+                    {
+                        "source": "platform",
+                        "phase": phase,
+                        "round_index": round_index,
+                        "agent_backend": agent_backend,
+                        "error": str(exc)[:2000],
+                    },
+                )
                 return None, str(exc)
 
         device_ready = bool(
@@ -600,27 +966,77 @@ class ScanOrchestrator:
                                 )
                     phase_one_cap = max(1, budget.remaining() // 2)
                     agent_result, agent_error = invoke_agent(
-                        phase="test_planning", timeout_cap=phase_one_cap
+                        phase="test_planning",
+                        timeout_cap=phase_one_cap,
+                        round_index=0,
                     )
-                    if agent_result and agent_result.result.requested_tests and prepared:
+                    completed_rounds = 0
+                    while (
+                        agent_result
+                        and agent_result.result.requested_tests
+                        and prepared
+                        and completed_rounds < self.settings.agent_max_rounds
+                        and not budget.expired
+                    ):
+                        planning_result = agent_result
+                        planning_turn_id = planning_result.turn_id
+                        submitted_tests = [
+                            item.model_dump(mode="json")
+                            for item in planning_result.result.requested_tests
+                        ]
                         requested, request_gaps = self._validate_requested_tests(
-                            agent_result.result.requested_tests,
+                            planning_result.result.requested_tests,
                             entries,
                             auth_available=bool(auth_capability.get("available")),
+                            limit=self.settings.agent_tests_per_round,
                         )
                         coverage_gaps.extend(request_gaps)
-                        if requested and not budget.expired:
-                            executed_agent_tests, execution_gaps, requested_observed = (
-                                self._execute_requested_tests(
-                                    scan_id=scan_id,
-                                    task_id=task_id,
-                                    package_name=package_name,
-                                    entries=entries,
-                                    requests=requested,
-                                    budget=budget,
-                                    evidence_summaries=evidence_summaries,
-                                )
+                        for accepted in requested:
+                            self._record_exploration_event(
+                                scan_id,
+                                task_id,
+                                "action.accepted",
+                                "平台已接受 AI 申请的受控入口测试",
+                                {
+                                    "source": "platform",
+                                    "round_index": completed_rounds,
+                                    "entry_point_id": accepted.entry_point_id,
+                                    "state": accepted.state,
+                                    "rationale_summary": accepted.rationale,
+                                },
                             )
+                        if request_gaps or len(requested) < len(submitted_tests):
+                            self._record_exploration_event(
+                                scan_id,
+                                task_id,
+                                "action.rejected",
+                                "部分 AI 测试申请被平台边界策略拒绝或截断",
+                                {
+                                    "source": "platform",
+                                    "round_index": completed_rounds,
+                                    "submitted_count": len(submitted_tests),
+                                    "accepted_count": len(requested),
+                                    "gaps": request_gaps,
+                                },
+                            )
+
+                        execution_gaps: list[str] = []
+                        executed_this_round: list[dict[str, Any]] = []
+                        if requested and not budget.expired:
+                            (
+                                executed_this_round,
+                                execution_gaps,
+                                requested_observed,
+                            ) = self._execute_requested_tests(
+                                scan_id=scan_id,
+                                task_id=task_id,
+                                package_name=package_name,
+                                entries=entries,
+                                requests=requested,
+                                budget=budget,
+                                evidence_summaries=evidence_summaries,
+                            )
+                            executed_agent_tests.extend(executed_this_round)
                             coverage_gaps.extend(execution_gaps)
                             stages["instrumented_attempted"] = (
                                 stages["instrumented_attempted"]
@@ -629,23 +1045,74 @@ class ScanOrchestrator:
                             stages["instrumented_observed"] = (
                                 stages["instrumented_observed"] or requested_observed
                             )
-                            final_result, final_error = invoke_agent(
-                                phase="final_evaluation",
-                                executed_tests=executed_agent_tests,
+                        elif requested:
+                            execution_gaps.append(
+                                "Task budget expired before accepted AI-requested tests ran."
                             )
-                            if final_result is not None:
-                                agent_result = final_result
-                                agent_error = None
-                                if final_result.result.requested_tests:
-                                    coverage_gaps.append(
-                                        "Additional agent-requested tests were not executed because "
-                                        "the platform permits one bounded follow-up round per task."
-                                    )
-                            else:
+                            coverage_gaps.extend(execution_gaps)
+
+                        self._record_agent_test_validation(
+                            task_id=task_id,
+                            turn_id=planning_turn_id,
+                            submitted=submitted_tests,
+                            accepted=[
+                                item.model_dump(mode="json") for item in requested
+                            ],
+                            executed=executed_this_round,
+                            gaps=[*request_gaps, *execution_gaps],
+                        )
+                        completed_rounds += 1
+                        if (
+                            not executed_this_round
+                            or budget.expired
+                            or completed_rounds >= self.settings.agent_max_rounds
+                        ):
+                            break
+                        next_result, next_error = invoke_agent(
+                            phase="exploration_round",
+                            timeout_cap=max(1, budget.remaining() // 2),
+                            executed_tests=executed_agent_tests,
+                            round_index=completed_rounds,
+                        )
+                        if next_result is None:
+                            coverage_gaps.append(
+                                "Adaptive AI exploration round failed; retained prior result: "
+                                f"{next_error}"
+                            )
+                            break
+                        agent_result = next_result
+                        agent_error = None
+
+                    if (
+                        agent_result
+                        and agent_result.result.requested_tests
+                        and completed_rounds >= self.settings.agent_max_rounds
+                    ):
+                        coverage_gaps.append(
+                            "Further AI-requested tests were not executed because the configured "
+                            "adaptive exploration round limit was reached."
+                        )
+                    if executed_agent_tests and not budget.expired:
+                        final_result, final_error = invoke_agent(
+                            phase="final_evaluation",
+                            executed_tests=executed_agent_tests,
+                            round_index=completed_rounds,
+                        )
+                        if final_result is not None:
+                            agent_result = final_result
+                            agent_error = None
+                            if final_result.result.requested_tests:
                                 coverage_gaps.append(
-                                    "Final AI evaluation failed; retained first-pass result: "
-                                    f"{final_error}"
+                                    "Final evaluation requested additional tests, but final turns "
+                                    "cannot schedule new device actions."
                                 )
+                        else:
+                            coverage_gaps.append(
+                                "Final AI evaluation failed; retained the latest exploration result: "
+                                f"{final_error}"
+                            )
+                except AgentCancelledError:
+                    raise
                 except Exception as exc:
                     coverage_gaps.append(f"Dynamic investigation failed safely: {exc}")
                     if agent_result is None:
@@ -669,14 +1136,30 @@ class ScanOrchestrator:
                         cleanup = self.device.cleanup(package_name)
                         self._record_commands(scan_id, task_id, cleanup, None)
 
+        self._raise_if_cancelled(cancel_event)
+        validated_payload: dict[str, Any] | None = None
+        validated_result_value: str | None = None
+        if agent_result:
+            raw_payload = agent_result.result.model_dump(mode="json")
+            validated_payload, validated_result_value = self._validated_agent_payload(
+                deepcopy(raw_payload), evidence_summaries
+            )
+            self._record_agent_validation(
+                task_id=task_id,
+                turn_id=agent_result.turn_id,
+                raw_payload=raw_payload,
+                validated_payload=validated_payload,
+            )
+
         with self.database.session_factory() as session:
             task = session.get(InvestigationTask, task_id)
             scan = session.get(Scan, scan_id)
             assert task is not None and scan is not None
             if agent_result:
-                payload, result_value = self._validated_agent_payload(
-                    agent_result.result.model_dump(mode="json"), evidence_summaries
-                )
+                assert validated_payload is not None
+                assert validated_result_value is not None
+                payload = validated_payload
+                result_value = validated_result_value
                 task.thread_id = agent_result.thread_id
                 task.turn_id = agent_result.turn_id
                 task.result = {
@@ -691,6 +1174,22 @@ class ScanOrchestrator:
                         "executed_agent_tests": executed_agent_tests,
                     },
                 }
+                add_event(
+                    session,
+                    scan_id,
+                    "exploration.conclusion.recorded",
+                    f"平台已确认 AI 结论：{result_value}",
+                    {
+                        "task_id": task.id,
+                        "source": "platform",
+                        "agent_backend": agent_backend,
+                        "thread_id": agent_result.thread_id,
+                        "turn_id": agent_result.turn_id,
+                        "result": result_value,
+                        "confidence": payload.get("confidence"),
+                        "evidence_ids": payload.get("evidence_ids", []),
+                    },
+                )
                 task.status = (
                     TaskStatus.NOT_REPRODUCED.value
                     if result_value == FindingStatus.NOT_REPRODUCED.value
@@ -754,6 +1253,75 @@ class ScanOrchestrator:
                     "agent_backend": agent_backend,
                 },
             )
+            add_event(
+                session,
+                scan_id,
+                "exploration.completed",
+                f"入口探索任务结束：{task.status}",
+                {
+                    "task_id": task.id,
+                    "source": "platform",
+                    "status": task.status,
+                    "agent_backend": agent_backend,
+                    "evidence_count": len(evidence_summaries),
+                },
+            )
+            session.commit()
+
+    @staticmethod
+    def _raise_if_cancelled(cancel_event: threading.Event) -> None:
+        if cancel_event.is_set():
+            raise AgentCancelledError("investigation was cancelled by the user")
+
+    def _mark_task_canceled(self, scan_id: str, task_id: str) -> None:
+        with self.database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            if task is None:
+                return
+            task.status = TaskStatus.CANCELED.value
+            task.error = "用户已停止本次分析"
+            task.completed_at = now()
+            task.result = {
+                **dict(task.result or {}),
+                "cancellation": {
+                    "requested": True,
+                    "acknowledged": True,
+                    "completed_at": task.completed_at.isoformat(),
+                },
+            }
+            coverage = list(
+                session.scalars(
+                    select(CoverageItem).where(
+                        CoverageItem.scan_id == scan_id,
+                        CoverageItem.entry_point_id.in_(task.target_entry_ids),
+                    )
+                )
+            )
+            for item in coverage:
+                item.status = "partial"
+                item.gap_reason = "入口探索由用户主动停止，未形成最终判断。"
+                item.stages = {
+                    **item.stages,
+                    "agent": "cancelled",
+                }
+            add_event(
+                session,
+                scan_id,
+                "task.cancelled",
+                "用户已停止入口探索任务",
+                {"task_id": task_id, "status": TaskStatus.CANCELED.value},
+            )
+            add_event(
+                session,
+                scan_id,
+                "exploration.cancelled",
+                "AI 分析已停止，未生成新的最终结论",
+                {
+                    "task_id": task_id,
+                    "source": "platform",
+                    "status": TaskStatus.CANCELED.value,
+                },
+            )
             session.commit()
 
     @staticmethod
@@ -762,12 +1330,13 @@ class ScanOrchestrator:
         entries: list[EntryPoint],
         *,
         auth_available: bool,
+        limit: int = 12,
     ) -> tuple[list[AgentRequestedTest], list[str]]:
         entries_by_id = {entry.id: entry for entry in entries}
         accepted: list[AgentRequestedTest] = []
         gaps: list[str] = []
         seen: set[str] = set()
-        for request in requests[:12]:
+        for request in requests[:limit]:
             entry = entries_by_id.get(request.entry_point_id)
             reason = None
             if entry is None:
@@ -799,6 +1368,11 @@ class ScanOrchestrator:
                 continue
             seen.add(signature)
             accepted.append(request)
+        if len(requests) > limit:
+            gaps.append(
+                f"Rejected {len(requests) - limit} agent-requested test(s) above the "
+                f"per-round limit of {limit}."
+            )
         return accepted, gaps
 
     @staticmethod
@@ -885,6 +1459,19 @@ class ScanOrchestrator:
                         gaps.append("Task budget expired before all agent-requested tests ran.")
                         break
                     before = len(evidence_summaries)
+                    self._record_exploration_event(
+                        scan_id,
+                        task_id,
+                        "action.started",
+                        f"开始执行 AI 申请的 {state} 状态入口测试",
+                        {
+                            "source": "platform",
+                            "test_case_id": test_case_id,
+                            "entry_point_id": request.entry_point_id,
+                            "state": state,
+                            "rationale_summary": request.rationale,
+                        },
+                    )
                     probe = self.device.probe(
                         entries_by_id[request.entry_point_id],
                         package_name,
@@ -909,6 +1496,19 @@ class ScanOrchestrator:
                             "evidence_ids": evidence_ids,
                         }
                     )
+                    self._record_exploration_event(
+                        scan_id,
+                        task_id,
+                        "action.completed",
+                        f"AI 申请的入口测试已完成，生成 {len(evidence_ids)} 条证据",
+                        {
+                            "source": "platform",
+                            "test_case_id": test_case_id,
+                            "entry_point_id": request.entry_point_id,
+                            "state": state,
+                            "evidence_ids": evidence_ids,
+                        },
+                    )
             finally:
                 if frida_session is not None:
                     result = self.frida.collect(frida_session)
@@ -924,6 +1524,399 @@ class ScanOrchestrator:
                     )
         return executed, gaps, instrumented_observed
 
+    def _record_agent_request(
+        self,
+        *,
+        scan: Scan,
+        task: InvestigationTask,
+        entries: list[EntryPoint],
+        evidence: list[dict[str, Any]],
+        platform_context: dict[str, Any],
+        backend: str,
+        phase: str,
+        capability: dict[str, Any],
+    ) -> str:
+        direct_tool_access = backend == "codex"
+        provider = "openai" if backend == "codex" else "deepseek"
+        model = (
+            self.settings.codex_worker_model
+            if backend == "codex"
+            else self.settings.opencode_model
+        )
+        output_mode = opencode_output_mode(model) if backend == "opencode" else "json_schema"
+        isolation = (
+            self.settings.codex_isolation
+            if backend == "codex"
+            else self.settings.opencode_isolation
+        )
+        audit_id = str(uuid.uuid4())
+        metadata = {
+            "audit_id": audit_id,
+            "backend": backend,
+            "provider": provider,
+            "model": model,
+            "isolation": isolation,
+            "phase": phase,
+            "attempt": task.attempts,
+        }
+        prompt = investigation_prompt(
+            scan,
+            task,
+            entries,
+            evidence,
+            platform_context,
+            direct_tool_access=direct_tool_access,
+        )
+        if backend == "opencode":
+            prompt = opencode_prompt_for_model(
+                prompt,
+                model=model,
+                output_schema=AGENT_RESULT_JSON_SCHEMA,
+            )
+        request = {
+            "schema_version": "1.0",
+            "backend": backend,
+            "provider": provider,
+            "model": model,
+            "sdk_version": capability.get("version"),
+            "isolation": isolation,
+            "provider_base_url": (
+                self.settings.deepseek_base_url or "provider_default"
+                if backend == "opencode"
+                else "provider_default"
+            ),
+            "phase": phase,
+            "task_id": task.id,
+            "attempt": task.attempts,
+            "developer_instructions": developer_instructions(
+                direct_tool_access=direct_tool_access
+            ),
+            "prompt": prompt,
+            "output_schema": AGENT_RESULT_JSON_SCHEMA,
+            "tool_boundary": {
+                "direct_tool_access": direct_tool_access,
+                "model_tools_enabled": backend == "codex",
+                "structured_output_tool_enabled": (
+                    backend == "opencode"
+                    and output_mode == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
+                ),
+                "platform_executes_requested_tests": True,
+            },
+            "runtime_options": {
+                "reasoning_effort": "medium" if backend == "codex" else "provider_default",
+                "output_mode": output_mode,
+                "structured_output_retries": (
+                    2
+                    if backend == "opencode"
+                    and output_mode == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
+                    else None
+                ),
+                "prompted_json_retries": (
+                    2
+                    if backend == "opencode"
+                    and output_mode == OPENCODE_OUTPUT_MODE_PROMPTED_JSON
+                    else None
+                ),
+                "schema_validator": (
+                    f"ajv@{AJV_VERSION}"
+                    if backend == "opencode"
+                    and output_mode == OPENCODE_OUTPUT_MODE_PROMPTED_JSON
+                    else None
+                ),
+            },
+        }
+        with self.database.session_factory() as session:
+            self.evidence.json(
+                session,
+                scan_id=scan.id,
+                task_id=task.id,
+                kind="agent.request",
+                value=request,
+                summary=f"{backend} {phase} request",
+                metadata=metadata,
+            )
+            session.commit()
+        return audit_id
+
+    def _record_agent_response(
+        self,
+        *,
+        scan_id: str,
+        task_id: str,
+        audit_id: str,
+        backend: str,
+        phase: str,
+        attempt: int,
+        result: Any,
+    ) -> None:
+        metadata = {
+            "audit_id": audit_id,
+            "backend": backend,
+            "provider": "openai" if backend == "codex" else "deepseek",
+            "model": (
+                self.settings.codex_worker_model
+                if backend == "codex"
+                else self.settings.opencode_model
+            ),
+            "isolation": (
+                self.settings.codex_isolation
+                if backend == "codex"
+                else self.settings.opencode_isolation
+            ),
+            "phase": phase,
+            "attempt": attempt,
+            "thread_id": result.thread_id,
+            "turn_id": result.turn_id,
+        }
+        response = {
+            "schema_version": "1.0",
+            "thread_id": result.thread_id,
+            "turn_id": result.turn_id,
+            "structured_output": result.result.model_dump(mode="json"),
+            "usage": result.usage,
+            "output_transport": getattr(result, "output_transport", {}),
+        }
+        with self.database.session_factory() as session:
+            self.evidence.json(
+                session,
+                scan_id=scan_id,
+                task_id=task_id,
+                kind="agent.response",
+                value=response,
+                summary=f"{backend} {phase} structured response",
+                metadata=metadata,
+            )
+            session.commit()
+
+    def _record_agent_runtime_events(
+        self,
+        *,
+        scan_id: str,
+        task_id: str,
+        audit_id: str,
+        backend: str,
+        phase: str,
+        attempt: int,
+        events: list[dict[str, Any]],
+    ) -> None:
+        metadata = {
+            "audit_id": audit_id,
+            "backend": backend,
+            "provider": "openai" if backend == "codex" else "deepseek",
+            "model": (
+                self.settings.codex_worker_model
+                if backend == "codex"
+                else self.settings.opencode_model
+            ),
+            "isolation": (
+                self.settings.codex_isolation
+                if backend == "codex"
+                else self.settings.opencode_isolation
+            ),
+            "phase": phase,
+            "attempt": attempt,
+        }
+        with self.database.session_factory() as session:
+            self.evidence.json(
+                session,
+                scan_id=scan_id,
+                task_id=task_id,
+                kind="agent.events",
+                value={
+                    "schema_version": "1.0",
+                    "events": events,
+                },
+                summary=f"{backend} {phase} normalized runtime events",
+                metadata=metadata,
+            )
+            session.commit()
+
+    def _record_agent_error(
+        self,
+        *,
+        scan_id: str,
+        task_id: str,
+        audit_id: str,
+        backend: str,
+        phase: str,
+        attempt: int,
+        error: Exception | str,
+    ) -> None:
+        metadata = {
+            "audit_id": audit_id,
+            "backend": backend,
+            "provider": "openai" if backend == "codex" else "deepseek",
+            "model": (
+                self.settings.codex_worker_model
+                if backend == "codex"
+                else self.settings.opencode_model
+            ),
+            "isolation": (
+                self.settings.codex_isolation
+                if backend == "codex"
+                else self.settings.opencode_isolation
+            ),
+            "phase": phase,
+            "attempt": attempt,
+        }
+        error_message = str(error)
+        audit_details = getattr(error, "audit_details", None)
+        value: dict[str, Any] = {
+            "schema_version": "1.0",
+            "error": error_message,
+        }
+        if isinstance(audit_details, dict) and audit_details:
+            value["details"] = audit_details
+        with self.database.session_factory() as session:
+            self.evidence.json(
+                session,
+                scan_id=scan_id,
+                task_id=task_id,
+                kind="agent.error",
+                value=value,
+                summary=f"{backend} {phase} failed",
+                metadata=metadata,
+            )
+            session.commit()
+
+    def _record_agent_cancellation(
+        self,
+        *,
+        scan_id: str,
+        task_id: str,
+        audit_id: str,
+        backend: str,
+        phase: str,
+        attempt: int,
+        error: Exception | str,
+    ) -> None:
+        metadata = {
+            "audit_id": audit_id,
+            "backend": backend,
+            "provider": "openai" if backend == "codex" else "deepseek",
+            "model": (
+                self.settings.codex_worker_model
+                if backend == "codex"
+                else self.settings.opencode_model
+            ),
+            "isolation": (
+                self.settings.codex_isolation
+                if backend == "codex"
+                else self.settings.opencode_isolation
+            ),
+            "phase": phase,
+            "attempt": attempt,
+        }
+        with self.database.session_factory() as session:
+            self.evidence.json(
+                session,
+                scan_id=scan_id,
+                task_id=task_id,
+                kind="agent.cancellation",
+                value={
+                    "schema_version": "1.0",
+                    "requested_by": "local_console_user",
+                    "acknowledged": True,
+                    "reason": str(error),
+                },
+                summary=f"{backend} {phase} cancelled by user",
+                metadata=metadata,
+            )
+            session.commit()
+
+    def _record_agent_test_validation(
+        self,
+        *,
+        task_id: str,
+        turn_id: str,
+        submitted: list[dict[str, Any]],
+        accepted: list[dict[str, Any]],
+        executed: list[dict[str, Any]],
+        gaps: list[str],
+    ) -> None:
+        match = self._agent_response_for_turn(task_id, turn_id)
+        if match is None:
+            return
+        response, metadata = match
+        with self.database.session_factory() as session:
+            self.evidence.json(
+                session,
+                scan_id=response.scan_id,
+                task_id=task_id,
+                kind="agent.test_validation",
+                value={
+                    "schema_version": "1.0",
+                    "submitted": submitted,
+                    "accepted": accepted,
+                    "executed": executed,
+                    "gaps": gaps,
+                },
+                summary="Platform validation of AI-requested tests",
+                metadata=metadata,
+            )
+            session.commit()
+
+    def _record_agent_validation(
+        self,
+        *,
+        task_id: str,
+        turn_id: str,
+        raw_payload: dict[str, Any],
+        validated_payload: dict[str, Any],
+    ) -> None:
+        match = self._agent_response_for_turn(task_id, turn_id)
+        if match is None:
+            return
+        response, metadata = match
+        claimed_evidence = list(raw_payload.get("evidence_ids", []))
+        accepted_evidence = list(validated_payload.get("evidence_ids", []))
+        with self.database.session_factory() as session:
+            self.evidence.json(
+                session,
+                scan_id=response.scan_id,
+                task_id=task_id,
+                kind="agent.validation",
+                value={
+                    "schema_version": "1.0",
+                    "claimed_result": raw_payload.get("result"),
+                    "final_result": validated_payload.get("result"),
+                    "downgraded": (
+                        raw_payload.get("result") != validated_payload.get("result")
+                    ),
+                    "claimed_evidence_ids": claimed_evidence,
+                    "accepted_evidence_ids": accepted_evidence,
+                    "rejected_evidence_ids": sorted(
+                        set(claimed_evidence) - set(accepted_evidence)
+                    ),
+                    "raw_structured_output": raw_payload,
+                    "validated_output": validated_payload,
+                },
+                summary="Platform evidence validation of AI result",
+                metadata=metadata,
+            )
+            session.commit()
+
+    def _agent_response_for_turn(
+        self,
+        task_id: str,
+        turn_id: str,
+    ) -> tuple[Evidence, dict[str, Any]] | None:
+        with self.database.session_factory() as session:
+            responses = list(
+                session.scalars(
+                    select(Evidence)
+                    .where(
+                        Evidence.task_id == task_id,
+                        Evidence.kind == "agent.response",
+                    )
+                    .order_by(Evidence.created_at.desc())
+                )
+            )
+            for response in responses:
+                if response.metadata_json.get("turn_id") == turn_id:
+                    return response, dict(response.metadata_json)
+        return None
+
     def _static_evidence_summaries(self, scan_id: str) -> list[dict[str, Any]]:
         with self.database.session_factory() as session:
             items = list(
@@ -935,6 +1928,181 @@ class ScanOrchestrator:
                 )
             )
         return [self._evidence_summary(item) for item in items]
+
+    def _target_code_context(
+        self,
+        scan_id: str,
+        entries: list[EntryPoint],
+    ) -> dict[str, Any]:
+        index = self._load_or_build_code_index(scan_id)
+        if index is None:
+            return {
+                "schema_version": "1.0",
+                "global_decompilation": {"status": "index_unavailable"},
+                "components": [],
+            }
+        raw_components = index.get("components")
+        if not isinstance(raw_components, dict):
+            raw_components = {}
+        names = list(
+            dict.fromkeys(
+                str(entry.owner_component or entry.name)
+                for entry in entries
+                if entry.owner_component or entry.name
+            )
+        )
+        components: list[dict[str, Any]] = []
+        remaining_content = 64_000
+        for name in names:
+            raw = raw_components.get(name)
+            if not isinstance(raw, dict):
+                components.append(
+                    {
+                        "component": name,
+                        "status": "source_not_found",
+                        "target_in_jadx_failure_list": False,
+                        "target_source_has_decompiler_errors": False,
+                        "anchors": [],
+                    }
+                )
+                continue
+            anchors: list[dict[str, Any]] = []
+            for value in raw.get("anchors", []):
+                if not isinstance(value, dict):
+                    continue
+                anchor = dict(value)
+                content = anchor.get("content")
+                if isinstance(content, str):
+                    accepted = content[:remaining_content]
+                    anchor["content"] = accepted
+                    if len(accepted) < len(content):
+                        anchor["context_truncated"] = True
+                    remaining_content -= len(accepted)
+                anchors.append(anchor)
+                if remaining_content <= 0:
+                    break
+            components.append(
+                {
+                    "component": name,
+                    "status": raw.get("status", "source_not_found"),
+                    "target_in_jadx_failure_list": bool(
+                        raw.get("target_in_jadx_failure_list")
+                    ),
+                    "target_source_has_decompiler_errors": bool(
+                        raw.get("target_source_has_decompiler_errors")
+                    ),
+                    "global_decompilation_status": raw.get(
+                        "global_decompilation_status"
+                    ),
+                    "anchors": anchors,
+                }
+            )
+        return {
+            "schema_version": "1.0",
+            "global_decompilation": {
+                key: value
+                for key, value in dict(index.get("decompilation") or {}).items()
+                if key != "failed_classes"
+            },
+            "components": components,
+        }
+
+    def _load_or_build_code_index(self, scan_id: str) -> dict[str, Any] | None:
+        workspace = self.settings.data_dir / "workspaces" / scan_id
+        index_path = workspace / "code_index.json"
+        try:
+            value = json.loads(index_path.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                return value
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        with self.database.session_factory() as session:
+            entries = list(
+                session.scalars(
+                    select(EntryPoint).where(EntryPoint.scan_id == scan_id)
+                )
+            )
+            jadx_evidence = session.scalar(
+                select(Evidence)
+                .where(
+                    Evidence.scan_id == scan_id,
+                    Evidence.kind == "static.jadx",
+                )
+                .order_by(Evidence.created_at.desc())
+                .limit(1)
+            )
+        if not entries or not workspace.is_dir():
+            return None
+
+        payload: dict[str, Any] = {}
+        if jadx_evidence is not None:
+            try:
+                stored = self.store.read_json_artifact(
+                    "evidence",
+                    jadx_evidence.path,
+                    jadx_evidence.sha256,
+                )
+                if isinstance(stored, dict):
+                    payload = stored
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                payload = {}
+        decompilation = payload.get("decompilation")
+        if not isinstance(decompilation, dict):
+            exit_code = payload.get("exit_code")
+            command_result = CommandResult(
+                argv=[
+                    str(value)
+                    for value in payload.get("argv", [])
+                    if isinstance(value, str)
+                ],
+                exit_code=exit_code if isinstance(exit_code, int) else 1,
+                stdout=str(payload.get("stdout") or ""),
+                stderr=str(payload.get("stderr") or ""),
+                timed_out=bool(payload.get("timed_out")),
+            )
+            decompilation = self.inspector._jadx_decompilation_summary(
+                command_result,
+                workspace / "jadx",
+            )
+        code_index = self.inspector._build_code_index(
+            result_entries=entries,
+            workspace=workspace,
+            jadx_dir=workspace / "jadx",
+            decoded_dir=workspace / "apktool",
+            archive_dir=workspace / "archive",
+            decompilation=decompilation,
+        )
+        value = {
+            "schema_version": "1.0",
+            "decompilation": decompilation,
+            "components": code_index,
+            "generated_lazily": True,
+        }
+        with suppress(OSError):
+            index_path.write_text(
+                json.dumps(value, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return value
+
+    @staticmethod
+    def _static_tool_evidence_summary(
+        tool: str,
+        payload: dict[str, Any],
+    ) -> str:
+        if tool != "jadx":
+            return f"{tool} exited with {payload['exit_code']}"
+        decompilation = payload.get("decompilation")
+        if not isinstance(decompilation, dict):
+            return f"jadx exited with {payload['exit_code']}"
+        status = str(decompilation.get("status", "unknown"))
+        generated = int(decompilation.get("generated_java_files", 0))
+        errors = int(decompilation.get("reported_error_count", 0))
+        return (
+            f"jadx {status}: generated {generated} Java files; "
+            f"{errors} errors reported (exit {payload['exit_code']})"
+        )
 
     def _materialize_agent_evidence(
         self,
@@ -1001,6 +2169,22 @@ class ScanOrchestrator:
                 )
                 if summaries is not None:
                     summaries.append(self._evidence_summary(item))
+                add_event(
+                    session,
+                    scan_id,
+                    "exploration.evidence.created",
+                    f"已生成验证证据：{kind}",
+                    {
+                        "task_id": task_id,
+                        "source": "platform",
+                        "evidence_id": item.id,
+                        "evidence_kind": kind,
+                        "exit_code": item.exit_code,
+                        "summary": item.summary,
+                        "test_case_id": metadata.get("test_case_id"),
+                        "request_id": metadata.get("request_id"),
+                    },
+                )
             session.commit()
 
     @staticmethod

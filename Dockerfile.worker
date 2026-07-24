@@ -4,7 +4,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 LABEL io.apkscanner.version="0.1.0" \
-      io.apkscanner.sdk-version="0.144.4"
+      io.apkscanner.sdk-version="0.144.4" \
+      io.apkscanner.worker-protocol="2"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends android-tools-adb ca-certificates \

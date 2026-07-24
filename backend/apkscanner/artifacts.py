@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import tempfile
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -96,6 +98,66 @@ class ArtifactStore:
     def stream_file(path: Path, chunk_size: int = 1024 * 1024) -> BinaryIO:
         del chunk_size
         return path.open("rb")
+
+    def read_json_artifact(
+        self,
+        category: str,
+        path: str | Path,
+        expected_sha256: str,
+    ) -> Any:
+        candidate = self.verify_content_addressed(category, path, expected_sha256)
+        return json.loads(candidate.read_text(encoding="utf-8"))
+
+    def verify_content_addressed(
+        self,
+        category: str,
+        path: str | Path,
+        expected_sha256: str,
+    ) -> Path:
+        candidate = Path(path)
+        root = self._category_root(category)
+        if candidate.is_symlink() or not candidate.is_file():
+            raise ValueError("content-addressed artifact is unavailable")
+        if not candidate.resolve().is_relative_to(root.resolve()):
+            raise ValueError("content-addressed artifact escapes its configured root")
+        self._verify_existing(candidate, expected_sha256)
+        return candidate
+
+    def delete_content_addressed(
+        self,
+        category: str,
+        path: str | Path,
+        expected_sha256: str,
+    ) -> bool:
+        candidate = Path(path)
+        root = self._category_root(category)
+        if candidate.is_symlink():
+            raise ValueError("refusing to delete a symbolic-link artifact")
+        if not candidate.exists():
+            return False
+        if not candidate.is_file() or not candidate.resolve().is_relative_to(root.resolve()):
+            raise ValueError("refusing to delete an artifact outside its configured root")
+        if candidate.stem != expected_sha256:
+            raise ValueError("refusing to delete an artifact with an unexpected filename")
+        candidate.unlink()
+        if candidate.parent != root:
+            with suppress(OSError):
+                candidate.parent.rmdir()
+        return True
+
+    def delete_scan_workspace(self, scan_id: str) -> bool:
+        if not re.fullmatch(r"[a-f0-9-]{36}", scan_id):
+            raise ValueError("scan ID is unsafe for workspace deletion")
+        root = self._category_root("workspaces")
+        workspace = root / scan_id
+        if workspace.is_symlink():
+            raise ValueError("refusing to delete a symbolic-link workspace")
+        if not workspace.exists():
+            return False
+        if not workspace.is_dir() or not workspace.resolve().is_relative_to(root.resolve()):
+            raise ValueError("refusing to delete a workspace outside its configured root")
+        shutil.rmtree(workspace)
+        return True
 
     @staticmethod
     def _verify_existing(path: Path, expected_sha256: str) -> None:

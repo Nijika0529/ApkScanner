@@ -1,4 +1,5 @@
 import type {
+  AgentAudit,
   CoverageItem,
   EntryPoint,
   Finding,
@@ -6,7 +7,9 @@ import type {
   InvestigationTask,
   InvestigatorChoice,
   Scan,
+  ScanDeleteResult,
   ScanEvent,
+  TaskDeleteResult,
 } from "./types"
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -28,6 +31,7 @@ export const api = {
   findings: (id: string) => request<Finding[]>(`/api/v1/scans/${id}/findings`),
   coverage: (id: string) => request<CoverageItem[]>(`/api/v1/scans/${id}/coverage`),
   tasks: (id: string) => request<InvestigationTask[]>(`/api/v1/scans/${id}/tasks`),
+  agentAudits: (id: string) => request<AgentAudit[]>(`/api/v1/scans/${id}/agent-audits`),
   events: (id: string) => request<ScanEvent[]>(`/api/v1/scans/${id}/events`),
   upload: async (file: File, investigator: InvestigatorChoice = "configured") => {
     const form = new FormData()
@@ -43,4 +47,10 @@ export const api = {
     }),
   retryTask: (taskId: string) =>
     request<InvestigationTask>(`/api/v1/tasks/${taskId}/retry`, { method: "POST" }),
+  cancelTask: (taskId: string) =>
+    request<InvestigationTask>(`/api/v1/tasks/${taskId}/cancel`, { method: "POST" }),
+  deleteTask: (taskId: string) =>
+    request<TaskDeleteResult>(`/api/v1/tasks/${taskId}`, { method: "DELETE" }),
+  deleteScan: (scanId: string) =>
+    request<ScanDeleteResult>(`/api/v1/scans/${scanId}`, { method: "DELETE" }),
 }

@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .agent_events import normalize_codex_notification
 from .codex_runner import CodexInvestigator
 
 
@@ -36,26 +35,12 @@ def _prepare_auth() -> None:
     target.chmod(0o600)
 
 
-def _connect_remote_adb() -> None:
-    serial = os.getenv("APKSCANNER_ADB_SERIAL")
-    if not serial or not re.fullmatch(r"[A-Za-z0-9_.-]+:\d{1,5}", serial):
-        return
-    subprocess.run(
-        ["adb", "connect", serial],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        timeout=30,
-        check=False,
-    )
-
-
 def main() -> None:
     raw = sys.stdin.buffer.read(10_000_001)
     if len(raw) > 10_000_000:
         raise ValueError("worker request exceeds 10 MB")
     request = WorkerRequest.model_validate_json(raw)
     _prepare_auth()
-    _connect_remote_adb()
 
     from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
     from openai_codex.generated.v2_all import ReasoningEffort
@@ -67,31 +52,68 @@ def main() -> None:
             developer_instructions=request.developer_instructions,
             ephemeral=True,
             model=request.model,
-            sandbox=Sandbox.full_access,
+            sandbox=Sandbox.read_only,
             service_name="apk-scanner-container-worker",
         )
-        turn = thread.run(
+        _emit_event(
+            "model.session.started",
+            "Codex SDK 会话已建立",
+            {"thread_id": thread.id},
+        )
+        handle = thread.turn(
             request.prompt,
             approval_mode=ApprovalMode.deny_all,
             cwd="/workspace",
             effort=ReasoningEffort.medium,
             model=request.model,
             output_schema=request.output_schema,
-            sandbox=Sandbox.full_access,
+            sandbox=Sandbox.read_only,
         )
+        from openai_codex.api import _collect_turn_result
+
+        def stream():  # noqa: ANN202
+            for notification in handle.stream():
+                event = normalize_codex_notification(notification)
+                if event is not None:
+                    _emit_event(event.event_type, event.message, event.data)
+                yield notification
+
+        turn = _collect_turn_result(stream(), turn_id=handle.id)
     parsed = CodexInvestigator._parse_response(turn.final_response)
+    _emit_event(
+        "model.output.validated",
+        "Codex 结构化输出已通过本地校验",
+        {"turn_id": turn.id},
+    )
     usage = turn.usage.model_dump(mode="json") if turn.usage else {}
-    print(
-        json.dumps(
-            {
+    _emit_record(
+        {
+            "type": "result",
+            "result": {
                 "thread_id": thread.id,
                 "turn_id": turn.id,
                 "result": parsed.model_dump(mode="json"),
                 "usage": usage,
             },
-            ensure_ascii=False,
-        )
+        }
     )
+
+
+def _emit_event(event_type: str, message: str, data: dict[str, Any]) -> None:
+    _emit_record(
+        {
+            "type": "event",
+            "event": {
+                "event_type": event_type,
+                "message": message,
+                "data": data,
+            },
+        }
+    )
+
+
+def _emit_record(value: dict[str, Any]) -> None:
+    print(json.dumps(value, ensure_ascii=False), flush=True)
 
 
 if __name__ == "__main__":

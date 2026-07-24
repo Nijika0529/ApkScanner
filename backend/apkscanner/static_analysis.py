@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import zipfile
 from dataclasses import dataclass, field
@@ -25,6 +26,8 @@ class StaticAnalysisResult:
     signing: dict[str, Any]
     file_inventory: dict[str, Any]
     searchable_roots: list[Path] = field(default_factory=list)
+    decompilation: dict[str, Any] = field(default_factory=dict)
+    code_index: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 class ApkInspector:
@@ -41,8 +44,16 @@ class ApkInspector:
         tool_versions = discover_tools(self.runner)
         tool_results: dict[str, dict[str, Any]] = {}
         decoded_dir = workspace / "apktool"
+        jadx_dir = workspace / "jadx"
         manifest_path: Path | None = None
         searchable_roots: list[Path] = []
+        decompilation: dict[str, Any] = {
+            "status": "not_available",
+            "exit_code": None,
+            "generated_java_files": 0,
+            "reported_error_count": 0,
+            "failed_classes": [],
+        }
 
         if self.runner.available("apktool"):
             result = self._run(
@@ -52,7 +63,12 @@ class ApkInspector:
             )
             tool_results["apktool"] = self._serialize_result(result)
             candidate = decoded_dir / "AndroidManifest.xml"
-            if candidate.exists():
+            if (
+                result.exit_code == 0
+                and candidate.is_file()
+                and candidate.stat().st_size > 0
+                and candidate.read_bytes().lstrip().startswith(b"<")
+            ):
                 manifest_path = candidate
                 searchable_roots.append(decoded_dir)
 
@@ -84,7 +100,6 @@ class ApkInspector:
         searchable_roots.append(archive_dir)
 
         if self.runner.available("jadx"):
-            jadx_dir = workspace / "jadx"
             result = self._run(
                 [
                     "jadx",
@@ -97,7 +112,11 @@ class ApkInspector:
                 budget,
                 self.settings.tool_timeout_seconds,
             )
-            tool_results["jadx"] = self._serialize_result(result)
+            decompilation = self._jadx_decompilation_summary(result, jadx_dir)
+            tool_results["jadx"] = {
+                **self._serialize_result(result),
+                "decompilation": decompilation,
+            }
             if jadx_dir.exists():
                 searchable_roots.insert(0, jadx_dir)
 
@@ -118,6 +137,27 @@ class ApkInspector:
             tool_results["apksigner"] = self._serialize_result(result)
             signing = self._parse_signing(result)
 
+        code_index = self._build_code_index(
+            result_entries=manifest.entries,
+            workspace=workspace,
+            jadx_dir=jadx_dir,
+            decoded_dir=decoded_dir,
+            archive_dir=archive_dir,
+            decompilation=decompilation,
+        )
+        (workspace / "code_index.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "decompilation": decompilation,
+                    "components": code_index,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
         return StaticAnalysisResult(
             manifest=manifest,
             workspace=workspace,
@@ -126,6 +166,8 @@ class ApkInspector:
             signing=signing,
             file_inventory=file_inventory,
             searchable_roots=searchable_roots,
+            decompilation=decompilation,
+            code_index=code_index,
         )
 
     def _run(
@@ -220,6 +262,193 @@ class ApkInspector:
             "stderr": result.stderr,
             "timed_out": result.timed_out,
         }
+
+    @classmethod
+    def _jadx_decompilation_summary(
+        cls,
+        result: CommandResult,
+        jadx_dir: Path,
+    ) -> dict[str, Any]:
+        generated = sum(1 for _path in jadx_dir.rglob("*.java")) if jadx_dir.is_dir() else 0
+        combined_output = f"{result.stdout}\n{result.stderr}"
+        failed_classes = cls._failed_jadx_classes(combined_output)
+        error_count_match = re.search(
+            r"finished with errors,\s*count:\s*(\d+)",
+            combined_output,
+            flags=re.IGNORECASE,
+        )
+        reported_error_count = (
+            int(error_count_match.group(1))
+            if error_count_match
+            else len(failed_classes)
+        )
+        if result.timed_out:
+            status = "partial_timeout" if generated else "timed_out"
+        elif result.exit_code == 0:
+            status = "complete_success" if generated else "completed_without_java"
+        elif generated:
+            status = "partial_success"
+        else:
+            status = "tool_failed"
+        return {
+            "status": status,
+            "exit_code": result.exit_code,
+            "generated_java_files": generated,
+            "reported_error_count": reported_error_count,
+            "identified_failed_class_count": len(failed_classes),
+            "failed_classes": failed_classes[:2000],
+            "output_usable": generated > 0,
+        }
+
+    @staticmethod
+    def _failed_jadx_classes(output: str) -> list[str]:
+        patterns = (
+            r"failed to (?:decompile|process|load) (?:class\s*)?:?\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)",
+            r"error processing class\s*:?\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)",
+            r"in method:\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)\.[A-Za-z_$<][\w$<>]*\(",
+        )
+        found: set[str] = set()
+        for pattern in patterns:
+            found.update(re.findall(pattern, output, flags=re.IGNORECASE))
+        return sorted(found)
+
+    @classmethod
+    def _build_code_index(
+        cls,
+        *,
+        result_entries: list[Any],
+        workspace: Path,
+        jadx_dir: Path,
+        decoded_dir: Path,
+        archive_dir: Path,
+        decompilation: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        java_root = jadx_dir / "sources" if (jadx_dir / "sources").is_dir() else jadx_dir
+        java_files = cls._class_file_map([java_root], ".java")
+        smali_roots = [
+            path
+            for parent in (decoded_dir, archive_dir)
+            if parent.is_dir()
+            for path in parent.glob("smali*")
+            if path.is_dir()
+        ]
+        smali_files = cls._class_file_map(smali_roots, ".smali")
+        java_by_simple: dict[str, list[Path]] = {}
+        for paths in java_files.values():
+            for path in paths:
+                java_by_simple.setdefault(path.stem, []).append(path)
+
+        failed_classes = {
+            str(value) for value in decompilation.get("failed_classes", [])
+        }
+        component_names = {
+            str(entry.owner_component or entry.name)
+            for entry in result_entries
+            if entry.owner_component or entry.name
+        }
+        index: dict[str, dict[str, Any]] = {}
+        for component in sorted(component_names):
+            candidates = [component]
+            if "$" in component:
+                candidates.append(component.split("$", 1)[0])
+            java_matches = cls._unique_paths(
+                path for candidate in candidates for path in java_files.get(candidate, [])
+            )
+            if not java_matches:
+                simple_name = candidates[-1].rsplit(".", 1)[-1]
+                simple_matches = cls._unique_paths(java_by_simple.get(simple_name, []))
+                if len(simple_matches) == 1:
+                    java_matches = simple_matches
+            smali_matches = cls._unique_paths(
+                path for candidate in candidates for path in smali_files.get(candidate, [])
+            )
+            failed = any(
+                value == component
+                or value.startswith(f"{component}.")
+                or component.startswith(f"{value}$")
+                for value in failed_classes
+            )
+            source_matches = java_matches or smali_matches
+            anchors = [
+                cls._source_anchor(path, workspace, include_content=True)
+                for path in source_matches[:3]
+            ]
+            source_has_errors = any(
+                bool(anchor.get("decompiler_error_markers"))
+                for anchor in anchors
+                if anchor.get("language") == "java"
+            )
+            if java_matches and (failed or source_has_errors):
+                status = "partial_source_available"
+            elif java_matches:
+                status = "source_available"
+            elif smali_matches:
+                status = "smali_fallback"
+            elif failed:
+                status = "target_decompilation_failed"
+            else:
+                status = "source_not_found"
+            index[component] = {
+                "component": component,
+                "status": status,
+                "target_in_jadx_failure_list": failed,
+                "target_source_has_decompiler_errors": source_has_errors,
+                "global_decompilation_status": decompilation.get("status"),
+                "anchors": anchors,
+            }
+        return index
+
+    @staticmethod
+    def _class_file_map(roots: list[Path], suffix: str) -> dict[str, list[Path]]:
+        mapped: dict[str, list[Path]] = {}
+        for root in roots:
+            if not root.is_dir():
+                continue
+            for path in root.rglob(f"*{suffix}"):
+                try:
+                    relative = path.relative_to(root).with_suffix("")
+                except ValueError:
+                    continue
+                class_name = ".".join(relative.parts)
+                mapped.setdefault(class_name, []).append(path)
+        return mapped
+
+    @staticmethod
+    def _unique_paths(paths) -> list[Path]:  # noqa: ANN001
+        return list(dict.fromkeys(paths))
+
+    @staticmethod
+    def _source_anchor(
+        path: Path,
+        workspace: Path,
+        *,
+        include_content: bool,
+        max_chars: int = 24_000,
+    ) -> dict[str, Any]:
+        raw = path.read_bytes()
+        text = raw.decode("utf-8", errors="replace")
+        excerpt = text[:max_chars]
+        anchor: dict[str, Any] = {
+            "path": str(path.relative_to(workspace)),
+            "language": "java" if path.suffix == ".java" else "smali",
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "line_start": 1,
+            "line_end": excerpt.count("\n") + 1,
+            "truncated": len(text) > len(excerpt),
+            "source_bytes": len(raw),
+            "decompiler_error_markers": [
+                marker
+                for marker in (
+                    "JADX ERROR",
+                    "Method not decompiled",
+                    "Method dump skipped",
+                )
+                if marker.lower() in text.lower()
+            ],
+        }
+        if include_content:
+            anchor["content"] = excerpt
+        return anchor
 
     @staticmethod
     def _merge_badging(manifest: ManifestDocument, text: str) -> None:

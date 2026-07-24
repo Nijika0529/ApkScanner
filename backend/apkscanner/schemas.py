@@ -132,6 +132,34 @@ class EventOut(ApiModel):
     created_at: datetime
 
 
+class AgentAuditArtifact(BaseModel):
+    evidence_id: str
+    sha256: str
+    content: dict[str, Any] | list[Any] | str | int | float | bool | None
+    created_at: datetime
+
+
+class AgentAuditOut(BaseModel):
+    id: str
+    scan_id: str
+    task_id: str | None
+    attempt: int
+    phase: str
+    backend: str
+    provider: str
+    model: str
+    isolation: str
+    status: Literal["running", "completed", "failed", "cancelled"]
+    thread_id: str | None
+    turn_id: str | None
+    usage: dict[str, Any]
+    artifacts: dict[str, AgentAuditArtifact]
+    integrity: Literal["verified", "failed"]
+    integrity_errors: list[str]
+    started_at: datetime
+    completed_at: datetime | None
+
+
 class Capability(BaseModel):
     name: str
     available: bool
@@ -145,6 +173,19 @@ class HealthResponse(BaseModel):
     default_investigator: Literal["codex", "opencode", "none"] = "codex"
     enabled_investigators: list[Literal["codex", "opencode"]] = Field(default_factory=list)
     capabilities: list[Capability]
+
+
+class ScanDeleteResult(BaseModel):
+    id: str
+    deleted: Literal[True] = True
+    files_removed: int
+    cleanup_warnings: list[str]
+
+
+class TaskDeleteResult(BaseModel):
+    id: str
+    deleted: Literal[True] = True
+    audit_artifacts_preserved: int
 
 
 class AgentRequestedTest(BaseModel):

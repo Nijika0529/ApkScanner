@@ -8,7 +8,8 @@ from .models import EntryPoint, InvestigationTask, Scan
 
 def developer_instructions(*, direct_tool_access: bool) -> str:
     tool_boundary = (
-        "Use shell/ADB only inside the supplied scan workspace and authorized target scope."
+        "File and shell tools may only inspect the supplied scan workspace. Do not modify files, "
+        "run ADB, or make target/network requests; request executable checks through requested_tests."
         if direct_tool_access
         else (
             "All filesystem, shell, network, and subagent tools are disabled. Reason only over "
@@ -63,6 +64,7 @@ def investigation_prompt(
                 "permission": entry.permission,
                 "permission_protection": entry.permission_protection,
                 "deep_links": entry.deep_links,
+                "code_anchors": entry.code_anchors,
                 "metadata": entry.metadata_json,
             }
             for entry in entries
@@ -71,7 +73,8 @@ def investigation_prompt(
         "platform_context": platform_context,
     }
     access_instruction = (
-        "You may inspect the task workspace and use shell/ADB only within the authorized scope."
+        "You may inspect the task workspace with read-only file and shell commands. Device and "
+        "network actions must be requested through requested_tests."
         if direct_tool_access
         else (
             "You cannot inspect files or execute commands directly. Treat TASK_CONTEXT_JSON as "
@@ -80,15 +83,20 @@ def investigation_prompt(
     )
     return (
         "Assess the assigned Android entry point. Correlate manifest facts, decompiled-code "
-        f"summaries, and supplied dynamic evidence. {access_instruction} Test each hypothesis "
-        "where feasible. Do not infer successful exploitation merely from an exported declaration "
+        f"summaries, and supplied dynamic evidence. {access_instruction} "
+        "Use platform_context.target_code_context to decide target-specific source availability. "
+        "A non-zero global JADX exit code does not mean the assigned component source is missing "
+        "when its target status is source_available, partial_source_available, or smali_fallback. "
+        "Test each hypothesis where feasible. Do not infer successful exploitation merely from an exported declaration "
         "or a zero exit code. For black-box reproduction, cite both the successful Probe APK "
         "request evidence and the corresponding log evidence. For instrumented observation, cite "
-        "Frida evidence. During the test_planning phase you may request at most 12 bounded follow-up "
-        "tests against only the supplied entry-point IDs. Deep-link and provider URI mutations must "
-        "preserve the declared scheme and authority. Use requested_tests only when the initial "
-        "evidence cannot answer a concrete hypothesis. During final_evaluation, request no "
-        "additional tests and decide from the evidence issued by the platform. Return the exact "
+        "Frida evidence. During test_planning and exploration_round phases, use the limits in "
+        "platform_context.exploration_limits and request only the next smallest set of bounded "
+        "follow-up tests against supplied entry-point IDs. Deep-link and provider URI mutations "
+        "must preserve the declared scheme and authority. Use requested_tests only when existing "
+        "evidence cannot answer a concrete hypothesis, and adapt later requests to the executed "
+        "tests and evidence returned by the platform. During final_evaluation, request no "
+        "additional tests and decide from platform-issued evidence. Return the exact "
         "structured result schema.\n\nTASK_CONTEXT_JSON:\n"
         + json.dumps(payload, ensure_ascii=False, indent=2)
     )

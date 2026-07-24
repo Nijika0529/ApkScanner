@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@opencode-ai/sdk": "1.18.4",
+    "ajv": "8.20.0",
     "opencode-ai": "1.18.4"
   }
 }
