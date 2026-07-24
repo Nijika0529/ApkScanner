@@ -121,7 +121,7 @@ export interface AgentAudit {
   provider: string
   model: string
   isolation: string
-  status: "running" | "completed" | "failed"
+  status: "running" | "completed" | "failed" | "cancelled"
   thread_id: string | null
   turn_id: string | null
   usage: Record<string, unknown>

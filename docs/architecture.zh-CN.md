@@ -35,6 +35,8 @@ flowchart LR
 
 静态阶段结束即发布 preliminary report，并继续动态任务。外部工具、MobSF 请求和每个任务都有超时；超过 4 小时 preliminary 目标或 24 小时整单预算会写入事件及 coverage gap。
 
+JADX 的非零退出码不直接等同于反编译不可用。平台把结果归一化为完整成功、部分成功、部分超时或工具失败，并生成 `code_index.json`：逐个组件记录目标类是否位于失败列表、可用 Java/Smali 路径、文件 SHA-256 和有界源码片段。Codex 和 OpenCode 都接收相同的目标级代码上下文；OpenCode 不需要文件系统权限。历史扫描在任务重试时可从已有 workspace 与 `static.jadx` Evidence 懒生成索引，不会为了补上下文再次运行 JADX。
+
 ## 信任边界
 
 | 区域 | 可访问内容 | 约束 |
@@ -85,7 +87,9 @@ Agent 声称但不属于本 scan/task 的 Evidence ID 会被删除。需要证�
    用例及其 Evidence ID；
 5. `agent.validation`：模型声称的结论和 Evidence ID、平台接受/拒绝的 Evidence ID、是否
    降级以及最终落库结果；
-6. `agent.error`：已发起但失败的模型调用错误。
+6. `agent.error`：已发起但失败的模型调用错误；
+7. `agent.cancellation`：用户停止请求、运行时确认、后端和任务阶段；此前已产生的事件继续
+   保留，被停止的调用不生成新的最终结论。
 
 OpenCode 审计还记录实际输出通道。`deepseek-v4-pro` 保持思考模式，但使用无工具的
 `format=text`：prompt 携带精确 JSON Schema，worker 用 Ajv 本地校验，失败后最多进行
@@ -98,8 +102,18 @@ Codex 的 app-server notification 与 OpenCode 的 `event.subscribe()` SSE 会�
 持久化隐藏思维链；模型必须通过结构化字段提供可审计的简短理由。
 
 这些记录不包含模型 API Key。每份内容在写入时计算 SHA-256，Web 的“AI 审计”页和 JSON
-报告展示同一份内容及摘要；读取时再次校验文件路径与 SHA-256，损坏或篡改会显示为完整性
-异常。没有实际调用 AI 的任务不会伪造审计记录。
+报告展示同一份内容及摘要；Web 会优先展示平台校验后的结论、风险级别、置信度、有效
+Evidence 数和降级原因，再提供完整原始 JSON；读取时再次校验文件路径与 SHA-256，损坏或
+篡改会显示为完整性异常。没有实际调用 AI 的任务不会伪造审计记录。
+
+## 任务停止
+
+Web 把任务明确区分为等待判断、正在分析、已判断、未形成判断和已停止。排队或等待设备的
+任务取消后立即进入 `canceled`；运行中的任务先进入 `cancel_requested`，控制面再调用
+Codex `turn/interrupt`，或终止 OpenCode 的一次性进程/容器。设备清理仍在 `finally` 中
+执行。运行时确认后任务进入 `canceled`，Coverage 标为 partial，并把取消原因写入事件和
+`agent.cancellation` Evidence。停止不会删除已经产生的证据，也不会把半成品模型文本落为
+Finding；用户可显式重试或删除已经终止的任务。
 
 ## 扫描删除
 

@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import threading
 from dataclasses import replace
 from types import SimpleNamespace
 
-from apkscanner.agent_events import AgentRuntimeEvent
+from apkscanner.agent_audit import build_agent_audits
+from apkscanner.agent_events import AgentCancelledError, AgentRuntimeEvent
 from apkscanner.artifacts import ArtifactStore
 from apkscanner.db import Database
 from apkscanner.models import (
@@ -103,6 +105,9 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
         def investigate(**kwargs):  # noqa: ANN003, ANN205
             task = kwargs["task"]
             evidence = kwargs["evidence"]
+            code_context = kwargs["platform_context"]["target_code_context"]
+            assert code_context["schema_version"] == "1.0"
+            assert code_context["components"]
             kwargs["event_callback"](
                 AgentRuntimeEvent(
                     event_type="model.turn.started",
@@ -170,3 +175,181 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
         "agent.validation",
     }
     assert len(exploration_events) == len(tasks)
+
+
+def test_existing_scan_lazily_builds_target_code_context_from_partial_jadx(
+    settings,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    store = ArtifactStore(settings)
+    scan_id = "00000000-0000-0000-0000-000000000090"
+    component = "com.example.PartialProvider"
+    source = (
+        settings.data_dir
+        / "workspaces"
+        / scan_id
+        / "jadx"
+        / "sources"
+        / "com"
+        / "example"
+        / "PartialProvider.java"
+    )
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "package com.example;\npublic class PartialProvider {}\n",
+        encoding="utf-8",
+    )
+    evidence_sha, evidence_path = store.put_json(
+        "evidence",
+        {
+            "argv": ["jadx", "legacy.apk"],
+            "exit_code": 3,
+            "stdout": "ERROR - finished with errors, count: 322",
+            "stderr": "Failed to decompile class: com.example.OtherBrokenClass",
+            "timed_out": False,
+        },
+    )
+    with database.session_factory() as session:
+        scan = Scan(
+            id=scan_id,
+            status="final",
+            filename="legacy.apk",
+            artifact_sha256="f" * 64,
+            artifact_path=str(settings.data_dir / "missing.apk"),
+        )
+        entry = EntryPoint(
+            scan_id=scan_id,
+            kind="provider",
+            name=component,
+            owner_component=component,
+            exported=True,
+        )
+        session.add_all([scan, entry])
+        session.flush()
+        session.add(
+            Evidence(
+                scan_id=scan_id,
+                kind="static.jadx",
+                sha256=evidence_sha,
+                path=str(evidence_path),
+                summary="jadx exited with 3",
+            )
+        )
+        session.commit()
+
+    orchestrator = ScanOrchestrator(settings, database, store)
+    context = orchestrator._target_code_context(scan_id, [entry])
+    assert context["global_decompilation"]["status"] == "partial_success"
+    assert context["components"][0]["status"] == "source_available"
+    assert "class PartialProvider" in context["components"][0]["anchors"][0]["content"]
+    assert (
+        settings.data_dir / "workspaces" / scan_id / "code_index.json"
+    ).is_file()
+
+
+def test_running_agent_is_interrupted_and_audited_as_cancelled(settings) -> None:  # noqa: ANN001
+    configured = replace(settings, codex_enabled=True)
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    store = ArtifactStore(configured)
+    started = threading.Event()
+    scan_id = "00000000-0000-0000-0000-000000000095"
+    task_id = "00000000-0000-0000-0000-000000000096"
+    entry_id = "00000000-0000-0000-0000-000000000097"
+    workspace = configured.data_dir / "workspaces" / scan_id
+    workspace.mkdir(parents=True)
+    with database.session_factory() as session:
+        scan = Scan(
+            id=scan_id,
+            status="final",
+            filename="cancel.apk",
+            artifact_sha256="3" * 64,
+            artifact_path=str(configured.data_dir / "missing.apk"),
+            stats={"investigator": "codex"},
+        )
+        entry = EntryPoint(
+            id=entry_id,
+            scan_id=scan_id,
+            kind="provider",
+            name="com.example.CancelProvider",
+            owner_component="com.example.CancelProvider",
+            exported=True,
+        )
+        task = InvestigationTask(
+            id=task_id,
+            scan_id=scan_id,
+            task_type="component",
+            status="queued",
+            target_entry_ids=[entry_id],
+        )
+        session.add_all([scan, entry, task])
+        session.commit()
+
+    class BlockingInvestigator:
+        @staticmethod
+        def capability(*, deep=False):  # noqa: ANN001, ANN205
+            return {"available": True, "version": "fake-sdk", "deep": deep}
+
+        @staticmethod
+        def investigate(**kwargs):  # noqa: ANN003, ANN205
+            started.set()
+            assert kwargs["cancel_event"].wait(timeout=5)
+            raise AgentCancelledError("cancelled by unit test")
+
+    orchestrator = ScanOrchestrator(configured, database, store)
+    orchestrator.investigators["codex"] = BlockingInvestigator()
+    worker = threading.Thread(
+        target=orchestrator._run_task,
+        args=(scan_id, task_id, 10),
+    )
+    worker.start()
+    assert started.wait(timeout=5)
+    assert orchestrator.request_task_cancellation(task_id) is True
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+
+    with database.session_factory() as session:
+        task = session.get(InvestigationTask, task_id)
+        assert task is not None
+        assert task.status == "canceled"
+        assert task.result["cancellation"]["acknowledged"] is True
+        audits = build_agent_audits(session, store, scan_id)
+        assert audits[0]["status"] == "cancelled"
+        assert "cancellation" in audits[0]["artifacts"]
+
+
+def test_canceled_task_selected_before_dispatch_is_not_restarted(settings) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    store = ArtifactStore(settings)
+    scan_id = "00000000-0000-0000-0000-000000000098"
+    task_id = "00000000-0000-0000-0000-000000000099"
+    with database.session_factory() as session:
+        scan = Scan(
+            id=scan_id,
+            status="investigating",
+            filename="dispatch-race.apk",
+            artifact_sha256="4" * 64,
+            artifact_path=str(settings.data_dir / "missing.apk"),
+        )
+        task = InvestigationTask(
+            id=task_id,
+            scan_id=scan_id,
+            task_type="component",
+            status="canceled",
+            attempts=0,
+        )
+        session.add_all([scan, task])
+        session.commit()
+
+    orchestrator = ScanOrchestrator(settings, database, store)
+    orchestrator._run_task(scan_id, task_id, 10)
+
+    with database.session_factory() as session:
+        task = session.get(InvestigationTask, task_id)
+        assert task is not None
+        assert task.status == "canceled"
+        assert task.attempts == 0

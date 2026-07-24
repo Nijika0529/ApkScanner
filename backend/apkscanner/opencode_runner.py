@@ -7,6 +7,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
@@ -14,12 +15,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from .agent_events import AgentEventCallback
+from .agent_events import AgentCancelledError, AgentEventCallback
 from .agent_prompt import developer_instructions, investigation_prompt
 from .config import Settings
 from .models import EntryPoint, InvestigationTask, Scan
 from .schemas import AGENT_RESULT_JSON_SCHEMA, AgentInvestigationResult
-from .worker_protocol import WorkerTimeoutError, consume_worker_process
+from .worker_protocol import (
+    WorkerCancelledError,
+    WorkerTimeoutError,
+    consume_worker_process,
+)
 
 OPENCODE_SDK_VERSION = "1.18.4"
 OPENCODE_CLI_VERSION = "1.18.4"
@@ -187,6 +192,7 @@ class OpenCodeInvestigator:
         platform_context: dict[str, Any] | None = None,
         timeout_seconds: int | None = None,
         event_callback: AgentEventCallback | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> OpenCodeRunResult:
         if not workspace.is_dir():
             raise ValueError("scan workspace is unavailable")
@@ -215,13 +221,14 @@ class OpenCodeInvestigator:
             "output_schema": AGENT_RESULT_JSON_SCHEMA,
             "timeout_ms": max(1, timeout) * 1000,
         }
-        if event_callback is None:
+        if event_callback is None and cancel_event is None:
             response = self._invoke(payload, timeout_seconds=timeout + 15)
         else:
             response = self._invoke(
                 payload,
                 timeout_seconds=timeout + 15,
                 event_callback=event_callback,
+                cancel_event=cancel_event,
             )
         if response.get("error"):
             error = response["error"]
@@ -415,17 +422,20 @@ class OpenCodeInvestigator:
         *,
         timeout_seconds: int,
         event_callback: AgentEventCallback | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         if self.settings.opencode_isolation == "docker":
             return self._invoke_docker(
                 payload,
                 timeout_seconds=timeout_seconds,
                 event_callback=event_callback,
+                cancel_event=cancel_event,
             )
         return self._invoke_host(
             payload,
             timeout_seconds=timeout_seconds,
             event_callback=event_callback,
+            cancel_event=cancel_event,
         )
 
     def _invoke_host(
@@ -434,6 +444,7 @@ class OpenCodeInvestigator:
         *,
         timeout_seconds: int,
         event_callback: AgentEventCallback | None,
+        cancel_event: threading.Event | None,
     ) -> dict[str, Any]:
         node = self.settings.opencode_node_bin or shutil.which("node")
         if node is None:
@@ -459,7 +470,13 @@ class OpenCodeInvestigator:
                     timeout_seconds=timeout_seconds,
                     event_callback=event_callback,
                     on_timeout=lambda: self._kill_process_group(process),
+                    cancel_event=cancel_event,
+                    on_cancel=lambda: self._kill_process_group(process),
                 )
+            except WorkerCancelledError as exc:
+                raise AgentCancelledError(
+                    "OpenCode investigation was cancelled by the user"
+                ) from exc
             except WorkerTimeoutError as exc:
                 raise TimeoutError(
                     f"OpenCode investigation exceeded {timeout_seconds} seconds"
@@ -512,6 +529,7 @@ class OpenCodeInvestigator:
         *,
         timeout_seconds: int,
         event_callback: AgentEventCallback | None,
+        cancel_event: threading.Event | None,
     ) -> dict[str, Any]:
         executable = shutil.which("docker")
         if executable is None:
@@ -589,7 +607,13 @@ class OpenCodeInvestigator:
                 timeout_seconds=timeout_seconds,
                 event_callback=event_callback,
                 on_timeout=stop_container,
+                cancel_event=cancel_event,
+                on_cancel=stop_container,
             )
+        except WorkerCancelledError as exc:
+            raise AgentCancelledError(
+                "containerized OpenCode investigation was cancelled by the user"
+            ) from exc
         except WorkerTimeoutError as exc:
             raise TimeoutError(
                 f"containerized OpenCode investigation exceeded {timeout_seconds} seconds"

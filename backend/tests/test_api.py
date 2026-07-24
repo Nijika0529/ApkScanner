@@ -205,6 +205,103 @@ def test_running_task_cannot_be_deleted(settings) -> None:  # noqa: ANN001
         assert response.status_code == 409
 
 
+def test_waiting_task_can_be_cancelled_before_dispatch(settings) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    with TestClient(app) as client:
+        with app.state.database.session_factory() as session:
+            scan = Scan(
+                status="final",
+                filename="queued-cancel.apk",
+                artifact_sha256="1" * 64,
+                artifact_path=str(settings.data_dir / "missing.apk"),
+            )
+            task = InvestigationTask(
+                scan=scan,
+                task_type="component",
+                status="queued",
+            )
+            session.add_all([scan, task])
+            session.commit()
+        response = client.post(
+            f"/api/v1/tasks/{task.id}/cancel",
+            headers={"X-APKScanner-Request": "console"},
+        )
+        assert response.status_code == 202
+        assert response.json()["status"] == "canceled"
+        assert response.json()["result"]["cancellation"]["acknowledged"] is True
+
+
+def test_running_task_cancellation_signals_the_orchestrator(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    signaled: list[str] = []
+    monkeypatch.setattr(
+        app.state.orchestrator,
+        "request_task_cancellation",
+        lambda task_id: signaled.append(task_id) or True,
+    )
+    with TestClient(app) as client:
+        with app.state.database.session_factory() as session:
+            scan = Scan(
+                status="final",
+                filename="running-cancel.apk",
+                artifact_sha256="2" * 64,
+                artifact_path=str(settings.data_dir / "missing.apk"),
+            )
+            task = InvestigationTask(
+                scan=scan,
+                task_type="component",
+                status="running",
+                attempts=1,
+            )
+            session.add_all([scan, task])
+            session.commit()
+        response = client.post(
+            f"/api/v1/tasks/{task.id}/cancel",
+            headers={"X-APKScanner-Request": "console"},
+        )
+        assert response.status_code == 202
+        assert response.json()["status"] == "cancel_requested"
+        assert signaled == [task.id]
+
+
+def test_running_task_cancellation_is_acknowledged_when_runtime_already_exited(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    monkeypatch.setattr(
+        app.state.orchestrator,
+        "request_task_cancellation",
+        lambda _task_id: False,
+    )
+    with TestClient(app) as client:
+        with app.state.database.session_factory() as session:
+            scan = Scan(
+                status="final",
+                filename="late-cancel.apk",
+                artifact_sha256="3" * 64,
+                artifact_path=str(settings.data_dir / "missing.apk"),
+            )
+            task = InvestigationTask(
+                scan=scan,
+                task_type="component",
+                status="running",
+                attempts=1,
+            )
+            session.add_all([scan, task])
+            session.commit()
+        response = client.post(
+            f"/api/v1/tasks/{task.id}/cancel",
+            headers={"X-APKScanner-Request": "console"},
+        )
+        assert response.status_code == 202
+        assert response.json()["status"] == "canceled"
+        assert response.json()["result"]["cancellation"]["acknowledged"] is True
+
+
 def test_deleting_one_scan_preserves_a_shared_apk(settings) -> None:  # noqa: ANN001
     app = create_app(settings)
     sha256, artifact_path = app.state.store.put_bytes(

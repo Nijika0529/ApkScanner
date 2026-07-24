@@ -18,6 +18,7 @@ from .enums import ScanStatus, TaskStatus
 from .models import CoverageItem, EntryPoint, Evidence, Finding, InvestigationTask, Scan, ScanEvent
 from .orchestrator import ScanOrchestrator
 from .reports import ReportBuilder
+from .repository import add_event, now
 from .schemas import (
     AgentAuditOut,
     Capability,
@@ -399,12 +400,19 @@ async def retry_task(
     task = session.get(InvestigationTask, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
-    if task.status in {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}:
+    if task.status in {
+        TaskStatus.QUEUED.value,
+        TaskStatus.RUNNING.value,
+        TaskStatus.CANCEL_REQUESTED.value,
+    }:
         raise HTTPException(409, "Task is already queued or running")
     if task.attempts >= orchestrator.settings.task_max_attempts:
         raise HTTPException(409, "Task retry budget is exhausted")
     task.status = TaskStatus.QUEUED.value
     task.error = None
+    task.result = {}
+    task.started_at = None
+    task.completed_at = None
     scan = session.get(Scan, task.scan_id)
     if scan is None:
         raise HTTPException(404, "Scan not found")
@@ -414,6 +422,97 @@ async def retry_task(
     background = asyncio.create_task(orchestrator.submit(task.scan_id), name=f"retry-{task.id}")
     request.app.state.background_tasks.add(background)
     background.add_done_callback(request.app.state.background_tasks.discard)
+    return task
+
+
+@router.post(
+    "/tasks/{task_id}/cancel",
+    response_model=InvestigationTaskOut,
+    status_code=202,
+)
+def cancel_task(
+    task_id: str,
+    session: Session = Depends(get_session),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> InvestigationTask:
+    task = session.get(InvestigationTask, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    if task.status == TaskStatus.CANCEL_REQUESTED.value:
+        raise HTTPException(409, "Task cancellation is already pending")
+    if task.status not in {
+        TaskStatus.QUEUED.value,
+        TaskStatus.AWAITING_DEVICE.value,
+        TaskStatus.RUNNING.value,
+    }:
+        raise HTTPException(409, "Only a queued or running task can be cancelled")
+
+    requested_at = now()
+    task.result = {
+        **dict(task.result or {}),
+        "cancellation": {
+            "requested": True,
+            "acknowledged": task.status != TaskStatus.RUNNING.value,
+            "requested_at": requested_at.isoformat(),
+        },
+    }
+    if task.status == TaskStatus.RUNNING.value:
+        task.status = TaskStatus.CANCEL_REQUESTED.value
+        task.error = "正在停止当前 AI 分析"
+        should_signal = True
+        message = "用户已请求停止正在运行的 AI 分析"
+    else:
+        should_signal = False
+        task.status = TaskStatus.CANCELED.value
+        task.error = "用户在任务执行前取消了分析"
+        task.completed_at = requested_at
+        message = "用户已取消等待中的入口探索任务"
+    add_event(
+        session,
+        task.scan_id,
+        "task.cancel_requested",
+        message,
+        {
+            "task_id": task.id,
+            "status": task.status,
+            "requested_at": requested_at.isoformat(),
+        },
+    )
+    add_event(
+        session,
+        task.scan_id,
+        "exploration.cancel_requested",
+        message,
+        {
+            "task_id": task.id,
+            "source": "platform",
+            "status": task.status,
+        },
+    )
+    session.commit()
+    if should_signal and not orchestrator.request_task_cancellation(task_id):
+        session.refresh(task)
+        if task.status == TaskStatus.CANCEL_REQUESTED.value:
+            task.status = TaskStatus.CANCELED.value
+            task.error = "分析运行时已经退出，停止请求已确认"
+            task.completed_at = now()
+            task.result = {
+                **dict(task.result or {}),
+                "cancellation": {
+                    **dict((task.result or {}).get("cancellation") or {}),
+                    "acknowledged": True,
+                    "completed_at": task.completed_at.isoformat(),
+                },
+            }
+            add_event(
+                session,
+                task.scan_id,
+                "task.cancelled",
+                "分析运行时已经退出，停止请求已确认",
+                {"task_id": task.id, "status": TaskStatus.CANCELED.value},
+            )
+            session.commit()
+    session.refresh(task)
     return task
 
 
@@ -432,6 +531,7 @@ def delete_task(
         TaskStatus.INCONCLUSIVE.value,
         TaskStatus.TIMED_OUT.value,
         TaskStatus.FAILED.value,
+        TaskStatus.CANCELED.value,
     }:
         raise HTTPException(409, "Only a terminal task can be deleted")
 

@@ -5,6 +5,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+class AgentCancelledError(RuntimeError):
+    """Raised when a user-requested investigation cancellation is acknowledged."""
+
+
 @dataclass(frozen=True, slots=True)
 class AgentRuntimeEvent:
     """A provider-neutral, intentionally compact SDK/runtime event."""

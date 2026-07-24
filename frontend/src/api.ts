@@ -47,6 +47,8 @@ export const api = {
     }),
   retryTask: (taskId: string) =>
     request<InvestigationTask>(`/api/v1/tasks/${taskId}/retry`, { method: "POST" }),
+  cancelTask: (taskId: string) =>
+    request<InvestigationTask>(`/api/v1/tasks/${taskId}/cancel`, { method: "POST" }),
   deleteTask: (taskId: string) =>
     request<TaskDeleteResult>(`/api/v1/tasks/${taskId}`, { method: "DELETE" }),
   deleteScan: (scanId: string) =>

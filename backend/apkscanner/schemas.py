@@ -149,7 +149,7 @@ class AgentAuditOut(BaseModel):
     provider: str
     model: str
     isolation: str
-    status: Literal["running", "completed", "failed"]
+    status: Literal["running", "completed", "failed", "cancelled"]
     thread_id: str | None
     turn_id: str | None
     usage: dict[str, Any]

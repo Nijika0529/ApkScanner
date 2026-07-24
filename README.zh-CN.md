@@ -18,9 +18,11 @@ v1 产品是一个单用户、仅限本机（localhost）的 Web 应用。它接
 - 官方 `openai-codex==0.144.4` 集成：严格 JSON Schema、全新线程、无子 Agent fan-out、一轮平台介导的补充测试、证据支撑的结果降级。
 - 固定版本 `@opencode-ai/sdk`/OpenCode `1.18.4` 集成（适配 DeepSeek）：全新会话、Schema 校验输出、拒绝所有可执行 Agent 工具、隔离的一次性桥接。
 - 可选的每任务 Docker Worker，带只读扫描挂载和资源/能力限制。
-- 响应式 React 审核控制台、人工 Finding 判定、实时事件、JSON/HTML/SARIF 导出。
+- 响应式明亮主题 React 审核控制台、人工 Finding 判定、实时事件、任务停止/删除、JSON/HTML/SARIF 导出。
 
 详细的控制流程、信任边界、Security IR 和判定规则参见 [`docs/architecture.zh-CN.md`](docs/architecture.zh-CN.md)。
+用于内部汇报的一页式说明与数据口径参见
+[`docs/project-brief.zh-CN.md`](docs/project-brief.zh-CN.md)。
 
 ## 本地搭建
 
@@ -150,6 +152,7 @@ export APKSCANNER_MOBSF_API_KEY=...
 APK 上传
   → ZIP 安全检查、SHA-256 寻址
   → Apktool 反编译 + JADX 反编译（可选）
+  → 生成组件级代码索引；区分 JADX 全局部分失败与目标类源码可用性
   → Manifest 解析：枚举 Activity、Service、Receiver、Provider、Deep Link
   → 内置规则引擎：17+ 条面向 MASVS 的发现
   → 可选 MobSF 广度静态扫描
@@ -169,6 +172,10 @@ APK 上传
       → 清理：pm clear、App Link 重置
   → 生成最终报告
 ```
+
+等待中的任务可以直接取消；正在运行的任务可以从 Web 请求停止。控制面会中断 Codex turn
+或终止 OpenCode worker，保留已产生的关键事件并写入不可变的 `agent.cancellation`
+审计证据。被停止的任务不会伪造新的最终判断，可按原有重试预算重新执行。
 
 ## 判定与证据规则
 

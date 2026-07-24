@@ -16,6 +16,7 @@ AGENT_AUDIT_KINDS = {
     "agent.error",
     "agent.test_validation",
     "agent.validation",
+    "agent.cancellation",
 }
 
 
@@ -71,7 +72,9 @@ def _build_audit(
     request_object = request if isinstance(request, dict) else {}
     response = artifacts.get("response", {}).get("content")
     status = (
-        "failed"
+        "cancelled"
+        if "cancellation" in artifacts
+        else "failed"
         if "error" in artifacts
         else "completed"
         if "response" in artifacts
@@ -81,7 +84,13 @@ def _build_audit(
         (
             item.created_at
             for item in reversed(evidence)
-            if item.kind in {"agent.response", "agent.error", "agent.validation"}
+            if item.kind
+            in {
+                "agent.response",
+                "agent.error",
+                "agent.validation",
+                "agent.cancellation",
+            }
         ),
         None,
     )

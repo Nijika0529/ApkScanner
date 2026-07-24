@@ -4,8 +4,10 @@ import asyncio
 import json
 import re
 import shutil
+import threading
 import uuid
 from collections import defaultdict
+from contextlib import suppress
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,7 +16,7 @@ from urllib.parse import urlsplit
 
 from sqlalchemy import select
 
-from .agent_events import AgentRuntimeEvent
+from .agent_events import AgentCancelledError, AgentRuntimeEvent
 from .agent_prompt import developer_instructions, investigation_prompt
 from .artifacts import ArtifactStore
 from .codex_runner import CodexInvestigator
@@ -39,7 +41,7 @@ from .repository import add_event, now
 from .rules import BuiltinRuleEngine
 from .schemas import AGENT_RESULT_JSON_SCHEMA, AgentRequestedTest
 from .static_analysis import ApkInspector
-from .tools import TimeBudget, ToolRunner
+from .tools import CommandResult, TimeBudget, ToolRunner
 
 
 class ScanOrchestrator:
@@ -62,6 +64,8 @@ class ScanOrchestrator:
         }
         self._running: set[str] = set()
         self._running_lock = asyncio.Lock()
+        self._task_cancellations: dict[str, threading.Event] = {}
+        self._task_cancellations_lock = threading.Lock()
 
     def resolve_investigator(self, requested: str = "configured") -> str:
         backend = (
@@ -185,9 +189,27 @@ class ScanOrchestrator:
                 "workspace": str(result.workspace),
                 "static_finding_count": len(findings),
                 "preliminary_deadline": preliminary_deadline.isoformat(),
+                "decompilation": {
+                    key: value
+                    for key, value in result.decompilation.items()
+                    if key != "failed_classes"
+                },
             }
             entries: list[EntryPoint] = []
             for parsed in result.manifest.entries:
+                code_context = result.code_index.get(
+                    parsed.owner_component or parsed.name,
+                    {},
+                )
+                public_anchors = [
+                    {
+                        key: value
+                        for key, value in anchor.items()
+                        if key != "content"
+                    }
+                    for anchor in code_context.get("anchors", [])
+                    if isinstance(anchor, dict)
+                ]
                 entry = EntryPoint(
                     scan_id=scan.id,
                     kind=parsed.kind,
@@ -199,7 +221,25 @@ class ScanOrchestrator:
                     permission_protection=parsed.permission_protection,
                     intent_filters=parsed.intent_filters,
                     deep_links=parsed.deep_links,
-                    metadata_json=parsed.metadata,
+                    code_anchors=public_anchors,
+                    metadata_json={
+                        **parsed.metadata,
+                        "decompilation": {
+                            "status": code_context.get("status", "source_not_found"),
+                            "target_in_jadx_failure_list": bool(
+                                code_context.get("target_in_jadx_failure_list")
+                            ),
+                            "target_source_has_decompiler_errors": bool(
+                                code_context.get(
+                                    "target_source_has_decompiler_errors"
+                                )
+                            ),
+                            "global_status": code_context.get(
+                                "global_decompilation_status",
+                                result.decompilation.get("status"),
+                            ),
+                        },
+                    },
                 )
                 session.add(entry)
                 entries.append(entry)
@@ -286,13 +326,25 @@ class ScanOrchestrator:
                     )
                 )
             for tool, payload in result.tool_results.items():
+                metadata = (
+                    {
+                        key: value
+                        for key, value in dict(
+                            payload.get("decompilation") or {}
+                        ).items()
+                        if key != "failed_classes"
+                    }
+                    if tool == "jadx"
+                    else None
+                )
                 self.evidence.json(
                     session,
                     scan_id=scan.id,
                     task_id=None,
                     kind=f"static.{tool}",
                     value=payload,
-                    summary=f"{tool} exited with {payload['exit_code']}",
+                    summary=self._static_tool_evidence_summary(tool, payload),
+                    metadata=metadata,
                 )
             if mobsf_result is not None:
                 self.evidence.json(
@@ -398,11 +450,51 @@ class ScanOrchestrator:
                 return
             self._run_task(scan_id, task.id, min(self.settings.task_timeout_seconds, remaining))
 
-    def _run_task(self, scan_id: str, task_id: str, timeout_seconds: int | None = None) -> None:
+    def request_task_cancellation(self, task_id: str) -> bool:
+        with self._task_cancellations_lock:
+            event = self._task_cancellations.get(task_id)
+            if event is None:
+                return False
+            event.set()
+            return True
+
+    def _run_task(
+        self,
+        scan_id: str,
+        task_id: str,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        cancel_event = threading.Event()
+        with self._task_cancellations_lock:
+            self._task_cancellations[task_id] = cancel_event
+        try:
+            self._run_task_impl(
+                scan_id,
+                task_id,
+                timeout_seconds,
+                cancel_event=cancel_event,
+            )
+        except AgentCancelledError:
+            self._mark_task_canceled(scan_id, task_id)
+        finally:
+            with self._task_cancellations_lock:
+                if self._task_cancellations.get(task_id) is cancel_event:
+                    self._task_cancellations.pop(task_id, None)
+
+    def _run_task_impl(
+        self,
+        scan_id: str,
+        task_id: str,
+        timeout_seconds: int | None = None,
+        *,
+        cancel_event: threading.Event,
+    ) -> None:
         with self.database.session_factory() as session:
             scan = session.get(Scan, scan_id)
             task = session.get(InvestigationTask, task_id)
             assert scan is not None and task is not None
+            if task.status != TaskStatus.QUEUED.value:
+                return
             entries = list(
                 session.scalars(select(EntryPoint).where(EntryPoint.id.in_(task.target_entry_ids)))
             )
@@ -447,8 +539,10 @@ class ScanOrchestrator:
             )
             session.commit()
 
+        self._raise_if_cancelled(cancel_event)
         budget = TimeBudget.from_seconds(timeout_seconds or self.settings.task_timeout_seconds)
         evidence_summaries = self._static_evidence_summaries(scan_id)
+        target_code_context = self._target_code_context(scan_id, entries)
         coverage_gaps: list[str] = []
         stages: dict[str, Any] = {
             "device_attempted": False,
@@ -476,6 +570,7 @@ class ScanOrchestrator:
         ):  # noqa: ANN202
             audit_id: str | None = None
             runtime_events: list[dict[str, Any]] = []
+            self._raise_if_cancelled(cancel_event)
             if investigator is None:
                 return None, "AI investigation is disabled for this scan"
             if not agent_enabled:
@@ -486,6 +581,7 @@ class ScanOrchestrator:
             if remaining <= 0:
                 return None, "task time budget exhausted before AI dispatch"
             capability = investigator.capability(deep=True)
+            self._raise_if_cancelled(cancel_event)
             if not capability.get("available"):
                 return None, capability.get(
                     "detail", f"{agent_backend} capability probe failed"
@@ -504,6 +600,7 @@ class ScanOrchestrator:
                     "authentication": auth_capability,
                     "frida": frida_capability,
                     "coverage_gaps": coverage_gaps,
+                    "target_code_context": target_code_context,
                     "executed_agent_tests": executed_tests or [],
                     "further_test_rounds_available": (
                         phase != "final_evaluation"
@@ -524,6 +621,10 @@ class ScanOrchestrator:
                         "phase": phase,
                         "round_index": round_index,
                         "evidence_count": len(evidence_summaries),
+                        "target_code_statuses": [
+                            item.get("status")
+                            for item in target_code_context.get("components", [])
+                        ],
                         "executed_test_count": len(executed_tests or []),
                         "agent_backend": agent_backend,
                     },
@@ -583,7 +684,9 @@ class ScanOrchestrator:
                     platform_context=platform_context,
                     timeout_seconds=remaining,
                     event_callback=on_runtime_event,
+                    cancel_event=cancel_event,
                 )
+                self._raise_if_cancelled(cancel_event)
                 self._record_agent_response(
                     scan_id=scan_id,
                     task_id=task_id,
@@ -650,6 +753,40 @@ class ScanOrchestrator:
                         },
                     )
                 return result, None
+            except AgentCancelledError as exc:
+                if audit_id is not None and runtime_events:
+                    self._record_agent_runtime_events(
+                        scan_id=scan_id,
+                        task_id=task_id,
+                        audit_id=audit_id,
+                        backend=agent_backend,
+                        phase=phase,
+                        attempt=task.attempts,
+                        events=runtime_events,
+                    )
+                if audit_id is not None:
+                    self._record_agent_cancellation(
+                        scan_id=scan_id,
+                        task_id=task_id,
+                        audit_id=audit_id,
+                        backend=agent_backend,
+                        phase=phase,
+                        attempt=task.attempts,
+                        error=exc,
+                    )
+                self._record_exploration_event(
+                    scan_id,
+                    task_id,
+                    "model.cancelled",
+                    f"{agent_backend} SDK 本轮调用已由用户停止",
+                    {
+                        "source": "platform",
+                        "phase": phase,
+                        "round_index": round_index,
+                        "agent_backend": agent_backend,
+                    },
+                )
+                raise
             except Exception as exc:
                 if audit_id is not None and runtime_events:
                     self._record_agent_runtime_events(
@@ -974,6 +1111,8 @@ class ScanOrchestrator:
                                 "Final AI evaluation failed; retained the latest exploration result: "
                                 f"{final_error}"
                             )
+                except AgentCancelledError:
+                    raise
                 except Exception as exc:
                     coverage_gaps.append(f"Dynamic investigation failed safely: {exc}")
                     if agent_result is None:
@@ -997,6 +1136,7 @@ class ScanOrchestrator:
                         cleanup = self.device.cleanup(package_name)
                         self._record_commands(scan_id, task_id, cleanup, None)
 
+        self._raise_if_cancelled(cancel_event)
         validated_payload: dict[str, Any] | None = None
         validated_result_value: str | None = None
         if agent_result:
@@ -1124,6 +1264,62 @@ class ScanOrchestrator:
                     "status": task.status,
                     "agent_backend": agent_backend,
                     "evidence_count": len(evidence_summaries),
+                },
+            )
+            session.commit()
+
+    @staticmethod
+    def _raise_if_cancelled(cancel_event: threading.Event) -> None:
+        if cancel_event.is_set():
+            raise AgentCancelledError("investigation was cancelled by the user")
+
+    def _mark_task_canceled(self, scan_id: str, task_id: str) -> None:
+        with self.database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            if task is None:
+                return
+            task.status = TaskStatus.CANCELED.value
+            task.error = "用户已停止本次分析"
+            task.completed_at = now()
+            task.result = {
+                **dict(task.result or {}),
+                "cancellation": {
+                    "requested": True,
+                    "acknowledged": True,
+                    "completed_at": task.completed_at.isoformat(),
+                },
+            }
+            coverage = list(
+                session.scalars(
+                    select(CoverageItem).where(
+                        CoverageItem.scan_id == scan_id,
+                        CoverageItem.entry_point_id.in_(task.target_entry_ids),
+                    )
+                )
+            )
+            for item in coverage:
+                item.status = "partial"
+                item.gap_reason = "入口探索由用户主动停止，未形成最终判断。"
+                item.stages = {
+                    **item.stages,
+                    "agent": "cancelled",
+                }
+            add_event(
+                session,
+                scan_id,
+                "task.cancelled",
+                "用户已停止入口探索任务",
+                {"task_id": task_id, "status": TaskStatus.CANCELED.value},
+            )
+            add_event(
+                session,
+                scan_id,
+                "exploration.cancelled",
+                "AI 分析已停止，未生成新的最终结论",
+                {
+                    "task_id": task_id,
+                    "source": "platform",
+                    "status": TaskStatus.CANCELED.value,
                 },
             )
             session.commit()
@@ -1583,6 +1779,51 @@ class ScanOrchestrator:
             )
             session.commit()
 
+    def _record_agent_cancellation(
+        self,
+        *,
+        scan_id: str,
+        task_id: str,
+        audit_id: str,
+        backend: str,
+        phase: str,
+        attempt: int,
+        error: Exception | str,
+    ) -> None:
+        metadata = {
+            "audit_id": audit_id,
+            "backend": backend,
+            "provider": "openai" if backend == "codex" else "deepseek",
+            "model": (
+                self.settings.codex_worker_model
+                if backend == "codex"
+                else self.settings.opencode_model
+            ),
+            "isolation": (
+                self.settings.codex_isolation
+                if backend == "codex"
+                else self.settings.opencode_isolation
+            ),
+            "phase": phase,
+            "attempt": attempt,
+        }
+        with self.database.session_factory() as session:
+            self.evidence.json(
+                session,
+                scan_id=scan_id,
+                task_id=task_id,
+                kind="agent.cancellation",
+                value={
+                    "schema_version": "1.0",
+                    "requested_by": "local_console_user",
+                    "acknowledged": True,
+                    "reason": str(error),
+                },
+                summary=f"{backend} {phase} cancelled by user",
+                metadata=metadata,
+            )
+            session.commit()
+
     def _record_agent_test_validation(
         self,
         *,
@@ -1687,6 +1928,181 @@ class ScanOrchestrator:
                 )
             )
         return [self._evidence_summary(item) for item in items]
+
+    def _target_code_context(
+        self,
+        scan_id: str,
+        entries: list[EntryPoint],
+    ) -> dict[str, Any]:
+        index = self._load_or_build_code_index(scan_id)
+        if index is None:
+            return {
+                "schema_version": "1.0",
+                "global_decompilation": {"status": "index_unavailable"},
+                "components": [],
+            }
+        raw_components = index.get("components")
+        if not isinstance(raw_components, dict):
+            raw_components = {}
+        names = list(
+            dict.fromkeys(
+                str(entry.owner_component or entry.name)
+                for entry in entries
+                if entry.owner_component or entry.name
+            )
+        )
+        components: list[dict[str, Any]] = []
+        remaining_content = 64_000
+        for name in names:
+            raw = raw_components.get(name)
+            if not isinstance(raw, dict):
+                components.append(
+                    {
+                        "component": name,
+                        "status": "source_not_found",
+                        "target_in_jadx_failure_list": False,
+                        "target_source_has_decompiler_errors": False,
+                        "anchors": [],
+                    }
+                )
+                continue
+            anchors: list[dict[str, Any]] = []
+            for value in raw.get("anchors", []):
+                if not isinstance(value, dict):
+                    continue
+                anchor = dict(value)
+                content = anchor.get("content")
+                if isinstance(content, str):
+                    accepted = content[:remaining_content]
+                    anchor["content"] = accepted
+                    if len(accepted) < len(content):
+                        anchor["context_truncated"] = True
+                    remaining_content -= len(accepted)
+                anchors.append(anchor)
+                if remaining_content <= 0:
+                    break
+            components.append(
+                {
+                    "component": name,
+                    "status": raw.get("status", "source_not_found"),
+                    "target_in_jadx_failure_list": bool(
+                        raw.get("target_in_jadx_failure_list")
+                    ),
+                    "target_source_has_decompiler_errors": bool(
+                        raw.get("target_source_has_decompiler_errors")
+                    ),
+                    "global_decompilation_status": raw.get(
+                        "global_decompilation_status"
+                    ),
+                    "anchors": anchors,
+                }
+            )
+        return {
+            "schema_version": "1.0",
+            "global_decompilation": {
+                key: value
+                for key, value in dict(index.get("decompilation") or {}).items()
+                if key != "failed_classes"
+            },
+            "components": components,
+        }
+
+    def _load_or_build_code_index(self, scan_id: str) -> dict[str, Any] | None:
+        workspace = self.settings.data_dir / "workspaces" / scan_id
+        index_path = workspace / "code_index.json"
+        try:
+            value = json.loads(index_path.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                return value
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        with self.database.session_factory() as session:
+            entries = list(
+                session.scalars(
+                    select(EntryPoint).where(EntryPoint.scan_id == scan_id)
+                )
+            )
+            jadx_evidence = session.scalar(
+                select(Evidence)
+                .where(
+                    Evidence.scan_id == scan_id,
+                    Evidence.kind == "static.jadx",
+                )
+                .order_by(Evidence.created_at.desc())
+                .limit(1)
+            )
+        if not entries or not workspace.is_dir():
+            return None
+
+        payload: dict[str, Any] = {}
+        if jadx_evidence is not None:
+            try:
+                stored = self.store.read_json_artifact(
+                    "evidence",
+                    jadx_evidence.path,
+                    jadx_evidence.sha256,
+                )
+                if isinstance(stored, dict):
+                    payload = stored
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                payload = {}
+        decompilation = payload.get("decompilation")
+        if not isinstance(decompilation, dict):
+            exit_code = payload.get("exit_code")
+            command_result = CommandResult(
+                argv=[
+                    str(value)
+                    for value in payload.get("argv", [])
+                    if isinstance(value, str)
+                ],
+                exit_code=exit_code if isinstance(exit_code, int) else 1,
+                stdout=str(payload.get("stdout") or ""),
+                stderr=str(payload.get("stderr") or ""),
+                timed_out=bool(payload.get("timed_out")),
+            )
+            decompilation = self.inspector._jadx_decompilation_summary(
+                command_result,
+                workspace / "jadx",
+            )
+        code_index = self.inspector._build_code_index(
+            result_entries=entries,
+            workspace=workspace,
+            jadx_dir=workspace / "jadx",
+            decoded_dir=workspace / "apktool",
+            archive_dir=workspace / "archive",
+            decompilation=decompilation,
+        )
+        value = {
+            "schema_version": "1.0",
+            "decompilation": decompilation,
+            "components": code_index,
+            "generated_lazily": True,
+        }
+        with suppress(OSError):
+            index_path.write_text(
+                json.dumps(value, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return value
+
+    @staticmethod
+    def _static_tool_evidence_summary(
+        tool: str,
+        payload: dict[str, Any],
+    ) -> str:
+        if tool != "jadx":
+            return f"{tool} exited with {payload['exit_code']}"
+        decompilation = payload.get("decompilation")
+        if not isinstance(decompilation, dict):
+            return f"jadx exited with {payload['exit_code']}"
+        status = str(decompilation.get("status", "unknown"))
+        generated = int(decompilation.get("generated_java_files", 0))
+        errors = int(decompilation.get("reported_error_count", 0))
+        return (
+            f"jadx {status}: generated {generated} Java files; "
+            f"{errors} errors reported (exit {payload['exit_code']})"
+        )
 
     def _materialize_agent_evidence(
         self,

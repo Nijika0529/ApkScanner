@@ -26,6 +26,8 @@ class EntryPointKind(StrEnum):
 class TaskStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
+    CANCEL_REQUESTED = "cancel_requested"
+    CANCELED = "canceled"
     AWAITING_DEVICE = "awaiting_device"
     BLOCKED_DEVICE = "blocked_device"
     COMPLETED = "completed"

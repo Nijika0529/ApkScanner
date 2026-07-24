@@ -6,6 +6,8 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -15,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .agent_events import (
+    AgentCancelledError,
     AgentEventCallback,
     emit_agent_event,
     normalize_codex_notification,
@@ -23,7 +26,11 @@ from .agent_prompt import developer_instructions, investigation_prompt
 from .config import Settings
 from .models import EntryPoint, InvestigationTask, Scan
 from .schemas import AGENT_RESULT_JSON_SCHEMA, AgentInvestigationResult
-from .worker_protocol import WorkerTimeoutError, consume_worker_process
+from .worker_protocol import (
+    WorkerCancelledError,
+    WorkerTimeoutError,
+    consume_worker_process,
+)
 
 
 @dataclass(slots=True)
@@ -83,6 +90,7 @@ class CodexInvestigator:
         platform_context: dict[str, Any] | None = None,
         timeout_seconds: int | None = None,
         event_callback: AgentEventCallback | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> CodexRunResult:
         from openai_codex import ApprovalMode, Sandbox
         from openai_codex.generated.v2_all import ReasoningEffort
@@ -102,7 +110,10 @@ class CodexInvestigator:
                 workspace=workspace,
                 timeout_seconds=timeout_seconds,
                 event_callback=event_callback,
+                cancel_event=cancel_event,
             )
+        if cancel_event is not None and cancel_event.is_set():
+            raise AgentCancelledError("Codex investigation was cancelled before dispatch")
         with self._client() as codex:
             thread = codex.thread_start(
                 approval_mode=ApprovalMode.deny_all,
@@ -144,18 +155,37 @@ class CodexInvestigator:
 
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="codex-investigation")
             future = executor.submit(consume_turn)
-            try:
-                turn = future.result(timeout=timeout_seconds)
-            except FutureTimeoutError as exc:
-                try:
-                    handle.interrupt()
-                finally:
+            deadline = time.monotonic() + (
+                timeout_seconds or self.settings.task_timeout_seconds
+            )
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    with suppress(Exception):
+                        handle.interrupt()
+                    emit_agent_event(
+                        event_callback,
+                        "model.turn.cancelled",
+                        "Codex 本轮分析已收到停止请求",
+                        {"thread_id": thread.id, "turn_id": handle.id},
+                    )
                     executor.shutdown(wait=False, cancel_futures=True)
-                raise TimeoutError(
-                    f"Codex investigation exceeded {timeout_seconds} seconds"
-                ) from exc
-            else:
-                executor.shutdown(wait=False, cancel_futures=True)
+                    raise AgentCancelledError(
+                        "Codex investigation was cancelled by the user"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    with suppress(Exception):
+                        handle.interrupt()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise TimeoutError(
+                        f"Codex investigation exceeded {timeout_seconds} seconds"
+                    )
+                try:
+                    turn = future.result(timeout=min(0.25, remaining))
+                    break
+                except FutureTimeoutError:
+                    continue
+            executor.shutdown(wait=False, cancel_futures=True)
             parsed = self._parse_response(turn.final_response)
             emit_agent_event(
                 event_callback,
@@ -242,6 +272,7 @@ class CodexInvestigator:
         workspace: Path,
         timeout_seconds: int | None,
         event_callback: AgentEventCallback | None,
+        cancel_event: threading.Event | None,
     ) -> CodexRunResult:
         capability = self._docker_capability(
             {
@@ -331,7 +362,13 @@ class CodexInvestigator:
                 timeout_seconds=timeout_seconds or self.settings.task_timeout_seconds,
                 event_callback=event_callback,
                 on_timeout=stop_container,
+                cancel_event=cancel_event,
+                on_cancel=stop_container,
             )
+        except WorkerCancelledError as exc:
+            raise AgentCancelledError(
+                "containerized Codex investigation was cancelled by the user"
+            ) from exc
         except WorkerTimeoutError as exc:
             raise TimeoutError(
                 f"containerized Codex investigation exceeded {timeout_seconds} seconds"

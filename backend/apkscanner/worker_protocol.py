@@ -16,6 +16,10 @@ class WorkerTimeoutError(TimeoutError):
     pass
 
 
+class WorkerCancelledError(RuntimeError):
+    pass
+
+
 def consume_worker_process(
     process: subprocess.Popen[str],
     *,
@@ -23,6 +27,8 @@ def consume_worker_process(
     timeout_seconds: int,
     event_callback: AgentEventCallback | None = None,
     on_timeout: Callable[[], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    on_cancel: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Exchange one request with an NDJSON worker while forwarding event envelopes."""
 
@@ -63,10 +69,10 @@ def consume_worker_process(
     process.stdin.write(json.dumps(payload, ensure_ascii=False))
     process.stdin.close()
 
-    def terminate_timed_out_process() -> None:
-        if on_timeout is not None:
+    def terminate_process(callback: Callable[[], None] | None) -> None:
+        if callback is not None:
             with suppress(Exception):
-                on_timeout()
+                callback()
         if process.poll() is None:
             with suppress(Exception):
                 process.kill()
@@ -77,9 +83,12 @@ def consume_worker_process(
     result: dict[str, Any] | None = None
     stdout_eof = False
     while not stdout_eof:
+        if cancel_event is not None and cancel_event.is_set():
+            terminate_process(on_cancel)
+            raise WorkerCancelledError("worker was cancelled by the user")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            terminate_timed_out_process()
+            terminate_process(on_timeout)
             raise WorkerTimeoutError(f"worker exceeded {timeout_seconds} seconds")
         try:
             kind, raw = messages.get(timeout=min(0.25, remaining))
@@ -117,7 +126,7 @@ def consume_worker_process(
     try:
         return_code = process.wait(timeout=remaining)
     except subprocess.TimeoutExpired as exc:
-        terminate_timed_out_process()
+        terminate_process(on_timeout)
         raise WorkerTimeoutError(f"worker exceeded {timeout_seconds} seconds") from exc
     stdout_thread.join(timeout=1)
     stderr_thread.join(timeout=1)

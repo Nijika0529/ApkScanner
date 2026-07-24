@@ -64,6 +64,7 @@ def investigation_prompt(
                 "permission": entry.permission,
                 "permission_protection": entry.permission_protection,
                 "deep_links": entry.deep_links,
+                "code_anchors": entry.code_anchors,
                 "metadata": entry.metadata_json,
             }
             for entry in entries
@@ -82,8 +83,11 @@ def investigation_prompt(
     )
     return (
         "Assess the assigned Android entry point. Correlate manifest facts, decompiled-code "
-        f"summaries, and supplied dynamic evidence. {access_instruction} Test each hypothesis "
-        "where feasible. Do not infer successful exploitation merely from an exported declaration "
+        f"summaries, and supplied dynamic evidence. {access_instruction} "
+        "Use platform_context.target_code_context to decide target-specific source availability. "
+        "A non-zero global JADX exit code does not mean the assigned component source is missing "
+        "when its target status is source_available, partial_source_available, or smali_fallback. "
+        "Test each hypothesis where feasible. Do not infer successful exploitation merely from an exported declaration "
         "or a zero exit code. For black-box reproduction, cite both the successful Probe APK "
         "request evidence and the corresponding log evidence. For instrumented observation, cite "
         "Frida evidence. During test_planning and exploration_round phases, use the limits in "

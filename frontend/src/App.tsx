@@ -46,8 +46,8 @@ const severityTone = {
 function statusTone(status: string): "neutral" | "good" | "warning" | "danger" | "info" {
   if (["final", "completed", "covered", "accepted", "reproduced_blackbox"].includes(status)) return "good"
   if (["failed", "critical", "high", "tool_failed"].includes(status)) return "danger"
-  if (["inconclusive", "timed_out", "blocked_device", "partial", "degraded", "preliminary_ready"].includes(status)) return "warning"
-  if (["investigating", "static_running", "observed_instrumented", "running"].includes(status)) return "info"
+  if (["inconclusive", "timed_out", "blocked_device", "partial", "degraded", "preliminary_ready", "cancel_requested"].includes(status)) return "warning"
+  if (["investigating", "static_running", "observed_instrumented", "running", "queued"].includes(status)) return "info"
   return "neutral"
 }
 
@@ -109,6 +109,8 @@ function App() {
     source.onmessage = refresh
     source.addEventListener("static.completed", refresh)
     source.addEventListener("task.completed", refresh)
+    source.addEventListener("task.cancel_requested", refresh)
+    source.addEventListener("task.cancelled", refresh)
     source.addEventListener("exploration.update", refresh)
     source.addEventListener("scan.final", refresh)
     source.addEventListener("scan.failed", refresh)
@@ -308,10 +310,24 @@ function Tasks({ tasks, entries, audits, events, onRefresh }: { tasks: Investiga
   const auditCounts = audits.reduce((counts, audit) => counts.set(audit.task_id, (counts.get(audit.task_id) ?? 0) + 1), new Map<string | null, number>())
   const [retrying, setRetrying] = useState<string | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<InvestigationTask | null>(null)
+  const [cancelTarget, setCancelTarget] = useState<InvestigationTask | null>(null)
   async function retry(id: string) { setRetrying(id); try { await api.retryTask(id); await onRefresh() } finally { setRetrying(null) } }
+  const stateCounts = tasks.reduce((counts, task) => {
+    const state = taskVisualState(task).group
+    counts[state] = (counts[state] ?? 0) + 1
+    return counts
+  }, {} as Record<string, number>)
   return (
     <div className="space-y-3">
+      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5" aria-label="探索任务状态汇总">
+        <TaskStateMetric label="等待判断" value={stateCounts.waiting ?? 0} tone="border-cyan-200 bg-cyan-50 text-cyan-900" />
+        <TaskStateMetric label="正在分析" value={stateCounts.active ?? 0} tone="border-violet-200 bg-violet-50 text-violet-900" />
+        <TaskStateMetric label="已判断" value={stateCounts.judged ?? 0} tone="border-emerald-200 bg-emerald-50 text-emerald-900" />
+        <TaskStateMetric label="未形成判断" value={stateCounts.unresolved ?? 0} tone="border-amber-200 bg-amber-50 text-amber-950" />
+        <TaskStateMetric label="已停止" value={stateCounts.stopped ?? 0} tone="border-slate-200 bg-slate-100 text-slate-800" />
+      </div>
       {tasks.map((task) => {
+        const visualState = taskVisualState(task)
         const taskEvents = events.filter((event) => event.event_type.startsWith("exploration.") && event.data.task_id === task.id)
         const latest = taskEvents.at(-1)
         const started = taskEvents.find((event) => event.event_type === "exploration.started")
@@ -322,7 +338,14 @@ function Tasks({ tasks, entries, audits, events, onRefresh }: { tasks: Investiga
         const phase = textValue(lastPhased?.data.phase)
         const session = task.thread_id ?? textValue(lastSession?.data.thread_id) ?? textValue(lastSession?.data.session_id)
         return (
-          <article key={task.id} className={cn("overflow-hidden rounded-xl border bg-slate-50/70", task.status === "running" ? "border-violet-300 shadow-[0_12px_35px_rgba(124,58,237,.09)]" : "border-slate-200")}>
+          <article key={task.id} className={cn("overflow-hidden rounded-xl border bg-white shadow-sm", visualState.card)}>
+            <div className={cn("flex flex-col gap-2 border-b px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-5", visualState.banner)}>
+              <div className="flex items-center gap-2">
+                {visualState.group === "active" ? <Activity className="h-4 w-4 animate-pulse motion-reduce:animate-none" /> : visualState.group === "judged" ? <Check className="h-4 w-4" /> : visualState.group === "unresolved" ? <AlertTriangle className="h-4 w-4" /> : visualState.group === "stopped" ? <X className="h-4 w-4" /> : <Clock3 className="h-4 w-4" />}
+                <p className="text-sm font-bold">{visualState.label}</p>
+              </div>
+              <p className="text-xs opacity-80">{visualState.description}</p>
+            </div>
             <div className="p-4 sm:p-5">
               <div className="flex flex-col gap-4 sm:flex-row sm:items-start">
                 <div className={cn("grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-violet-500/10 text-violet-700", task.status === "running" && "animate-pulse motion-reduce:animate-none")}><Bot className="h-5 w-5" /></div>
@@ -354,7 +377,8 @@ function Tasks({ tasks, entries, audits, events, onRefresh }: { tasks: Investiga
                 <div className="flex shrink-0 items-center gap-3 text-xs text-slate-600">
                   <span>attempt {task.attempts}/2</span>
                   {["failed", "inconclusive", "blocked_device"].includes(task.status) && task.attempts < 2 && <Button variant="secondary" size="sm" onClick={() => retry(task.id)} disabled={retrying === task.id}>{retrying === task.id ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}重试</Button>}
-                  {["blocked_device", "completed", "not_reproduced", "inconclusive", "timed_out", "failed"].includes(task.status) && <Button variant="danger" size="sm" onClick={() => setDeleteTarget(task)}><Trash2 className="h-3.5 w-3.5" />删除</Button>}
+                  {["queued", "awaiting_device", "running", "cancel_requested"].includes(task.status) && <Button variant="danger" size="sm" onClick={() => setCancelTarget(task)} disabled={task.status === "cancel_requested"}>{task.status === "cancel_requested" ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <X className="h-3.5 w-3.5" />}{task.status === "queued" ? "取消等待" : task.status === "cancel_requested" ? "正在停止" : "停止分析"}</Button>}
+                  {["blocked_device", "completed", "not_reproduced", "inconclusive", "timed_out", "failed", "canceled"].includes(task.status) && <Button variant="danger" size="sm" onClick={() => setDeleteTarget(task)}><Trash2 className="h-3.5 w-3.5" />删除</Button>}
                 </div>
               </div>
             </div>
@@ -379,7 +403,57 @@ function Tasks({ tasks, entries, audits, events, onRefresh }: { tasks: Investiga
         onOpenChange={(open) => !open && setDeleteTarget(null)}
         onDeleted={async () => { setDeleteTarget(null); await onRefresh() }}
       />
+      <CancelTaskDialog
+        task={cancelTarget}
+        target={cancelTarget?.target_entry_ids.map((id) => names.get(id) ?? id).join(" · ") ?? ""}
+        onOpenChange={(open) => !open && setCancelTarget(null)}
+        onCancelled={async () => { setCancelTarget(null); await onRefresh() }}
+      />
     </div>
+  )
+}
+
+function TaskStateMetric({ label, value, tone }: { label: string; value: number; tone: string }) {
+  return <div className={cn("flex items-center justify-between rounded-xl border px-3 py-2.5", tone)}><span className="text-xs font-semibold">{label}</span><span className="text-lg font-black tabular-nums">{value}</span></div>
+}
+
+function taskVisualState(task: InvestigationTask) {
+  if (task.status === "queued" || task.status === "awaiting_device") return { group: "waiting", label: "等待判断", description: "尚未占用设备或调用 AI", card: "border-cyan-200", banner: "border-cyan-200 bg-cyan-50 text-cyan-950" }
+  if (task.status === "running") return { group: "active", label: "正在分析", description: "SDK 正在探索并持续记录关键事件", card: "border-violet-300 shadow-[0_12px_35px_rgba(124,58,237,.10)]", banner: "border-violet-200 bg-violet-50 text-violet-950" }
+  if (task.status === "cancel_requested") return { group: "active", label: "正在停止", description: "已发送中止请求，等待 Worker 确认", card: "border-amber-300", banner: "border-amber-200 bg-amber-50 text-amber-950" }
+  if (task.status === "completed" || task.status === "not_reproduced") return { group: "judged", label: "已判断", description: task.result.result ? `平台结论：${statusLabel(String(task.result.result))}` : "平台已完成证据校验", card: "border-emerald-200", banner: "border-emerald-200 bg-emerald-50 text-emerald-950" }
+  if (task.status === "canceled") return { group: "stopped", label: "已停止", description: "用户主动终止，未产生新的最终结论", card: "border-slate-300", banner: "border-slate-200 bg-slate-100 text-slate-800" }
+  return { group: "unresolved", label: "未形成判断", description: task.status === "blocked_device" ? "设备或 AI 能力阻塞，可修复后重试" : "证据、工具或预算不足", card: "border-amber-200", banner: "border-amber-200 bg-amber-50 text-amber-950" }
+}
+
+function CancelTaskDialog({ task, target, onOpenChange, onCancelled }: { task: InvestigationTask | null; target: string; onOpenChange: (open: boolean) => void; onCancelled: () => Promise<void> }) {
+  const [cancelling, setCancelling] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => setError(null), [task?.id])
+  async function cancel() {
+    if (!task) return
+    setCancelling(true)
+    setError(null)
+    try {
+      await api.cancelTask(task.id)
+      await onCancelled()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "停止失败")
+    } finally {
+      setCancelling(false)
+    }
+  }
+  const waiting = task?.status === "queued" || task?.status === "awaiting_device"
+  return (
+    <Dialog open={Boolean(task)} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogTitle className="text-xl font-bold text-slate-950">{waiting ? "取消等待任务？" : "停止当前 AI 分析？"}</DialogTitle>
+        <DialogDescription className="mt-2 text-sm leading-6 text-slate-600">{waiting ? "任务会从等待队列中取消，不会占用云真机或调用模型。" : "平台会中止当前 Codex turn 或 OpenCode Worker，保留已经产生的 Evidence 和审计事件，但本次任务不会生成新的最终判断。"}</DialogDescription>
+        {task && <div className="mt-5 rounded-xl border border-amber-200 bg-amber-50 p-4"><p className="font-semibold text-amber-950">{task.task_type === "deep_link" ? "Deep Link handler 探索" : "导出组件探索"}</p><p className="mt-1 break-all font-mono text-xs text-amber-800">{target || task.id}</p></div>}
+        {error && <p role="alert" className="mt-4 text-sm text-rose-700">{error}</p>}
+        <div className="mt-6 flex justify-end gap-2"><Button variant="ghost" onClick={() => onOpenChange(false)} disabled={cancelling}>继续分析</Button><Button variant="danger" onClick={cancel} disabled={cancelling}>{cancelling ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <X className="h-4 w-4" />}{cancelling ? "正在处理" : waiting ? "确认取消等待" : "确认停止分析"}</Button></div>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -464,6 +538,7 @@ function AgentAudits({ audits, tasks, entries }: { audits: AgentAudit[]; tasks: 
                 <p className="mt-1 font-mono">audit {shortHash(audit.id)}</p>
               </div>
             </div>
+            <AuditConclusion audit={audit} />
             <div className="grid gap-3 p-4 md:grid-cols-2">
               <AuditValue label="Thread ID" value={audit.thread_id ?? "—"} />
               <AuditValue label="Turn ID" value={audit.turn_id ?? "—"} />
@@ -475,6 +550,7 @@ function AgentAudits({ audits, tasks, entries }: { audits: AgentAudit[]; tasks: 
               <AuditArtifact title="模型结构化原始输出" artifact={audit.artifacts.response} />
               <AuditArtifact title="AI 申请测试的白名单裁决" artifact={audit.artifacts.test_validation} />
               <AuditArtifact title="平台证据校验与最终结论" artifact={audit.artifacts.validation} />
+              <AuditArtifact title="用户中止记录" artifact={audit.artifacts.cancellation} />
               <AuditArtifact title="调用错误" artifact={audit.artifacts.error} />
             </div>
           </article>
@@ -482,6 +558,80 @@ function AgentAudits({ audits, tasks, entries }: { audits: AgentAudit[]; tasks: 
       })}
     </div>
   )
+}
+
+function AuditConclusion({ audit }: { audit: AgentAudit }) {
+  const response = asRecord(audit.artifacts.response?.content)
+  const validation = asRecord(audit.artifacts.validation?.content)
+  const rawOutput = asRecord(response?.structured_output)
+  const validatedOutput = asRecord(validation?.validated_output) ?? rawOutput
+  if (!validatedOutput) return null
+
+  const result = textValue(validation?.final_result) ?? textValue(validatedOutput.result) ?? "inconclusive"
+  const claimedResult = textValue(validation?.claimed_result)
+  const summary = textValue(validatedOutput.summary) ?? "模型未提供结论摘要。"
+  const severity = textValue(validatedOutput.severity_proposal) ?? "—"
+  const confidence = textValue(validatedOutput.confidence) ?? "—"
+  const evidenceIds = stringValues(validation?.accepted_evidence_ids ?? validatedOutput.evidence_ids)
+  const rejectedEvidenceIds = stringValues(validation?.rejected_evidence_ids)
+  const gaps = stringValues(validatedOutput.coverage_gaps)
+  const downgraded = validation?.downgraded === true
+  const presentation = auditResultPresentation(result)
+  const headingId = `audit-conclusion-${audit.id}`
+
+  return (
+    <section aria-labelledby={headingId} className={cn("mx-4 mt-4 overflow-hidden rounded-xl border", presentation.container)}>
+      <div className="flex flex-col gap-4 p-4 sm:flex-row sm:items-start sm:justify-between">
+        <div className="flex min-w-0 gap-3">
+          <div className={cn("grid h-11 w-11 shrink-0 place-items-center rounded-xl ring-1 ring-inset", presentation.iconContainer)}>
+            {result === "not_reproduced" ? <ShieldCheck className="h-5 w-5" /> : result === "inconclusive" ? <AlertTriangle className="h-5 w-5" /> : <ShieldX className="h-5 w-5" />}
+          </div>
+          <div className="min-w-0">
+            <p className={cn("text-[11px] font-bold uppercase tracking-[0.16em]", presentation.eyebrow)}>{validation ? "平台校验后的最终结论" : "模型本轮结论"}</p>
+            <h4 id={headingId} className="mt-1 text-lg font-bold text-slate-950">{presentation.label}</h4>
+            <p className="mt-2 text-sm leading-6 text-slate-700">{summary}</p>
+          </div>
+        </div>
+        <div className="grid shrink-0 grid-cols-3 gap-2 sm:min-w-72">
+          <ConclusionMetric label="风险等级" value={severity.toUpperCase()} />
+          <ConclusionMetric label="置信度" value={confidenceLabel(confidence)} />
+          <ConclusionMetric label="有效证据" value={String(evidenceIds.length)} />
+        </div>
+      </div>
+      {(downgraded || gaps.length > 0 || rejectedEvidenceIds.length > 0) && (
+        <div className="border-t border-current/10 bg-white/55 px-4 py-3">
+          {downgraded && <div role="status" className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /><span>平台因证据条件不足，将模型声明从“{auditResultPresentation(claimedResult ?? "inconclusive").label}”降级为“{presentation.label}”。</span></div>}
+          <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-xs text-slate-600">
+            {gaps.slice(0, 3).map((gap, index) => <span key={`${index}-${gap}`} className="flex items-start gap-1.5"><CircleDot className="mt-0.5 h-3 w-3 shrink-0" />{gap}</span>)}
+            {rejectedEvidenceIds.length > 0 && <span>拒绝了 {rejectedEvidenceIds.length} 个无效 Evidence ID</span>}
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}
+
+function ConclusionMetric({ label, value }: { label: string; value: string }) {
+  return <div className="rounded-lg border border-white/70 bg-white/75 px-2 py-2 text-center shadow-sm"><p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">{label}</p><p className="mt-1 text-xs font-bold text-slate-900">{value}</p></div>
+}
+
+function auditResultPresentation(result: string) {
+  if (["reproduced_blackbox", "observed_instrumented"].includes(result)) return { label: result === "reproduced_blackbox" ? "已完成黑盒复现" : "已观察到插桩证据", container: "border-rose-200 bg-rose-50/80", iconContainer: "bg-rose-100 text-rose-700 ring-rose-200", eyebrow: "text-rose-700" }
+  if (result === "supported_static") return { label: "静态证据支持风险", container: "border-orange-200 bg-orange-50/80", iconContainer: "bg-orange-100 text-orange-700 ring-orange-200", eyebrow: "text-orange-700" }
+  if (result === "not_reproduced") return { label: "当前测试未能复现", container: "border-emerald-200 bg-emerald-50/80", iconContainer: "bg-emerald-100 text-emerald-700 ring-emerald-200", eyebrow: "text-emerald-700" }
+  return { label: "证据不足，暂无法定论", container: "border-amber-200 bg-amber-50/80", iconContainer: "bg-amber-100 text-amber-800 ring-amber-200", eyebrow: "text-amber-800" }
+}
+
+function confidenceLabel(value: string) {
+  return { high: "高", medium: "中", low: "低" }[value] ?? value
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+}
+
+function stringValues(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []
 }
 
 function AuditArtifact({ title, artifact }: { title: string; artifact?: AgentAudit["artifacts"][string] }) {
