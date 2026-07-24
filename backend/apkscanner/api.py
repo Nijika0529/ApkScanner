@@ -7,11 +7,11 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
-from sqlalchemy import case, desc, select
+from sqlalchemy import case, desc, select, update
 from sqlalchemy.orm import Session
 
 from . import __version__
-from .agent_audit import build_agent_audits
+from .agent_audit import AGENT_AUDIT_KINDS, build_agent_audits
 from .artifacts import ArtifactStore, ArtifactTooLargeError
 from .db import Database
 from .enums import ScanStatus, TaskStatus
@@ -32,6 +32,7 @@ from .schemas import (
     ScanDeleteResult,
     ScanDetail,
     ScanSummary,
+    TaskDeleteResult,
 )
 
 router = APIRouter(prefix="/api/v1")
@@ -414,6 +415,45 @@ async def retry_task(
     request.app.state.background_tasks.add(background)
     background.add_done_callback(request.app.state.background_tasks.discard)
     return task
+
+
+@router.delete("/tasks/{task_id}", response_model=TaskDeleteResult)
+def delete_task(
+    task_id: str,
+    session: Session = Depends(get_session),
+) -> TaskDeleteResult:
+    task = session.get(InvestigationTask, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    if task.status not in {
+        TaskStatus.BLOCKED_DEVICE.value,
+        TaskStatus.COMPLETED.value,
+        TaskStatus.NOT_REPRODUCED.value,
+        TaskStatus.INCONCLUSIVE.value,
+        TaskStatus.TIMED_OUT.value,
+        TaskStatus.FAILED.value,
+    }:
+        raise HTTPException(409, "Only a terminal task can be deleted")
+
+    audit_artifacts = list(
+        session.scalars(
+            select(Evidence).where(
+                Evidence.task_id == task_id,
+                Evidence.kind.in_(AGENT_AUDIT_KINDS),
+            )
+        )
+    )
+    # Evidence and findings are scan-level security records. Detach them from the
+    # execution row before deleting the task so AI audits remain available.
+    session.execute(
+        update(Evidence).where(Evidence.task_id == task_id).values(task_id=None)
+    )
+    session.delete(task)
+    session.commit()
+    return TaskDeleteResult(
+        id=task_id,
+        audit_artifacts_preserved=len(audit_artifacts),
+    )
 
 
 @router.get("/evidence/{evidence_id}", response_model=EvidenceOut)

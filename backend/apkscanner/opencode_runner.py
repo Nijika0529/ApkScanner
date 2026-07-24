@@ -23,6 +23,7 @@ from .worker_protocol import WorkerTimeoutError, consume_worker_process
 
 OPENCODE_SDK_VERSION = "1.18.4"
 OPENCODE_CLI_VERSION = "1.18.4"
+AJV_VERSION = "8.20.0"
 OPENCODE_PROVIDER = "deepseek"
 OPENCODE_OUTPUT_MODE_PROMPTED_JSON = "prompted_json"
 OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL = "structured_output_tool"
@@ -318,14 +319,20 @@ class OpenCodeInvestigator:
             }
         sdk_version = self._installed_package_version("@opencode-ai/sdk")
         cli_version = self._installed_package_version("opencode-ai")
-        if sdk_version != OPENCODE_SDK_VERSION or cli_version != OPENCODE_CLI_VERSION:
+        ajv_version = self._installed_package_version("ajv")
+        if (
+            sdk_version != OPENCODE_SDK_VERSION
+            or cli_version != OPENCODE_CLI_VERSION
+            or ajv_version != AJV_VERSION
+        ):
             return {
                 **capability,
                 "available": False,
                 "detail": (
-                    f"run npm ci --prefix {self.worker_dir}; expected SDK/CLI "
-                    f"{OPENCODE_SDK_VERSION}, found {sdk_version or 'missing'}/"
-                    f"{cli_version or 'missing'}"
+                    f"run npm ci --prefix {self.worker_dir}; expected SDK/CLI/Ajv "
+                    f"{OPENCODE_SDK_VERSION}/{OPENCODE_CLI_VERSION}/{AJV_VERSION}, found "
+                    f"{sdk_version or 'missing'}/{cli_version or 'missing'}/"
+                    f"{ajv_version or 'missing'}"
                 ),
             }
         opencode_bin = self.worker_dir / "node_modules" / ".bin" / "opencode"
@@ -362,6 +369,7 @@ class OpenCodeInvestigator:
                     (
                         '{{ index .Config.Labels "io.apkscanner.opencode-sdk-version" }}'
                         '|{{ index .Config.Labels "io.apkscanner.opencode-version" }}'
+                        '|{{ index .Config.Labels "io.apkscanner.ajv-version" }}'
                         '|{{ index .Config.Labels "io.apkscanner.worker-protocol" }}'
                     ),
                     image,
@@ -380,7 +388,7 @@ class OpenCodeInvestigator:
                 "available": False,
                 "detail": f"build the OpenCode worker image first: {image}",
             }
-        expected = f"{OPENCODE_SDK_VERSION}|{OPENCODE_CLI_VERSION}|2"
+        expected = f"{OPENCODE_SDK_VERSION}|{OPENCODE_CLI_VERSION}|{AJV_VERSION}|2"
         if inspected.stdout.strip() != expected:
             return {
                 **capability,

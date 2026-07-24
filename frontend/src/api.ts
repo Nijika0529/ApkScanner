@@ -9,6 +9,7 @@ import type {
   Scan,
   ScanDeleteResult,
   ScanEvent,
+  TaskDeleteResult,
 } from "./types"
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -46,6 +47,8 @@ export const api = {
     }),
   retryTask: (taskId: string) =>
     request<InvestigationTask>(`/api/v1/tasks/${taskId}/retry`, { method: "POST" }),
+  deleteTask: (taskId: string) =>
+    request<TaskDeleteResult>(`/api/v1/tasks/${taskId}`, { method: "DELETE" }),
   deleteScan: (scanId: string) =>
     request<ScanDeleteResult>(`/api/v1/scans/${scanId}`, { method: "DELETE" }),
 }

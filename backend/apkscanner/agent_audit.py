@@ -67,6 +67,8 @@ def _build_audit(
             "created_at": item.created_at.isoformat(),
         }
 
+    request = artifacts.get("request", {}).get("content")
+    request_object = request if isinstance(request, dict) else {}
     response = artifacts.get("response", {}).get("content")
     status = (
         "failed"
@@ -87,7 +89,9 @@ def _build_audit(
     return {
         "id": audit_id,
         "scan_id": first.scan_id,
-        "task_id": first.task_id,
+        # A completed task may be removed from the operational queue. Its
+        # immutable request artifact still carries the original task ID.
+        "task_id": first.task_id or request_object.get("task_id"),
         "attempt": int(metadata.get("attempt", 0)),
         "phase": str(metadata.get("phase", "unknown")),
         "backend": str(metadata.get("backend", "unknown")),

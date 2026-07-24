@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from apkscanner.models import EntryPoint, InvestigationTask, Scan
 from apkscanner.opencode_runner import (
+    AJV_VERSION,
     OPENCODE_CLI_VERSION,
     OPENCODE_OUTPUT_MODE_PROMPTED_JSON,
     OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
@@ -23,6 +24,7 @@ def _worker_tree(root: Path) -> Path:
     worker = root / "opencode-worker"
     (worker / "node_modules" / "@opencode-ai" / "sdk").mkdir(parents=True)
     (worker / "node_modules" / "opencode-ai").mkdir(parents=True)
+    (worker / "node_modules" / "ajv").mkdir(parents=True)
     (worker / "node_modules" / ".bin").mkdir(parents=True)
     (worker / "worker.mjs").write_text("// test worker\n", encoding="utf-8")
     (worker / "node_modules" / "@opencode-ai" / "sdk" / "package.json").write_text(
@@ -31,6 +33,10 @@ def _worker_tree(root: Path) -> Path:
     )
     (worker / "node_modules" / "opencode-ai" / "package.json").write_text(
         json.dumps({"version": OPENCODE_CLI_VERSION}),
+        encoding="utf-8",
+    )
+    (worker / "node_modules" / "ajv" / "package.json").write_text(
+        json.dumps({"version": AJV_VERSION}),
         encoding="utf-8",
     )
     (worker / "node_modules" / ".bin" / "opencode").write_text(
@@ -70,7 +76,13 @@ def test_host_capability_requires_key_and_pinned_packages(
     package.write_text(json.dumps({"version": "0.0.0"}), encoding="utf-8")
     incompatible = investigator.capability()
     assert incompatible["available"] is False
-    assert "expected SDK/CLI" in incompatible["detail"]
+    assert "expected SDK/CLI/Ajv" in incompatible["detail"]
+
+    package.write_text(json.dumps({"version": OPENCODE_SDK_VERSION}), encoding="utf-8")
+    (worker / "node_modules" / "ajv" / "package.json").unlink()
+    missing_ajv = investigator.capability()
+    assert missing_ajv["available"] is False
+    assert "missing" in missing_ajv["detail"]
 
 
 def test_capability_rejects_credential_bearing_base_url(

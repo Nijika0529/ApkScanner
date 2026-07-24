@@ -10,6 +10,7 @@ ENV NODE_ENV=production \
 LABEL io.apkscanner.version="0.1.0" \
       io.apkscanner.opencode-sdk-version="1.18.4" \
       io.apkscanner.opencode-version="1.18.4" \
+      io.apkscanner.ajv-version="8.20.0" \
       io.apkscanner.worker-protocol="2"
 
 WORKDIR /opt/apkscanner-opencode

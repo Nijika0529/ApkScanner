@@ -307,6 +307,7 @@ function Tasks({ tasks, entries, audits, events, onRefresh }: { tasks: Investiga
   const names = new Map(entries.map((item) => [item.id, item.name]))
   const auditCounts = audits.reduce((counts, audit) => counts.set(audit.task_id, (counts.get(audit.task_id) ?? 0) + 1), new Map<string | null, number>())
   const [retrying, setRetrying] = useState<string | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<InvestigationTask | null>(null)
   async function retry(id: string) { setRetrying(id); try { await api.retryTask(id); await onRefresh() } finally { setRetrying(null) } }
   return (
     <div className="space-y-3">
@@ -353,6 +354,7 @@ function Tasks({ tasks, entries, audits, events, onRefresh }: { tasks: Investiga
                 <div className="flex shrink-0 items-center gap-3 text-xs text-slate-600">
                   <span>attempt {task.attempts}/2</span>
                   {["failed", "inconclusive", "blocked_device"].includes(task.status) && task.attempts < 2 && <Button variant="secondary" size="sm" onClick={() => retry(task.id)} disabled={retrying === task.id}>{retrying === task.id ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}重试</Button>}
+                  {["blocked_device", "completed", "not_reproduced", "inconclusive", "timed_out", "failed"].includes(task.status) && <Button variant="danger" size="sm" onClick={() => setDeleteTarget(task)}><Trash2 className="h-3.5 w-3.5" />删除</Button>}
                 </div>
               </div>
             </div>
@@ -371,7 +373,43 @@ function Tasks({ tasks, entries, audits, events, onRefresh }: { tasks: Investiga
         )
       })}
       {!tasks.length && <EmptyRow text="静态规划完成后将生成入口探索任务" />}
+      <DeleteTaskDialog
+        task={deleteTarget}
+        target={deleteTarget?.target_entry_ids.map((id) => names.get(id) ?? id).join(" · ") ?? ""}
+        onOpenChange={(open) => !open && setDeleteTarget(null)}
+        onDeleted={async () => { setDeleteTarget(null); await onRefresh() }}
+      />
     </div>
+  )
+}
+
+function DeleteTaskDialog({ task, target, onOpenChange, onDeleted }: { task: InvestigationTask | null; target: string; onOpenChange: (open: boolean) => void; onDeleted: () => Promise<void> }) {
+  const [deleting, setDeleting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => setError(null), [task?.id])
+  async function remove() {
+    if (!task) return
+    setDeleting(true)
+    setError(null)
+    try {
+      await api.deleteTask(task.id)
+      await onDeleted()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "删除失败")
+    } finally {
+      setDeleting(false)
+    }
+  }
+  return (
+    <Dialog open={Boolean(task)} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogTitle className="text-xl font-bold text-slate-950">删除已执行任务？</DialogTitle>
+        <DialogDescription className="mt-2 text-sm leading-6 text-slate-600">任务将从探索任务列表移除。已经形成的 Finding、Evidence 和 AI 审计不会删除，仍可在报告与“AI 审计”页中追溯。</DialogDescription>
+        {task && <div className="mt-5 rounded-xl border border-rose-200 bg-rose-50 p-4"><p className="font-semibold text-rose-900">{task.task_type === "deep_link" ? "Deep Link handler 探索" : "导出组件探索"}</p><p className="mt-1 break-all font-mono text-xs text-rose-700">{target || task.id}</p></div>}
+        {error && <p role="alert" className="mt-4 text-sm text-rose-700">{error}</p>}
+        <div className="mt-6 flex justify-end gap-2"><Button variant="ghost" onClick={() => onOpenChange(false)} disabled={deleting}>取消</Button><Button variant="danger" onClick={remove} disabled={deleting}>{deleting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}{deleting ? "正在删除" : "确认删除任务"}</Button></div>
+      </DialogContent>
+    </Dialog>
   )
 }
 

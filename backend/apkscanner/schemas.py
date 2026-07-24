@@ -182,6 +182,12 @@ class ScanDeleteResult(BaseModel):
     cleanup_warnings: list[str]
 
 
+class TaskDeleteResult(BaseModel):
+    id: str
+    deleted: Literal[True] = True
+    audit_artifacts_preserved: int
+
+
 class AgentRequestedTest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

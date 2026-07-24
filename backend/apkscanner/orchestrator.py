@@ -27,6 +27,7 @@ from .instrumentation import FridaAdapter
 from .mobsf import MobSFAdapter
 from .models import CoverageItem, EntryPoint, Evidence, Finding, InvestigationTask, Scan
 from .opencode_runner import (
+    AJV_VERSION,
     OPENCODE_OUTPUT_MODE_PROMPTED_JSON,
     OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
     OpenCodeInvestigator,
@@ -1421,7 +1422,7 @@ class ScanOrchestrator:
                     else None
                 ),
                 "schema_validator": (
-                    "ajv@8.20.0"
+                    f"ajv@{AJV_VERSION}"
                     if backend == "opencode"
                     and output_mode == OPENCODE_OUTPUT_MODE_PROMPTED_JSON
                     else None

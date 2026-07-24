@@ -109,6 +109,102 @@ def test_running_scan_cannot_be_deleted(settings) -> None:  # noqa: ANN001
         assert response.status_code == 409
 
 
+def test_terminal_task_can_be_deleted_while_ai_audit_is_preserved(settings) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    evidence_sha, evidence_path = app.state.store.put_json(
+        "evidence",
+        {"task_id": "00000000-0000-0000-0000-000000000042"},
+    )
+    with app.state.database.session_factory() as session:
+        scan = Scan(
+            id="00000000-0000-0000-0000-000000000040",
+            status="final",
+            filename="task-delete.apk",
+            artifact_sha256="d" * 64,
+            artifact_path=str(settings.data_dir / "missing-task-delete.apk"),
+        )
+        task = InvestigationTask(
+            id="00000000-0000-0000-0000-000000000042",
+            scan_id=scan.id,
+            task_type="component",
+            status="blocked_device",
+            attempts=1,
+        )
+        session.add_all([scan, task])
+        session.flush()
+        session.add(
+            Evidence(
+                scan_id=scan.id,
+                task_id=task.id,
+                kind="agent.request",
+                sha256=evidence_sha,
+                path=str(evidence_path),
+                metadata_json={
+                    "audit_id": "00000000-0000-0000-0000-000000000043",
+                    "backend": "opencode",
+                    "provider": "deepseek",
+                    "model": "deepseek-v4-pro",
+                    "isolation": "host",
+                    "phase": "test_planning",
+                    "attempt": 1,
+                },
+            )
+        )
+        session.commit()
+
+    with TestClient(app) as client:
+        blocked = client.delete(f"/api/v1/tasks/{task.id}")
+        assert blocked.status_code == 403
+        deleted = client.delete(
+            f"/api/v1/tasks/{task.id}",
+            headers={"X-APKScanner-Request": "console"},
+        )
+        assert deleted.status_code == 200
+        assert deleted.json() == {
+            "id": task.id,
+            "deleted": True,
+            "audit_artifacts_preserved": 1,
+        }
+        assert client.get(f"/api/v1/scans/{scan.id}/tasks").json() == []
+        audits = client.get(f"/api/v1/scans/{scan.id}/agent-audits").json()
+        assert audits[0]["task_id"] == task.id
+        assert audits[0]["integrity"] == "verified"
+
+    assert evidence_path.exists()
+    with app.state.database.session_factory() as session:
+        assert session.get(InvestigationTask, task.id) is None
+        evidence = session.scalar(select(Evidence).where(Evidence.scan_id == scan.id))
+        assert evidence is not None
+        assert evidence.task_id is None
+
+
+def test_running_task_cannot_be_deleted(settings) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    with app.state.database.session_factory() as session:
+        scan = Scan(
+            id="00000000-0000-0000-0000-000000000050",
+            status="investigating",
+            filename="running-task.apk",
+            artifact_sha256="e" * 64,
+            artifact_path=str(settings.data_dir / "missing-running-task.apk"),
+        )
+        task = InvestigationTask(
+            id="00000000-0000-0000-0000-000000000051",
+            scan_id=scan.id,
+            task_type="component",
+            status="running",
+        )
+        session.add_all([scan, task])
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.delete(
+            f"/api/v1/tasks/{task.id}",
+            headers={"X-APKScanner-Request": "console"},
+        )
+        assert response.status_code == 409
+
+
 def test_deleting_one_scan_preserves_a_shared_apk(settings) -> None:  # noqa: ANN001
     app = create_app(settings)
     sha256, artifact_path = app.state.store.put_bytes(

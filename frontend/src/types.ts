@@ -139,6 +139,12 @@ export interface ScanDeleteResult {
   cleanup_warnings: string[]
 }
 
+export interface TaskDeleteResult {
+  id: string
+  deleted: true
+  audit_artifacts_preserved: number
+}
+
 export interface Capability {
   name: string
   available: boolean
