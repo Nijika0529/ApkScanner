@@ -15,3 +15,4 @@ config/auth-flow.json
 frontend/package-lock.json
 opencode
 opencode-worker/node_modules/
+.vscode
