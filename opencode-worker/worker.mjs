@@ -13,12 +13,16 @@ const PROMPTED_JSON_RETRY_COUNT = 2
 const WORKSPACE_TOOL_PROFILE = "workspace_shell"
 const WORKSPACE_TOOLS = ["read", "glob", "grep", "bash"]
 const MAX_AGENT_STEPS = 100
+const LOCAL_POLL_INTERVAL_MS = 250
+const LOCAL_READ_RETRY_COUNT = 3
 
 let server
 let sessionID
+let workerDeadline
 
 async function main() {
   const payload = validatePayload(await readPayload())
+  workerDeadline = Date.now() + payload.timeout_ms
   const controller = new AbortController()
   const timeout = setTimeout(
     () => controller.abort(new Error("OpenCode worker deadline exceeded")),
@@ -165,11 +169,10 @@ async function investigatePromptedJson(client, payload) {
       output_mode: OUTPUT_MODE_PROMPTED_JSON,
     })
     const enabledTools = index === 0 ? workspaceToolFlags(payload) : disabledWorkspaceToolFlags()
-    const response = await prompt(
+    const response = await promptAsyncAndWait(
       client,
       payload,
       promptText,
-      { type: "text" },
       enabledTools,
     )
     responses.push(response)
@@ -268,18 +271,124 @@ function prompt(client, payload, promptText, format, tools) {
     .prompt({
       path: { id: sessionID },
       body: {
-        agent: "apkscanner",
-        model: {
-          providerID: PROVIDER_ID,
-          modelID: payload.model,
-        },
-        system: payload.developer_instructions,
+        ...promptBody(payload, promptText, tools),
         format,
-        tools,
-        parts: [{ type: "text", text: promptText }],
       },
     })
     .then((response) => unwrap(response, "session.prompt"))
+}
+
+async function promptAsyncAndWait(client, payload, promptText, tools) {
+  const before = unwrap(
+    await localRead(
+      () => client.session.messages({ path: { id: sessionID } }),
+      "session.messages.before",
+    ),
+    "session.messages.before",
+  )
+  const knownMessageIDs = new Set(
+    before
+      .map((message) => message?.info?.id)
+      .filter((value) => typeof value === "string"),
+  )
+  emitRuntimeEvent(
+    "model.transport.selected",
+    "DeepSeek Pro 已切换为异步下发与短连接结果轮询",
+    {
+      session_id: sessionID,
+      request_mode: "prompt_async_poll",
+      poll_interval_ms: LOCAL_POLL_INTERVAL_MS,
+    },
+  )
+  unwrap(
+    await client.session.promptAsync({
+      path: { id: sessionID },
+      body: promptBody(payload, promptText, tools),
+    }),
+    "session.prompt_async",
+  )
+
+  while (Date.now() < workerDeadline) {
+    const messages = unwrap(
+      await localRead(
+        () => client.session.messages({ path: { id: sessionID } }),
+        "session.messages.poll",
+      ),
+      "session.messages.poll",
+    )
+    const completed = messages
+      .filter(
+        (message) =>
+          message?.info?.role === "assistant" &&
+          !knownMessageIDs.has(message.info.id) &&
+          (message.info.error ||
+            message.info.time?.completed ||
+            message.info.finish),
+      )
+      .sort(
+        (left, right) =>
+          (right.info.time?.created ?? 0) - (left.info.time?.created ?? 0),
+      )[0]
+    if (completed) return completed
+    const remaining = workerDeadline - Date.now()
+    if (remaining <= 0) break
+    await delay(Math.min(LOCAL_POLL_INTERVAL_MS, remaining))
+  }
+  throw new Error("OpenCode async prompt exceeded the worker deadline")
+}
+
+function promptBody(payload, promptText, tools) {
+  return {
+    agent: "apkscanner",
+    model: {
+      providerID: PROVIDER_ID,
+      modelID: payload.model,
+    },
+    system: payload.developer_instructions,
+    tools,
+    parts: [{ type: "text", text: promptText }],
+  }
+}
+
+async function localRead(operation, label) {
+  let lastError
+  for (let attempt = 1; attempt <= LOCAL_READ_RETRY_COUNT; attempt += 1) {
+    try {
+      return await operation()
+    } catch (error) {
+      lastError = error
+      if (!isFetchFailure(error) || attempt === LOCAL_READ_RETRY_COUNT) throw error
+      const backoffMs = 100 * 2 ** (attempt - 1)
+      if (Date.now() + backoffMs >= workerDeadline) throw error
+      emitRuntimeEvent("model.transport.retry", "OpenCode 本地读取连接短暂中断，正在重试", {
+        session_id: sessionID,
+        operation: label,
+        attempt,
+        backoff_ms: backoffMs,
+        error: formatThrownError(error).slice(0, 1000),
+      })
+      await delay(backoffMs)
+    }
+  }
+  throw lastError
+}
+
+function isFetchFailure(error) {
+  if (!(error instanceof Error)) return false
+  if (error.name === "TypeError" && /fetch failed/i.test(error.message)) return true
+  const code = error.cause?.code
+  return [
+    "ECONNREFUSED",
+    "ECONNRESET",
+    "EPIPE",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_SOCKET",
+  ].includes(code)
+}
+
+function delay(milliseconds) {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds))
 }
 
 async function startEventPump(client) {
@@ -437,6 +546,7 @@ function promptedJsonTransport(calls) {
   return {
     mode: OUTPUT_MODE_PROMPTED_JSON,
     format: "text",
+    request_mode: "prompt_async_poll",
     tool_choice: "auto",
     tools: WORKSPACE_TOOLS,
     schema_validator: "ajv@8.20.0",
@@ -796,10 +906,29 @@ main()
   .then((result) => emitRecord({ type: "result", result }))
   .catch((error) => {
     const secret = process.env.DEEPSEEK_API_KEY
-    const message = error instanceof Error ? error.stack ?? error.message : String(error)
+    const message = formatThrownError(error)
     stderr.write(secret ? message.replaceAll(secret, "[redacted]") : message)
     process.exitCode = 1
   })
+
+function formatThrownError(error) {
+  if (!(error instanceof Error)) return String(error)
+  const lines = [error.stack ?? `${error.name}: ${error.message}`]
+  const seen = new Set([error])
+  let cause = error.cause
+  while (cause && !seen.has(cause)) {
+    seen.add(cause)
+    if (cause instanceof Error) {
+      const code = typeof cause.code === "string" ? ` [${cause.code}]` : ""
+      lines.push(`Caused by${code}: ${cause.stack ?? `${cause.name}: ${cause.message}`}`)
+      cause = cause.cause
+    } else {
+      lines.push(`Caused by: ${formatError(cause)}`)
+      break
+    }
+  }
+  return lines.join("\n")
+}
 
 function emitRuntimeEvent(eventType, message, data = {}) {
   emitRecord({

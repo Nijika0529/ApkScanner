@@ -206,7 +206,10 @@ scan workspace or `/tmp`; the container root filesystem stays read-only. Native 
 and subagent tools remain denied. ADB is blocked by OpenCode permissions and a PATH shim, and no
 device serial or socket is mounted. `deepseek-v4-pro` uses the normal OpenCode tool loop and returns
 text JSON without the incompatible `tool_choice: required`; the worker validates it locally with
-Ajv and can issue two tool-disabled correction turns in the same session. `deepseek-v4-flash` uses
+Ajv and can issue two tool-disabled correction turns in the same session. Pro turns are dispatched
+with `promptAsync` and observed through short message polls, so review and exploration do not depend
+on one long-lived loopback HTTP response. A retryable local transport failure can rebuild the worker
+once within the original task budget without changing models. `deepseek-v4-flash` uses
 the same workspace tools plus OpenCode's internal `StructuredOutput` collector. Requested Android
 tests are always validated and executed by the Python control plane.
 

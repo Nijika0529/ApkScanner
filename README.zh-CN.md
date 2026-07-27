@@ -160,7 +160,12 @@ export APKSCANNER_INVESTIGATOR_BACKEND=opencode
 scanctl capabilities --deep
 ```
 
-Host Worker 为每次调用创建私有的临时 HOME/XDG 目录树以及认证过的 loopback OpenCode 服务器。无论哪种模式，OpenCode 都只接收平台生成的任务 JSON：文件系统、Shell、Web、MCP 和子 Agent 工具均被拒绝。其唯一可调用的工具是 OpenCode 内置的 `StructuredOutput` 结果收集器；请求的 Android 测试由 Python 控制面验证并执行。
+Host Worker 为每次调用创建私有的临时 HOME/XDG 目录树以及认证过的 loopback OpenCode
+服务器。两种模式都允许 OpenCode 使用 `read`、`glob`、`grep` 和 `bash` 检查当前扫描
+workspace；原生编辑、Web、MCP、子 Agent 和 ADB 保持禁用，请求的 Android 测试仍由
+Python 控制面验证并执行。`deepseek-v4-pro` 通过 `promptAsync` 和短连接消息轮询完成
+长推理，避免 review/自由探索阶段依赖一条长期占用的 loopback HTTP 请求；瞬时本地连接
+失败会在剩余任务预算内重建一次 worker，不会静默切换模型。
 
 设置 `APKSCANNER_OPENCODE_MODEL=deepseek-v4-flash` 可选用成本更低的模型。可通过 `APKSCANNER_DEEPSEEK_BASE_URL` 指定企业 DeepSeek 兼容网关；远程网关必须使用 HTTPS，纯 HTTP 仅在 loopback 上接受。该 URL 中的凭据、查询参数和片段将被拒绝，API Key 仍通过 `DEEPSEEK_API_KEY` 提供。
 

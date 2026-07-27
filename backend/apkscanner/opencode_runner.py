@@ -8,6 +8,7 @@ import signal
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from .agent_events import AgentCancelledError, AgentEventCallback
+from .agent_events import AgentCancelledError, AgentEventCallback, emit_agent_event
 from .agent_prompt import developer_instructions, investigation_prompt
 from .config import Settings
 from .models import EntryPoint, InvestigationTask, Scan
@@ -250,20 +251,13 @@ class OpenCodeInvestigator:
             "tool_profile": OPENCODE_TOOL_PROFILE,
             "timeout_ms": max(1, timeout) * 1000,
         }
-        if event_callback is None and cancel_event is None:
-            response = self._invoke(
-                payload,
-                timeout_seconds=timeout + 15,
-                workspace=workspace,
-            )
-        else:
-            response = self._invoke(
-                payload,
-                timeout_seconds=timeout + 15,
-                workspace=workspace,
-                event_callback=event_callback,
-                cancel_event=cancel_event,
-            )
+        response = self._invoke_investigation_with_retry(
+            payload,
+            timeout_seconds=timeout,
+            workspace=workspace,
+            event_callback=event_callback,
+            cancel_event=cancel_event,
+        )
         if response.get("error"):
             error = response["error"]
             message = (
@@ -287,6 +281,84 @@ class OpenCodeInvestigator:
             result=AgentInvestigationResult.model_validate(response["result"]),
             usage=dict(response.get("usage") or {}),
             output_transport=dict(response.get("output_transport") or {}),
+        )
+
+    def _invoke_investigation_with_retry(
+        self,
+        payload: dict[str, Any],
+        *,
+        timeout_seconds: int,
+        workspace: Path,
+        event_callback: AgentEventCallback | None,
+        cancel_event: threading.Event | None,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + max(timeout_seconds, 0)
+        transport_attempt = 1
+        attempt_timeout = max(timeout_seconds, 0)
+        while True:
+            attempt_payload = {
+                **payload,
+                "timeout_ms": max(1, attempt_timeout) * 1000,
+            }
+            try:
+                if event_callback is None and cancel_event is None:
+                    response = self._invoke(
+                        attempt_payload,
+                        timeout_seconds=attempt_timeout + 15,
+                        workspace=workspace,
+                    )
+                else:
+                    response = self._invoke(
+                        attempt_payload,
+                        timeout_seconds=attempt_timeout + 15,
+                        workspace=workspace,
+                        event_callback=event_callback,
+                        cancel_event=cancel_event,
+                    )
+            except (AgentCancelledError, TimeoutError):
+                raise
+            except RuntimeError as exc:
+                remaining = int(deadline - time.monotonic())
+                if (
+                    transport_attempt >= 2
+                    or remaining <= 0
+                    or not self._retryable_transport_failure(exc)
+                ):
+                    raise
+                transport_attempt += 1
+                attempt_timeout = remaining
+                with suppress(Exception):
+                    emit_agent_event(
+                        event_callback,
+                        "model.worker.retry",
+                        "OpenCode 本地 Server 连接中断，正在用剩余任务预算重建会话",
+                        {
+                            "attempt": transport_attempt,
+                            "remaining_seconds": remaining,
+                            "error": str(exc)[:1000],
+                        },
+                    )
+                continue
+
+            transport = dict(response.get("output_transport") or {})
+            transport["worker_transport_attempts"] = transport_attempt
+            response["output_transport"] = transport
+            return response
+
+    @staticmethod
+    def _retryable_transport_failure(error: RuntimeError) -> bool:
+        message = str(error).lower()
+        return any(
+            marker in message
+            for marker in (
+                "typeerror: fetch failed",
+                "econnrefused",
+                "econnreset",
+                "epipe",
+                "und_err_connect_timeout",
+                "und_err_headers_timeout",
+                "und_err_socket",
+            )
         )
 
     def _configuration_error(self) -> str | None:

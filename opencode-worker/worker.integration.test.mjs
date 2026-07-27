@@ -206,6 +206,7 @@ test("pro avoids required tool choice and retries text JSON through local valida
     assert.equal(result.usage.calls, 2)
     assert.equal(result.output_transport.mode, "prompted_json")
     assert.equal(result.output_transport.format, "text")
+    assert.equal(result.output_transport.request_mode, "prompt_async_poll")
     assert.equal(result.output_transport.tool_choice, "auto")
     assert.deepEqual(result.output_transport.tools, ["read", "glob", "grep", "bash"])
     assert.equal(result.output_transport.schema_validator, "ajv@8.20.0")
@@ -234,6 +235,13 @@ test("pro avoids required tool choice and retries text JSON through local valida
     )
     assert.ok(events.some((item) => item.event_type === "model.validation.failed"))
     assert.ok(events.some((item) => item.event_type === "model.output.validated"))
+    assert.ok(
+      events.some(
+        (item) =>
+          item.event_type === "model.transport.selected" &&
+          item.data.request_mode === "prompt_async_poll",
+      ),
+    )
   } finally {
     api.close()
     await rm(root, { recursive: true, force: true })

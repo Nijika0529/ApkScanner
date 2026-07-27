@@ -167,22 +167,7 @@ def test_investigate_builds_a_workspace_shell_prompt_and_validates_result(
         lambda **_kwargs: {"available": True},
     )
 
-    def invoke(payload, *, timeout_seconds, workspace):  # noqa: ANN001
-        assert timeout_seconds == configured.task_timeout_seconds + 15
-        assert workspace == expected_workspace
-        assert payload["action"] == "investigate"
-        assert payload["model"] == "deepseek-v4-pro"
-        assert "run shell commands" in payload["prompt"]
-        assert "workspace or /tmp" in payload["prompt"]
-        assert payload["tool_profile"] == "workspace_shell"
-        assert "DEEPSEEK_THINKING_OUTPUT_ADAPTER" in payload["prompt"]
-        assert "OUTPUT_JSON_SCHEMA" in payload["prompt"]
-        assert payload["output_schema"]["title"] == "AgentInvestigationResult"
-        assert payload["output_schema"]["additionalProperties"] is False
-        assert payload["output_schema"]["properties"]["requested_tests"]["maxItems"] == 100
-        serialized_schema = json.dumps(payload["output_schema"])
-        assert '"$defs"' not in serialized_schema
-        assert '"$ref"' not in serialized_schema
+    def valid_worker_response() -> dict:  # noqa: ANN401
         return {
             "thread_id": "session-test",
             "turn_id": "message-test",
@@ -201,6 +186,24 @@ def test_investigate_builds_a_workspace_shell_prompt_and_validates_result(
             },
             "usage": {"tokens": {"input": 10, "output": 5}},
         }
+
+    def invoke(payload, *, timeout_seconds, workspace):  # noqa: ANN001
+        assert timeout_seconds == configured.task_timeout_seconds + 15
+        assert workspace == expected_workspace
+        assert payload["action"] == "investigate"
+        assert payload["model"] == "deepseek-v4-pro"
+        assert "run shell commands" in payload["prompt"]
+        assert "workspace or /tmp" in payload["prompt"]
+        assert payload["tool_profile"] == "workspace_shell"
+        assert "DEEPSEEK_THINKING_OUTPUT_ADAPTER" in payload["prompt"]
+        assert "OUTPUT_JSON_SCHEMA" in payload["prompt"]
+        assert payload["output_schema"]["title"] == "AgentInvestigationResult"
+        assert payload["output_schema"]["additionalProperties"] is False
+        assert payload["output_schema"]["properties"]["requested_tests"]["maxItems"] == 100
+        serialized_schema = json.dumps(payload["output_schema"])
+        assert '"$defs"' not in serialized_schema
+        assert '"$ref"' not in serialized_schema
+        return valid_worker_response()
 
     monkeypatch.setattr(investigator, "_invoke", invoke)
     workspace = tmp_path / "workspace"
@@ -238,6 +241,34 @@ def test_investigate_builds_a_workspace_shell_prompt_and_validates_result(
     assert result.thread_id == "session-test"
     assert result.turn_id == "message-test"
     assert result.result.result == "inconclusive"
+    assert result.output_transport["worker_transport_attempts"] == 1
+
+    transport_calls = 0
+    runtime_events = []
+
+    def flaky_transport(_payload, **_kwargs):  # noqa: ANN001, ANN003
+        nonlocal transport_calls
+        transport_calls += 1
+        if transport_calls == 1:
+            raise RuntimeError(
+                "OpenCode worker failed: TypeError: fetch failed\n"
+                "Caused by [ECONNRESET]: socket closed"
+            )
+        return valid_worker_response()
+
+    monkeypatch.setattr(investigator, "_invoke", flaky_transport)
+    retried = investigator.investigate(
+        scan=scan,
+        task=task,
+        entries=[entry],
+        workspace=workspace,
+        evidence=[],
+        timeout_seconds=30,
+        event_callback=runtime_events.append,
+    )
+    assert transport_calls == 2
+    assert retried.output_transport["worker_transport_attempts"] == 2
+    assert any(event.event_type == "model.worker.retry" for event in runtime_events)
 
     monkeypatch.setattr(
         investigator,

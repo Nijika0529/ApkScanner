@@ -3,9 +3,9 @@
 ## 调研结论
 
 OpenCode 官方提供的是 JS/TS SDK。SDK 通过 `createOpencodeServer` 启动本地 server，再用
-`createOpencodeClient` 创建类型化客户端；会话主路径是 `session.create` 和
-`session.prompt`。它支持给 prompt 传 JSON Schema，并通过内部 `StructuredOutput` 工具
-收集结构化结果。官方资料：
+`createOpencodeClient` 创建类型化客户端；会话主路径是 `session.create`，Flash 使用
+`session.prompt`，Pro 使用 `session.promptAsync` 加短连接消息轮询。SDK 支持给同步
+prompt 传 JSON Schema，并通过内部 `StructuredOutput` 工具收集结构化结果。官方资料：
 
 - [OpenCode SDK](https://opencode.ai/docs/sdk/)
 - [OpenCode Providers / DeepSeek](https://opencode.ai/docs/providers)
@@ -29,10 +29,10 @@ OpenCode 官方提供的是 JS/TS SDK。SDK 通过 `createOpencodeServer` 启动
 
 因此平台按模型选择输出适配器，而不是在 Pro 失败后静默换成 Flash：
 
-| 模型 | OpenCode format | 发给模型的工具 / `tool_choice` | 结果校验 |
+| 模型 | OpenCode format / 传输 | 发给模型的工具 / `tool_choice` | 结果校验 |
 | --- | --- | --- | --- |
-| `deepseek-v4-pro`（及其版本后缀） | `text` | 首轮允许 `read/glob/grep/bash`，使用普通自动工具选择，不使用 `required` | prompt 携带精确 Schema 和最小示例；Ajv 8.20.0 本地校验，纠正轮关闭工具，最多 2 次 |
-| `deepseek-v4-flash` | `json_schema` | `read/glob/grep/bash` + `StructuredOutput`；`required` | OpenCode 内部校验，最多 2 次重试 |
+| `deepseek-v4-pro`（及其版本后缀） | `text`；`promptAsync` + `session.messages` 短轮询 | 首轮允许 `read/glob/grep/bash`，使用普通自动工具选择，不使用 `required` | prompt 携带精确 Schema 和最小示例；Ajv 8.20.0 本地校验，纠正轮关闭工具，最多 2 次 |
+| `deepseek-v4-flash` | `json_schema`；同步 `prompt` | `read/glob/grep/bash` + `StructuredOutput`；`required` | OpenCode 内部校验，最多 2 次重试 |
 
 Pro 通道不会把思考模式关掉，也不会绕过 OpenCode session/provider。它只避开
 OpenCode 当前由工具实现的 StructuredOutput。普通文件工具仍按 OpenCode CLI 的常规
@@ -65,14 +65,18 @@ sequenceDiagram
         D-->>O: StructuredOutput tool call
         O-->>W: OpenCode-validated result
     else deepseek-v4-pro
-        W->>O: session.prompt(format=text)
+        W->>O: session.promptAsync(text)
+        O-->>W: 204 accepted
         O->>D: tools=[read,glob,grep,bash], ordinary tool selection
         D->>O: inspect and run commands in the scan workspace
         D-->>O: JSON text
-        O-->>W: text response
+        loop bounded short polling
+            W->>O: session.messages
+            O-->>W: current message state
+        end
         W->>W: Ajv validate
         opt invalid, at most 2 corrections
-            W->>O: exact validation errors + correction prompt
+            W->>O: promptAsync(exact validation errors)
         end
     end
     W-->>P: stdout NDJSON: event* + terminal result
@@ -105,6 +109,10 @@ OpenCode 本身是 coding agent，默认会暴露读文件、Shell、编辑、We
 - 每次调用使用新 session、新 OpenCode server 和临时 HOME/XDG 数据目录。
 - worker 在发送 prompt 前订阅 `event.subscribe()` SSE，并把会话状态、步骤、响应、
   重试、校验和错误归一化为 NDJSON 事件；Python 按 `task_id` 写入实时扫描时间线。
+- Pro 不再让 SDK 到 loopback server 的一个同步 HTTP 请求覆盖整段深度推理；异步下发
+  后只用短 GET 读取消息状态。安全的本地读取遇到连接重置会指数退避重试 3 次；worker
+  本身若因 `fetch failed`、`ECONNRESET` 或 Undici socket/header timeout 退出，Python
+  只在剩余任务预算内重建一次 worker/session，不切换模型。
 - loopback server 使用随机端口与随机 Basic Auth；进程超时后终止整个进程组。
 - Docker 模式使用只读 rootfs、无 capabilities、`no-new-privileges`、PID/CPU/内存限制
   和临时 HOME。
@@ -144,6 +152,7 @@ Web 上传框和 CLI 的 `--investigator` 可以为单个扫描选择：
 摘要和状态。Pro 的
 `output_transport.model_calls` 还会保存
 每一轮实际 prompt、原始文本响应、解析错误、Schema 校验错误、是否被接受和单轮 usage；
+`request_mode=prompt_async_poll` 与 `worker_transport_attempts` 记录实际传输路径及是否重建；
 即使 3 次都失败，这些内容也进入 `agent.error` 的不可变 Evidence。API Key 和隐藏思考
 内容不进入审计。规范化 SDK 关键事件另存为 `agent.events` Evidence。
 
@@ -169,8 +178,9 @@ scanctl capabilities --deep
 4. Pro 能在 workspace 和 `/tmp` 执行 Bash 并继续生成 JSON；
 5. PATH 中的 ADB 阻断程序固定返回 126；
 6. Pro 首次返回不合格 JSON 时，Ajv 拒绝结果，关闭工具并通过同一 session 下发纠正提示；
-7. worker 在两种模式下都输出可增量消费的事件 envelope 和唯一 terminal result；
-8. 通过本地 Schema 校验后，两个通道归一化为相同的 worker 响应。
+7. Pro 使用 `prompt_async_poll`，避免长推理占用一个同步 loopback HTTP 请求；
+8. worker 在两种模式下都输出可增量消费的事件 envelope 和唯一 terminal result；
+9. 通过本地 Schema 校验后，两个通道归一化为相同的 worker 响应。
 
 升级时必须：
 
