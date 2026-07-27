@@ -489,7 +489,7 @@ function Tasks({ scan, tasks, entries, audits, events, health, onRefresh }: { sc
                   <Button variant="ghost" size="sm" onClick={() => void updateTaskControl(task, !taskAgentEnabled(task))} disabled={!masterEnabled || ["running", "cancel_requested"].includes(task.status) || controlSaving === task.id} title={!masterEnabled ? "先开启扫描级 AI 总开关" : "覆盖本任务的 AI 使用设置"}>{controlSaving === task.id ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Bot className="h-3.5 w-3.5" />}AI {taskAgentEnabled(task) ? "开" : "关"}</Button>
                   {isTerminalTask(task.status) && <Button variant={task.status === "timed_out" ? "primary" : "secondary"} size="sm" onClick={() => retry(task)} disabled={retrying === task.id}>{retrying === task.id ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}{task.status === "timed_out" ? "继续深度探索" : "重新分析"}</Button>}
                   {["queued", "awaiting_device", "running", "cancel_requested"].includes(task.status) && <Button variant="danger" size="sm" onClick={() => setCancelTarget(task)} disabled={task.status === "cancel_requested"}>{task.status === "cancel_requested" ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <X className="h-3.5 w-3.5" />}{task.status === "queued" ? "取消等待" : task.status === "cancel_requested" ? "正在停止" : "停止分析"}</Button>}
-                  {["blocked_device", "completed", "not_reproduced", "inconclusive", "timed_out", "failed", "canceled"].includes(task.status) && <Button variant="danger" size="sm" onClick={() => setDeleteTarget(task)}><Trash2 className="h-3.5 w-3.5" />删除</Button>}
+                  {["blocked_device", "completed", "not_reproduced", "inconclusive", "timed_out", "failed", "canceled", "cancel_requested"].includes(task.status) && <Button variant="danger" size="sm" onClick={() => setDeleteTarget(task)}><Trash2 className="h-3.5 w-3.5" />删除</Button>}
                 </div>
               </div>
             </div>
@@ -641,7 +641,7 @@ function DeleteTaskDialog({ task, target, onOpenChange, onDeleted }: { task: Inv
     <Dialog open={Boolean(task)} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogTitle className="text-xl font-bold text-slate-950">删除已执行任务？</DialogTitle>
-        <DialogDescription className="mt-2 text-sm leading-6 text-slate-600">任务将从探索任务列表移除。已经形成的 Hypothesis、辩论记录、Proof Attempt、Finding、Evidence 和 AI 审计均会保留，仍可在报告、验证链与“AI 审计”页中追溯。</DialogDescription>
+        <DialogDescription className="mt-2 text-sm leading-6 text-slate-600">任务将从探索任务列表移除。已经形成的 Hypothesis、辩论记录、Proof Attempt、Finding、Evidence 和 AI 审计均会保留，仍可在报告、验证链与“AI 审计”页中追溯。正在停止的任务会继续完成后台中止和设备清理，但不会重新出现在列表中。</DialogDescription>
         {task && <div className="mt-5 rounded-xl border border-rose-200 bg-rose-50 p-4"><p className="font-semibold text-rose-900">{task.task_type === "deep_link" ? "Deep Link handler 探索" : "导出组件探索"}</p><p className="mt-1 break-all font-mono text-xs text-rose-700">{target || task.id}</p></div>}
         {error && <p role="alert" className="mt-4 text-sm text-rose-700">{error}</p>}
         <div className="mt-6 flex justify-end gap-2"><Button variant="ghost" onClick={() => onOpenChange(false)} disabled={deleting}>取消</Button><Button variant="danger" onClick={remove} disabled={deleting}>{deleting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}{deleting ? "正在删除" : "确认删除任务"}</Button></div>

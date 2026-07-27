@@ -91,6 +91,15 @@ Without ADB or the Probe APK, scans still complete and explicitly mark dynamic c
 An `adb shell` success is retained as a separate identity and is never treated as equivalent to an
 ordinary third-party application.
 
+When `APKSCANNER_ANDROID_SDK_ROOT` points to an SDK containing platform API 36 and build-tools,
+an OpenCode Agent may create a source-only PoC under its isolated `poc/` directory. The control
+plane rejects build scripts, binaries, symlinks, escaped paths, package collisions, oversized
+projects, and undeclared launch activities. It then builds and signs the APK itself, records the
+source/APK SHA-256 values, enters the same ADB queue, installs and launches the PoC as an ordinary
+application UID, correlates its nonce-tagged log result, and uninstalls it. The Agent never receives
+ADB access. A PoC's own impact boolean is retained as a claim and cannot by itself satisfy the
+platform harm oracle.
+
 The default worker pool explores up to three entry points concurrently across all scans. Every
 install, reset, probe, optional instrumentation action, and cleanup still passes through one global
 priority/FIFO device queue. The device is released before model planning, critic, review, and final
@@ -232,6 +241,9 @@ replay. The finalizer always disables thinking and uses OpenCode `StructuredOutp
 (`tool_choice: required`), then Ajv and platform semantic rules validate the result. Each retry uses
 a fresh session. A retryable local transport failure can rebuild the worker once within the original
 task budget without changing models.
+Explorer/analyzer turns receive up to 1,000 steps by default. If a turn exhausts its tool work and
+becomes idle on `finish=tool-calls` without a text handoff, the worker starts a tool-disabled,
+non-thinking memo-writer turn in the same session; an empty memo is never passed to the finalizer.
 
 Use the default `deepseek-v4-flash` model to establish the end-to-end baseline. Set
 `APKSCANNER_OPENCODE_MODEL=deepseek-v4-pro` only for explicit Pro compatibility testing. Both models
@@ -264,6 +276,10 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_FRONTEND_DIST` | unset | Built frontend directory served by FastAPI |
 | `APKSCANNER_ADB_SERIAL` | unset | Remote cloud-device ADB serial |
 | `APKSCANNER_PROBE_APK` | unset | Built Probe APK path |
+| `APKSCANNER_ANDROID_SDK_ROOT` | Android SDK env/unset | SDK used for platform-managed Agent PoC builds |
+| `APKSCANNER_POC_ENABLED` | `true` | Permit validated source-only Agent PoC builds |
+| `APKSCANNER_POC_BUILD_TIMEOUT` | 180 s | Per-command PoC build timeout (30–600 s) |
+| `APKSCANNER_POC_MAX_SOURCE_BYTES` | 512 KiB | PoC source-project limit (64 KiB–2 MiB) |
 | `APKSCANNER_AUTH_FLOW` | unset | Non-secret login replay JSON |
 | `APKSCANNER_FRIDA_DEVICE` | ADB serial | Frida device identifier |
 | `APKSCANNER_FRIDA_HOST` | unset | Remote frida-server endpoint |
@@ -276,6 +292,7 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_OPENCODE_ENABLED` | `false` | Allow OpenCode + DeepSeek investigations |
 | `APKSCANNER_OPENCODE_MODEL` | `deepseek-v4-flash` | DeepSeek model ID; opt into `deepseek-v4-pro` for compatibility testing |
 | `APKSCANNER_OPENCODE_REASONING_EFFORT` | `high` | Thinking explorer effort: `high` or `max` |
+| `APKSCANNER_OPENCODE_AGENT_STEPS` | 1000 | OpenCode analyzer/explorer step budget (50–1000) |
 | `APKSCANNER_OPENCODE_ISOLATION` | `docker` | `docker` or explicit `host` fallback |
 | `APKSCANNER_OPENCODE_DOCKER_IMAGE` | `apk-scanner-opencode-worker:0.1.0` | Worker image |
 | `APKSCANNER_OPENCODE_NODE_BIN` | `node` on PATH | Host-mode Node.js override |
@@ -290,7 +307,7 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_TASK_MAX_ATTEMPTS` | 2 | Retry budget |
 | `APKSCANNER_AGENT_CONCURRENCY` | 3 | Global entry-investigation worker limit (1–8); ADB remains single-concurrency |
 | `APKSCANNER_AGENT_MAX_ROUNDS` | 3 | Maximum adaptive AI/device rounds per task (1–5) |
-| `APKSCANNER_AGENT_TESTS_PER_ROUND` | 100 | Maximum accepted AI-requested tests per round (1–100) |
+| `APKSCANNER_AGENT_TESTS_PER_ROUND` | 800 | Maximum accepted AI-requested tests per round (1–1000) |
 
 ## Verification
 

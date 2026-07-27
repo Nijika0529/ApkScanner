@@ -20,8 +20,9 @@ const PROFILE_STRUCTURED_FINALIZER = "structured_finalizer"
 const STRUCTURED_RETRY_COUNT = 2
 const WORKSPACE_TOOL_PROFILE = "workspace_shell"
 const WORKSPACE_TOOLS = ["read", "glob", "grep", "bash"]
-const MAX_AGENT_STEPS = 100
-const MAX_PROVIDER_REQUESTS = MAX_AGENT_STEPS + 20
+const DEFAULT_MAX_AGENT_STEPS = 1_000
+const MAX_CONFIGURED_AGENT_STEPS = 1_000
+const PROVIDER_REQUEST_HEADROOM = 100
 const MAX_EXPLORER_MEMO_BYTES = 128 * 1024
 const LOCAL_POLL_INTERVAL_MS = 250
 const LOCAL_READ_RETRY_COUNT = 3
@@ -38,9 +39,11 @@ let providerWireAudit = []
 let providerAPIKey
 let loopbackProxyAPIKey
 let providerRequestCount = 0
+let providerRequestLimit = DEFAULT_MAX_AGENT_STEPS + PROVIDER_REQUEST_HEADROOM
 
 async function main() {
   const payload = validatePayload(await readPayload())
+  providerRequestLimit = payload.max_agent_steps + PROVIDER_REQUEST_HEADROOM
   providerAPIKey = process.env.DEEPSEEK_API_KEY?.trim()
   if (!providerAPIKey) {
     throw new Error("DEEPSEEK_API_KEY is not configured")
@@ -105,8 +108,8 @@ async function capability(client, payload) {
     output_mode: executionProfile(payload).output_mode,
     tool_profile: WORKSPACE_TOOL_PROFILE,
     workspace_tools: WORKSPACE_TOOLS,
-    max_steps: MAX_AGENT_STEPS,
-    max_provider_requests: MAX_PROVIDER_REQUESTS,
+    max_steps: payload.max_agent_steps,
+    max_provider_requests: payload.max_agent_steps + PROVIDER_REQUEST_HEADROOM,
     ...(liveProbe ? { live_probe: liveProbe } : {}),
   }
 }
@@ -227,6 +230,8 @@ async function investigate(client, payload) {
 async function runTextStage(client, payload, { stage, promptText, title }) {
   const responses = []
   let response
+  let text = ""
+  let terminalized = false
   let stageSessionID
   await withSession(client, title, async (createdSessionID) => {
     stageSessionID = createdSessionID
@@ -246,9 +251,40 @@ async function runTextStage(client, payload, { stage, promptText, title }) {
       stage.name === "explorer" ? "apkscanner-explorer" : "apkscanner-analyzer",
       stage,
     )
+    responses.push(response)
+    text = responseText(response.parts ?? [])
+    if (!response.info?.error && !text) {
+      emitRuntimeEvent(
+        "model.memo.terminalizing",
+        "分析阶段未产生文本备忘录，正在禁用工具并强制收尾",
+        {
+          stage: stage.name,
+          finish: response.info?.finish ?? null,
+          max_agent_steps: payload.max_agent_steps,
+        },
+      )
+      const terminalResponse = await promptAsyncAndWait(
+        client,
+        payload,
+        memoTerminalizationPrompt(stage),
+        disabledWorkspaceToolFlags(),
+        undefined,
+        "apkscanner-memo-writer",
+        {
+          ...stage,
+          name: "memo_writer",
+          thinking_mode: "disabled",
+          reasoning_effort: null,
+          workspace_tools: false,
+          wire_tool_choice: "omitted",
+        },
+      )
+      responses.push(terminalResponse)
+      response = terminalResponse
+      text = responseText(response.parts ?? [])
+      terminalized = true
+    }
   })
-  responses.push(response)
-  const text = responseText(response.parts ?? [])
   emitRuntimeEvent("model.response.received", "DeepSeek 分析阶段已返回证据备忘录", {
     stage: stage.name,
     attempt: 1,
@@ -269,13 +305,21 @@ async function runTextStage(client, payload, { stage, promptText, title }) {
     stage,
     attempt: 1,
     promptText,
-    response,
+    response: terminalized
+      ? {
+          ...response,
+          apkscanner_turn_messages: responses.flatMap(
+            (item) => item.apkscanner_turn_messages ?? [item],
+          ),
+        }
+      : response,
     responseTextValue: text,
     parseError,
     validationErrors: [],
     accepted: !providerError && !parseError,
     tools: workspaceToolNames(payload),
   })
+  call.terminalized = terminalized
   if (providerError) {
     return {
       ok: false,
@@ -533,6 +577,7 @@ async function promptAsyncAndWait(
   )
 
   let toolLoopWaitReported = false
+  let idleToolCallSince
   while (Date.now() < workerDeadline) {
     const messages = unwrap(
       await localRead(
@@ -575,15 +620,28 @@ async function promptAsyncAndWait(
     )
     const status = statuses?.[sessionID]
     const idle = !status || status.type === "idle"
-    if (idle && latestCompleted) {
+    const completedWithToolCall =
+      latestCompleted?.info?.finish === "tool-calls"
+    if (idle && latestCompleted && !completedWithToolCall) {
       return {
         ...latestCompleted,
         apkscanner_turn_messages: assistantMessages,
       }
     }
+    if (idle && latestCompleted && completedWithToolCall) {
+      idleToolCallSince ??= Date.now()
+      if (Date.now() - idleToolCallSince >= 1_500) {
+        return {
+          ...latestCompleted,
+          apkscanner_turn_messages: assistantMessages,
+        }
+      }
+    } else {
+      idleToolCallSince = undefined
+    }
     if (
       !toolLoopWaitReported &&
-      latestCompleted?.info?.finish === "tool-calls"
+      completedWithToolCall
     ) {
       toolLoopWaitReported = true
       emitRuntimeEvent(
@@ -878,7 +936,7 @@ function outputTransport({ profile, calls, explorerSessionID, explorerMemo }) {
     provider_wire_requests: providerWireAudit.map((item) => ({ ...item })),
     schema_validator: "ajv@8.20.0",
     semantic_validator: "apkscanner@1.0",
-    max_provider_requests: MAX_PROVIDER_REQUESTS,
+    max_provider_requests: providerRequestLimit,
     structured_retry_count: STRUCTURED_RETRY_COUNT,
     model_calls: calls,
   }
@@ -939,7 +997,7 @@ function buildConfig(payload) {
         mode: "primary",
         model,
         prompt: payload.explorer_instructions ?? payload.developer_instructions,
-        steps: MAX_AGENT_STEPS,
+        steps: payload.max_agent_steps,
         options: thinkingOptions("disabled", null),
         permission: workspacePermission,
       },
@@ -947,18 +1005,30 @@ function buildConfig(payload) {
         mode: "primary",
         model,
         prompt: payload.explorer_instructions ?? payload.developer_instructions,
-        steps: MAX_AGENT_STEPS,
+        steps: payload.max_agent_steps,
         options: thinkingOptions(
           "enabled",
           explorerStage(payload)?.reasoning_effort ?? "high",
         ),
         permission: workspacePermission,
       },
+      "apkscanner-memo-writer": {
+        mode: "primary",
+        model,
+        prompt:
+          "Summarize the completed investigation as a concise plain-text evidence memo. " +
+          "Do not call tools and do not emit JSON or tool-call markup.",
+        steps: 20,
+        options: thinkingOptions("disabled", null),
+        permission: {
+          "*": "deny",
+        },
+      },
       "apkscanner-finalizer": {
         mode: "primary",
         model,
         prompt: payload.developer_instructions,
-        steps: Math.min(MAX_AGENT_STEPS, 20),
+        steps: 20,
         options: thinkingOptions("disabled", null),
         permission: finalizerPermission,
       },
@@ -1024,6 +1094,16 @@ function validatePayload(value) {
     value.timeout_ms > 86_400_000
   ) {
     throw new Error("invalid OpenCode worker timeout")
+  }
+  if (value.max_agent_steps === undefined || value.max_agent_steps === null) {
+    value.max_agent_steps = DEFAULT_MAX_AGENT_STEPS
+  }
+  if (
+    !Number.isInteger(value.max_agent_steps) ||
+    value.max_agent_steps < 50 ||
+    value.max_agent_steps > MAX_CONFIGURED_AGENT_STEPS
+  ) {
+    throw new Error("invalid OpenCode max agent steps")
   }
   if (value.base_url !== null && value.base_url !== undefined) {
     validateBaseURL(value.base_url)
@@ -1355,6 +1435,18 @@ function finalizerPrompt(basePrompt, explorerMemo) {
   )
 }
 
+function memoTerminalizationPrompt(stage) {
+  return (
+    "MEMO_TERMINALIZATION:\n" +
+    `The ${stage.name} phase has finished its available tool work but did not produce a text ` +
+    "handoff. Tools are now disabled. Using the investigation and tool results already present " +
+    "in this session, write a concise plain-text memo now. Include inspected paths, relevant " +
+    "evidence, supported and refuted hypotheses, concrete impact reasoning, unresolved gaps, " +
+    "and the smallest requested tests or PoC request needed next. Do not call tools, emit JSON, " +
+    "or output tool-call markup."
+  )
+}
+
 function normalizedProviderError(value) {
   const message = formatError(value)
   const serialized = redactSecret(
@@ -1575,7 +1667,7 @@ async function startProviderCompatibilityProxy(payload) {
         return
       }
       providerRequestCount += 1
-      if (providerRequestCount > MAX_PROVIDER_REQUESTS) {
+      if (providerRequestCount > providerRequestLimit) {
         sendProviderProxyError(response, 429, "provider_request_limit_exceeded")
         return
       }

@@ -92,6 +92,13 @@ export APKSCANNER_PROBE_APK="$PWD/probe/app/build/outputs/apk/debug/app-debug.ap
 
 没有 ADB 或 Probe APK 时，扫描仍会完成，并显式标注动态覆盖为 blocked。`adb shell` 成功会保留为独立身份，永远不会被视为等同于普通第三方应用。
 
+当 `APKSCANNER_ANDROID_SDK_ROOT` 指向包含 API 36 platform 和 build-tools 的 Android SDK
+时，OpenCode Agent 可以在隔离工作区的 `poc/` 下生成仅含 Manifest/Java 的 PoC。控制面会
+拒绝构建脚本、二进制文件、符号链接、路径逃逸、包名冲突、超限工程和未声明的启动
+Activity；随后由平台完成构建与签名，登记源码/APK SHA-256，进入同一 ADB 队列，以普通
+应用 UID 安装和启动，通过随机 nonce 关联结果日志，最后卸载。Agent 始终拿不到 ADB。
+PoC 自己上报的影响布尔值只作为可审计声明保存，不能单独满足平台的实际危害证明条件。
+
 单 ADB 模式默认允许 3 个入口 worker 并发分析，但所有 worker 共用一条全局显式设备队列：
 风险优先级高的任务先执行，相同优先级按入队顺序执行。设备租约只覆盖安装、探测和清理；
 模型思考阶段释放 ADB，等待设备的时间不消耗单任务 20 分钟预算。
@@ -184,6 +191,9 @@ DeepSeek 思考模式拒绝任何 `tool_choice`，而 OpenCode 1.18.4 会注入
 `reasoning_content` 回放。定稿器始终关闭思考，使用 OpenCode `StructuredOutput`
 （`tool_choice: required`），随后再通过 Ajv 和平台语义规则校验；每次纠正都使用全新
 会话，避免 DSML/tool-call 上下文污染。
+Analyzer/Explorer 默认最多执行 1000 步。如果工具探索耗尽后停在
+`finish=tool-calls` 且没有文本交接，Worker 会在同一会话追加一个禁用工具、关闭
+thinking 的 memo-writer 收尾回合；空 memo 不再交给 Finalizer。
 
 当前建议先用默认的 `deepseek-v4-flash` 跑通扫描、工具调用、动态申请和最终裁决全链路。
 仅在单独验证 Pro 适配时设置 `APKSCANNER_OPENCODE_MODEL=deepseek-v4-pro`；两者使用同一
@@ -223,7 +233,7 @@ APK 上传
       → 认证探测：通过 ADB 输入事件回放登录流程，然后重新探测
       → 收集 Frida 观察结果
       → 清理并释放唯一 ADB，再由 AI 进行 test_planning
-      → AI 最多请求 100 个限定补充测试
+      → AI 默认最多请求 800 个限定补充测试（可配置上限 1000）
       → 平台验证申请；如需执行则重新进入单设备队列，prepare 后串行执行并再次释放
       → Codex 第二阶段（final_evaluation）：AI 做出最终判定
       → 证据校验：平台检查引用的 Evidence ID 是否存在，降级无效声明
@@ -266,6 +276,10 @@ AI 审计中，不能被当作平台确认风险等级。
 | `APKSCANNER_FRONTEND_DIST` | 未设置 | FastAPI 提供的前端构建产物目录 |
 | `APKSCANNER_ADB_SERIAL` | 未设置 | 远程云真机 ADB 序列号 |
 | `APKSCANNER_PROBE_APK` | 未设置 | 已构建的 Probe APK 路径 |
+| `APKSCANNER_ANDROID_SDK_ROOT` | Android SDK 环境变量/未设置 | 平台托管 Agent PoC 构建所用 SDK |
+| `APKSCANNER_POC_ENABLED` | `true` | 是否允许经校验的源码型 Agent PoC 构建 |
+| `APKSCANNER_POC_BUILD_TIMEOUT` | 180 秒 | PoC 单条构建命令超时（30–600 秒） |
+| `APKSCANNER_POC_MAX_SOURCE_BYTES` | 512 KiB | PoC 源码工程上限（64 KiB–2 MiB） |
 | `APKSCANNER_AUTH_FLOW` | 未设置 | 非敏感的登录回放 JSON |
 | `APKSCANNER_FRIDA_DEVICE` | ADB 序列号 | Frida 设备标识 |
 | `APKSCANNER_FRIDA_HOST` | 未设置 | 远程 frida-server 端点 |
@@ -278,6 +292,7 @@ AI 审计中，不能被当作平台确认风险等级。
 | `APKSCANNER_OPENCODE_ENABLED` | `false` | 是否启用 OpenCode + DeepSeek 调查 |
 | `APKSCANNER_OPENCODE_MODEL` | `deepseek-v4-flash` | DeepSeek 模型 ID；Pro 适配验证时显式改为 `deepseek-v4-pro` |
 | `APKSCANNER_OPENCODE_REASONING_EFFORT` | `high` | 思考型 Explorer 强度：`high` 或 `max` |
+| `APKSCANNER_OPENCODE_AGENT_STEPS` | 1000 | OpenCode Analyzer/Explorer 步数预算（50–1000） |
 | `APKSCANNER_OPENCODE_ISOLATION` | `docker` | `docker` 或显式 `host` 降级 |
 | `APKSCANNER_OPENCODE_DOCKER_IMAGE` | `apk-scanner-opencode-worker:0.1.0` | Worker 镜像名称 |
 | `APKSCANNER_OPENCODE_NODE_BIN` | PATH 中的 `node` | Host 模式下的 Node.js 覆盖 |
@@ -292,7 +307,7 @@ AI 审计中，不能被当作平台确认风险等级。
 | `APKSCANNER_TASK_MAX_ATTEMPTS` | 2 | 重试次数预算 |
 | `APKSCANNER_AGENT_CONCURRENCY` | 3 | 全局入口探索 worker 上限（1–8）；ADB 仍固定单并发 |
 | `APKSCANNER_AGENT_MAX_ROUNDS` | 3 | 每任务最大自适应 AI/设备轮数（1–5） |
-| `APKSCANNER_AGENT_TESTS_PER_ROUND` | 100 | 每轮最多接受的 AI 测试数（1–100） |
+| `APKSCANNER_AGENT_TESTS_PER_ROUND` | 800 | 每轮最多接受的 AI 测试数（1–1000） |
 
 ## 验证
 

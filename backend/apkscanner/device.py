@@ -16,6 +16,7 @@ from typing import Any
 from .auth import CredentialStore, load_auth_flow
 from .config import Settings
 from .models import EntryPoint
+from .schemas import AgentPocSpec
 from .tools import CommandResult, TimeBudget, ToolRunner
 
 
@@ -521,6 +522,123 @@ class AdbDeviceAdapter:
                 "entry_point": entry.id,
                 "session_state": state,
                 "probe_identity_attempted": probe_request is not None,
+                "command_count": len(commands),
+            },
+        )
+
+    def execute_poc(
+        self,
+        apk_path: Path,
+        spec: AgentPocSpec,
+        *,
+        state: str,
+        budget: TimeBudget | None = None,
+        extras: dict[str, str | int | bool] | None = None,
+        test_case_id: str | None = None,
+    ) -> DeviceProbeResult:
+        """Install and launch a platform-built PoC as an ordinary application UID."""
+        if not self.configured:
+            raise RuntimeError("remote ADB device is not configured")
+        self._validate_package(spec.package_name)
+        if not apk_path.is_file():
+            raise ValueError("platform-built PoC APK is unavailable")
+        component = (
+            f"{spec.package_name}{spec.launch_component}"
+            if spec.launch_component.startswith(".")
+            else spec.launch_component
+        )
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.$]+", component):
+            raise ValueError("PoC launch component is unsafe")
+        request_id = secrets.token_hex(12)
+        encoded_payload = base64.urlsafe_b64encode(
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "state": state,
+                    "extras": extras or {},
+                },
+                separators=(",", ":"),
+            ).encode()
+        ).decode()
+        common = {
+            "caller_identity": "agent_poc_app",
+            "poc_package": spec.package_name,
+            "request_id": request_id,
+            "session_state": state,
+            "test_case_id": test_case_id,
+        }
+        commands: list[tuple[str, CommandResult, dict[str, Any]]] = []
+        with self._lease:
+            install = self._adb_budget(
+                ["install", "-r", "-t", str(apk_path)],
+                budget,
+                300,
+            )
+            commands.append(("blackbox.poc_install", install, dict(common)))
+            if install.exit_code == 0:
+                clear = self._adb_budget(
+                    ["shell", "pm", "clear", spec.package_name],
+                    budget,
+                    60,
+                )
+                commands.append(("blackbox.poc_clear", clear, dict(common)))
+                launch = self._adb_budget(
+                    [
+                        "shell",
+                        "am",
+                        "start",
+                        "-W",
+                        "-n",
+                        f"{spec.package_name}/{component}",
+                        "--es",
+                        "apkscanner_request_id",
+                        request_id,
+                        "--es",
+                        "apkscanner_payload_base64",
+                        encoded_payload,
+                    ],
+                    budget,
+                    spec.timeout_seconds,
+                )
+                commands.append(("blackbox.poc_launch", launch, dict(common)))
+                log_result = self._adb_budget(
+                    ["logcat", "-d", "-t", "500", "-s", f"{spec.log_tag}:I"],
+                    budget,
+                    60,
+                )
+                matching = [
+                    line for line in log_result.stdout.splitlines() if request_id in line
+                ]
+                normalized = [line.lower().replace(" ", "") for line in matching]
+                commands.append(
+                    (
+                        "blackbox.poc_logcat",
+                        log_result,
+                        {
+                            **common,
+                            "request_observed": bool(matching),
+                            "poc_success": any('"success":true' in line for line in normalized),
+                            "poc_claimed_security_impact": any(
+                                '"security_impact_observed":true' in line
+                                for line in normalized
+                            ),
+                            "matching_line_count": len(matching),
+                        },
+                    )
+                )
+            uninstall = self._adb(
+                ["uninstall", spec.package_name],
+                timeout=90,
+                respect_cancellation=False,
+            )
+            commands.append(("blackbox.poc_uninstall", uninstall, dict(common)))
+        return DeviceProbeResult(
+            stage="blackbox_poc",
+            commands=commands,
+            summary={
+                "poc_package": spec.package_name,
+                "request_id": request_id,
+                "session_state": state,
                 "command_count": len(commands),
             },
         )

@@ -17,7 +17,9 @@ def developer_instructions(
         tool_boundary = (
             "File and shell tools may inspect the supplied scan workspace. Shell commands may "
             "create or modify files only inside that workspace or /tmp. Do not run ADB or make "
-            "target/network requests; request device checks through requested_tests."
+            "target/network requests; request device checks through requested_tests. When the "
+            "platform advertises poc_builder.available=true, you may create a source-only Android "
+            "PoC under poc/<name>/ and reference it from requested_tests.poc."
         )
     elif direct_tool_access and shell_access:
         tool_boundary = (
@@ -108,7 +110,18 @@ def investigation_prompt(
         access_instruction = (
             "You may inspect the complete task workspace and run shell commands there. Temporary "
             "scripts and analysis artifacts may be created only in the workspace or /tmp. ADB, "
-            "device, and target-network actions must be requested through requested_tests."
+            "device, and target-network actions must be requested through requested_tests. If the "
+            "generic Probe APK cannot express a required ordinary-app-UID test and "
+            "platform_context.poc_builder.available is true, create a source-only project at "
+            "poc/<name>/ containing AndroidManifest.xml and src/**/*.java, then attach a poc "
+            "object to that requested test. Do not add Gradle files, binaries, native libraries, "
+            "or downloaded dependencies. The PoC package must start with io.apkscanner.poc.; its "
+            "declared launch Activity must read the apkscanner_request_id Intent extra and log a "
+            "single JSON result using the requested log_tag. Include that request ID plus "
+            "success and security_impact_observed booleans. The platform, not you, builds, signs, "
+            "installs, launches, records, and uninstalls the APK. A PoC's self-reported "
+            "security_impact_observed value is an auditable claim, not independent platform proof "
+            "of harm; cite the concrete returned data or another platform observation."
         )
     elif direct_tool_access and shell_access:
         access_instruction = (

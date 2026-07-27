@@ -117,7 +117,7 @@ Analyzer/Explorer 使用 `promptAsync` 下发，再以短连接轮询 `session.m
 退避重试；整个 Worker 仍失败时，Python 只会在原任务剩余预算内重建一次，不延长总预算、
 不切换模型。单任务的 OpenCode 最大步骤数保持为 100，平台的 AI 总超时和手动续跑机制
 仍是外层硬边界；每个一次性 Worker 最多向 provider 转发 120 个经过认证的
-`chat/completions` 请求，为 100 个 Agent 步骤、定稿和少量传输重试留出空间。
+`chat/completions` 请求，为默认 1000 个 Agent 步骤、定稿和少量传输重试留出空间。
 
 ## 结构化结果与危害约束
 

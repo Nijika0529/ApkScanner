@@ -143,6 +143,14 @@ def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> Health
             detail=auth.get("detail"),
         )
     )
+    poc_builder = orchestrator.poc_builder.capability()
+    capabilities.append(
+        Capability(
+            name="agent_poc_builder",
+            available=bool(poc_builder.get("available")),
+            detail=poc_builder.get("detail"),
+        )
+    )
     return HealthResponse(
         version=__version__,
         default_investigator=orchestrator.resolve_investigator(),
@@ -955,6 +963,7 @@ def cancel_task(
 def delete_task(
     task_id: str,
     session: Session = Depends(get_session),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
 ) -> TaskDeleteResult:
     task = session.get(InvestigationTask, task_id)
     if task is None:
@@ -969,8 +978,13 @@ def delete_task(
         TaskStatus.TIMED_OUT.value,
         TaskStatus.FAILED.value,
         TaskStatus.CANCELED.value,
+        TaskStatus.CANCEL_REQUESTED.value,
     }:
-        raise HTTPException(409, "Only a terminal task can be deleted")
+        raise HTTPException(409, "Only a terminal or stopping task can be deleted")
+
+    stopping_runtime = task.status == TaskStatus.CANCEL_REQUESTED.value
+    if stopping_runtime:
+        orchestrator.request_task_cancellation(task_id)
 
     audit_artifacts = list(
         session.scalars(
@@ -985,10 +999,11 @@ def delete_task(
     task.error = None
     task.result = {
         **dict(task.result or {}),
-        "deletion": {
-            "soft_deleted": True,
-            "deleted_at": deleted_at.isoformat(),
-            "reason": (
+            "deletion": {
+                "soft_deleted": True,
+                "deleted_at": deleted_at.isoformat(),
+                "runtime_stop_pending": stopping_runtime,
+                "reason": (
                 "Execution row hidden while evidence, hypotheses, proof attempts, and AI audit "
                 "lineage remain preserved."
             ),

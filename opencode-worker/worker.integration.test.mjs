@@ -163,6 +163,85 @@ test("stable analyzer uses non-thinking tools, then an isolated finalizer", asyn
   }
 })
 
+test("empty tool-loop completion is terminalized into a non-empty memo", async () => {
+  const requests = []
+  const api = createServer(async (request, response) => {
+    const body = await readJSON(request)
+    requests.push({ url: request.url, body })
+    if (requests.length === 1) {
+      sendCompletion(response, body, {
+        id: "terminalize-tool",
+        toolCalls: [
+          {
+            index: 0,
+            id: "call-terminalize-bash",
+            type: "function",
+            function: {
+              name: "bash",
+              arguments: JSON.stringify({
+                command: "true",
+                description: "Finish evidence inspection",
+              }),
+            },
+          },
+        ],
+        finish: "tool_calls",
+      })
+      return
+    }
+    if (requests.length === 2) {
+      sendCompletion(response, body, {
+        id: "terminalize-empty",
+        content: "",
+      })
+      return
+    }
+    if (requests.length === 3) {
+      sendCompletion(response, body, {
+        id: "terminalize-memo",
+        content:
+          "Inspection completed; request one bounded ordinary-app-UID provider test.",
+      })
+      return
+    }
+    sendCompletion(response, body, {
+      id: "terminalize-finalizer",
+      toolCalls: [structuredOutputCall(expected)],
+      finish: "tool_calls",
+    })
+  })
+  await listen(api)
+  const address = api.address()
+  assert(address && typeof address !== "string")
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-terminalize-test-"))
+  try {
+    const completed = await runWorker(
+      root,
+      investigationPayload({
+        baseURL: `http://127.0.0.1:${address.port}`,
+        profile: stableProfile(),
+      }),
+    )
+    assert.equal(completed.code, 0, completed.stderr)
+    const { result, events } = parseWorkerOutput(completed.stdout)
+    assert.deepEqual(result.result, expected)
+    assert.equal(requests.length, 4)
+    assert.equal(result.output_transport.model_calls[0].terminalized, true)
+    assert.match(
+      result.output_transport.explorer_memo,
+      /ordinary-app-UID provider test/,
+    )
+    assert.deepEqual(toolNames(requests[2].body), [])
+    assert.match(JSON.stringify(requests[2].body.messages), /MEMO_TERMINALIZATION/)
+    assert.ok(
+      events.some((item) => item.event_type === "model.memo.terminalizing"),
+    )
+  } finally {
+    api.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test("workspace tools cannot read or shell-cat files outside workspace and /tmp", async () => {
   const requests = []
   const secret = "APKS_TEST_EXTERNAL_BOUNDARY_SECRET"
@@ -469,8 +548,8 @@ test("deep capability performs a real non-thinking provider probe", async () => 
     const { result } = parseWorkerOutput(completed.stdout)
     assert.equal(result.live_probe.ok, true)
     assert.equal(result.live_probe.thinking_mode, "disabled")
-    assert.equal(result.max_steps, 100)
-    assert.equal(result.max_provider_requests, 120)
+    assert.equal(result.max_steps, 1000)
+    assert.equal(result.max_provider_requests, 1100)
     assert.equal(requests.length, 1)
     assert.equal(requests[0].body.thinking.type, "disabled")
     assert.equal(requests[0].body.tool_choice, "required")

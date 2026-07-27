@@ -270,11 +270,35 @@ class HypothesisLedger:
             if item.get("kind") == "blackbox.logcat"
             and item.get("metadata", {}).get("request_observed")
         }
+        poc_request_ids = {
+            item.get("metadata", {}).get("request_id")
+            for item in evidence
+            if item.get("kind") == "blackbox.poc_launch"
+            and item.get("exit_code") == 0
+        }
+        poc_observed_ids = {
+            item.get("metadata", {}).get("request_id")
+            for item in evidence
+            if item.get("kind") == "blackbox.poc_logcat"
+            and item.get("metadata", {}).get("request_observed")
+        }
         correlated = bool((request_ids & observed_ids) - {None})
+        poc_correlated = bool((poc_request_ids & poc_observed_ids) - {None})
         probe_succeeded = correlated and any(
             item.get("kind") == "blackbox.logcat"
             and item.get("metadata", {}).get("request_id") in request_ids
             and item.get("metadata", {}).get("probe_success")
+            for item in evidence
+        )
+        poc_succeeded = poc_correlated and any(
+            item.get("kind") == "blackbox.poc_logcat"
+            and item.get("metadata", {}).get("request_id") in poc_request_ids
+            and item.get("metadata", {}).get("poc_success")
+            for item in evidence
+        )
+        poc_claimed_impact = any(
+            item.get("kind") == "blackbox.poc_logcat"
+            and item.get("metadata", {}).get("poc_claimed_security_impact") is True
             for item in evidence
         )
         instrumented = any(
@@ -283,7 +307,7 @@ class HypothesisLedger:
             and item.get("metadata", {}).get("observation_count", 0) > 0
             for item in evidence
         )
-        execution_demonstrated = probe_succeeded or instrumented
+        execution_demonstrated = probe_succeeded or poc_succeeded or instrumented
         impact_observed = any(
             item.get("metadata", {}).get("security_impact_observed") is True
             for item in evidence
@@ -311,6 +335,9 @@ class HypothesisLedger:
                 "schema_version": "1.0",
                 "correlated_probe_result": correlated,
                 "probe_succeeded": probe_succeeded,
+                "correlated_poc_result": poc_correlated,
+                "poc_succeeded": poc_succeeded,
+                "poc_claimed_security_impact": poc_claimed_impact,
                 "instrumented_observation": instrumented,
                 "execution_demonstrated": execution_demonstrated,
                 "security_impact_observed": impact_observed,
