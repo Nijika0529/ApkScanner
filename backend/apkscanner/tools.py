@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +17,7 @@ class CommandResult:
     stdout: str
     stderr: str
     timed_out: bool = False
+    canceled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,12 +56,29 @@ class ToolRunner:
         cwd: Path | None = None,
         timeout: int | None = None,
         env: dict[str, str] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> CommandResult:
         if not argv or not shutil.which(argv[0]):
             return CommandResult(argv=argv, exit_code=127, stdout="", stderr="tool not found")
+        if cancel_event is not None and cancel_event.is_set():
+            return CommandResult(
+                argv=argv,
+                exit_code=130,
+                stdout="",
+                stderr="command cancelled before dispatch",
+                canceled=True,
+            )
         command_env = os.environ.copy()
         if env:
             command_env.update(env)
+        if cancel_event is not None:
+            return self._run_cancelable(
+                argv,
+                cwd=cwd,
+                env=command_env,
+                timeout=timeout or self.timeout_seconds,
+                cancel_event=cancel_event,
+            )
         try:
             completed = subprocess.run(
                 argv,
@@ -85,6 +105,79 @@ class ToolRunner:
                 stderr=self._decode_timeout(exc.stderr) or "command timed out",
                 timed_out=True,
             )
+
+    def _run_cancelable(
+        self,
+        argv: list[str],
+        *,
+        cwd: Path | None,
+        env: dict[str, str],
+        timeout: int,
+        cancel_event: threading.Event,
+    ) -> CommandResult:
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancel_event.is_set():
+                stdout, stderr = self._terminate(process)
+                return CommandResult(
+                    argv=argv,
+                    exit_code=130,
+                    stdout=stdout[-self.max_output_chars :],
+                    stderr=(stderr or "command cancelled")[-self.max_output_chars :],
+                    canceled=True,
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stdout, stderr = self._terminate(process)
+                return CommandResult(
+                    argv=argv,
+                    exit_code=124,
+                    stdout=stdout[-self.max_output_chars :],
+                    stderr=(stderr or "command timed out")[-self.max_output_chars :],
+                    timed_out=True,
+                )
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                return CommandResult(
+                    argv=argv,
+                    exit_code=process.returncode,
+                    stdout=stdout[-self.max_output_chars :],
+                    stderr=stderr[-self.max_output_chars :],
+                )
+            except subprocess.TimeoutExpired:
+                continue
+
+    @staticmethod
+    def _terminate(process: subprocess.Popen[str]) -> tuple[str, str]:
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            return process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+            return process.communicate()
 
     @staticmethod
     def _decode_timeout(value: str | bytes | None) -> str:

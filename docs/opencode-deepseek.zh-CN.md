@@ -124,7 +124,7 @@ export DEEPSEEK_API_KEY=...
 
 Web 上传框和 CLI 的 `--investigator` 可以为单个扫描选择：
 
-- `configured`：创建时解析并固化服务默认值；
+- `configured`：创建时解析并记录服务默认值，后续只能由用户在扫描控制台显式修改；
 - `codex`：使用 Codex；
 - `opencode`：使用 OpenCode + DeepSeek；
 - `none`：只执行静态规则与确定性动态测试。

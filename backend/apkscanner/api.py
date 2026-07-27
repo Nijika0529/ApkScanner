@@ -14,7 +14,7 @@ from . import __version__
 from .agent_audit import AGENT_AUDIT_KINDS, build_agent_audits
 from .artifacts import ArtifactStore, ArtifactTooLargeError
 from .db import Database
-from .enums import ScanStatus, TaskStatus
+from .enums import FindingStatus, ScanStatus, TaskStatus
 from .models import CoverageItem, EntryPoint, Evidence, Finding, InvestigationTask, Scan, ScanEvent
 from .orchestrator import ScanOrchestrator
 from .reports import ReportBuilder
@@ -30,9 +30,12 @@ from .schemas import (
     FindingReview,
     HealthResponse,
     InvestigationTaskOut,
+    ScanAgentControl,
     ScanDeleteResult,
     ScanDetail,
+    ScanRerunResult,
     ScanSummary,
+    TaskAgentControl,
     TaskDeleteResult,
 )
 
@@ -85,7 +88,7 @@ def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> Health
             detail=opencode.get("detail"),
         )
     )
-    device = orchestrator.device.capability()
+    device = orchestrator.device.capability(non_blocking=True)
     capabilities.append(
         Capability(
             name="remote_android_device",
@@ -159,6 +162,10 @@ async def create_scan(
         stats={
             "upload_bytes": size,
             "investigator": resolved_investigator,
+            "agent_control": {
+                "enabled": resolved_investigator != "none",
+                "backend": resolved_investigator,
+            },
         },
     )
     session.add(scan)
@@ -390,6 +397,148 @@ def review_finding(
     return finding
 
 
+@router.patch("/scans/{scan_id}/agent-control", response_model=ScanDetail)
+def update_scan_agent_control(
+    scan_id: str,
+    control: ScanAgentControl,
+    session: Session = Depends(get_session),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> Scan:
+    scan = session.get(Scan, scan_id)
+    if scan is None:
+        raise HTTPException(404, "Scan not found")
+    current_backend = str(
+        (scan.stats.get("agent_control") or {}).get("backend")
+        or scan.stats.get("investigator")
+        or "configured"
+    )
+    requested_backend = control.backend or current_backend
+    if control.enabled and requested_backend == "none":
+        requested_backend = orchestrator.resolve_investigator()
+    try:
+        backend = orchestrator.resolve_investigator(requested_backend)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if control.enabled and backend == "none":
+        raise HTTPException(422, "An enabled AI control requires codex or opencode")
+
+    scan.stats = {
+        **scan.stats,
+        "investigator": backend,
+        "agent_control": {
+            "enabled": bool(control.enabled),
+            "backend": backend,
+            "updated_at": now().isoformat(),
+        },
+    }
+    add_event(
+        session,
+        scan.id,
+        "exploration.control.updated",
+        "扫描级 AI 总开关已更新",
+        {
+            "source": "platform",
+            "enabled": bool(control.enabled),
+            "backend": backend,
+            "scope": "scan",
+        },
+    )
+    session.commit()
+    session.refresh(scan)
+    return scan
+
+
+@router.patch("/tasks/{task_id}/agent-control", response_model=InvestigationTaskOut)
+def update_task_agent_control(
+    task_id: str,
+    control: TaskAgentControl,
+    session: Session = Depends(get_session),
+) -> InvestigationTask:
+    task = session.get(InvestigationTask, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    if task.status in {
+        TaskStatus.RUNNING.value,
+        TaskStatus.CANCEL_REQUESTED.value,
+    }:
+        raise HTTPException(409, "A running task keeps the AI control resolved at its start")
+    task.preconditions = {
+        **dict(task.preconditions or {}),
+        "agent_enabled": bool(control.enabled),
+    }
+    add_event(
+        session,
+        task.scan_id,
+        "exploration.control.updated",
+        "任务级 AI 开关已更新",
+        {
+            "task_id": task.id,
+            "source": "platform",
+            "enabled": bool(control.enabled),
+            "scope": "task",
+        },
+    )
+    session.commit()
+    session.refresh(task)
+    return task
+
+
+def _reset_task_for_manual_rerun(
+    session: Session,
+    task: InvestigationTask,
+    *,
+    reason: str,
+) -> None:
+    previous_status = task.status
+    requested_at = now()
+    task.status = TaskStatus.QUEUED.value
+    task.error = None
+    task.result = {
+        "manual_rerun": {
+            "requested_at": requested_at.isoformat(),
+            "previous_status": previous_status,
+            "reason": reason,
+        }
+    }
+    task.thread_id = None
+    task.turn_id = None
+    task.started_at = None
+    task.completed_at = None
+    add_event(
+        session,
+        task.scan_id,
+        "exploration.rerun.requested",
+        "入口探索已重新排队；静态产物将被复用",
+        {
+            "task_id": task.id,
+            "source": "platform",
+            "previous_status": previous_status,
+            "attempts_completed": task.attempts,
+            "reason": reason,
+        },
+    )
+
+
+def _task_needs_supplemental_rerun(task: InvestigationTask) -> bool:
+    if task.status in {
+        TaskStatus.BLOCKED_DEVICE.value,
+        TaskStatus.INCONCLUSIVE.value,
+        TaskStatus.TIMED_OUT.value,
+        TaskStatus.FAILED.value,
+    }:
+        return True
+    return (
+        task.status == TaskStatus.COMPLETED.value
+        and str((task.result or {}).get("result")) == FindingStatus.INCONCLUSIVE.value
+    )
+
+
+def _resume_scan(session: Session, scan: Scan) -> None:
+    scan.status = ScanStatus.INVESTIGATING.value
+    scan.error = None
+    scan.completed_at = None
+
+
 @router.post("/tasks/{task_id}/retry", response_model=InvestigationTaskOut, status_code=202)
 async def retry_task(
     task_id: str,
@@ -402,27 +551,119 @@ async def retry_task(
         raise HTTPException(404, "Task not found")
     if task.status in {
         TaskStatus.QUEUED.value,
+        TaskStatus.AWAITING_DEVICE.value,
         TaskStatus.RUNNING.value,
         TaskStatus.CANCEL_REQUESTED.value,
     }:
         raise HTTPException(409, "Task is already queued or running")
     if task.attempts >= orchestrator.settings.task_max_attempts:
-        raise HTTPException(409, "Task retry budget is exhausted")
-    task.status = TaskStatus.QUEUED.value
-    task.error = None
-    task.result = {}
-    task.started_at = None
-    task.completed_at = None
+        raise HTTPException(
+            409,
+            "Task retry budget is exhausted; use the explicit rerun action after reviewing side effects",
+        )
     scan = session.get(Scan, task.scan_id)
     if scan is None:
         raise HTTPException(404, "Scan not found")
-    scan.status = ScanStatus.INVESTIGATING.value
-    scan.completed_at = None
+    _reset_task_for_manual_rerun(
+        session,
+        task,
+        reason="用户请求重新执行该入口的设备验证与 AI 分析",
+    )
+    _resume_scan(session, scan)
     session.commit()
     background = asyncio.create_task(orchestrator.submit(task.scan_id), name=f"retry-{task.id}")
     request.app.state.background_tasks.add(background)
     background.add_done_callback(request.app.state.background_tasks.discard)
     return task
+
+
+@router.post("/tasks/{task_id}/rerun", response_model=InvestigationTaskOut, status_code=202)
+async def rerun_task(
+    task_id: str,
+    request: Request,
+    session: Session = Depends(get_session),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> InvestigationTask:
+    task = session.get(InvestigationTask, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    if task.status in {
+        TaskStatus.QUEUED.value,
+        TaskStatus.AWAITING_DEVICE.value,
+        TaskStatus.RUNNING.value,
+        TaskStatus.CANCEL_REQUESTED.value,
+    }:
+        raise HTTPException(409, "Task is already queued or running")
+    scan = session.get(Scan, task.scan_id)
+    if scan is None:
+        raise HTTPException(404, "Scan not found")
+    _reset_task_for_manual_rerun(
+        session,
+        task,
+        reason="用户显式请求重新执行该入口，已确认可能产生新的设备与模型调用",
+    )
+    _resume_scan(session, scan)
+    session.commit()
+    background = asyncio.create_task(orchestrator.submit(task.scan_id), name=f"rerun-{task.id}")
+    request.app.state.background_tasks.add(background)
+    background.add_done_callback(request.app.state.background_tasks.discard)
+    return task
+
+
+@router.post(
+    "/scans/{scan_id}/rerun-incomplete",
+    response_model=ScanRerunResult,
+    status_code=202,
+)
+async def rerun_incomplete_tasks(
+    scan_id: str,
+    request: Request,
+    session: Session = Depends(get_session),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> ScanRerunResult:
+    scan = session.get(Scan, scan_id)
+    if scan is None:
+        raise HTTPException(404, "Scan not found")
+    if scan.status not in {ScanStatus.FINAL.value, ScanStatus.FAILED.value}:
+        raise HTTPException(409, "Wait for the current scan run to finish before supplementing it")
+    tasks = list(
+        session.scalars(
+            select(InvestigationTask)
+            .where(InvestigationTask.scan_id == scan_id)
+            .order_by(InvestigationTask.priority.desc(), InvestigationTask.created_at)
+        )
+    )
+    selected = [task for task in tasks if _task_needs_supplemental_rerun(task)]
+    if not selected:
+        raise HTTPException(409, "No incomplete or device-blocked tasks need a supplemental rerun")
+    for task in selected:
+        _reset_task_for_manual_rerun(
+            session,
+            task,
+            reason="能力恢复后的全局补扫",
+        )
+    _resume_scan(session, scan)
+    add_event(
+        session,
+        scan.id,
+        "exploration.rerun.batch_requested",
+        f"已将 {len(selected)} 个信息不全的入口任务加入补扫队列",
+        {
+            "source": "platform",
+            "task_ids": [task.id for task in selected],
+            "count": len(selected),
+            "reuse_static_artifacts": True,
+        },
+    )
+    session.commit()
+    background = asyncio.create_task(orchestrator.submit(scan.id), name=f"rerun-{scan.id}")
+    request.app.state.background_tasks.add(background)
+    background.add_done_callback(request.app.state.background_tasks.discard)
+    return ScanRerunResult(
+        scan_id=scan.id,
+        queued_task_ids=[task.id for task in selected],
+        queued_count=len(selected),
+    )
 
 
 @router.post(
@@ -448,21 +689,36 @@ def cancel_task(
         raise HTTPException(409, "Only a queued or running task can be cancelled")
 
     requested_at = now()
+    previous_status = task.status
+    runtime_active = previous_status in {
+        TaskStatus.AWAITING_DEVICE.value,
+        TaskStatus.RUNNING.value,
+    }
     task.result = {
         **dict(task.result or {}),
         "cancellation": {
             "requested": True,
-            "acknowledged": task.status != TaskStatus.RUNNING.value,
+            "acknowledged": not runtime_active,
             "requested_at": requested_at.isoformat(),
         },
     }
-    if task.status == TaskStatus.RUNNING.value:
+    if runtime_active:
         task.status = TaskStatus.CANCEL_REQUESTED.value
-        task.error = "正在停止当前 AI 分析"
+        task.error = (
+            "正在从云真机队列取消任务"
+            if previous_status == TaskStatus.AWAITING_DEVICE.value
+            else "正在停止当前分析"
+        )
         should_signal = True
-        message = "用户已请求停止正在运行的 AI 分析"
+        message = (
+            "用户已请求取消等待云真机的入口探索任务"
+            if previous_status == TaskStatus.AWAITING_DEVICE.value
+            else "用户已请求停止正在运行的入口探索任务"
+        )
     else:
-        should_signal = False
+        # A queued task may already have a registered runtime immediately before
+        # it enters the device scheduler. Signalling is harmless when no runtime exists.
+        should_signal = True
         task.status = TaskStatus.CANCELED.value
         task.error = "用户在任务执行前取消了分析"
         task.completed_at = requested_at

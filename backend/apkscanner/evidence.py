@@ -30,6 +30,7 @@ class EvidenceRecorder:
             "stdout": result.stdout,
             "stderr": result.stderr,
             "timed_out": result.timed_out,
+            "canceled": result.canceled,
             "metadata": metadata or {},
         }
         digest, path = self.store.put_json("evidence", payload)

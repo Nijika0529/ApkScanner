@@ -29,13 +29,39 @@ flowchart LR
     M --> N[Web / JSON / HTML / SARIF + 人工复核]
 ```
 
-平台而不是 Codex/OpenCode 负责 fan-out。一个导出组件对应一个任务；同一 handler 的 Deep Links 合并成一个任务。Agent 不能创建子 Agent，也不能直接把自己的文字当作复现证据。默认最多进行 3 个自适应测试轮次、每轮接受 4 个受限测试：只能使用当前任务的入口 ID；Deep Link 和 Provider URI 必须保持 Manifest 声明的 scheme、host/authority 和 port；额外参数有数量、键名、类型和长度上限。每轮证据都会回灌下一次判断，最终再执行禁止申请新动作的证据总结。轮次和单轮测试数可在 1–5 / 1–12 的安全范围内配置。每次扫描在创建时固化 `codex`、`opencode` 或 `none`，服务默认值的后续变更不会让同一扫描混用模型后端。
+平台而不是 Codex/OpenCode 负责 fan-out。一个导出组件对应一个任务；同一 handler 的 Deep Links 合并成一个任务。Agent 不能创建子 Agent，也不能直接把自己的文字当作复现证据。默认最多进行 3 个自适应测试轮次、每轮接受 4 个受限测试：只能使用当前任务的入口 ID；Deep Link 和 Provider URI 必须保持 Manifest 声明的 scheme、host/authority 和 port；额外参数有数量、键名、类型和长度上限。每轮证据都会回灌下一次判断，最终再执行禁止申请新动作的证据总结。轮次和单轮测试数可在 1–5 / 1–12 的安全范围内配置。每次扫描在创建时记录初始 `codex`、`opencode` 或 `none`；服务默认值的后续变更不会静默改变它，只有用户在扫描控制台显式调整才会影响后续任务。
+
+扫描创建后的 Agent 控制分两层：`Scan.stats.agent_control` 是总开关和后端选择；
+`InvestigationTask.preconditions.agent_enabled` 是单任务覆盖。总开关关闭时所有任务只运行
+规则和确定性动态验证；总开关开启后，任务级开关仍可关闭某个入口的 AI。运行中的任务保留
+启动瞬间解析出的配置，避免一次审计调用途中切换模型；新配置只影响未启动或重新分析的任务。
 
 一个任务以 `task_id + attempt` 作为平台逻辑探索运行。为保持一次性 worker 的隔离边界，目前每次物理模型调用使用新的 Codex thread 或 OpenCode session；下一轮会重新装载完整的静态上下文、累计 Evidence 和已执行测试，因此不会依赖供应商侧隐藏状态。Web 将这些物理调用统一聚合到同一个任务时间线。
 
 静态阶段结束即发布 preliminary report，并继续动态任务。外部工具、MobSF 请求和每个任务都有超时；超过 4 小时 preliminary 目标或 24 小时整单预算会写入事件及 coverage gap。
 
 JADX 的非零退出码不直接等同于反编译不可用。平台把结果归一化为完整成功、部分成功、部分超时或工具失败，并生成 `code_index.json`：逐个组件记录目标类是否位于失败列表、可用 Java/Smali 路径、文件 SHA-256 和有界源码片段。Codex 和 OpenCode 都接收相同的目标级代码上下文；OpenCode 不需要文件系统权限。历史扫描在任务重试时可从已有 workspace 与 `static.jadx` Evidence 懒生成索引，不会为了补上下文再次运行 JADX。
+
+## 单云真机调度
+
+v1 只有一个 `APKSCANNER_ADB_SERIAL`，因此所有扫描共享一个显式
+`SingleDeviceScheduler`。任务按风险优先级降序排队，相同优先级按入队序号 FIFO；数据库
+状态从 `queued` 进入 `awaiting_device`，获取租约后才进入 `running`。任务结果记录
+`position_at_enqueue`、`requested_at`、`acquired_at`、`wait_seconds`、`released_at` 和
+`held_seconds`，Web 同步展示排队状态和设备关键事件。
+
+设备租约覆盖健康检查、安装、`pm clear`、访客/认证探测、Frida、Agent 自适应补充测试和
+清理。这里刻意在需要补充测试的 AI 轮次之间继续持有设备：虽然会降低设备利用率，但能够
+保持同一任务的安装版本、登录态、日志窗口和插桩会话不被其他 APK 污染。最终清理完成后
+才释放给下一任务。健康检查等旁路 ADB 调用也经过同一命令锁，不能穿透正在运行的会话。
+
+排队任务取消时，控制面同时设置任务 cancellation event 并唤醒调度 Condition，无需等待
+前一任务释放后才能确认。运行中的 ADB 子进程使用独立进程组；停止任务会终止当前命令，
+后续设备命令直接返回 canceled，但 `pm clear` 和 App Link reset 清理仍会忽略取消信号执行。
+Web 健康检查在设备繁忙时读取最近一次能力结果，不会插入或阻塞当前设备会话。控制面重启
+时，`awaiting_device` 任务安全恢复为 `queued`；
+`cancel_requested` 直接确认为 `canceled`；已进入 `running` 的设备会话不会自动重放，而是
+标为 `inconclusive` 并要求人工重试，避免重复外部副作用。
 
 ## 信任边界
 
@@ -74,6 +100,24 @@ APK、反编译代码、资源、日志、网页和工具输出都属于不可�
 | `inconclusive` | 证据不足、工具缺失、预算耗尽或前置条件失败 |
 
 Agent 声称但不属于本 scan/task 的 Evidence ID 会被删除。需要证据的结论不满足条件时自动降级为 `inconclusive`。重试产生不同结果时，旧 Agent Finding 不删除，但会标记为已被新 turn 取代且降级为 inconclusive。
+
+风险等级与结论等级分开校验。模型输出的 `severity_proposal` 是原始建议；只有
+`supported_static`、`reproduced_blackbox` 或 `observed_instrumented` 等平台接受的风险结论
+才产生 `platform_severity`。最终结果为 `inconclusive` 时平台风险等级是未定，而不是 LOW；
+验证 Evidence 同时记录 `claimed_severity`、`final_severity=null` 和
+`severity_disposition=undetermined_due_to_incomplete_evidence`。
+
+## 能力恢复后的增量补扫
+
+连接 ADB、补齐 Probe APK/登录流程或恢复模型后端后，不需要重新上传 APK。单任务“重新分析”
+和扫描级“补扫信息不全项”都会把目标任务重新置为 `queued`，将扫描恢复为
+`investigating`，随后复用已有 workspace、代码索引和静态 Evidence，重新执行设备租约、
+动态验证和按当前开关决定的 Agent 调用。批量补扫仅选择设备阻塞、证据不足、超时、失败及
+平台最终结果为 `inconclusive` 的任务，不自动重跑已经确认或当前未复现的结论。
+
+人工重新分析不受自动尝试预算限制，但每次仍增加 `attempts`，产生新的 thread/turn 和完整
+AI 审计；旧 Evidence 不删除。批量补扫仅允许在当前扫描已经 `final`/`failed` 时启动，避免
+与仍在运行的设备任务竞态。
 
 ## AI 内容审计
 

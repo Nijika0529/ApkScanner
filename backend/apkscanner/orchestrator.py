@@ -22,7 +22,7 @@ from .artifacts import ArtifactStore
 from .codex_runner import CodexInvestigator
 from .config import Settings
 from .db import Database
-from .device import AdbDeviceAdapter
+from .device import AdbDeviceAdapter, DeviceLeaseCancelledError
 from .enums import FindingStatus, ScanStatus, TaskStatus
 from .evidence import EvidenceRecorder
 from .instrumentation import FridaAdapter
@@ -77,6 +77,22 @@ class ScanOrchestrator:
             raise ValueError("investigator must be configured, codex, opencode, or none")
         return backend
 
+    def resolve_task_investigator(
+        self,
+        scan: Scan,
+        task: InvestigationTask,
+    ) -> str:
+        control = scan.stats.get("agent_control")
+        if not isinstance(control, dict):
+            control = {}
+        backend = self.resolve_investigator(
+            str(control.get("backend") or scan.stats.get("investigator", "configured"))
+        )
+        master_enabled = bool(control.get("enabled", backend != "none"))
+        task_override = (task.preconditions or {}).get("agent_enabled")
+        task_enabled = task_override if isinstance(task_override, bool) else True
+        return backend if master_enabled and task_enabled else "none"
+
     def _record_exploration_event(
         self,
         scan_id: str,
@@ -111,6 +127,113 @@ class ScanOrchestrator:
         finally:
             async with self._running_lock:
                 self._running.discard(scan_id)
+
+    def recover_interrupted_device_tasks(self) -> None:
+        """Normalize transient single-device states after a control-plane restart."""
+        recovered_at = now()
+        with self.database.session_factory() as session:
+            tasks = list(
+                session.scalars(
+                    select(InvestigationTask)
+                    .join(Scan, Scan.id == InvestigationTask.scan_id)
+                    .where(
+                        Scan.status.in_(
+                            {
+                                ScanStatus.QUEUED.value,
+                                ScanStatus.STATIC_RUNNING.value,
+                                ScanStatus.STATIC_COMPLETE.value,
+                                ScanStatus.INVESTIGATING.value,
+                                ScanStatus.PRELIMINARY_READY.value,
+                            }
+                        ),
+                        InvestigationTask.status.in_(
+                            {
+                                TaskStatus.AWAITING_DEVICE.value,
+                                TaskStatus.RUNNING.value,
+                                TaskStatus.CANCEL_REQUESTED.value,
+                            }
+                        ),
+                    )
+                )
+            )
+            for task in tasks:
+                previous_status = task.status
+                if previous_status == TaskStatus.AWAITING_DEVICE.value:
+                    task.status = TaskStatus.QUEUED.value
+                    task.error = "服务重启后已重新进入云真机队列"
+                    queue_data = dict((task.result or {}).get("device_queue") or {})
+                    task.result = {
+                        **dict(task.result or {}),
+                        "device_queue": {
+                            **queue_data,
+                            "recovered_at": recovered_at.isoformat(),
+                        },
+                    }
+                    event_type = "task.device_requeued"
+                    message = "服务重启，等待云真机的任务已安全重新入队"
+                elif previous_status == TaskStatus.CANCEL_REQUESTED.value:
+                    task.status = TaskStatus.CANCELED.value
+                    task.error = "服务重启时确认了停止请求"
+                    task.completed_at = recovered_at
+                    task.result = {
+                        **dict(task.result or {}),
+                        "cancellation": {
+                            **dict((task.result or {}).get("cancellation") or {}),
+                            "acknowledged": True,
+                            "completed_at": recovered_at.isoformat(),
+                            "recovered_after_restart": True,
+                        },
+                    }
+                    event_type = "task.cancelled"
+                    message = "服务重启后确认任务已停止"
+                else:
+                    prior_gaps = (task.result or {}).get("coverage_gaps")
+                    if not isinstance(prior_gaps, list):
+                        prior_gaps = []
+                    task.status = TaskStatus.INCONCLUSIVE.value
+                    task.error = "控制面在设备会话中重启；为避免重复副作用，需要人工重试"
+                    task.completed_at = recovered_at
+                    task.result = {
+                        **dict(task.result or {}),
+                        "device_queue": {
+                            **dict((task.result or {}).get("device_queue") or {}),
+                            "interrupted_at": recovered_at.isoformat(),
+                        },
+                        "coverage_gaps": [
+                            *prior_gaps,
+                            "Device session was interrupted by a control-plane restart.",
+                        ],
+                    }
+                    coverage = list(
+                        session.scalars(
+                            select(CoverageItem).where(
+                                CoverageItem.scan_id == task.scan_id,
+                                CoverageItem.entry_point_id.in_(task.target_entry_ids),
+                            )
+                        )
+                    )
+                    for item in coverage:
+                        item.status = "partial"
+                        item.gap_reason = "控制面在云真机会话中重启，需要人工重试该入口。"
+                        item.stages = {
+                            **item.stages,
+                            "deterministic_dynamic": "interrupted",
+                            "agent": "interrupted",
+                        }
+                    event_type = "task.device_interrupted"
+                    message = "设备会话因服务重启中断，任务已标记为证据不足"
+                add_event(
+                    session,
+                    task.scan_id,
+                    event_type,
+                    message,
+                    {
+                        "task_id": task.id,
+                        "previous_status": previous_status,
+                        "status": task.status,
+                    },
+                )
+            session.commit()
 
     def _run_sync(self, scan_id: str) -> None:
         try:
@@ -456,7 +579,164 @@ class ScanOrchestrator:
             if event is None:
                 return False
             event.set()
+            self.device.scheduler.wake_waiters()
             return True
+
+    def _device_queue_priority(self, scan_id: str, task_id: str) -> int | None:
+        with self.database.session_factory() as session:
+            scan = session.get(Scan, scan_id)
+            task = session.get(InvestigationTask, task_id)
+            if (
+                scan is None
+                or task is None
+                or task.status != TaskStatus.QUEUED.value
+                or not self.device.configured
+                or not scan.package_name
+                or not self.device.package_safe(scan.package_name)
+            ):
+                return None
+            return int(task.priority)
+
+    def _mark_task_awaiting_device(
+        self,
+        scan_id: str,
+        task_id: str,
+        position: int,
+    ) -> None:
+        requested_at = now()
+        with self.database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            if task is None or task.status != TaskStatus.QUEUED.value:
+                return
+            task.status = TaskStatus.AWAITING_DEVICE.value
+            task.result = {
+                **dict(task.result or {}),
+                "device_queue": {
+                    "serial": self.device.serial,
+                    "position_at_enqueue": position,
+                    "requested_at": requested_at.isoformat(),
+                },
+            }
+            add_event(
+                session,
+                scan_id,
+                "task.awaiting_device",
+                f"任务正在等待唯一云真机，当前排队位置 {position}",
+                {
+                    "task_id": task_id,
+                    "status": TaskStatus.AWAITING_DEVICE.value,
+                    "queue_position": position,
+                    "priority": task.priority,
+                    "device_serial": self.device.serial,
+                },
+            )
+            add_event(
+                session,
+                scan_id,
+                "exploration.device.queued",
+                "入口探索已进入云真机队列",
+                {
+                    "task_id": task_id,
+                    "source": "platform",
+                    "queue_position": position,
+                    "priority": task.priority,
+                    "device_serial": self.device.serial,
+                },
+            )
+            session.commit()
+
+    def _record_device_acquired(
+        self,
+        scan_id: str,
+        task_id: str,
+        waited_seconds: float,
+    ) -> None:
+        acquired_at = now()
+        with self.database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            if task is None or task.status not in {
+                TaskStatus.QUEUED.value,
+                TaskStatus.AWAITING_DEVICE.value,
+            }:
+                return
+            queue_data = dict((task.result or {}).get("device_queue") or {})
+            task.result = {
+                **dict(task.result or {}),
+                "device_queue": {
+                    **queue_data,
+                    "acquired_at": acquired_at.isoformat(),
+                    "wait_seconds": round(waited_seconds, 3),
+                },
+            }
+            add_event(
+                session,
+                scan_id,
+                "task.device_acquired",
+                f"任务已独占云真机，等待 {waited_seconds:.1f} 秒",
+                {
+                    "task_id": task_id,
+                    "device_serial": self.device.serial,
+                    "wait_seconds": round(waited_seconds, 3),
+                },
+            )
+            add_event(
+                session,
+                scan_id,
+                "exploration.device.acquired",
+                "已获取云真机独占租约",
+                {
+                    "task_id": task_id,
+                    "source": "platform",
+                    "device_serial": self.device.serial,
+                    "wait_seconds": round(waited_seconds, 3),
+                },
+            )
+            session.commit()
+
+    def _record_device_released(
+        self,
+        scan_id: str,
+        task_id: str,
+        held_seconds: float,
+    ) -> None:
+        released_at = now()
+        with self.database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            if task is None:
+                return
+            queue_data = dict((task.result or {}).get("device_queue") or {})
+            task.result = {
+                **dict(task.result or {}),
+                "device_queue": {
+                    **queue_data,
+                    "released_at": released_at.isoformat(),
+                    "held_seconds": round(held_seconds, 3),
+                },
+            }
+            add_event(
+                session,
+                scan_id,
+                "task.device_released",
+                "云真机清理完成，独占租约已释放",
+                {
+                    "task_id": task_id,
+                    "device_serial": self.device.serial,
+                    "held_seconds": round(held_seconds, 3),
+                },
+            )
+            add_event(
+                session,
+                scan_id,
+                "exploration.device.released",
+                "云真机已释放给下一个等待任务",
+                {
+                    "task_id": task_id,
+                    "source": "platform",
+                    "device_serial": self.device.serial,
+                    "held_seconds": round(held_seconds, 3),
+                },
+            )
+            session.commit()
 
     def _run_task(
         self,
@@ -468,12 +748,40 @@ class ScanOrchestrator:
         with self._task_cancellations_lock:
             self._task_cancellations[task_id] = cancel_event
         try:
-            self._run_task_impl(
-                scan_id,
-                task_id,
-                timeout_seconds,
-                cancel_event=cancel_event,
-            )
+            device_priority = self._device_queue_priority(scan_id, task_id)
+            if device_priority is None:
+                self._run_task_impl(
+                    scan_id,
+                    task_id,
+                    timeout_seconds,
+                    cancel_event=cancel_event,
+                )
+            else:
+                try:
+                    with self.device.task_lease(
+                        task_id,
+                        priority=device_priority,
+                        cancel_event=cancel_event,
+                        on_queued=lambda position: self._mark_task_awaiting_device(
+                            scan_id, task_id, position
+                        ),
+                        on_acquired=lambda waited: self._record_device_acquired(
+                            scan_id, task_id, waited
+                        ),
+                        on_released=lambda held: self._record_device_released(
+                            scan_id, task_id, held
+                        ),
+                    ):
+                        self._raise_if_cancelled(cancel_event)
+                        self._run_task_impl(
+                            scan_id,
+                            task_id,
+                            timeout_seconds,
+                            cancel_event=cancel_event,
+                        )
+                        self._raise_if_cancelled(cancel_event)
+                except DeviceLeaseCancelledError as exc:
+                    raise AgentCancelledError(str(exc)) from exc
         except AgentCancelledError:
             self._mark_task_canceled(scan_id, task_id)
         finally:
@@ -493,14 +801,15 @@ class ScanOrchestrator:
             scan = session.get(Scan, scan_id)
             task = session.get(InvestigationTask, task_id)
             assert scan is not None and task is not None
-            if task.status != TaskStatus.QUEUED.value:
+            if task.status not in {
+                TaskStatus.QUEUED.value,
+                TaskStatus.AWAITING_DEVICE.value,
+            }:
                 return
             entries = list(
                 session.scalars(select(EntryPoint).where(EntryPoint.id.in_(task.target_entry_ids)))
             )
-            agent_backend = self.resolve_investigator(
-                str(scan.stats.get("investigator", "configured"))
-            )
+            agent_backend = self.resolve_task_investigator(scan, task)
             task.status = TaskStatus.RUNNING.value
             task.attempts += 1
             task.started_at = now()
@@ -1155,6 +1464,7 @@ class ScanOrchestrator:
             task = session.get(InvestigationTask, task_id)
             scan = session.get(Scan, scan_id)
             assert task is not None and scan is not None
+            existing_result = dict(task.result or {})
             if agent_result:
                 assert validated_payload is not None
                 assert validated_result_value is not None
@@ -1163,6 +1473,7 @@ class ScanOrchestrator:
                 task.thread_id = agent_result.thread_id
                 task.turn_id = agent_result.turn_id
                 task.result = {
+                    **existing_result,
                     **payload,
                     "result": result_value,
                     "agent_backend": agent_backend,
@@ -1210,6 +1521,7 @@ class ScanOrchestrator:
                 task.status = TaskStatus.TIMED_OUT.value
                 task.error = agent_error or "task time budget exhausted"
                 task.result = {
+                    **existing_result,
                     "deterministic_evidence": evidence_summaries,
                     "coverage_gaps": coverage_gaps,
                     "agent_backend": agent_backend,
@@ -1218,6 +1530,7 @@ class ScanOrchestrator:
                 task.status = TaskStatus.INCONCLUSIVE.value
                 task.error = agent_error
                 task.result = {
+                    **existing_result,
                     "deterministic_evidence": evidence_summaries,
                     "coverage_gaps": [
                         *coverage_gaps,
@@ -1229,6 +1542,7 @@ class ScanOrchestrator:
                 task.status = TaskStatus.BLOCKED_DEVICE.value
                 task.error = agent_error or str(device_capability.get("detail"))
                 task.result = {
+                    **existing_result,
                     "coverage_gaps": coverage_gaps,
                     "static_agent_attempted": agent_enabled,
                     "agent_backend": agent_backend,
@@ -1880,6 +2194,11 @@ class ScanOrchestrator:
                     "schema_version": "1.0",
                     "claimed_result": raw_payload.get("result"),
                     "final_result": validated_payload.get("result"),
+                    "claimed_severity": raw_payload.get("severity_proposal"),
+                    "final_severity": validated_payload.get("platform_severity"),
+                    "severity_disposition": validated_payload.get(
+                        "severity_disposition", "accepted"
+                    ),
                     "downgraded": (
                         raw_payload.get("result") != validated_payload.get("result")
                     ),
@@ -2256,6 +2575,12 @@ class ScanOrchestrator:
             result_value = FindingStatus.INCONCLUSIVE.value
         payload["coverage_gaps"] = gaps
         payload["result"] = result_value
+        if result_value == FindingStatus.INCONCLUSIVE.value:
+            payload["platform_severity"] = None
+            payload["severity_disposition"] = "undetermined_due_to_incomplete_evidence"
+        else:
+            payload["platform_severity"] = payload.get("severity_proposal")
+            payload["severity_disposition"] = "accepted"
         return payload, result_value
 
     @staticmethod

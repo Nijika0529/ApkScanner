@@ -8,6 +8,7 @@ import type {
   InvestigatorChoice,
   Scan,
   ScanDeleteResult,
+  ScanRerunResult,
   ScanEvent,
   TaskDeleteResult,
 } from "./types"
@@ -46,7 +47,21 @@ export const api = {
       body: JSON.stringify({ status, note }),
     }),
   retryTask: (taskId: string) =>
-    request<InvestigationTask>(`/api/v1/tasks/${taskId}/retry`, { method: "POST" }),
+    request<InvestigationTask>(`/api/v1/tasks/${taskId}/rerun`, { method: "POST" }),
+  updateScanAgentControl: (scanId: string, enabled: boolean, backend: "codex" | "opencode" | "none") =>
+    request<Scan>(`/api/v1/scans/${scanId}/agent-control`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled, backend }),
+    }),
+  updateTaskAgentControl: (taskId: string, enabled: boolean) =>
+    request<InvestigationTask>(`/api/v1/tasks/${taskId}/agent-control`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    }),
+  rerunIncomplete: (scanId: string) =>
+    request<ScanRerunResult>(`/api/v1/scans/${scanId}/rerun-incomplete`, { method: "POST" }),
   cancelTask: (taskId: string) =>
     request<InvestigationTask>(`/api/v1/tasks/${taskId}/cancel`, { method: "POST" }),
   deleteTask: (taskId: string) =>

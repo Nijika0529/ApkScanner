@@ -29,6 +29,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         application.state.background_tasks = set()
+        orchestrator.recover_interrupted_device_tasks()
         with database.session_factory() as session:
             resumable = list(
                 session.scalars(

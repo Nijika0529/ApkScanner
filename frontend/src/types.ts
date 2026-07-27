@@ -145,6 +145,12 @@ export interface TaskDeleteResult {
   audit_artifacts_preserved: number
 }
 
+export interface ScanRerunResult {
+  scan_id: string
+  queued_task_ids: string[]
+  queued_count: number
+}
+
 export interface Capability {
   name: string
   available: boolean

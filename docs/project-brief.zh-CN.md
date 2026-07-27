@@ -35,17 +35,20 @@ APK Scanner 是一个运行在安全人员本地电脑上的 Android 上线前�
 | 部署边界 | 单用户、本机 loopback 控制面；可访问已授权远程云真机 |
 | 输入限制 | 单 APK；默认最大 512 MiB |
 | 动态基线 | Android 16 / API 36；单测试账号；`pm clear` 复位 |
+| 单设备调度 | 全局优先级队列；同优先级 FIFO；可取消等待；记录排队/占用时长；重启安全恢复 |
 | 入口类型 | 6 类：Activity、Activity Alias、Service、Receiver、Provider、Deep Link |
 | 内置规则 | 17 条固定规则 + 5 类导出组件动态规则，共 22 个规则 ID 类型 |
 | 覆盖模型 | 8 个 MASVS 域；static、deterministic、blackbox、authenticated、agent、instrumented 多阶段记录 |
 | AI 后端 | 2 套：Codex SDK；OpenCode SDK + DeepSeek V4 Pro/Flash |
+| AI 运行控制 | 扫描级总开关与后端选择；逐任务开关；运行中配置冻结 |
+| 增量补扫 | ADB/模型能力恢复后批量补扫信息不全项，或单入口重新分析；不重复反编译 |
 | AI 探索预算 | 默认最多 3 轮、每轮接受 4 个测试；安全可配范围分别为 1–5 轮、1–12 个 |
 | 单任务预算 | 默认 20 分钟；最多 2 次尝试 |
 | 整单时限 | preliminary 目标 4 小时；整单截止 24 小时 |
 | AI 审计证据 | 7 类：request、events、response、test validation、result validation、error、cancellation |
 | 报告出口 | 4 种：Web、JSON、HTML、SARIF |
 | 任务视觉状态 | 5 组：等待判断、正在分析、已判断、未形成判断、已停止 |
-| 自动化回归 | 后端 36 项测试；OpenCode Worker 2 项 Pro/Flash 集成测试；前端 lint + production build |
+| 自动化回归 | 后端 46 项测试；OpenCode Worker 2 项 Pro/Flash 集成测试；前端 lint + production build |
 
 规则数量按当前代码统计：4 条 Manifest、2 条 Deep Link、4 条 APK/签名、7 条代码模式，以及
 Activity、Activity Alias、Service、Receiver、Provider 5 类按入口动态生成的导出规则。

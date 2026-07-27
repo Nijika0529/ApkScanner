@@ -70,6 +70,12 @@ export APKSCANNER_PROBE_APK="$PWD/probe/app/build/outputs/apk/debug/app-debug.ap
 
 没有 ADB 或 Probe APK 时，扫描仍会完成，并显式标注动态覆盖为 blocked。`adb shell` 成功会保留为独立身份，永远不会被视为等同于普通第三方应用。
 
+单 ADB 模式使用全局显式设备队列：风险优先级高的任务先执行，相同优先级按入队顺序执行。
+任务在 Web 中依次显示 `等待云真机 → 正在分析 → 已判断/未形成判断`，排队阶段可以立即
+取消。一个任务从设备健康检查、安装、访客/登录态探测、AI 申请的补充测试到最终清理完整
+持有独占租约，避免不同 APK 的登录态、logcat、Frida 和 App Link 状态相互污染。队列等待
+时间、设备占用时间和获取/释放事件会写入任务结果。
+
 使用非敏感的 JSON 流程和操作系统密钥环引用配置单账号登录回放：
 
 ```bash
@@ -177,6 +183,12 @@ APK 上传
 或终止 OpenCode worker，保留已产生的关键事件并写入不可变的 `agent.cancellation`
 审计证据。被停止的任务不会伪造新的最终判断，可按原有重试预算重新执行。
 
+扫描详情的“探索任务”页提供扫描级 AI 总开关、Codex/OpenCode 后端选择和逐任务 AI
+覆盖开关。ADB、Probe、登录流程或模型能力后续恢复后，可以“补扫信息不全项”，批量重跑
+`blocked_device`、`inconclusive`、`timed_out`、`failed` 以及最终结果为
+`inconclusive` 的任务；也可以对任意终态任务单独“重新分析”。补扫直接复用已有 Manifest、
+Apktool、JADX/Smali、代码索引和静态 Evidence，不再次反编译。
+
 ## 判定与证据规则
 
 | 判定 | 平台最低要求 |
@@ -188,6 +200,10 @@ APK 上传
 | `inconclusive` | 证据不足、工具缺失、预算耗尽或前置条件失败 |
 
 Agent 声称的、不属于当前 Scan/Task 的 Evidence ID 会被移除。需要特定证据的判定在不满足条件时会自动降级为 `inconclusive`。重试时，旧的 Agent Finding 不删除，但会被标记为已被新 turn 取代并降级。
+
+`severity_proposal` 始终只是模型风险建议。当平台最终结果为 `inconclusive` 时，
+`platform_severity` 固定为空，Web 显示“风险未定”；模型原始的 LOW/MEDIUM/HIGH 只保留在
+AI 审计中，不能被当作平台确认风险等级。
 
 ## 环境变量
 

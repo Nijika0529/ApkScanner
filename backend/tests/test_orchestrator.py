@@ -353,3 +353,87 @@ def test_canceled_task_selected_before_dispatch_is_not_restarted(settings) -> No
         assert task is not None
         assert task.status == "canceled"
         assert task.attempts == 0
+
+
+def test_restart_recovery_normalizes_transient_device_states(settings) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    store = ArtifactStore(settings)
+    scan_id = "00000000-0000-0000-0000-000000000100"
+    task_ids = {
+        "awaiting": "00000000-0000-0000-0000-000000000101",
+        "running": "00000000-0000-0000-0000-000000000102",
+        "cancel": "00000000-0000-0000-0000-000000000103",
+    }
+    with database.session_factory() as session:
+        scan = Scan(
+            id=scan_id,
+            status="investigating",
+            filename="restart.apk",
+            artifact_sha256="6" * 64,
+            artifact_path=str(settings.data_dir / "missing.apk"),
+        )
+        session.add(scan)
+        session.add_all(
+            [
+                InvestigationTask(
+                    id=task_ids["awaiting"],
+                    scan_id=scan_id,
+                    task_type="component",
+                    status="awaiting_device",
+                ),
+                InvestigationTask(
+                    id=task_ids["running"],
+                    scan_id=scan_id,
+                    task_type="component",
+                    status="running",
+                    attempts=1,
+                ),
+                InvestigationTask(
+                    id=task_ids["cancel"],
+                    scan_id=scan_id,
+                    task_type="component",
+                    status="cancel_requested",
+                ),
+            ]
+        )
+        session.commit()
+
+    orchestrator = ScanOrchestrator(settings, database, store)
+    orchestrator.recover_interrupted_device_tasks()
+
+    with database.session_factory() as session:
+        awaiting = session.get(InvestigationTask, task_ids["awaiting"])
+        running = session.get(InvestigationTask, task_ids["running"])
+        canceled = session.get(InvestigationTask, task_ids["cancel"])
+        assert awaiting is not None and awaiting.status == "queued"
+        assert awaiting.result["device_queue"]["recovered_at"]
+        assert running is not None and running.status == "inconclusive"
+        assert "restart" in running.result["coverage_gaps"][0].lower()
+        assert canceled is not None and canceled.status == "canceled"
+        assert canceled.result["cancellation"]["acknowledged"] is True
+
+
+def test_inconclusive_agent_result_has_no_platform_risk_severity() -> None:
+    payload = AgentInvestigationResult(
+        summary="Dynamic evidence is missing.",
+        result="inconclusive",
+        hypotheses_tested=["Exported provider may expose data"],
+        test_cases=[],
+        evidence_ids=[],
+        severity_proposal="low",
+        confidence="low",
+        coverage_gaps=["ADB unavailable"],
+        followups=[],
+        requested_tests=[],
+    ).model_dump(mode="json")
+
+    validated, result = ScanOrchestrator._validated_agent_payload(payload, [])
+
+    assert result == "inconclusive"
+    assert validated["severity_proposal"] == "low"
+    assert validated["platform_severity"] is None
+    assert (
+        validated["severity_disposition"]
+        == "undetermined_due_to_incomplete_evidence"
+    )

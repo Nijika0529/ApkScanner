@@ -18,6 +18,7 @@ import {
   Menu,
   Network,
   Plus,
+  Power,
   RefreshCw,
   ScanSearch,
   ScrollText,
@@ -109,6 +110,9 @@ function App() {
     source.onmessage = refresh
     source.addEventListener("static.completed", refresh)
     source.addEventListener("task.completed", refresh)
+    source.addEventListener("task.awaiting_device", refresh)
+    source.addEventListener("task.device_acquired", refresh)
+    source.addEventListener("task.device_released", refresh)
     source.addEventListener("task.cancel_requested", refresh)
     source.addEventListener("task.cancelled", refresh)
     source.addEventListener("exploration.update", refresh)
@@ -255,7 +259,7 @@ function ScanDetailView({ data, health, onRefresh, onDelete }: { data: DetailDat
           <TabsContent value="entries"><EntryPoints entries={entries} /></TabsContent>
           <TabsContent value="findings"><Findings findings={findings} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="coverage"><CoverageMatrix coverage={coverage} /></TabsContent>
-          <TabsContent value="tasks"><Tasks tasks={tasks} entries={entries} audits={audits} events={events} onRefresh={onRefresh} /></TabsContent>
+          <TabsContent value="tasks"><Tasks scan={scan} tasks={tasks} entries={entries} audits={audits} events={events} health={health} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="audits"><AgentAudits audits={audits} tasks={tasks} entries={entries} /></TabsContent>
         </Tabs>
       </Card>
@@ -305,13 +309,50 @@ function CoverageMatrix({ coverage }: { coverage: CoverageItem[] }) {
   return <div className="space-y-8"><div><SectionTitle icon={ShieldCheck} title="MASVS 域覆盖" description="覆盖不代表无漏洞；缺口必须进入报告" /><div className="mt-4 overflow-x-auto rounded-xl border border-slate-200"><table className="w-full min-w-[850px] text-sm"><thead className="bg-slate-50 text-xs text-slate-500"><tr><th className="px-4 py-3 text-left font-medium">Domain</th>{stages.map((stage) => <th key={stage} className="px-3 py-3 text-center font-medium">{stage.replace("deterministic_dynamic", "确定性动态")}</th>)}<th className="px-4 py-3 text-left font-medium">缺口</th></tr></thead><tbody className="divide-y divide-slate-200">{baseline.map((item) => <tr key={item.id}><td className="px-4 py-3 font-semibold text-slate-700">{item.domain}</td>{stages.map((stage) => <td key={stage} className="px-3 py-3 text-center"><StageState value={String(item.stages[stage] ?? "pending")} /></td>)}<td className="max-w-xs px-4 py-3 text-xs leading-relaxed text-slate-500">{item.gap_reason ?? "—"}</td></tr>)}</tbody></table></div></div><div><SectionTitle icon={CircleDot} title="入口覆盖" description={`${entryCoverage.length} 个入口的逐项状态`} /><div className="mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-3">{entryCoverage.map((item) => <div key={item.id} className="rounded-xl border border-slate-200 p-3"><div className="mb-2 flex items-center justify-between gap-3"><p className="truncate font-mono text-xs text-slate-700" title={item.title}>{item.title.replace("Entry point: ", "")}</p><Badge tone={statusTone(item.status)}>{statusLabel(item.status)}</Badge></div><p className="line-clamp-2 text-xs text-slate-600">{item.gap_reason ?? "全部计划阶段已记录"}</p></div>)}</div></div></div>
 }
 
-function Tasks({ tasks, entries, audits, events, onRefresh }: { tasks: InvestigationTask[]; entries: EntryPoint[]; audits: AgentAudit[]; events: ScanEvent[]; onRefresh: () => Promise<void> }) {
+function Tasks({ scan, tasks, entries, audits, events, health, onRefresh }: { scan: Scan; tasks: InvestigationTask[]; entries: EntryPoint[]; audits: AgentAudit[]; events: ScanEvent[]; health: Health | null; onRefresh: () => Promise<void> }) {
   const names = new Map(entries.map((item) => [item.id, item.name]))
   const auditCounts = audits.reduce((counts, audit) => counts.set(audit.task_id, (counts.get(audit.task_id) ?? 0) + 1), new Map<string | null, number>())
   const [retrying, setRetrying] = useState<string | null>(null)
+  const [controlSaving, setControlSaving] = useState<string | null>(null)
+  const [rerunOpen, setRerunOpen] = useState(false)
+  const [controlError, setControlError] = useState<string | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<InvestigationTask | null>(null)
   const [cancelTarget, setCancelTarget] = useState<InvestigationTask | null>(null)
   async function retry(id: string) { setRetrying(id); try { await api.retryTask(id); await onRefresh() } finally { setRetrying(null) } }
+  const agentControl = recordValue(scan.stats.agent_control)
+  const configuredBackend = textValue(agentControl?.backend) ?? textValue(scan.stats.investigator) ?? "none"
+  const backend: "codex" | "opencode" | "none" = configuredBackend === "opencode" ? "opencode" : configuredBackend === "codex" ? "codex" : "none"
+  const masterEnabled = booleanValue(agentControl?.enabled) ?? backend !== "none"
+  const deviceReady = Boolean(health?.capabilities.find((item) => item.name === "remote_android_device")?.available)
+  const codexReady = Boolean(health?.enabled_investigators.includes("codex") && health.capabilities.find((item) => item.name === "codex")?.available)
+  const opencodeReady = Boolean(health?.enabled_investigators.includes("opencode") && health.capabilities.find((item) => item.name === "opencode_deepseek")?.available)
+  const selectedBackendReady = backend === "codex" ? codexReady : backend === "opencode" ? opencodeReady : false
+  const incompleteCount = tasks.filter(taskNeedsSupplementalRerun).length
+  async function updateMaster(enabled: boolean, selectedBackend: "codex" | "opencode" | "none" = backend) {
+    setControlSaving("scan")
+    setControlError(null)
+    try {
+      const fallback = selectedBackend === "none" ? (opencodeReady ? "opencode" : "codex") : selectedBackend
+      await api.updateScanAgentControl(scan.id, enabled, enabled ? fallback : selectedBackend)
+      await onRefresh()
+    } catch (reason) {
+      setControlError(reason instanceof Error ? reason.message : "更新 AI 总开关失败")
+    } finally {
+      setControlSaving(null)
+    }
+  }
+  async function updateTaskControl(task: InvestigationTask, enabled: boolean) {
+    setControlSaving(task.id)
+    setControlError(null)
+    try {
+      await api.updateTaskAgentControl(task.id, enabled)
+      await onRefresh()
+    } catch (reason) {
+      setControlError(reason instanceof Error ? reason.message : "更新任务 AI 开关失败")
+    } finally {
+      setControlSaving(null)
+    }
+  }
   const stateCounts = tasks.reduce((counts, task) => {
     const state = taskVisualState(task).group
     counts[state] = (counts[state] ?? 0) + 1
@@ -319,6 +360,21 @@ function Tasks({ tasks, entries, audits, events, onRefresh }: { tasks: Investiga
   }, {} as Record<string, number>)
   return (
     <div className="space-y-3">
+      <div className="rounded-xl border border-violet-200 bg-violet-50/70 p-4">
+        <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+          <div>
+            <div className="flex items-center gap-2"><Power className="h-4 w-4 text-violet-700" /><h3 className="text-sm font-bold text-violet-950">AI 探索控制</h3><Badge tone={masterEnabled ? "good" : "neutral"}>{masterEnabled ? "总开关已开启" : "总开关已关闭"}</Badge></div>
+            <p className="mt-1 text-xs leading-5 text-violet-800">设置只影响尚未启动或之后重新分析的任务；运行中的模型调用保持启动时配置。</p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <label><span className="sr-only">AI 后端</span><select className="field h-9 min-w-44 py-1.5 text-xs" value={backend} disabled={controlSaving === "scan"} onChange={(event) => { const selected = event.target.value as "codex" | "opencode" | "none"; void updateMaster(selected === "none" ? false : masterEnabled, selected) }}><option value="codex" disabled={!codexReady}>Codex{codexReady ? "" : " · 未就绪"}</option><option value="opencode" disabled={!opencodeReady}>OpenCode + DeepSeek{opencodeReady ? "" : " · 未就绪"}</option><option value="none">不使用 AI</option></select></label>
+            <Button variant={masterEnabled ? "secondary" : "primary"} size="sm" onClick={() => void updateMaster(!masterEnabled)} disabled={controlSaving === "scan" || (!masterEnabled && !codexReady && !opencodeReady)}>{controlSaving === "scan" ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Power className="h-3.5 w-3.5" />}{masterEnabled ? "关闭全部 AI" : "开启全部 AI"}</Button>
+            <Button variant="secondary" size="sm" onClick={() => setRerunOpen(true)} disabled={!["final", "failed"].includes(scan.status) || incompleteCount === 0}><RefreshCw className="h-3.5 w-3.5" />补扫信息不全项 · {incompleteCount}</Button>
+          </div>
+        </div>
+        <div className="mt-3 flex flex-wrap gap-2 text-xs"><Badge tone={deviceReady ? "good" : "warning"}>{deviceReady ? "ADB 已就绪" : "ADB 当前不可用"}</Badge><Badge tone={masterEnabled && selectedBackendReady ? "good" : "warning"}>{masterEnabled ? selectedBackendReady ? "AI 后端已就绪" : "AI 后端未就绪" : "AI 已关闭"}</Badge><span className="text-violet-800">补扫会复用 Manifest、JADX/Smali 和静态 Evidence，只重新执行设备验证与 AI。</span></div>
+        {controlError && <p role="alert" className="mt-3 text-xs text-rose-700">{controlError}</p>}
+      </div>
       <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5" aria-label="探索任务状态汇总">
         <TaskStateMetric label="等待判断" value={stateCounts.waiting ?? 0} tone="border-cyan-200 bg-cyan-50 text-cyan-900" />
         <TaskStateMetric label="正在分析" value={stateCounts.active ?? 0} tone="border-violet-200 bg-violet-50 text-violet-900" />
@@ -375,8 +431,9 @@ function Tasks({ tasks, entries, audits, events, onRefresh }: { tasks: Investiga
                   {task.error && <p className="mt-3 text-xs text-amber-700">{task.error}</p>}
                 </div>
                 <div className="flex shrink-0 items-center gap-3 text-xs text-slate-600">
-                  <span>attempt {task.attempts}/2</span>
-                  {["failed", "inconclusive", "blocked_device"].includes(task.status) && task.attempts < 2 && <Button variant="secondary" size="sm" onClick={() => retry(task.id)} disabled={retrying === task.id}>{retrying === task.id ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}重试</Button>}
+                  <span>attempt {task.attempts}</span>
+                  <Button variant="ghost" size="sm" onClick={() => void updateTaskControl(task, !taskAgentEnabled(task))} disabled={!masterEnabled || ["running", "cancel_requested"].includes(task.status) || controlSaving === task.id} title={!masterEnabled ? "先开启扫描级 AI 总开关" : "覆盖本任务的 AI 使用设置"}>{controlSaving === task.id ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Bot className="h-3.5 w-3.5" />}AI {taskAgentEnabled(task) ? "开" : "关"}</Button>
+                  {isTerminalTask(task.status) && <Button variant="secondary" size="sm" onClick={() => retry(task.id)} disabled={retrying === task.id}>{retrying === task.id ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}重新分析</Button>}
                   {["queued", "awaiting_device", "running", "cancel_requested"].includes(task.status) && <Button variant="danger" size="sm" onClick={() => setCancelTarget(task)} disabled={task.status === "cancel_requested"}>{task.status === "cancel_requested" ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <X className="h-3.5 w-3.5" />}{task.status === "queued" ? "取消等待" : task.status === "cancel_requested" ? "正在停止" : "停止分析"}</Button>}
                   {["blocked_device", "completed", "not_reproduced", "inconclusive", "timed_out", "failed", "canceled"].includes(task.status) && <Button variant="danger" size="sm" onClick={() => setDeleteTarget(task)}><Trash2 className="h-3.5 w-3.5" />删除</Button>}
                 </div>
@@ -409,6 +466,7 @@ function Tasks({ tasks, entries, audits, events, onRefresh }: { tasks: Investiga
         onOpenChange={(open) => !open && setCancelTarget(null)}
         onCancelled={async () => { setCancelTarget(null); await onRefresh() }}
       />
+      <RerunIncompleteDialog scan={rerunOpen ? scan : null} count={incompleteCount} deviceReady={deviceReady} onOpenChange={setRerunOpen} onQueued={onRefresh} />
     </div>
   )
 }
@@ -418,12 +476,62 @@ function TaskStateMetric({ label, value, tone }: { label: string; value: number;
 }
 
 function taskVisualState(task: InvestigationTask) {
-  if (task.status === "queued" || task.status === "awaiting_device") return { group: "waiting", label: "等待判断", description: "尚未占用设备或调用 AI", card: "border-cyan-200", banner: "border-cyan-200 bg-cyan-50 text-cyan-950" }
-  if (task.status === "running") return { group: "active", label: "正在分析", description: "SDK 正在探索并持续记录关键事件", card: "border-violet-300 shadow-[0_12px_35px_rgba(124,58,237,.10)]", banner: "border-violet-200 bg-violet-50 text-violet-950" }
-  if (task.status === "cancel_requested") return { group: "active", label: "正在停止", description: "已发送中止请求，等待 Worker 确认", card: "border-amber-300", banner: "border-amber-200 bg-amber-50 text-amber-950" }
+  if (task.status === "awaiting_device") {
+    const queue = recordValue(task.result.device_queue)
+    const position = numberValue(queue?.position_at_enqueue)
+    return { group: "waiting", label: "等待云真机", description: position ? `入队时位于第 ${position} 位，可立即取消` : "已进入单设备队列，可立即取消", card: "border-cyan-300", banner: "border-cyan-200 bg-cyan-50 text-cyan-950" }
+  }
+  if (task.status === "queued") return { group: "waiting", label: "等待判断", description: "等待调度，尚未占用云真机或调用 AI", card: "border-cyan-200", banner: "border-cyan-200 bg-cyan-50 text-cyan-950" }
+  if (task.status === "running") return { group: "active", label: "正在分析", description: "平台正在执行设备验证或 SDK 探索，并持续记录关键事件", card: "border-violet-300 shadow-[0_12px_35px_rgba(124,58,237,.10)]", banner: "border-violet-200 bg-violet-50 text-violet-950" }
+  if (task.status === "cancel_requested") return { group: "active", label: "正在停止", description: "已发送中止请求，等待设备或模型运行时确认", card: "border-amber-300", banner: "border-amber-200 bg-amber-50 text-amber-950" }
+  if (task.status === "completed" && textValue(task.result.result) === "inconclusive") return { group: "unresolved", label: "信息不全", description: "平台结论为证据不足，可在能力恢复后补扫", card: "border-amber-200", banner: "border-amber-200 bg-amber-50 text-amber-950" }
   if (task.status === "completed" || task.status === "not_reproduced") return { group: "judged", label: "已判断", description: task.result.result ? `平台结论：${statusLabel(String(task.result.result))}` : "平台已完成证据校验", card: "border-emerald-200", banner: "border-emerald-200 bg-emerald-50 text-emerald-950" }
   if (task.status === "canceled") return { group: "stopped", label: "已停止", description: "用户主动终止，未产生新的最终结论", card: "border-slate-300", banner: "border-slate-200 bg-slate-100 text-slate-800" }
   return { group: "unresolved", label: "未形成判断", description: task.status === "blocked_device" ? "设备或 AI 能力阻塞，可修复后重试" : "证据、工具或预算不足", card: "border-amber-200", banner: "border-amber-200 bg-amber-50 text-amber-950" }
+}
+
+function taskAgentEnabled(task: InvestigationTask) {
+  return booleanValue(task.preconditions.agent_enabled) ?? true
+}
+
+function taskNeedsSupplementalRerun(task: InvestigationTask) {
+  if (["blocked_device", "inconclusive", "timed_out", "failed"].includes(task.status)) return true
+  return task.status === "completed" && textValue(task.result.result) === "inconclusive"
+}
+
+function isTerminalTask(status: string) {
+  return !["queued", "awaiting_device", "running", "cancel_requested"].includes(status)
+}
+
+function RerunIncompleteDialog({ scan, count, deviceReady, onOpenChange, onQueued }: { scan: Scan | null; count: number; deviceReady: boolean; onOpenChange: (open: boolean) => void; onQueued: () => Promise<void> }) {
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => setError(null), [scan?.id])
+  async function rerun() {
+    if (!scan) return
+    setSubmitting(true)
+    setError(null)
+    try {
+      await api.rerunIncomplete(scan.id)
+      onOpenChange(false)
+      await onQueued()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "补扫启动失败")
+    } finally {
+      setSubmitting(false)
+    }
+  }
+  return (
+    <Dialog open={Boolean(scan)} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogTitle className="text-xl font-bold text-slate-950">补扫所有信息不全项？</DialogTitle>
+        <DialogDescription className="mt-2 text-sm leading-6 text-slate-600">将重新排队 {count} 个设备阻塞、执行失败、超时或平台结论为“证据不足”的任务。静态扫描和反编译结果会直接复用，不会再次运行 JADX。</DialogDescription>
+        <div className={cn("mt-5 rounded-xl border p-4 text-sm", deviceReady ? "border-emerald-200 bg-emerald-50 text-emerald-900" : "border-amber-200 bg-amber-50 text-amber-950")}>{deviceReady ? "ADB 当前已就绪，可以开始补充动态证据。" : "ADB 当前仍不可用；继续补扫可能再次得到证据不足。"} AI 是否执行由总开关和各任务开关共同决定。</div>
+        {error && <p role="alert" className="mt-4 text-sm text-rose-700">{error}</p>}
+        <div className="mt-6 flex justify-end gap-2"><Button variant="ghost" onClick={() => onOpenChange(false)} disabled={submitting}>取消</Button><Button onClick={rerun} disabled={submitting}>{submitting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{submitting ? "正在排队" : `确认补扫 ${count} 项`}</Button></div>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 function CancelTaskDialog({ task, target, onOpenChange, onCancelled }: { task: InvestigationTask | null; target: string; onOpenChange: (open: boolean) => void; onCancelled: () => Promise<void> }) {
@@ -570,7 +678,10 @@ function AuditConclusion({ audit }: { audit: AgentAudit }) {
   const result = textValue(validation?.final_result) ?? textValue(validatedOutput.result) ?? "inconclusive"
   const claimedResult = textValue(validation?.claimed_result)
   const summary = textValue(validatedOutput.summary) ?? "模型未提供结论摘要。"
-  const severity = textValue(validatedOutput.severity_proposal) ?? "—"
+  const proposedSeverity = textValue(validatedOutput.severity_proposal) ?? "—"
+  const severity = result === "inconclusive"
+    ? "未定"
+    : (textValue(validation?.final_severity) ?? proposedSeverity).toUpperCase()
   const confidence = textValue(validatedOutput.confidence) ?? "—"
   const evidenceIds = stringValues(validation?.accepted_evidence_ids ?? validatedOutput.evidence_ids)
   const rejectedEvidenceIds = stringValues(validation?.rejected_evidence_ids)
@@ -593,7 +704,7 @@ function AuditConclusion({ audit }: { audit: AgentAudit }) {
           </div>
         </div>
         <div className="grid shrink-0 grid-cols-3 gap-2 sm:min-w-72">
-          <ConclusionMetric label="风险等级" value={severity.toUpperCase()} />
+          <ConclusionMetric label="风险等级" value={severity} />
           <ConclusionMetric label="置信度" value={confidenceLabel(confidence)} />
           <ConclusionMetric label="有效证据" value={String(evidenceIds.length)} />
         </div>
@@ -605,6 +716,11 @@ function AuditConclusion({ audit }: { audit: AgentAudit }) {
             {gaps.slice(0, 3).map((gap, index) => <span key={`${index}-${gap}`} className="flex items-start gap-1.5"><CircleDot className="mt-0.5 h-3 w-3 shrink-0" />{gap}</span>)}
             {rejectedEvidenceIds.length > 0 && <span>拒绝了 {rejectedEvidenceIds.length} 个无效 Evidence ID</span>}
           </div>
+        </div>
+      )}
+      {result === "inconclusive" && proposedSeverity !== "—" && (
+        <div className="border-t border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-950">
+          模型曾建议风险等级 {proposedSeverity.toUpperCase()}，但平台因证据不足未采纳；该值仅保留在原始审计中供后续补扫参考。
         </div>
       )}
     </section>
@@ -682,6 +798,20 @@ function textValue(value: unknown): string | undefined {
   return typeof value === "string" && value ? value : undefined
 }
 
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function booleanValue(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
 function formatAuditContent(value: unknown) {
   if (value === null || value === undefined) return "内容不可用"
   if (typeof value === "string") return value
@@ -730,7 +860,7 @@ function UploadDialog({ open, onOpenChange, onUploaded, health }: { open: boolea
   const defaultLabel = health?.default_investigator === "opencode" ? "OpenCode + DeepSeek" : health?.default_investigator === "codex" ? "Codex" : "仅静态与确定性动态"
   const codexReady = Boolean(health?.enabled_investigators.includes("codex") && health.capabilities.find((item) => item.name === "codex")?.available)
   const opencodeReady = Boolean(health?.enabled_investigators.includes("opencode") && health.capabilities.find((item) => item.name === "opencode_deepseek")?.available)
-  return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent><DialogTitle className="text-xl font-bold text-slate-950">新建 APK 安全扫描</DialogTitle><DialogDescription className="mt-2 text-sm leading-relaxed text-slate-600">APK 将保存在本机内容寻址存储中。AI 受单次任务范围约束，所有进入报告的结论仍须通过平台证据校验。</DialogDescription><form className="mt-6" onSubmit={submit}><button type="button" className={cn("grid min-h-52 w-full place-items-center rounded-2xl border border-dashed p-6 text-center transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-700", dragging ? "border-cyan-300 bg-cyan-400/10" : "border-slate-300 bg-slate-50 hover:border-slate-500")} onClick={() => inputRef.current?.click()} onDragOver={(event) => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); choose(event.dataTransfer.files[0]) }}><input ref={inputRef} type="file" accept=".apk,application/vnd.android.package-archive" className="sr-only" onChange={(event) => choose(event.target.files?.[0])} /><div>{file ? <><FileArchive className="mx-auto h-10 w-10 text-cyan-700" /><p className="mt-4 break-all font-semibold text-slate-900">{file.name}</p><p className="mt-2 text-xs text-slate-500">{(file.size / 1024 / 1024).toFixed(2)} MB · 点击更换</p></> : <><UploadCloud className="mx-auto h-10 w-10 text-slate-500" /><p className="mt-4 font-semibold text-slate-800">拖入 APK 或点击选择</p><p className="mt-2 text-xs text-slate-600">最大 512 MB · 不支持 AAB/XAPK/split APK</p></>}</div></button><label className="mt-5 block"><span className="mb-2 block text-sm font-semibold text-slate-800">语义探索后端</span><select className="field w-full" value={investigator} onChange={(event) => setInvestigator(event.target.value as InvestigatorChoice)}><option value="configured">服务默认 · {defaultLabel}</option><option value="codex" disabled={!codexReady}>Codex · {codexReady ? "已就绪" : "未启用或依赖未就绪"}</option><option value="opencode" disabled={!opencodeReady}>OpenCode + DeepSeek · {opencodeReady ? "已就绪" : "未启用或依赖未就绪"}</option><option value="none">关闭 AI · 仅规则和确定性动态测试</option></select><span className="mt-2 block text-xs leading-relaxed text-slate-600">选择会固化到本次扫描；切换服务默认不会影响已经排队的任务。</span></label>{error && <p role="alert" className="mt-3 text-sm text-rose-700">{error}</p>}<div className="mt-6 flex justify-end gap-2"><Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>取消</Button><Button type="submit" disabled={!file || uploading}>{uploading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <ScanSearch className="h-4 w-4" />}{uploading ? "正在接收" : "开始扫描"}</Button></div></form></DialogContent></Dialog>
+  return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent><DialogTitle className="text-xl font-bold text-slate-950">新建 APK 安全扫描</DialogTitle><DialogDescription className="mt-2 text-sm leading-relaxed text-slate-600">APK 将保存在本机内容寻址存储中。AI 受单次任务范围约束，所有进入报告的结论仍须通过平台证据校验。</DialogDescription><form className="mt-6" onSubmit={submit}><button type="button" className={cn("grid min-h-52 w-full place-items-center rounded-2xl border border-dashed p-6 text-center transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-700", dragging ? "border-cyan-300 bg-cyan-400/10" : "border-slate-300 bg-slate-50 hover:border-slate-500")} onClick={() => inputRef.current?.click()} onDragOver={(event) => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); choose(event.dataTransfer.files[0]) }}><input ref={inputRef} type="file" accept=".apk,application/vnd.android.package-archive" className="sr-only" onChange={(event) => choose(event.target.files?.[0])} /><div>{file ? <><FileArchive className="mx-auto h-10 w-10 text-cyan-700" /><p className="mt-4 break-all font-semibold text-slate-900">{file.name}</p><p className="mt-2 text-xs text-slate-500">{(file.size / 1024 / 1024).toFixed(2)} MB · 点击更换</p></> : <><UploadCloud className="mx-auto h-10 w-10 text-slate-500" /><p className="mt-4 font-semibold text-slate-800">拖入 APK 或点击选择</p><p className="mt-2 text-xs text-slate-600">最大 512 MB · 不支持 AAB/XAPK/split APK</p></>}</div></button><label className="mt-5 block"><span className="mb-2 block text-sm font-semibold text-slate-800">语义探索后端</span><select className="field w-full" value={investigator} onChange={(event) => setInvestigator(event.target.value as InvestigatorChoice)}><option value="configured">服务默认 · {defaultLabel}</option><option value="codex" disabled={!codexReady}>Codex · {codexReady ? "已就绪" : "未启用或依赖未就绪"}</option><option value="opencode" disabled={!opencodeReady}>OpenCode + DeepSeek · {opencodeReady ? "已就绪" : "未启用或依赖未就绪"}</option><option value="none">关闭 AI · 仅规则和确定性动态测试</option></select><span className="mt-2 block text-xs leading-relaxed text-slate-600">这是本次扫描的初始选择；扫描详情中仍可显式调整总开关、后端和逐任务开关。</span></label>{error && <p role="alert" className="mt-3 text-sm text-rose-700">{error}</p>}<div className="mt-6 flex justify-end gap-2"><Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>取消</Button><Button type="submit" disabled={!file || uploading}>{uploading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <ScanSearch className="h-4 w-4" />}{uploading ? "正在接收" : "开始扫描"}</Button></div></form></DialogContent></Dialog>
 }
 
 function Metric({ label, value, icon: Icon, tone }: { label: string; value: number | string; icon: typeof AlertTriangle; tone: "rose" | "cyan" | "violet" | "emerald" }) {

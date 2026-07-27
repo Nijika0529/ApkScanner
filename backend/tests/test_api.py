@@ -180,24 +180,23 @@ def test_terminal_task_can_be_deleted_while_ai_audit_is_preserved(settings) -> N
 
 def test_running_task_cannot_be_deleted(settings) -> None:  # noqa: ANN001
     app = create_app(settings)
-    with app.state.database.session_factory() as session:
-        scan = Scan(
-            id="00000000-0000-0000-0000-000000000050",
-            status="investigating",
-            filename="running-task.apk",
-            artifact_sha256="e" * 64,
-            artifact_path=str(settings.data_dir / "missing-running-task.apk"),
-        )
-        task = InvestigationTask(
-            id="00000000-0000-0000-0000-000000000051",
-            scan_id=scan.id,
-            task_type="component",
-            status="running",
-        )
-        session.add_all([scan, task])
-        session.commit()
-
     with TestClient(app) as client:
+        with app.state.database.session_factory() as session:
+            scan = Scan(
+                id="00000000-0000-0000-0000-000000000050",
+                status="investigating",
+                filename="running-task.apk",
+                artifact_sha256="e" * 64,
+                artifact_path=str(settings.data_dir / "missing-running-task.apk"),
+            )
+            task = InvestigationTask(
+                id="00000000-0000-0000-0000-000000000051",
+                scan_id=scan.id,
+                task_type="component",
+                status="running",
+            )
+            session.add_all([scan, task])
+            session.commit()
         response = client.delete(
             f"/api/v1/tasks/{task.id}",
             headers={"X-APKScanner-Request": "console"},
@@ -264,6 +263,43 @@ def test_running_task_cancellation_signals_the_orchestrator(
         )
         assert response.status_code == 202
         assert response.json()["status"] == "cancel_requested"
+        assert signaled == [task.id]
+
+
+def test_device_queue_cancellation_wakes_the_waiting_runtime(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    signaled: list[str] = []
+    monkeypatch.setattr(
+        app.state.orchestrator,
+        "request_task_cancellation",
+        lambda task_id: signaled.append(task_id) or True,
+    )
+    with TestClient(app) as client:
+        with app.state.database.session_factory() as session:
+            scan = Scan(
+                status="investigating",
+                filename="device-queue-cancel.apk",
+                artifact_sha256="5" * 64,
+                artifact_path=str(settings.data_dir / "missing.apk"),
+            )
+            task = InvestigationTask(
+                scan=scan,
+                task_type="component",
+                status="awaiting_device",
+                result={"device_queue": {"position_at_enqueue": 2}},
+            )
+            session.add_all([scan, task])
+            session.commit()
+        response = client.post(
+            f"/api/v1/tasks/{task.id}/cancel",
+            headers={"X-APKScanner-Request": "console"},
+        )
+        assert response.status_code == 202
+        assert response.json()["status"] == "cancel_requested"
+        assert response.json()["result"]["cancellation"]["acknowledged"] is False
         assert signaled == [task.id]
 
 
@@ -555,3 +591,154 @@ def test_opencode_pro_audit_records_toolless_json_transport(settings) -> None:  
             "output_transport"
         ]
         assert recorded_transport == transport
+
+
+def test_scan_and_task_agent_controls_are_persisted(settings) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    with TestClient(app) as client:
+        with app.state.database.session_factory() as session:
+            scan = Scan(
+                status="final",
+                filename="agent-control.apk",
+                artifact_sha256="7" * 64,
+                artifact_path=str(settings.data_dir / "missing.apk"),
+                stats={"investigator": "codex"},
+            )
+            task = InvestigationTask(
+                scan=scan,
+                task_type="component",
+                status="inconclusive",
+            )
+            session.add_all([scan, task])
+            session.commit()
+
+        scan_response = client.patch(
+            f"/api/v1/scans/{scan.id}/agent-control",
+            headers={"X-APKScanner-Request": "console"},
+            json={"enabled": False, "backend": "opencode"},
+        )
+        assert scan_response.status_code == 200
+        control = scan_response.json()["stats"]["agent_control"]
+        assert control["enabled"] is False
+        assert control["backend"] == "opencode"
+        assert control["updated_at"]
+
+        task_response = client.patch(
+            f"/api/v1/tasks/{task.id}/agent-control",
+            headers={"X-APKScanner-Request": "console"},
+            json={"enabled": False},
+        )
+        assert task_response.status_code == 200
+        assert task_response.json()["preconditions"]["agent_enabled"] is False
+
+        with app.state.database.session_factory() as session:
+            persisted_scan = session.get(Scan, scan.id)
+            persisted_task = session.get(InvestigationTask, task.id)
+            assert persisted_scan is not None and persisted_task is not None
+            assert (
+                app.state.orchestrator.resolve_task_investigator(
+                    persisted_scan, persisted_task
+                )
+                == "none"
+            )
+
+
+def test_batch_rerun_only_queues_incomplete_tasks(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    submitted: list[str] = []
+
+    async def submit(scan_id: str) -> None:
+        submitted.append(scan_id)
+
+    monkeypatch.setattr(app.state.orchestrator, "submit", submit)
+    with TestClient(app) as client:
+        with app.state.database.session_factory() as session:
+            scan = Scan(
+                status="final",
+                filename="supplement.apk",
+                artifact_sha256="8" * 64,
+                artifact_path=str(settings.data_dir / "missing.apk"),
+                stats={"investigator": "codex"},
+            )
+            blocked = InvestigationTask(
+                scan=scan,
+                task_type="component",
+                status="blocked_device",
+                attempts=2,
+            )
+            incomplete = InvestigationTask(
+                scan=scan,
+                task_type="component",
+                status="completed",
+                attempts=3,
+                result={"result": "inconclusive", "severity_proposal": "low"},
+            )
+            confirmed = InvestigationTask(
+                scan=scan,
+                task_type="component",
+                status="completed",
+                result={"result": "supported_static"},
+            )
+            session.add_all([scan, blocked, incomplete, confirmed])
+            session.commit()
+
+        response = client.post(
+            f"/api/v1/scans/{scan.id}/rerun-incomplete",
+            headers={"X-APKScanner-Request": "console"},
+        )
+        assert response.status_code == 202
+        assert response.json()["queued_count"] == 2
+        assert set(response.json()["queued_task_ids"]) == {blocked.id, incomplete.id}
+
+        with app.state.database.session_factory() as session:
+            assert session.get(InvestigationTask, blocked.id).status == "queued"
+            assert session.get(InvestigationTask, incomplete.id).status == "queued"
+            assert session.get(InvestigationTask, confirmed.id).status == "completed"
+            persisted_scan = session.get(Scan, scan.id)
+            assert persisted_scan is not None
+            assert persisted_scan.status == "investigating"
+        assert submitted == [scan.id]
+
+
+def test_manual_task_rerun_is_not_blocked_by_automatic_attempt_budget(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    app = create_app(settings)
+
+    async def submit(_scan_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(app.state.orchestrator, "submit", submit)
+    with TestClient(app) as client:
+        with app.state.database.session_factory() as session:
+            scan = Scan(
+                status="final",
+                filename="manual-rerun.apk",
+                artifact_sha256="9" * 64,
+                artifact_path=str(settings.data_dir / "missing.apk"),
+            )
+            task = InvestigationTask(
+                scan=scan,
+                task_type="component",
+                status="inconclusive",
+                attempts=settings.task_max_attempts,
+            )
+            session.add_all([scan, task])
+            session.commit()
+        budgeted = client.post(
+            f"/api/v1/tasks/{task.id}/retry",
+            headers={"X-APKScanner-Request": "console"},
+        )
+        assert budgeted.status_code == 409
+        response = client.post(
+            f"/api/v1/tasks/{task.id}/rerun",
+            headers={"X-APKScanner-Request": "console"},
+        )
+        assert response.status_code == 202
+        assert response.json()["status"] == "queued"
+        assert response.json()["attempts"] == settings.task_max_attempts
+        assert response.json()["result"]["manual_rerun"]["previous_status"] == "inconclusive"

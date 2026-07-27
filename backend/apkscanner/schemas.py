@@ -77,6 +77,21 @@ class FindingReview(BaseModel):
     note: str = Field(min_length=1, max_length=4000)
 
 
+class ScanAgentControl(BaseModel):
+    enabled: StrictBool
+    backend: Literal["codex", "opencode", "none"] | None = None
+
+
+class TaskAgentControl(BaseModel):
+    enabled: StrictBool
+
+
+class ScanRerunResult(BaseModel):
+    scan_id: StrictStr
+    queued_task_ids: list[StrictStr]
+    queued_count: StrictInt
+
+
 class InvestigationTaskOut(ApiModel):
     id: str
     schema_version: str

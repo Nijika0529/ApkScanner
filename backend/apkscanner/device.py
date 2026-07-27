@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import heapq
 import json
 import re
 import secrets
@@ -8,7 +9,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,112 @@ class DeviceProbeResult:
     summary: dict[str, Any]
 
 
+class DeviceLeaseCancelledError(RuntimeError):
+    """Raised when a task is cancelled while waiting for the single device."""
+
+
+@dataclass(order=True, slots=True)
+class _DeviceWaiter:
+    sort_key: tuple[int, int]
+    task_id: str = field(compare=False)
+    enqueued_at: float = field(compare=False)
+    cancel_event: threading.Event = field(compare=False)
+
+
+class SingleDeviceScheduler:
+    """Observable priority queue for one exclusive Android device."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._queue: list[_DeviceWaiter] = []
+        self._sequence = 0
+        self._active_task_id: str | None = None
+
+    @contextmanager
+    def lease(
+        self,
+        task_id: str,
+        *,
+        priority: int,
+        cancel_event: threading.Event,
+        on_queued=None,  # noqa: ANN001
+        on_acquired=None,  # noqa: ANN001
+    ):  # noqa: ANN201
+        with self._condition:
+            self._sequence += 1
+            waiter = _DeviceWaiter(
+                sort_key=(-priority, self._sequence),
+                task_id=task_id,
+                enqueued_at=time.monotonic(),
+                cancel_event=cancel_event,
+            )
+            heapq.heappush(self._queue, waiter)
+            position = self._position(waiter)
+            self._condition.notify_all()
+        if on_queued is not None:
+            on_queued(position)
+
+        acquired = False
+        try:
+            with self._condition:
+                while True:
+                    if cancel_event.is_set():
+                        self._remove(waiter)
+                        self._condition.notify_all()
+                        raise DeviceLeaseCancelledError(
+                            "device lease was cancelled while queued"
+                        )
+                    if self._active_task_id is None and self._queue[0] is waiter:
+                        heapq.heappop(self._queue)
+                        self._active_task_id = task_id
+                        acquired = True
+                        break
+                    self._condition.wait(timeout=0.25)
+            waited_seconds = max(0.0, time.monotonic() - waiter.enqueued_at)
+            if on_acquired is not None:
+                on_acquired(waited_seconds)
+            yield {
+                "task_id": task_id,
+                "wait_seconds": waited_seconds,
+            }
+        finally:
+            with self._condition:
+                if not acquired:
+                    self._remove(waiter)
+                elif self._active_task_id == task_id:
+                    self._active_task_id = None
+                self._condition.notify_all()
+
+    def wake_waiters(self) -> None:
+        with self._condition:
+            self._condition.notify_all()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._condition:
+            waiting = sorted(self._queue)
+            return {
+                "active_task_id": self._active_task_id,
+                "waiting": [
+                    {
+                        "task_id": waiter.task_id,
+                        "position": index,
+                        "priority": -waiter.sort_key[0],
+                    }
+                    for index, waiter in enumerate(waiting, start=1)
+                ],
+            }
+
+    def _position(self, target: _DeviceWaiter) -> int:
+        return sorted(self._queue).index(target) + 1
+
+    def _remove(self, target: _DeviceWaiter) -> None:
+        try:
+            self._queue.remove(target)
+        except ValueError:
+            return
+        heapq.heapify(self._queue)
+
+
 class AdbDeviceAdapter:
     """Serialized remote-ADB adapter for the single-device MVP."""
 
@@ -33,6 +140,9 @@ class AdbDeviceAdapter:
         self.runner = runner
         self.serial = settings.adb_serial
         self._lease = threading.RLock()
+        self.scheduler = SingleDeviceScheduler()
+        self._last_capability: dict[str, Any] | None = None
+        self._active_cancel_event: threading.Event | None = None
         self.credentials = CredentialStore()
         self.auth_flow_error: str | None = None
         try:
@@ -51,28 +161,92 @@ class AdbDeviceAdapter:
         with self._lease:
             yield
 
-    def capability(self) -> dict[str, Any]:
+    @contextmanager
+    def task_lease(
+        self,
+        task_id: str,
+        *,
+        priority: int,
+        cancel_event: threading.Event,
+        on_queued=None,  # noqa: ANN001
+        on_acquired=None,  # noqa: ANN001
+        on_released=None,  # noqa: ANN001
+    ):  # noqa: ANN201
+        """Queue and exclusively assign the single cloud device to one task."""
+        with self.scheduler.lease(
+            task_id,
+            priority=priority,
+            cancel_event=cancel_event,
+            on_queued=on_queued,
+        ) as metadata:
+            command_lock_wait_started = time.monotonic()
+            held_seconds = 0.0
+            session_started = False
+            try:
+                with self._lease:
+                    self._active_cancel_event = cancel_event
+                    held_at = time.monotonic()
+                    metadata["wait_seconds"] += held_at - command_lock_wait_started
+                    try:
+                        if cancel_event.is_set():
+                            raise DeviceLeaseCancelledError(
+                                "device lease was cancelled before the command session"
+                            )
+                        session_started = True
+                        if on_acquired is not None:
+                            on_acquired(metadata["wait_seconds"])
+                        yield metadata
+                    finally:
+                        held_seconds = max(0.0, time.monotonic() - held_at)
+                        self._active_cancel_event = None
+            finally:
+                if session_started and on_released is not None:
+                    on_released(held_seconds)
+
+    def capability(self, *, non_blocking: bool = False) -> dict[str, Any]:
         if not self.configured:
             return {"available": False, "detail": "APKSCANNER_ADB_SERIAL is not configured"}
-        state = self._adb(["get-state"], timeout=30)
-        if state.exit_code != 0:
-            return {
-                "available": False,
-                "state": state.stdout.strip(),
-                "serial": self.serial,
-                "detail": state.stderr.strip() or "ADB device is unavailable",
-            }
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="adb-capability") as executor:
-            version_future = executor.submit(
-                self._adb, ["shell", "getprop", "ro.build.version.release"], 30
+        scheduler_state = self.scheduler.snapshot()
+        active_task_id = scheduler_state["active_task_id"]
+        if non_blocking and active_task_id:
+            cached = dict(
+                self._last_capability
+                or {
+                    "available": True,
+                    "serial": self.serial,
+                }
             )
-            sdk_future = executor.submit(
-                self._adb, ["shell", "getprop", "ro.build.version.sdk"], 30
+            cached.update(
+                {
+                    "busy": True,
+                    "active_task_id": active_task_id,
+                    "waiting_count": len(scheduler_state["waiting"]),
+                    "detail": "云真机正由入口探索任务独占，健康检查使用最近一次状态",
+                }
             )
-            root_future = executor.submit(self._adb, ["shell", "id", "-u"], 30)
-            version = version_future.result()
-            sdk = sdk_future.result()
-            root = root_future.result()
+            return cached
+        with self._lease:
+            state = self._adb(["get-state"], timeout=30)
+            if state.exit_code != 0:
+                result = {
+                    "available": False,
+                    "state": state.stdout.strip(),
+                    "serial": self.serial,
+                    "detail": state.stderr.strip() or "ADB device is unavailable",
+                }
+                self._last_capability = dict(result)
+                return result
+            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="adb-capability") as executor:
+                version_future = executor.submit(
+                    self._adb, ["shell", "getprop", "ro.build.version.release"], 30
+                )
+                sdk_future = executor.submit(
+                    self._adb, ["shell", "getprop", "ro.build.version.sdk"], 30
+                )
+                root_future = executor.submit(self._adb, ["shell", "id", "-u"], 30)
+                version = version_future.result()
+                sdk = sdk_future.result()
+                root = root_future.result()
         actual_api = sdk.stdout.strip()
         ready = state.exit_code == 0 and actual_api == str(self.settings.device_android_api)
         detail = None
@@ -82,7 +256,7 @@ class AdbDeviceAdapter:
                 f"{self.settings.device_android_api}, found {version.stdout.strip()} / API "
                 f"{actual_api or 'unknown'}"
             )
-        return {
+        result = {
             "available": ready,
             "state": state.stdout.strip(),
             "android_version": version.stdout.strip(),
@@ -91,6 +265,8 @@ class AdbDeviceAdapter:
             "serial": self.serial,
             "detail": detail,
         }
+        self._last_capability = dict(result)
+        return result
 
     def auth_capability(self, package_name: str | None = None) -> dict[str, Any]:
         if self.auth_flow_error:
@@ -171,7 +347,11 @@ class AdbDeviceAdapter:
         return [
             (
                 "device.clear",
-                self._adb(["shell", "pm", "clear", package_name], timeout=60),
+                self._adb(
+                    ["shell", "pm", "clear", package_name],
+                    timeout=60,
+                    respect_cancellation=False,
+                ),
                 {"package": package_name},
             ),
             (
@@ -179,6 +359,7 @@ class AdbDeviceAdapter:
                 self._adb(
                     ["shell", "pm", "set-app-links", "--package", package_name, "0", "all"],
                     timeout=60,
+                    respect_cancellation=False,
                 ),
                 {"package": package_name},
             ),
@@ -412,6 +593,7 @@ class AdbDeviceAdapter:
                     stdout=stdout,
                     stderr=stderr,
                     timed_out=actual.timed_out,
+                    canceled=actual.canceled,
                 )
             commands.append(("auth.step", result, metadata))
             if result.exit_code != 0:
@@ -467,10 +649,20 @@ class AdbDeviceAdapter:
             request["extras"] = extras
         return request
 
-    def _adb(self, args: list[str], timeout: int | None = None) -> CommandResult:
+    def _adb(
+        self,
+        args: list[str],
+        timeout: int | None = None,
+        *,
+        respect_cancellation: bool = True,
+    ) -> CommandResult:
         if not self.serial:
             return CommandResult(["adb", *args], 127, "", "ADB serial is not configured")
-        return self.runner.run(["adb", "-s", self.serial, *args], timeout=timeout)
+        return self.runner.run(
+            ["adb", "-s", self.serial, *args],
+            timeout=timeout,
+            cancel_event=self._active_cancel_event if respect_cancellation else None,
+        )
 
     def _adb_budget(
         self, args: list[str], budget: TimeBudget | None, cap: int
