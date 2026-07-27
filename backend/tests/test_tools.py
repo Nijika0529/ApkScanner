@@ -5,7 +5,7 @@ import sys
 import threading
 import time
 
-from apkscanner.tools import ToolRunner
+from apkscanner.tools import TimeBudget, ToolRunner
 
 
 def test_explicit_zero_timeout_does_not_fall_back_to_default(monkeypatch) -> None:  # noqa: ANN001
@@ -22,6 +22,13 @@ def test_explicit_zero_timeout_does_not_fall_back_to_default(monkeypatch) -> Non
     )
     assert result.exit_code == 0
     assert observed["timeout"] == 0
+
+
+def test_time_budget_can_exclude_shared_resource_queue_wait() -> None:
+    budget = TimeBudget(deadline=100.0)
+    assert budget.extend(12.5).deadline == 112.5
+    assert budget.extend(12.5, maximum_deadline=105.0).deadline == 105.0
+    assert budget.deadline == 100.0
 
 
 def test_tool_runner_cancels_an_active_process_group() -> None:

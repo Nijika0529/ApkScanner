@@ -29,7 +29,15 @@ flowchart LR
     M --> N[Web / JSON / HTML / SARIF + 人工复核]
 ```
 
-平台而不是 Codex/OpenCode 负责 fan-out。一个导出组件对应一个任务；同一 handler 的 Deep Links 合并成一个任务。Agent 不能创建子 Agent，也不能直接把自己的文字当作复现证据。默认最多进行 3 个自适应测试轮次、每轮接受 100 个受限测试：只能使用当前任务的入口 ID；Deep Link 和 Provider URI 必须保持 Manifest 声明的 scheme、host/authority 和 port；额外参数有数量、键名、类型和长度上限。每轮证据都会回灌下一次判断，最终再执行禁止申请新动作的证据总结。轮次和单轮测试数可在 1–5 / 1–100 的范围内配置。每次扫描在创建时记录初始 `codex`、`opencode` 或 `none`；服务默认值的后续变更不会静默改变它，只有用户在扫描控制台显式调整才会影响后续任务。
+平台而不是 Codex/OpenCode 负责 fan-out。默认有 3 个全局入口探索 worker，可通过
+`APKSCANNER_AGENT_CONCURRENCY` 调整为 1–8；多个扫描也共享这一上限。一个导出组件对应
+一个任务；同一 handler 的 Deep Links 合并成一个任务。Agent 不能创建子 Agent，也不能
+直接把自己的文字当作复现证据。默认最多进行 3 个自适应测试轮次、每轮接受 100 个受限
+测试：只能使用当前任务的入口 ID；Deep Link 和 Provider URI 必须保持 Manifest 声明的
+scheme、host/authority 和 port；额外参数有数量、键名、类型和长度上限。每轮证据都会回灌
+下一次判断，最终再执行禁止申请新动作的证据总结。轮次和单轮测试数可在 1–5 / 1–100 的
+范围内配置。每次扫描在创建时记录初始 `codex`、`opencode` 或 `none`；服务默认值的后续
+变更不会静默改变它，只有用户在扫描控制台显式调整才会影响后续任务。
 
 扫描创建后的 Agent 控制分两层：`Scan.stats.agent_control` 是总开关和后端选择；
 `InvestigationTask.preconditions.agent_enabled` 是单任务覆盖。总开关关闭时所有任务只运行
@@ -44,39 +52,51 @@ JADX 的非零退出码不直接等同于反编译不可用。平台把结果归
 
 ## 单云真机调度
 
-v1 只有一个 `APKSCANNER_ADB_SERIAL`，因此所有扫描共享一个显式
-`SingleDeviceScheduler`。任务按风险优先级降序排队，相同优先级按入队序号 FIFO；数据库
-状态从 `queued` 进入 `awaiting_device`，获取租约后才进入 `running`。任务结果记录
-`position_at_enqueue`、`requested_at`、`acquired_at`、`wait_seconds`、`released_at` 和
-`held_seconds`，Web 同步展示排队状态和设备关键事件。
+v1 只有一个 `APKSCANNER_ADB_SERIAL`，因此所有并行 worker、所有扫描共享一个显式
+`SingleDeviceScheduler`。任务按风险优先级降序排队，相同优先级按入队序号 FIFO；已运行
+的 worker 在申请设备时进入 `awaiting_device`，获取租约后恢复为 `running`。任务结果按
+每次租约记录 `position_at_enqueue`、`requested_at`、`acquired_at`、`wait_seconds`、
+`released_at` 和 `held_seconds`，旧租约进入 `history`；Web 同步展示排队状态和设备关键
+事件。
 
-设备租约覆盖健康检查、安装、`pm clear`、访客/认证探测、Frida、Agent 自适应补充测试和
-清理。这里刻意在需要补充测试的 AI 轮次之间继续持有设备：虽然会降低设备利用率，但能够
-保持同一任务的安装版本、登录态、日志窗口和插桩会话不被其他 APK 污染。最终清理完成后
-才释放给下一任务。健康检查等旁路 ADB 调用也经过同一命令锁，不能穿透正在运行的会话。
+设备租约只覆盖真实设备操作：健康/安装/`pm clear`、访客与认证探测、可选 Frida 观察、
+Agent 已申请且经平台校验的补充测试，以及清理。初始动态证据收集完毕后先清理并释放设备，
+再调用模型；模型思考、Critic/Review 和最终总结均不占用 ADB。若模型申请下一轮测试，任务
+重新排队，获取租约后重新执行 `prepare`，避免其他并发任务改变设备上的 APK 或登录态。
+因此最多可有 3 个入口同时进行 AI/证据分析，但任意时刻只有 1 个入口能执行 ADB。设备排队
+时间不计入单任务 20 分钟预算，整单 24 小时截止时间仍然生效。
 
 排队任务取消时，控制面同时设置任务 cancellation event 并唤醒调度 Condition，无需等待
 前一任务释放后才能确认。运行中的 ADB 子进程使用独立进程组；停止任务会终止当前命令，
 后续设备命令直接返回 canceled，但 `pm clear` 和 App Link reset 清理仍会忽略取消信号执行。
-Web 健康检查在设备繁忙时读取最近一次能力结果，不会插入或阻塞当前设备会话。控制面重启
-时，`awaiting_device` 任务安全恢复为 `queued`；
-`cancel_requested` 直接确认为 `canceled`；已进入 `running` 的设备会话不会自动重放，而是
-标为 `inconclusive` 并要求人工重试，避免重复外部副作用。
+Web 健康检查使用真正的非阻塞锁；设备繁忙时读取最近一次能力结果，不会插入或等待当前
+设备会话。控制面重启时，`awaiting_device` 任务安全恢复为 `queued`；
+`cancel_requested` 直接确认为 `canceled`；在模型或平台计算阶段中断的 `running` 任务可
+安全重新排队，只有数据库显示“已获取但尚未释放设备租约”的任务才标为 `inconclusive`
+并要求人工重试，避免重复外部副作用。
 
 ## 信任边界
 
 | 区域 | 可访问内容 | 约束 |
 | --- | --- | --- |
 | 本地控制面 | SQLite、APK、workspace、evidence | FastAPI 仅监听 loopback；变更 API 需要自定义请求头；内容寻址文件拒绝 symlink/摘要冲突 |
-| Codex Docker worker | 当前 scan workspace、显式 Codex auth、模型网络 | 每次调用新容器、只读 bind mount/SDK sandbox/rootfs、无 ADB 参数、丢弃 capabilities、PID/CPU/内存限制；默认模式 |
-| Codex host worker | 只读 workspace 与模型网络 | 仅作为显式 `host` 降级模式；developer instructions 禁止 ADB/目标网络请求，设备动作仍走平台 |
-| OpenCode + DeepSeek Docker worker | scan workspace、`/tmp`、平台 task JSON、DeepSeek API | workspace 可写、rootfs 只读、临时 HOME、丢弃 capabilities；允许 read/glob/grep/bash，原生编辑/Web/MCP/子 Agent关闭，ADB 由 permission + PATH shim + 无设备挂载阻断；V4 Pro 使用普通工具循环 + 文本 JSON/Ajv |
+| Codex Docker worker | 当前任务 attempt workspace、显式 Codex auth、模型网络 | 每次调用新容器、只读 bind mount/SDK sandbox/rootfs、无 ADB 参数、丢弃 capabilities、PID/CPU/内存限制；默认模式 |
+| Codex host worker | 当前任务 attempt workspace 与模型网络 | 仅作为显式 `host` 降级模式；developer instructions 禁止 ADB/目标网络请求，设备动作仍走平台 |
+| OpenCode + DeepSeek Docker worker | 当前任务 attempt workspace、`/tmp`、平台 task JSON、DeepSeek API | workspace 可写、rootfs 只读、临时 HOME、丢弃 capabilities；允许 read/glob/grep/bash，原生编辑/Web/MCP/子 Agent关闭，ADB 由 permission + PATH shim + 无设备挂载阻断；V4 Pro 使用普通工具循环 + 文本 JSON/Ajv |
 | OpenCode + DeepSeek host worker | 平台生成的 task JSON、DeepSeek API | 每次调用使用临时 HOME/XDG 与带随机 Basic Auth 的 loopback server；仍仅适合个人受控环境 |
 | 云真机 | 目标 APK、Probe APK、测试账号 | 固定 Android 16/API 36；串行 lease；任务前后 `pm clear`；不声称完整快照复位 |
 | Probe APK | 以普通 App UID 调用目标入口 | 只接受最初发送者为 shell/root 的调度；仍只允许安装在专用测试设备 |
 | MobSF | 上传 APK并返回广度扫描报告 | 可选、显式 URL/API Key；失败不阻断内置基线，但标为 tool gap |
 
-APK、反编译代码、资源、日志、网页和工具输出都属于不可信数据。两个 Agent 后端的 developer instructions 都明确禁止服从这些内容中的指令。Codex 只读；OpenCode 可在当前 scan workspace 和 `/tmp` 执行命令并写入临时分析产物，容器 rootfs 和宿主机其他目录不在可写范围。云真机操作始终由 Python 平台校验后执行，Agent 不持有 ADB 参数、Socket 或可用命令。模型网络出口应分别限制到企业 Codex 或获批的 DeepSeek/代理端点。
+APK、反编译代码、资源、日志、网页和工具输出都属于不可信数据。两个 Agent 后端的
+developer instructions 都明确禁止服从这些内容中的指令。每个 `task_id + attempt` 获得独立
+workspace，平台只物化该入口的代码上下文和不可变 Evidence；并发 Agent 不共享可写扫描目录。
+目标组件命中的 Java/Smali 原文件会复制到 `target_source/`（每次调用最多 2 MiB），使
+Agent 能继续使用 grep/bash，而无需暴露整份共享反编译目录。Codex 只读；OpenCode 可在
+当前任务 workspace 和 `/tmp` 执行命令并写入临时分析产物，容器
+rootfs 和宿主机其他目录不在可写范围。云真机操作始终由 Python 平台校验后执行，Agent
+不持有 ADB 参数、Socket 或可用命令。模型网络出口应分别限制到企业 Codex 或获批的
+DeepSeek/代理端点。
 
 ## Security IR
 
@@ -176,7 +196,8 @@ Oracle 将“入口执行成功”和“实际危害”分开：普通应用 UID
    保留，被停止的调用不生成新的最终结论。
 
 OpenCode 审计还记录实际输出通道和只读工具事件。`deepseek-v4-pro` 保持思考模式，首轮
-使用 `read/glob/grep/bash` 探索完整 workspace，最终以 `format=text` 返回 JSON；worker 用
+使用 `read/glob/grep/bash` 探索当前任务隔离 workspace 中物化的入口代码与 Evidence，
+最终以 `format=text` 返回 JSON；worker 用
 Ajv 本地校验，失败后关闭工具并最多进行 2 次同 session 纠正。每轮 prompt、原始文本、
 校验错误、工具和 usage 都写入审计。`deepseek-v4-flash` 使用同一组只读工具和 OpenCode
 内部 StructuredOutput。这样 Pro 不会使用与思考模式冲突的

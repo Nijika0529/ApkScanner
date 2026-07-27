@@ -7,7 +7,8 @@ import shutil
 import threading
 import uuid
 from collections import defaultdict
-from contextlib import suppress
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager, suppress
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -81,6 +82,10 @@ class ScanOrchestrator:
         self._running_lock = asyncio.Lock()
         self._task_cancellations: dict[str, threading.Event] = {}
         self._task_cancellations_lock = threading.Lock()
+        # Bound task workers across all scans handled by this control-plane
+        # process. Per-scan executors may queue work, but model/device orchestration
+        # cannot exceed this shared limit.
+        self._agent_slots = threading.BoundedSemaphore(settings.agent_concurrency)
 
     def resolve_investigator(self, requested: str = "configured") -> str:
         backend = (
@@ -212,6 +217,37 @@ class ScanOrchestrator:
                     event_type = "task.cancelled"
                     message = "服务重启后确认任务已停止"
                 else:
+                    queue_data = dict((task.result or {}).get("device_queue") or {})
+                    device_session_active = bool(
+                        queue_data.get("acquired_at")
+                        and not queue_data.get("released_at")
+                    )
+                    if not device_session_active:
+                        task.status = TaskStatus.QUEUED.value
+                        task.error = "服务重启中断了 Agent/平台计算阶段，任务已安全重新排队"
+                        task.started_at = None
+                        task.completed_at = None
+                        task.result = {
+                            **dict(task.result or {}),
+                            "worker_recovery": {
+                                "requeued_at": recovered_at.isoformat(),
+                                "reason": "interrupted_outside_device_session",
+                            },
+                        }
+                        event_type = "task.worker_requeued"
+                        message = "服务重启发生在设备租约之外，入口探索任务已安全重新排队"
+                        add_event(
+                            session,
+                            task.scan_id,
+                            event_type,
+                            message,
+                            {
+                                "task_id": task.id,
+                                "previous_status": previous_status,
+                                "status": task.status,
+                            },
+                        )
+                        continue
                     prior_gaps = (task.result or {}).get("coverage_gaps")
                     if not isinstance(prior_gaps, list):
                         prior_gaps = []
@@ -221,7 +257,7 @@ class ScanOrchestrator:
                     task.result = {
                         **dict(task.result or {}),
                         "device_queue": {
-                            **dict((task.result or {}).get("device_queue") or {}),
+                            **queue_data,
                             "interrupted_at": recovered_at.isoformat(),
                         },
                         "coverage_gaps": [
@@ -589,27 +625,85 @@ class ScanOrchestrator:
             session.commit()
 
     def _run_tasks(self, scan_id: str) -> None:
-        while True:
-            with self.database.session_factory() as session:
-                scan = session.get(Scan, scan_id)
-                assert scan is not None
-                created_at = scan.created_at
-                if created_at.tzinfo is None:
-                    created_at = created_at.replace(tzinfo=UTC)
-                scan_deadline = created_at + timedelta(
-                    seconds=self.settings.scan_deadline_seconds
-                )
-                task = session.scalar(
-                    select(InvestigationTask)
-                    .where(
-                        InvestigationTask.scan_id == scan_id,
-                        InvestigationTask.status == TaskStatus.QUEUED.value,
+        max_workers = self.settings.agent_concurrency
+        with self.database.session_factory() as session:
+            scan = session.get(Scan, scan_id)
+            assert scan is not None
+            scan.stats = {
+                **dict(scan.stats or {}),
+                "execution_policy": {
+                    "agent_concurrency": max_workers,
+                    "adb_concurrency": 1,
+                    "device_wait_excluded_from_task_budget": True,
+                    "agent_workspace_scope": "task_attempt",
+                },
+            }
+            add_event(
+                session,
+                scan_id,
+                "investigation.pool.started",
+                f"入口探索池已启动：最多 {max_workers} 个并发任务，ADB 固定单并发",
+                {
+                    "agent_concurrency": max_workers,
+                    "adb_concurrency": 1,
+                },
+            )
+            session.commit()
+        futures: dict[Future[None], str] = {}
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix=f"apk-investigation-{scan_id[:8]}",
+        ) as executor:
+            while True:
+                while len(futures) < max_workers:
+                    claimed = self._claim_next_task(scan_id)
+                    if claimed is None:
+                        break
+                    task_id, timeout_seconds = claimed
+                    future = executor.submit(
+                        self._run_task,
+                        scan_id,
+                        task_id,
+                        timeout_seconds,
                     )
-                    .order_by(InvestigationTask.priority.desc(), InvestigationTask.created_at)
-                    .limit(1)
+                    futures[future] = task_id
+                if not futures:
+                    return
+                completed, _pending = wait(
+                    futures,
+                    return_when=FIRST_COMPLETED,
                 )
+                for future in completed:
+                    task_id = futures.pop(future)
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        self._mark_task_worker_failed(scan_id, task_id, exc)
+
+    def _claim_next_task(self, scan_id: str) -> tuple[str, int] | None:
+        with self.database.session_factory() as session:
+            scan = session.get(Scan, scan_id)
+            assert scan is not None
+            task = session.scalar(
+                select(InvestigationTask)
+                .where(
+                    InvestigationTask.scan_id == scan_id,
+                    InvestigationTask.status == TaskStatus.QUEUED.value,
+                )
+                .order_by(
+                    InvestigationTask.priority.desc(),
+                    InvestigationTask.created_at,
+                )
+                .limit(1)
+            )
             if task is None:
-                return
+                return None
+            created_at = scan.created_at
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+            scan_deadline = created_at + timedelta(
+                seconds=self.settings.scan_deadline_seconds
+            )
             task_result = dict(task.result or {})
             manual_dispatch = bool(
                 task_result.get("manual_rerun")
@@ -621,29 +715,77 @@ class ScanOrchestrator:
                 else int((scan_deadline - datetime.now(UTC)).total_seconds())
             )
             if remaining <= 0:
-                with self.database.session_factory() as session:
-                    pending_tasks = list(
-                        session.scalars(
-                            select(InvestigationTask).where(
-                                InvestigationTask.scan_id == scan_id,
-                                InvestigationTask.status == TaskStatus.QUEUED.value,
-                            )
+                pending_tasks = list(
+                    session.scalars(
+                        select(InvestigationTask).where(
+                            InvestigationTask.scan_id == scan_id,
+                            InvestigationTask.status == TaskStatus.QUEUED.value,
                         )
                     )
-                    for pending in pending_tasks:
-                        pending.status = TaskStatus.TIMED_OUT.value
-                        pending.error = "whole-scan deadline exhausted before task dispatch"
-                        pending.completed_at = now()
-                    add_event(
-                        session,
-                        scan_id,
-                        "scan.deadline_exhausted",
-                        "Whole-scan deadline exhausted; remaining tasks were not dispatched",
-                        {"remaining_tasks": len(pending_tasks)},
-                    )
-                    session.commit()
+                )
+                for pending in pending_tasks:
+                    pending.status = TaskStatus.TIMED_OUT.value
+                    pending.error = "whole-scan deadline exhausted before task dispatch"
+                    pending.completed_at = now()
+                add_event(
+                    session,
+                    scan_id,
+                    "scan.deadline_exhausted",
+                    "Whole-scan deadline exhausted; remaining tasks were not dispatched",
+                    {"remaining_tasks": len(pending_tasks)},
+                )
+                session.commit()
+                return None
+            # Claim before handing work to the executor so the dispatcher cannot
+            # submit the same row more than once.
+            task.status = TaskStatus.RUNNING.value
+            task.started_at = now()
+            session.commit()
+            return task.id, min(self.settings.task_timeout_seconds, remaining)
+
+    def _mark_task_worker_failed(
+        self,
+        scan_id: str,
+        task_id: str,
+        error: Exception,
+    ) -> None:
+        failed_at = now()
+        with self.database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            if task is None:
                 return
-            self._run_task(scan_id, task.id, min(self.settings.task_timeout_seconds, remaining))
+            if task.status == TaskStatus.CANCEL_REQUESTED.value:
+                task.status = TaskStatus.CANCELED.value
+                task.error = "停止请求在任务异常退出时已确认"
+            elif task.status not in {
+                TaskStatus.CANCELED.value,
+                TaskStatus.COMPLETED.value,
+                TaskStatus.NOT_REPRODUCED.value,
+                TaskStatus.INCONCLUSIVE.value,
+                TaskStatus.TIMED_OUT.value,
+                TaskStatus.FAILED.value,
+                TaskStatus.DELETED.value,
+            }:
+                task.status = TaskStatus.FAILED.value
+                task.error = f"investigation worker failed: {error}"
+            else:
+                return
+            task.completed_at = failed_at
+            task.result = {
+                **dict(task.result or {}),
+                "worker_failure": {
+                    "error": str(error),
+                    "failed_at": failed_at.isoformat(),
+                },
+            }
+            add_event(
+                session,
+                scan_id,
+                "task.failed",
+                "并发入口探索 worker 异常退出",
+                {"task_id": task_id, "error": str(error)[:2000]},
+            )
+            session.commit()
 
     def request_task_cancellation(self, task_id: str) -> bool:
         with self._task_cancellations_lock:
@@ -661,7 +803,11 @@ class ScanOrchestrator:
             if (
                 scan is None
                 or task is None
-                or task.status != TaskStatus.QUEUED.value
+                or task.status
+                not in {
+                    TaskStatus.RUNNING.value,
+                    TaskStatus.AWAITING_DEVICE.value,
+                }
                 or not self.device.configured
                 or not scan.package_name
                 or not self.device.package_safe(scan.package_name)
@@ -678,12 +824,17 @@ class ScanOrchestrator:
         requested_at = now()
         with self.database.session_factory() as session:
             task = session.get(InvestigationTask, task_id)
-            if task is None or task.status != TaskStatus.QUEUED.value:
+            if task is None or task.status != TaskStatus.RUNNING.value:
                 return
+            previous_queue = dict((task.result or {}).get("device_queue") or {})
+            history = list(previous_queue.pop("history", []) or [])
+            if previous_queue.get("requested_at"):
+                history.append(previous_queue)
             task.status = TaskStatus.AWAITING_DEVICE.value
             task.result = {
                 **dict(task.result or {}),
                 "device_queue": {
+                    "history": history,
                     "serial": self.device.serial,
                     "position_at_enqueue": position,
                     "requested_at": requested_at.isoformat(),
@@ -727,7 +878,7 @@ class ScanOrchestrator:
         with self.database.session_factory() as session:
             task = session.get(InvestigationTask, task_id)
             if task is None or task.status not in {
-                TaskStatus.QUEUED.value,
+                TaskStatus.RUNNING.value,
                 TaskStatus.AWAITING_DEVICE.value,
             }:
                 return
@@ -740,6 +891,7 @@ class ScanOrchestrator:
                     "wait_seconds": round(waited_seconds, 3),
                 },
             }
+            task.status = TaskStatus.RUNNING.value
             add_event(
                 session,
                 scan_id,
@@ -810,6 +962,36 @@ class ScanOrchestrator:
             )
             session.commit()
 
+    @contextmanager
+    def _task_device_session(
+        self,
+        scan_id: str,
+        task_id: str,
+        *,
+        priority: int,
+        cancel_event: threading.Event,
+    ):  # noqa: ANN201
+        try:
+            with self.device.task_lease(
+                task_id,
+                priority=priority,
+                cancel_event=cancel_event,
+                on_queued=lambda position: self._mark_task_awaiting_device(
+                    scan_id, task_id, position
+                ),
+                on_acquired=lambda waited: self._record_device_acquired(
+                    scan_id, task_id, waited
+                ),
+                on_released=lambda held: self._record_device_released(
+                    scan_id, task_id, held
+                ),
+            ) as lease:
+                self._raise_if_cancelled(cancel_event)
+                yield lease
+                self._raise_if_cancelled(cancel_event)
+        except DeviceLeaseCancelledError as exc:
+            raise AgentCancelledError(str(exc)) from exc
+
     def _run_task(
         self,
         scan_id: str,
@@ -817,46 +999,24 @@ class ScanOrchestrator:
         timeout_seconds: int | None = None,
     ) -> None:
         cancel_event = threading.Event()
+        slot_acquired = False
         with self._task_cancellations_lock:
             self._task_cancellations[task_id] = cancel_event
         try:
-            device_priority = self._device_queue_priority(scan_id, task_id)
-            if device_priority is None:
-                self._run_task_impl(
-                    scan_id,
-                    task_id,
-                    timeout_seconds,
-                    cancel_event=cancel_event,
-                )
-            else:
-                try:
-                    with self.device.task_lease(
-                        task_id,
-                        priority=device_priority,
-                        cancel_event=cancel_event,
-                        on_queued=lambda position: self._mark_task_awaiting_device(
-                            scan_id, task_id, position
-                        ),
-                        on_acquired=lambda waited: self._record_device_acquired(
-                            scan_id, task_id, waited
-                        ),
-                        on_released=lambda held: self._record_device_released(
-                            scan_id, task_id, held
-                        ),
-                    ):
-                        self._raise_if_cancelled(cancel_event)
-                        self._run_task_impl(
-                            scan_id,
-                            task_id,
-                            timeout_seconds,
-                            cancel_event=cancel_event,
-                        )
-                        self._raise_if_cancelled(cancel_event)
-                except DeviceLeaseCancelledError as exc:
-                    raise AgentCancelledError(str(exc)) from exc
+            while not self._agent_slots.acquire(timeout=0.25):
+                self._raise_if_cancelled(cancel_event)
+            slot_acquired = True
+            self._run_task_impl(
+                scan_id,
+                task_id,
+                timeout_seconds,
+                cancel_event=cancel_event,
+            )
         except AgentCancelledError:
             self._mark_task_canceled(scan_id, task_id)
         finally:
+            if slot_acquired:
+                self._agent_slots.release()
             with self._task_cancellations_lock:
                 if self._task_cancellations.get(task_id) is cancel_event:
                     self._task_cancellations.pop(task_id, None)
@@ -875,19 +1035,24 @@ class ScanOrchestrator:
             assert scan is not None and task is not None
             if task.status not in {
                 TaskStatus.QUEUED.value,
-                TaskStatus.AWAITING_DEVICE.value,
+                TaskStatus.RUNNING.value,
             }:
                 return
             entries = list(
                 session.scalars(select(EntryPoint).where(EntryPoint.id.in_(task.target_entry_ids)))
             )
+            persisted_task_result = dict(task.result or {})
             continuation_context = dict(
-                (task.result or {}).get("manual_continuation") or {}
+                persisted_task_result.get("manual_continuation") or {}
+            )
+            manual_dispatch = bool(
+                persisted_task_result.get("manual_rerun")
+                or persisted_task_result.get("manual_continuation")
             )
             agent_backend = self.resolve_task_investigator(scan, task)
             task.status = TaskStatus.RUNNING.value
             task.attempts += 1
-            task.started_at = now()
+            task.started_at = task.started_at or now()
             scan.status = ScanStatus.INVESTIGATING.value
             add_event(
                 session,
@@ -923,6 +1088,7 @@ class ScanOrchestrator:
                         "continuation_number"
                     ),
                     "reusing_task_evidence": bool(continuation_context),
+                    "agent_concurrency": self.settings.agent_concurrency,
                 },
             )
             session.commit()
@@ -937,6 +1103,21 @@ class ScanOrchestrator:
             else timeout_seconds
         )
         budget = TimeBudget.from_seconds(task_budget_seconds)
+        scan_deadline: float | None = None
+        if not manual_dispatch:
+            scan_created_at = scan.created_at
+            if scan_created_at.tzinfo is None:
+                scan_created_at = scan_created_at.replace(tzinfo=UTC)
+            hard_remaining = max(
+                0.0,
+                (
+                    scan_created_at
+                    + timedelta(seconds=self.settings.scan_deadline_seconds)
+                    - datetime.now(UTC)
+                ).total_seconds(),
+            )
+            scan_deadline = TimeBudget.from_seconds(hard_remaining).deadline
+            budget = TimeBudget(deadline=min(budget.deadline, scan_deadline))
         evidence_summaries = self._evidence_summaries_for_run(
             scan_id,
             task_id=task_id,
@@ -966,7 +1147,7 @@ class ScanOrchestrator:
             "instrumented_attempted": False,
             "instrumented_observed": False,
         }
-        device_capability = self.device.capability()
+        device_capability = self.device.capability(non_blocking=True)
         auth_capability: dict[str, Any] = {"available": False, "detail": "not evaluated"}
         frida_capability = self.frida.capability(deep=False)
         agent_result = None
@@ -992,9 +1173,14 @@ class ScanOrchestrator:
                 return None, "AI investigation is disabled for this scan"
             if not agent_enabled:
                 return None, f"{agent_backend} investigation is disabled"
-            remaining = budget.remaining()
-            if timeout_cap is not None:
-                remaining = min(remaining, timeout_cap)
+
+            def dispatch_remaining() -> int:
+                remaining_seconds = budget.remaining()
+                if timeout_cap is not None:
+                    remaining_seconds = min(remaining_seconds, timeout_cap)
+                return remaining_seconds
+
+            remaining = dispatch_remaining()
             if remaining <= 0:
                 return None, "task time budget exhausted before AI dispatch"
             capability = investigator.capability(deep=True)
@@ -1003,13 +1189,10 @@ class ScanOrchestrator:
                 return None, capability.get(
                     "detail", f"{agent_backend} capability probe failed"
                 )
+            remaining = dispatch_remaining()
+            if remaining <= 0:
+                return None, "task time budget exhausted during AI capability probe"
             try:
-                self._materialize_agent_evidence(
-                    scan_id,
-                    task_id,
-                    task.attempts,
-                    evidence_summaries,
-                )
                 platform_context = {
                     "phase": phase,
                     "round_index": round_index,
@@ -1032,6 +1215,13 @@ class ScanOrchestrator:
                     "candidate_under_review": candidate_under_review,
                     "debate": debate_context or None,
                 }
+                agent_workspace = self._materialize_agent_evidence(
+                    scan_id,
+                    task_id,
+                    task.attempts,
+                    evidence_summaries,
+                    platform_context=platform_context,
+                )
                 self._record_exploration_event(
                     scan_id,
                     task_id,
@@ -1096,11 +1286,16 @@ class ScanOrchestrator:
                         "agent_backend": agent_backend,
                     },
                 )
+                remaining = dispatch_remaining()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "task time budget exhausted while preparing the AI audit context"
+                    )
                 result = investigator.investigate(
                     scan=scan,
                     task=task,
                     entries=entries,
-                    workspace=self.settings.data_dir / "workspaces" / scan_id,
+                    workspace=agent_workspace,
                     evidence=evidence_summaries,
                     platform_context=platform_context,
                     timeout_seconds=remaining,
@@ -1263,8 +1458,11 @@ class ScanOrchestrator:
                 )
                 return None, str(exc)
 
+        # A cached/non-blocking health snapshot may be stale while another task
+        # owns ADB. Queue every safely addressable task when the adapter itself is
+        # configured; the leased prepare stage is the authoritative health check.
         device_ready = bool(
-            device_capability.get("available")
+            self.device.configured
             and package_name
             and self.device.package_safe(package_name)
         )
@@ -1283,7 +1481,18 @@ class ScanOrchestrator:
             )
             agent_result, agent_error = invoke_agent(phase="static_only")
         else:
-            with self.device.lease():
+            device_session = self._task_device_session(
+                scan_id,
+                task_id,
+                priority=int(task.priority),
+                cancel_event=cancel_event,
+            )
+            lease_metadata = device_session.__enter__()
+            budget = budget.extend(
+                lease_metadata["wait_seconds"],
+                maximum_deadline=scan_deadline,
+            )
+            if device_session is not None:
                 frida_session = None
                 prepared = False
                 try:
@@ -1339,11 +1548,6 @@ class ScanOrchestrator:
                                 coverage_gaps.append(
                                     startup_error.stderr or "Frida could not attach to the target."
                                 )
-                        else:
-                            coverage_gaps.append(
-                                str(frida_capability.get("detail") or "Frida is not configured.")
-                            )
-
                         for entry in entries:
                             if budget.expired:
                                 break
@@ -1404,6 +1608,12 @@ class ScanOrchestrator:
                                 coverage_gaps.append(
                                     "Frida was attempted but produced no validated entry-flow observations."
                                 )
+                    if prepared or stages["device_attempted"]:
+                        cleanup = self.device.cleanup(package_name)
+                        self._record_commands(scan_id, task_id, cleanup, None)
+                    completed_device_session = device_session
+                    device_session = None
+                    completed_device_session.__exit__(None, None, None)
                     phase_one_cap = max(1, budget.remaining() // 2)
                     agent_result, agent_error = invoke_agent(
                         phase="test_planning",
@@ -1531,21 +1741,73 @@ class ScanOrchestrator:
 
                         execution_gaps: list[str] = []
                         executed_this_round: list[dict[str, Any]] = []
+                        requested_observed = False
                         if requested and not budget.expired:
-                            (
-                                executed_this_round,
-                                execution_gaps,
-                                requested_observed,
-                            ) = self._execute_requested_tests(
-                                scan_id=scan_id,
-                                task_id=task_id,
-                                package_name=package_name,
-                                entries=entries,
-                                requests=requested,
-                                budget=budget,
-                                evidence_summaries=evidence_summaries,
-                                round_index=completed_rounds + 1,
-                            )
+                            with self._task_device_session(
+                                scan_id,
+                                task_id,
+                                priority=int(task.priority),
+                                cancel_event=cancel_event,
+                            ) as requested_lease:
+                                budget = budget.extend(
+                                    requested_lease["wait_seconds"],
+                                    maximum_deadline=scan_deadline,
+                                )
+                                try:
+                                    round_prepare = self.device.prepare(
+                                        Path(scan.artifact_path),
+                                        package_name,
+                                        budget,
+                                    )
+                                    self._record_commands(
+                                        scan_id,
+                                        task_id,
+                                        round_prepare,
+                                        evidence_summaries,
+                                    )
+                                    round_critical = {
+                                        kind: result
+                                        for kind, result, _metadata in round_prepare
+                                        if kind
+                                        in {
+                                            "device.health",
+                                            "device.install",
+                                            "device.clear",
+                                        }
+                                        and result.exit_code != 0
+                                    }
+                                    if round_critical:
+                                        failures = ", ".join(
+                                            f"{kind}=exit {result.exit_code}"
+                                            for kind, result in round_critical.items()
+                                        )
+                                        execution_gaps.append(
+                                            "Device preparation failed before "
+                                            f"agent-requested tests: {failures}"
+                                        )
+                                    else:
+                                        (
+                                            executed_this_round,
+                                            execution_gaps,
+                                            requested_observed,
+                                        ) = self._execute_requested_tests(
+                                            scan_id=scan_id,
+                                            task_id=task_id,
+                                            package_name=package_name,
+                                            entries=entries,
+                                            requests=requested,
+                                            budget=budget,
+                                            evidence_summaries=evidence_summaries,
+                                            round_index=completed_rounds + 1,
+                                        )
+                                finally:
+                                    cleanup = self.device.cleanup(package_name)
+                                    self._record_commands(
+                                        scan_id,
+                                        task_id,
+                                        cleanup,
+                                        None,
+                                    )
                             executed_agent_tests.extend(executed_this_round)
                             coverage_gaps.extend(execution_gaps)
                             stages["instrumented_attempted"] = (
@@ -1624,6 +1886,33 @@ class ScanOrchestrator:
                 except AgentCancelledError:
                     raise
                 except Exception as exc:
+                    if frida_session is not None:
+                        frida_result = self.frida.collect(frida_session)
+                        frida_session = None
+                        self._record_commands(
+                            scan_id,
+                            task_id,
+                            [
+                                (
+                                    "instrumented.frida",
+                                    frida_result,
+                                    self.frida.metadata(frida_result),
+                                )
+                            ],
+                            evidence_summaries,
+                        )
+                    if device_session is not None:
+                        if prepared or stages["device_attempted"]:
+                            cleanup = self.device.cleanup(package_name)
+                            self._record_commands(
+                                scan_id,
+                                task_id,
+                                cleanup,
+                                None,
+                            )
+                        failed_device_session = device_session
+                        device_session = None
+                        failed_device_session.__exit__(None, None, None)
                     coverage_gaps.append(f"Dynamic investigation failed safely: {exc}")
                     if agent_result is None:
                         agent_result, agent_error = invoke_agent(phase="recovery_evaluation")
@@ -1642,9 +1931,15 @@ class ScanOrchestrator:
                             ],
                             evidence_summaries,
                         )
-                    if prepared or stages["device_attempted"]:
+                    if device_session is not None and (
+                        prepared or stages["device_attempted"]
+                    ):
                         cleanup = self.device.cleanup(package_name)
                         self._record_commands(scan_id, task_id, cleanup, None)
+                    if device_session is not None:
+                        final_device_session = device_session
+                        device_session = None
+                        final_device_session.__exit__(None, None, None)
 
         self._raise_if_cancelled(cancel_event)
         validated_payload: dict[str, Any] | None = None
@@ -2247,8 +2542,9 @@ class ScanOrchestrator:
                 "write_enabled": workspace_write,
                 "native_write_tools_enabled": False,
                 "allowed_write_roots": (
-                    ["scan_workspace", "/tmp"] if workspace_write else []
+                    ["task_attempt_workspace", "/tmp"] if workspace_write else []
                 ),
+                "shared_scan_workspace_exposed": False,
                 "network_enabled": backend == "opencode",
                 "network_policy": (
                     "container_bridge; target requests prohibited by developer instructions"
@@ -2801,7 +3097,9 @@ class ScanOrchestrator:
         task_id: str,
         attempt: int,
         summaries: list[dict[str, Any]],
-    ) -> None:
+        *,
+        platform_context: dict[str, Any] | None = None,
+    ) -> Path:
         identifiers = [item["id"] for item in summaries if isinstance(item.get("id"), str)]
         task_root = (
             self.settings.data_dir
@@ -2813,6 +3111,11 @@ class ScanOrchestrator:
         )
         evidence_root = task_root / "evidence"
         evidence_root.mkdir(parents=True, exist_ok=True)
+        self._materialize_target_sources(
+            scan_id,
+            task_root,
+            platform_context or {},
+        )
         with self.database.session_factory() as session:
             records = list(
                 session.scalars(select(Evidence).where(Evidence.id.in_(identifiers)))
@@ -2829,17 +3132,78 @@ class ScanOrchestrator:
             suffix = source.suffix if source.suffix in {".json", ".txt", ".log"} else ".bin"
             target = evidence_root / f"{record.id}{suffix}"
             shutil.copyfile(source, target)
-            summary["artifact"] = str(target.relative_to(self.settings.data_dir / "workspaces" / scan_id))
+            summary["artifact"] = str(target.relative_to(task_root))
         context = {
             "schema_version": "1.0",
             "scan_id": scan_id,
             "task_id": task_id,
             "attempt": attempt,
             "evidence": summaries,
+            "platform_context": platform_context or {},
+            "workspace_policy": {
+                "writable_root": ".",
+                "shared_scan_workspace_exposed": False,
+                "reason": (
+                    "Concurrent agents receive isolated writable roots; relevant target code "
+                    "and immutable evidence are materialized in this context."
+                ),
+            },
         }
         (task_root / "context.json").write_text(
             json.dumps(context, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        return task_root
+
+    def _materialize_target_sources(
+        self,
+        scan_id: str,
+        task_root: Path,
+        platform_context: dict[str, Any],
+        *,
+        max_bytes: int = 2_000_000,
+    ) -> None:
+        """Copy only target-component sources into an agent's writable workspace."""
+        target_context = platform_context.get("target_code_context")
+        if not isinstance(target_context, dict):
+            return
+        components = target_context.get("components")
+        if not isinstance(components, list):
+            return
+        scan_workspace = (
+            self.settings.data_dir / "workspaces" / scan_id
+        ).resolve()
+        source_root = (task_root / "target_source").resolve()
+        copied_bytes = 0
+        for component in components:
+            if not isinstance(component, dict):
+                continue
+            anchors = component.get("anchors")
+            if not isinstance(anchors, list):
+                continue
+            for anchor in anchors:
+                if not isinstance(anchor, dict):
+                    continue
+                raw_path = anchor.get("path")
+                if not isinstance(raw_path, str):
+                    continue
+                source = (scan_workspace / raw_path).resolve()
+                if (
+                    not source.is_relative_to(scan_workspace)
+                    or not source.is_file()
+                ):
+                    continue
+                size = source.stat().st_size
+                if copied_bytes + size > max_bytes:
+                    anchor["materialization_skipped"] = "task_source_budget_exhausted"
+                    continue
+                relative = source.relative_to(scan_workspace)
+                target = (source_root / relative).resolve()
+                if not target.is_relative_to(source_root):
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
+                copied_bytes += size
+                anchor["materialized_path"] = str(target.relative_to(task_root))
 
     def _record_commands(
         self,

@@ -19,17 +19,19 @@ finding without platform evidence IDs.
 - Tamper-evident AI audit trail for exact prompts, normalized SDK runtime events, structured
   outputs, test-policy decisions, evidence downgrades, provider/model identity, thread/turn IDs,
   and usage.
-- Remote ADB adapter, serialized device lease, ordinary-app-UID Probe APK protocol, log evidence,
-  guest/authenticated replay, `pm clear` cleanup, and App Link state inspection/reset.
+- Three concurrent entry-investigation workers by default, with one global serialized ADB queue;
+  model/review turns release the device between validated device-action phases.
+- Remote ADB adapter, ordinary-app-UID Probe APK protocol, log evidence, guest/authenticated replay,
+  `pm clear` cleanup, and App Link state inspection/reset.
 - Bounded Frida side-channel tracing with URI/query redaction and a distinct instrumented verdict.
 - Optional MobSF upload/report normalization with explicit degraded coverage when absent.
 - Official `openai-codex==0.144.4` integration with strict JSON Schema, streamed turn/item events,
   read-only workspace inspection, no subagent fan-out, bounded adaptive platform-mediated test
   rounds, and evidence-backed result downgrades.
 - Pinned `@opencode-ai/sdk`/OpenCode `1.18.4` integration for DeepSeek, with fresh sessions,
-  tool-free/Ajv-validated V4 Pro JSON, native StructuredOutput for V4 Flash, all executable agent
-  tools denied, SSE runtime-event forwarding, and an isolated one-shot bridge.
-- Optional per-task Docker workers with read-only scan mounts and resource/capability limits.
+  workspace tools plus Ajv-validated V4 Pro text JSON, native StructuredOutput for V4 Flash,
+  ADB/subagent denial, SSE runtime-event forwarding, and an isolated one-shot bridge.
+- Optional per-task Docker workers with isolated task-attempt mounts and resource/capability limits.
 - Responsive React review console, human Finding decisions, live events, JSON/HTML/SARIF exports.
 - Light review console with confirmed deletion of completed scans and shared-artifact-safe cleanup.
 
@@ -87,6 +89,13 @@ export APKSCANNER_PROBE_APK="$PWD/probe/app/build/outputs/apk/debug/app-debug.ap
 Without ADB or the Probe APK, scans still complete and explicitly mark dynamic coverage as blocked.
 An `adb shell` success is retained as a separate identity and is never treated as equivalent to an
 ordinary third-party application.
+
+The default worker pool explores up to three entry points concurrently across all scans. Every
+install, reset, probe, optional instrumentation action, and cleanup still passes through one global
+priority/FIFO device queue. The device is released before model planning, critic, review, and final
+evaluation turns; an accepted model-requested test reacquires the lease and prepares the device
+again. Device-queue wait is excluded from the 20-minute task budget but remains bounded by the
+24-hour scan deadline.
 
 An investigation task receives a 20-minute budget by default. A task that reaches `timed_out`
 exposes the **继续深度探索** action in the Web console. Each manual continuation receives a fresh
@@ -200,11 +209,12 @@ scanctl capabilities --deep
 ```
 
 The host worker creates a private temporary HOME/XDG tree and an authenticated loopback OpenCode
-server for each invocation. In both modes, OpenCode can inspect the complete scan workspace with
-the native `read`, `glob`, `grep`, and `bash` tools. Bash may create analysis artifacts in the
-scan workspace or `/tmp`; the container root filesystem stays read-only. Native editing, web, MCP,
-and subagent tools remain denied. ADB is blocked by OpenCode permissions and a PATH shim, and no
-device serial or socket is mounted. `deepseek-v4-pro` uses the normal OpenCode tool loop and returns
+server for each invocation. In both modes, OpenCode receives an isolated per-task/attempt workspace
+containing the relevant code context and immutable evidence, exposed through the native `read`,
+`glob`, `grep`, and `bash` tools. Bash may create analysis artifacts in that workspace or `/tmp`;
+the shared scan workspace is not writable or exposed to concurrent agents. Native editing, web,
+MCP, and subagent tools remain denied. ADB is blocked by OpenCode permissions and a PATH shim, and
+no device serial or socket is mounted. `deepseek-v4-pro` uses the normal OpenCode tool loop and returns
 text JSON without the incompatible `tool_choice: required`; the worker validates it locally with
 Ajv and can issue two tool-disabled correction turns in the same session. Pro turns are dispatched
 with `promptAsync` and observed through short message polls, so review and exploration do not depend
@@ -260,6 +270,7 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_MAX_UPLOAD_BYTES` | 512 MiB | Intake limit |
 | `APKSCANNER_TASK_TIMEOUT` | 1200 s | Per-investigation budget |
 | `APKSCANNER_TASK_MAX_ATTEMPTS` | 2 | Retry budget |
+| `APKSCANNER_AGENT_CONCURRENCY` | 3 | Global entry-investigation worker limit (1–8); ADB remains single-concurrency |
 | `APKSCANNER_AGENT_MAX_ROUNDS` | 3 | Maximum adaptive AI/device rounds per task (1–5) |
 | `APKSCANNER_AGENT_TESTS_PER_ROUND` | 100 | Maximum accepted AI-requested tests per round (1–100) |
 
@@ -286,8 +297,9 @@ The server binds to `127.0.0.1` and rejects untrusted Host headers.
 - No source code or server authorization context is available; AUTH and PRIVACY remain partial.
 - v1 covers one APK, one Android 16 baseline, one authenticated role, and `pm clear` rather than a
   full device snapshot.
-- The Codex Docker worker has a read-only scan mount. The OpenCode worker receives task JSON only
-  and has no scan-workspace mount; all executable OpenCode tools are denied.
+- The Codex worker gets a read-only task-attempt mount. OpenCode gets a separate writable
+  task-attempt workspace with bounded target Java/Smali files and evidence; `read`, `glob`, `grep`,
+  and `bash` are enabled there, while ADB, web, MCP, native editing, and subagents remain denied.
 - Agent containers still have outbound networking for their selected model provider. Restrict each
   worker's egress to the approved provider/gateway before a team deployment.
 - DeepSeek receives the bounded task context and evidence summaries. Confirm company data handling,

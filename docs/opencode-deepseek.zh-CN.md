@@ -68,7 +68,7 @@ sequenceDiagram
         W->>O: session.promptAsync(text)
         O-->>W: 204 accepted
         O->>D: tools=[read,glob,grep,bash], ordinary tool selection
-        D->>O: inspect and run commands in the scan workspace
+        D->>O: inspect and run commands in the isolated task attempt workspace
         D-->>O: JSON text
         loop bounded short polling
             W->>O: session.messages
@@ -87,7 +87,7 @@ bridge 不参与任务规划、证据判定或设备操作。Python 仍然负责
 
 1. 静态工具覆盖面和入口枚举；
 2. 生成每个入口的任务与证据摘要；
-3. 在每个自适应轮次校验 Agent 提出的受限测试（默认每轮最多接受 4 个）；
+3. 在每个自适应轮次校验 Agent 提出的受限测试（默认每轮最多接受 100 个）；
 4. 在云真机上执行允许的 Probe/ADB/Frida 操作；
 5. 验证 Evidence ID，并把不满足条件的结论降级。
 
@@ -99,8 +99,10 @@ OpenCode 本身是 coding agent，默认会暴露读文件、Shell、编辑、We
 - OpenCode 的全局和专用 Agent permission 先 `* = deny`，只允许
   `read/glob/grep/bash`；
   Flash 通道另外允许内部 `StructuredOutput`。
-- Docker 将当前 scan workspace 挂载到 `/workspace`，Host 模式以该 workspace 为 cwd；
-  Bash 可以在 workspace 和 `/tmp` 创建脚本或分析产物，容器根文件系统保持只读。
+- 平台按 `task_id + attempt` 创建隔离 workspace，只物化当前入口的代码上下文和不可变
+  Evidence；Docker 将它挂载到 `/workspace`，Host 模式以它为 cwd。Bash 可以在该
+  workspace 和 `/tmp` 创建脚本或分析产物，容器根文件系统保持只读，并发任务之间不共享
+  可写扫描目录。
 - 原生 write/edit/patch、Web、MCP、task/subagent 均保持禁用。ADB 同时通过 Bash
   permission、PATH 阻断程序、无设备参数/Socket 三层禁用；不挂载认证流或宿主机其他目录。
   外部目录访问由 OpenCode `external_directory` permission 拒绝。

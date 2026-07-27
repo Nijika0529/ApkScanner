@@ -40,6 +40,18 @@ class TimeBudget:
             seconds = min(seconds, int(cap))
         return seconds
 
+    def extend(
+        self,
+        seconds: int | float,
+        *,
+        maximum_deadline: float | None = None,
+    ) -> TimeBudget:
+        """Return a budget that excludes time spent waiting for a shared resource."""
+        deadline = self.deadline + max(float(seconds), 0.0)
+        if maximum_deadline is not None:
+            deadline = min(deadline, maximum_deadline)
+        return TimeBudget(deadline=deadline)
+
 
 class ToolRunner:
     def __init__(self, timeout_seconds: int = 600, max_output_chars: int = 2_000_000):

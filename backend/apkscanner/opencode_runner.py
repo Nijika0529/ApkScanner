@@ -134,6 +134,7 @@ class OpenCodeInvestigator:
             Path(__file__).resolve().parents[2] / "opencode-worker"
         )
         self._deep_capability: dict[str, Any] | None = None
+        self._capability_lock = threading.Lock()
 
     def capability(self, *, deep: bool = False) -> dict[str, Any]:
         capability: dict[str, Any] = {
@@ -156,48 +157,49 @@ class OpenCodeInvestigator:
             capability = self._host_capability(capability)
         if not deep or not capability.get("available"):
             return capability
-        if self._deep_capability is not None:
-            return dict(self._deep_capability)
-        try:
-            probe = self._invoke(
-                {
-                    "schema_version": "1.0",
-                    "action": "capability",
-                    "model": self.settings.opencode_model,
-                    "base_url": self.settings.deepseek_base_url,
-                    "timeout_ms": 30_000,
-                },
-                timeout_seconds=45,
-            )
-            models = [str(item) for item in probe.get("models", [])]
-            capability["server_version"] = str(probe.get("server_version", ""))
-            capability["models"] = models
-            capability["output_mode"] = str(
-                probe.get(
-                    "output_mode",
-                    opencode_output_mode(self.settings.opencode_model),
+        with self._capability_lock:
+            if self._deep_capability is not None:
+                return dict(self._deep_capability)
+            try:
+                probe = self._invoke(
+                    {
+                        "schema_version": "1.0",
+                        "action": "capability",
+                        "model": self.settings.opencode_model,
+                        "base_url": self.settings.deepseek_base_url,
+                        "timeout_ms": 30_000,
+                    },
+                    timeout_seconds=45,
                 )
-            )
-            capability["tool_profile"] = str(
-                probe.get("tool_profile", OPENCODE_TOOL_PROFILE)
-            )
-            capability["workspace_tools"] = [
-                str(item)
-                for item in probe.get("workspace_tools", OPENCODE_WORKSPACE_TOOLS)
-            ]
-            capability["max_steps"] = int(
-                probe.get("max_steps", OPENCODE_MAX_STEPS)
-            )
-            if self.settings.opencode_model not in models:
+                models = [str(item) for item in probe.get("models", [])]
+                capability["server_version"] = str(probe.get("server_version", ""))
+                capability["models"] = models
+                capability["output_mode"] = str(
+                    probe.get(
+                        "output_mode",
+                        opencode_output_mode(self.settings.opencode_model),
+                    )
+                )
+                capability["tool_profile"] = str(
+                    probe.get("tool_profile", OPENCODE_TOOL_PROFILE)
+                )
+                capability["workspace_tools"] = [
+                    str(item)
+                    for item in probe.get("workspace_tools", OPENCODE_WORKSPACE_TOOLS)
+                ]
+                capability["max_steps"] = int(
+                    probe.get("max_steps", OPENCODE_MAX_STEPS)
+                )
+                if self.settings.opencode_model not in models:
+                    capability["available"] = False
+                    capability["detail"] = (
+                        f"DeepSeek model {self.settings.opencode_model!r} is not exposed by OpenCode"
+                    )
+            except Exception as exc:
                 capability["available"] = False
-                capability["detail"] = (
-                    f"DeepSeek model {self.settings.opencode_model!r} is not exposed by OpenCode"
-                )
-        except Exception as exc:
-            capability["available"] = False
-            capability["detail"] = f"OpenCode capability probe failed: {exc}"
-        if capability.get("available"):
-            self._deep_capability = dict(capability)
+                capability["detail"] = f"OpenCode capability probe failed: {exc}"
+            if capability.get("available"):
+                self._deep_capability = dict(capability)
         return capability
 
     def investigate(

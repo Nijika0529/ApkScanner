@@ -35,7 +35,8 @@ APK Scanner 是一个运行在安全人员本地电脑上的 Android 上线前�
 | 部署边界 | 单用户、本机 loopback 控制面；可访问已授权远程云真机 |
 | 输入限制 | 单 APK；默认最大 512 MiB |
 | 动态基线 | Android 16 / API 36；单测试账号；`pm clear` 复位 |
-| 单设备调度 | 全局优先级队列；同优先级 FIFO；可取消等待；记录排队/占用时长；重启安全恢复 |
+| AI/入口并发 | 默认全局 3 个 worker，可配置 1–8；不同扫描共享上限 |
+| 单设备调度 | 并发 worker 共享 1 条 ADB 通道；优先级队列 + FIFO；只在设备操作期间持有租约 |
 | 入口类型 | 6 类：Activity、Activity Alias、Service、Receiver、Provider、Deep Link |
 | 内置规则 | 17 条固定规则 + 5 类导出组件动态规则，共 22 个规则 ID 类型 |
 | 覆盖模型 | 8 个 MASVS 域；static、deterministic、blackbox、authenticated、agent、instrumented 多阶段记录 |
@@ -47,11 +48,12 @@ APK Scanner 是一个运行在安全人员本地电脑上的 Android 上线前�
 | 私有真值评测 | final Finding 对照已知漏洞；默认要求动态证明；F0.5 精确率权重为召回率两倍 |
 | AI 探索预算 | 默认最多 3 轮、每轮接受 100 个测试；可配范围分别为 1–5 轮、1–100 个 |
 | 单任务预算 | 默认 20 分钟；自动尝试最多 2 次，人工续跑不受此限制 |
+| ADB 排队预算 | 等待唯一设备的时间不消耗单任务 20 分钟预算；仍受整单 24 小时截止约束 |
 | 整单时限 | preliminary 目标 4 小时；整单截止 24 小时 |
 | AI 审计证据 | 7 类：request、events、response、test validation、result validation、error、cancellation |
 | 报告出口 | 4 种：Web、JSON、HTML、SARIF |
 | 任务视觉状态 | 5 组：等待判断、正在分析、已判断、未形成判断、已停止 |
-| 自动化回归 | 后端 52 项测试；OpenCode Worker 5 项 Pro/Flash/工具/ADB 阻断集成测试；前端 lint + production build |
+| 自动化回归 | 后端 77 项测试；OpenCode Worker 5 项 Pro/Flash/工具/ADB 阻断集成测试；前端 lint + production build |
 
 规则数量按当前代码统计：4 条 Manifest、2 条 Deep Link、4 条 APK/签名、7 条代码模式，以及
 Activity、Activity Alias、Service、Receiver、Provider 5 类按入口动态生成的导出规则。
@@ -60,6 +62,7 @@ Activity、Activity Alias、Service、Receiver、Provider 5 类按入口动态�
 
 - **覆盖面可解释**：不仅列出漏洞，还展示每个 MASVS 域和入口在哪个阶段被覆盖、为何未覆盖。
 - **AI 有边界**：Agent 不持有 ADB，不能创建子 Agent；测试参数、目标入口和副作用由平台校验。
+- **并行但不串设备**：模型分析可并发，ADB 安装、探测和清理始终全局串行；模型思考阶段会释放设备。
 - **结论有证据**：黑盒复现必须包含普通 App UID 的请求与结果证据；`adb shell` 成功不等价于漏洞。
 - **全过程可审计**：保留精确 prompt、模型/SDK、关键事件、原始结构化响应、token usage、
   平台接受/拒绝的证据和用户中止记录，但不展示或持久化隐藏思维链。

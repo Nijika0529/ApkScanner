@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 import threading
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -29,6 +30,321 @@ from apkscanner.reports import ReportBuilder
 from apkscanner.schemas import AgentInvestigationResult, AgentRequestedTest
 from apkscanner.tools import CommandResult, TimeBudget
 from sqlalchemy import select
+
+
+def test_task_dispatch_uses_configured_agent_concurrency(settings) -> None:  # noqa: ANN001
+    configured = replace(settings, agent_concurrency=3)
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            status="preliminary_ready",
+            filename="parallel.apk",
+            artifact_sha256="9" * 64,
+            artifact_path=str(configured.data_dir / "parallel.apk"),
+        )
+        session.add(scan)
+        session.flush()
+        session.add_all(
+            [
+                InvestigationTask(
+                    scan_id=scan.id,
+                    task_type="component",
+                    status="queued",
+                    priority=100 - index,
+                )
+                for index in range(6)
+            ]
+        )
+        session.commit()
+        scan_id = scan.id
+
+    orchestrator = ScanOrchestrator(configured, database, ArtifactStore(configured))
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_run_task(
+        _scan_id: str,
+        task_id: str,
+        _timeout_seconds: int | None = None,
+    ) -> None:
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.08)
+        with database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            assert task is not None
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            session.commit()
+        with state_lock:
+            active -= 1
+
+    orchestrator._run_task = fake_run_task  # type: ignore[method-assign]
+    orchestrator._run_tasks(scan_id)
+
+    assert max_active == 3
+    with database.session_factory() as session:
+        persisted_scan = session.get(Scan, scan_id)
+        statuses = list(
+            session.scalars(
+                select(InvestigationTask.status).where(
+                    InvestigationTask.scan_id == scan_id
+                )
+            )
+        )
+    assert persisted_scan is not None
+    assert persisted_scan.stats["execution_policy"] == {
+        "agent_concurrency": 3,
+        "adb_concurrency": 1,
+        "device_wait_excluded_from_task_budget": True,
+        "agent_workspace_scope": "task_attempt",
+    }
+    assert statuses == ["completed"] * 6
+
+
+def test_agent_concurrency_limit_is_shared_across_scan_workers(settings) -> None:  # noqa: ANN001
+    configured = replace(settings, agent_concurrency=3)
+    orchestrator = ScanOrchestrator(
+        configured,
+        Database(configured),
+        ArtifactStore(configured),
+    )
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+    start = threading.Barrier(6)
+
+    def fake_run_task_impl(
+        _scan_id: str,
+        _task_id: str,
+        _timeout_seconds: int | None,
+        *,
+        cancel_event: threading.Event,
+    ) -> None:
+        nonlocal active, max_active
+        assert not cancel_event.is_set()
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.06)
+        with state_lock:
+            active -= 1
+
+    orchestrator._run_task_impl = fake_run_task_impl  # type: ignore[method-assign]
+
+    def run(index: int) -> None:
+        start.wait(timeout=5)
+        orchestrator._run_task(
+            f"scan-{index % 2}",
+            f"task-{index}",
+            60,
+        )
+
+    workers = [threading.Thread(target=run, args=(index,)) for index in range(6)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+    assert max_active == 3
+
+
+def test_parallel_workers_share_only_one_device_session(settings) -> None:  # noqa: ANN001
+    configured = replace(settings, agent_concurrency=3)
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="one-device.apk",
+            artifact_sha256="8" * 64,
+            artifact_path=str(configured.data_dir / "one-device.apk"),
+        )
+        session.add(scan)
+        session.flush()
+        tasks = [
+            InvestigationTask(
+                scan_id=scan.id,
+                task_type="component",
+                status="running",
+                priority=90 - index,
+            )
+            for index in range(3)
+        ]
+        session.add_all(tasks)
+        session.commit()
+        scan_id = scan.id
+        task_ids = [task.id for task in tasks]
+
+    orchestrator = ScanOrchestrator(configured, database, ArtifactStore(configured))
+    state_lock = threading.Lock()
+    entered = 0
+    max_entered = 0
+    start = threading.Barrier(3)
+
+    def use_device(task_id: str, priority: int) -> None:
+        nonlocal entered, max_entered
+        start.wait(timeout=5)
+        with orchestrator._task_device_session(
+            scan_id,
+            task_id,
+            priority=priority,
+            cancel_event=threading.Event(),
+        ):
+            with state_lock:
+                entered += 1
+                max_entered = max(max_entered, entered)
+            time.sleep(0.05)
+            with state_lock:
+                entered -= 1
+
+    workers = [
+        threading.Thread(target=use_device, args=(task_id, 90 - index))
+        for index, task_id in enumerate(task_ids)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+
+    assert max_entered == 1
+    assert orchestrator.device.scheduler.snapshot() == {
+        "active_task_id": None,
+        "waiting": [],
+    }
+    with database.session_factory() as session:
+        persisted = [
+            session.get(InvestigationTask, task_id) for task_id in task_ids
+        ]
+        assert all(task is not None and task.status == "running" for task in persisted)
+        assert all(
+            (task.result.get("device_queue") or {}).get("released_at")
+            for task in persisted
+            if task is not None
+        )
+
+
+def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    store = ArtifactStore(settings)
+    orchestrator = ScanOrchestrator(settings, database, store)
+    scan_id = "00000000-0000-0000-0000-000000000070"
+    first_task_id = "00000000-0000-0000-0000-000000000071"
+    second_task_id = "00000000-0000-0000-0000-000000000072"
+    digest, evidence_path = store.put_json(
+        "evidence",
+        {"kind": "static.manifest", "exported": True},
+    )
+    with database.session_factory() as session:
+        scan = Scan(
+            id=scan_id,
+            status="preliminary_ready",
+            filename="isolated.apk",
+            artifact_sha256="7" * 64,
+            artifact_path=str(settings.data_dir / "isolated.apk"),
+        )
+        session.add(scan)
+        session.flush()
+        session.add_all(
+            [
+                InvestigationTask(
+                    id=first_task_id,
+                    scan_id=scan_id,
+                    task_type="component",
+                    status="running",
+                ),
+                InvestigationTask(
+                    id=second_task_id,
+                    scan_id=scan_id,
+                    task_type="component",
+                    status="running",
+                ),
+            ]
+        )
+        session.flush()
+        evidence = Evidence(
+            scan_id=scan_id,
+            kind="static.manifest",
+            sha256=digest,
+            path=str(evidence_path),
+            summary="Manifest exported component",
+        )
+        session.add(evidence)
+        session.commit()
+        evidence_summary = orchestrator._evidence_summary(evidence)
+    source = (
+        settings.data_dir
+        / "workspaces"
+        / scan_id
+        / "jadx"
+        / "sources"
+        / "example"
+        / "ExportedProvider.java"
+    )
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("class ExportedProvider {}", encoding="utf-8")
+
+    def context() -> dict[str, object]:
+        return {
+            "phase": "test_planning",
+            "target_code_context": {
+                "components": [
+                    {
+                        "component": "example.ExportedProvider",
+                        "anchors": [
+                            {
+                                "path": "jadx/sources/example/ExportedProvider.java",
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+
+    first = orchestrator._materialize_agent_evidence(
+        scan_id,
+        first_task_id,
+        1,
+        [dict(evidence_summary)],
+        platform_context=context(),
+    )
+    second = orchestrator._materialize_agent_evidence(
+        scan_id,
+        second_task_id,
+        1,
+        [dict(evidence_summary)],
+        platform_context=context(),
+    )
+    assert first != second
+    (first / "agent-note.txt").write_text("first", encoding="utf-8")
+    assert not (second / "agent-note.txt").exists()
+    first_context = json.loads((first / "context.json").read_text(encoding="utf-8"))
+    second_context = json.loads((second / "context.json").read_text(encoding="utf-8"))
+    assert first_context["task_id"] != second_context["task_id"]
+    assert first_context["workspace_policy"]["shared_scan_workspace_exposed"] is False
+    assert first_context["evidence"][0]["artifact"] == (
+        f"evidence/{evidence.id}.json"
+    )
+    assert (first / first_context["evidence"][0]["artifact"]).is_file()
+    materialized = "target_source/jadx/sources/example/ExportedProvider.java"
+    assert (first / materialized).read_text(encoding="utf-8") == (
+        "class ExportedProvider {}"
+    )
+    assert (
+        first_context["platform_context"]["target_code_context"]["components"][0][
+            "anchors"
+        ][0]["materialized_path"]
+        == materialized
+    )
 
 
 def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(settings, fixture_apk) -> None:  # noqa: ANN001
@@ -694,8 +1010,9 @@ def test_restart_recovery_normalizes_transient_device_states(settings) -> None: 
     scan_id = "00000000-0000-0000-0000-000000000100"
     task_ids = {
         "awaiting": "00000000-0000-0000-0000-000000000101",
-        "running": "00000000-0000-0000-0000-000000000102",
+        "running_agent": "00000000-0000-0000-0000-000000000102",
         "cancel": "00000000-0000-0000-0000-000000000103",
+        "running_device": "00000000-0000-0000-0000-000000000104",
     }
     with database.session_factory() as session:
         scan = Scan(
@@ -715,7 +1032,7 @@ def test_restart_recovery_normalizes_transient_device_states(settings) -> None: 
                     status="awaiting_device",
                 ),
                 InvestigationTask(
-                    id=task_ids["running"],
+                    id=task_ids["running_agent"],
                     scan_id=scan_id,
                     task_type="component",
                     status="running",
@@ -727,6 +1044,19 @@ def test_restart_recovery_normalizes_transient_device_states(settings) -> None: 
                     task_type="component",
                     status="cancel_requested",
                 ),
+                InvestigationTask(
+                    id=task_ids["running_device"],
+                    scan_id=scan_id,
+                    task_type="component",
+                    status="running",
+                    attempts=1,
+                    result={
+                        "device_queue": {
+                            "requested_at": datetime.now(UTC).isoformat(),
+                            "acquired_at": datetime.now(UTC).isoformat(),
+                        }
+                    },
+                ),
             ]
         )
         session.commit()
@@ -736,12 +1066,18 @@ def test_restart_recovery_normalizes_transient_device_states(settings) -> None: 
 
     with database.session_factory() as session:
         awaiting = session.get(InvestigationTask, task_ids["awaiting"])
-        running = session.get(InvestigationTask, task_ids["running"])
+        running_agent = session.get(InvestigationTask, task_ids["running_agent"])
+        running_device = session.get(InvestigationTask, task_ids["running_device"])
         canceled = session.get(InvestigationTask, task_ids["cancel"])
         assert awaiting is not None and awaiting.status == "queued"
         assert awaiting.result["device_queue"]["recovered_at"]
-        assert running is not None and running.status == "inconclusive"
-        assert "restart" in running.result["coverage_gaps"][0].lower()
+        assert running_agent is not None and running_agent.status == "queued"
+        assert (
+            running_agent.result["worker_recovery"]["reason"]
+            == "interrupted_outside_device_session"
+        )
+        assert running_device is not None and running_device.status == "inconclusive"
+        assert "restart" in running_device.result["coverage_gaps"][0].lower()
         assert canceled is not None and canceled.status == "canceled"
         assert canceled.result["cancellation"]["acknowledged"] is True
 

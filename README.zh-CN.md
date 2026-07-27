@@ -14,12 +14,13 @@ v1 产品是一个单用户、仅限本机（localhost）的 Web 应用。它接
 - 持久化的 SQLite Scan/Task/Finding/Evidence/Coverage/Event 模型。
 - 持久化 Hypothesis、Hunter/Critic 论证、Proof Attempt、危害 Oracle 和平台 Verdict；模型文字不能自证漏洞成立。
 - 私有 APK ground-truth 评测：只对平台确认的最终 Finding 计分，默认要求动态证明，并用 F0.5 重罚不匹配真值的高危结论。
-- 远程 ADB 适配器、串行设备租约、普通 App UID 的 Probe APK 协议、日志证据、访客/认证回放、`pm clear` 清理和 App Link 状态检查/重置。
+- 默认 3 个入口探索 worker 并发；所有扫描共享 1 条优先级/FIFO ADB 队列，模型与 Review 阶段不占设备。
+- 远程 ADB 适配器、普通 App UID 的 Probe APK 协议、日志证据、访客/认证回放、`pm clear` 清理和 App Link 状态检查/重置。
 - 有限范围的 Frida 旁路追踪（URI/Query 脱敏），带独立的 instrumented 判定。
 - 可选的 MobSF 上传/报告归一化，缺失时显式标注降级覆盖。
 - 官方 `openai-codex==0.144.4` 集成：严格 JSON Schema、全新线程、无子 Agent fan-out、一轮平台介导的补充测试、证据支撑的结果降级。
 - 固定版本 `@opencode-ai/sdk`/OpenCode `1.18.4` 集成（适配 DeepSeek）：全新会话、V4 Pro 文本 JSON/Ajv 校验、workspace read/glob/grep/bash、ADB 阻断和完整工具审计。
-- 可选的每任务 Docker Worker，带只读扫描挂载和资源/能力限制。
+- 可选的每任务 Docker Worker，带隔离的 task-attempt 挂载和资源/能力限制。
 - 响应式明亮主题 React 审核控制台、人工 Finding 判定、实时事件、任务停止/删除、JSON/HTML/SARIF 导出。
 
 详细的控制流程、信任边界、Security IR 和判定规则参见 [`docs/architecture.zh-CN.md`](docs/architecture.zh-CN.md)。
@@ -91,11 +92,14 @@ export APKSCANNER_PROBE_APK="$PWD/probe/app/build/outputs/apk/debug/app-debug.ap
 
 没有 ADB 或 Probe APK 时，扫描仍会完成，并显式标注动态覆盖为 blocked。`adb shell` 成功会保留为独立身份，永远不会被视为等同于普通第三方应用。
 
-单 ADB 模式使用全局显式设备队列：风险优先级高的任务先执行，相同优先级按入队顺序执行。
+单 ADB 模式默认允许 3 个入口 worker 并发分析，但所有 worker 共用一条全局显式设备队列：
+风险优先级高的任务先执行，相同优先级按入队顺序执行。设备租约只覆盖安装、探测和清理；
+模型思考阶段释放 ADB，等待设备的时间不消耗单任务 20 分钟预算。
 任务在 Web 中依次显示 `等待云真机 → 正在分析 → 已判断/未形成判断`，排队阶段可以立即
-取消。一个任务从设备健康检查、安装、访客/登录态探测、AI 申请的补充测试到最终清理完整
-持有独占租约，避免不同 APK 的登录态、logcat、Frida 和 App Link 状态相互污染。队列等待
-时间、设备占用时间和获取/释放事件会写入任务结果。
+取消。每次租约只覆盖健康检查、安装、访客/登录态探测、经平台接受的补充测试和最终清理；
+完成一段设备操作后先清理并释放，再进入 AI 规划、Critic、Review 或最终判断。AI 后续申请
+测试时会重新排队并再次 prepare，避免不同 APK 的登录态、logcat 和 App Link 状态相互
+污染。队列等待时间、设备占用时间和每次获取/释放事件都会写入任务结果。
 
 使用非敏感的 JSON 流程和操作系统密钥环引用配置单账号登录回放：
 
@@ -161,9 +165,11 @@ scanctl capabilities --deep
 ```
 
 Host Worker 为每次调用创建私有的临时 HOME/XDG 目录树以及认证过的 loopback OpenCode
-服务器。两种模式都允许 OpenCode 使用 `read`、`glob`、`grep` 和 `bash` 检查当前扫描
-workspace；原生编辑、Web、MCP、子 Agent 和 ADB 保持禁用，请求的 Android 测试仍由
-Python 控制面验证并执行。`deepseek-v4-pro` 通过 `promptAsync` 和短连接消息轮询完成
+服务器。两种模式都只给 OpenCode 一个按 `task_id + attempt` 隔离的 workspace，其中物化
+当前入口的代码上下文和不可变 Evidence；它可使用 `read`、`glob`、`grep` 和 `bash`，
+但不会与其他并发 Agent 共享可写扫描目录。原生编辑、Web、MCP、子 Agent 和 ADB 保持
+禁用，请求的 Android 测试仍由 Python 控制面验证并执行。`deepseek-v4-pro` 通过
+`promptAsync` 和短连接消息轮询完成
 长推理，避免 review/自由探索阶段依赖一条长期占用的 loopback HTTP 请求；瞬时本地连接
 失败会在剩余任务预算内重建一次 worker，不会静默切换模型。
 
@@ -190,18 +196,18 @@ APK 上传
   → 可选 MobSF 广度静态扫描
   → 发布 preliminary 报告
   → InvestigationPlanner 创建任务（每个导出组件一个，每个 Deep Link handler 一个）
-  → 对每个任务：
-      → 按优先级排队
+  → 默认最多 3 个任务并发进入入口探索：
+      → 任务 worker 按优先级领取
       → 如配置 ADB：安装 APK、安装 Probe APK、pm clear、启动 Frida（可选）
       → 访客探测：对每个入口通过 adb shell 和 Probe APK 广播分发
       → 认证探测：通过 ADB 输入事件回放登录流程，然后重新探测
       → 收集 Frida 观察结果
-      → Codex 第一阶段（test_planning）：AI 分析证据，最多请求 12 个限定补充测试
-      → 平台验证并执行 Agent 请求的测试
+      → 清理并释放唯一 ADB，再由 AI 进行 test_planning
+      → AI 最多请求 100 个限定补充测试
+      → 平台验证申请；如需执行则重新进入单设备队列，prepare 后串行执行并再次释放
       → Codex 第二阶段（final_evaluation）：AI 做出最终判定
       → 证据校验：平台检查引用的 Evidence ID 是否存在，降级无效声明
       → 持久化带 Agent 判定的发现
-      → 清理：pm clear、App Link 重置
   → 生成最终报告
 ```
 
@@ -263,6 +269,9 @@ AI 审计中，不能被当作平台确认风险等级。
 | `APKSCANNER_MAX_UPLOAD_BYTES` | 512 MiB | 上传大小限制 |
 | `APKSCANNER_TASK_TIMEOUT` | 1200 s | 每个调查任务的时间预算 |
 | `APKSCANNER_TASK_MAX_ATTEMPTS` | 2 | 重试次数预算 |
+| `APKSCANNER_AGENT_CONCURRENCY` | 3 | 全局入口探索 worker 上限（1–8）；ADB 仍固定单并发 |
+| `APKSCANNER_AGENT_MAX_ROUNDS` | 3 | 每任务最大自适应 AI/设备轮数（1–5） |
+| `APKSCANNER_AGENT_TESTS_PER_ROUND` | 100 | 每轮最多接受的 AI 测试数（1–100） |
 
 ## 验证
 

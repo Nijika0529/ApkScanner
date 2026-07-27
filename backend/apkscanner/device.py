@@ -68,11 +68,10 @@ class SingleDeviceScheduler:
             heapq.heappush(self._queue, waiter)
             position = self._position(waiter)
             self._condition.notify_all()
-        if on_queued is not None:
-            on_queued(position)
-
         acquired = False
         try:
+            if on_queued is not None:
+                on_queued(position)
             with self._condition:
                 while True:
                     if cancel_event.is_set():
@@ -209,44 +208,70 @@ class AdbDeviceAdapter:
         scheduler_state = self.scheduler.snapshot()
         active_task_id = scheduler_state["active_task_id"]
         if non_blocking and active_task_id:
-            cached = dict(
-                self._last_capability
-                or {
-                    "available": True,
-                    "serial": self.serial,
-                }
+            return self._busy_capability(
+                active_task_id=active_task_id,
+                waiting_count=len(scheduler_state["waiting"]),
             )
-            cached.update(
-                {
-                    "busy": True,
-                    "active_task_id": active_task_id,
-                    "waiting_count": len(scheduler_state["waiting"]),
-                    "detail": "云真机正由入口探索任务独占，健康检查使用最近一次状态",
-                }
-            )
-            return cached
+        if non_blocking:
+            acquired = self._lease.acquire(blocking=False)
+            if not acquired:
+                return self._busy_capability(
+                    active_task_id=active_task_id,
+                    waiting_count=len(scheduler_state["waiting"]),
+                )
+            try:
+                return self._probe_capability()
+            finally:
+                self._lease.release()
         with self._lease:
-            state = self._adb(["get-state"], timeout=30)
-            if state.exit_code != 0:
-                result = {
-                    "available": False,
-                    "state": state.stdout.strip(),
-                    "serial": self.serial,
-                    "detail": state.stderr.strip() or "ADB device is unavailable",
-                }
-                self._last_capability = dict(result)
-                return result
-            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="adb-capability") as executor:
-                version_future = executor.submit(
-                    self._adb, ["shell", "getprop", "ro.build.version.release"], 30
-                )
-                sdk_future = executor.submit(
-                    self._adb, ["shell", "getprop", "ro.build.version.sdk"], 30
-                )
-                root_future = executor.submit(self._adb, ["shell", "id", "-u"], 30)
-                version = version_future.result()
-                sdk = sdk_future.result()
-                root = root_future.result()
+            return self._probe_capability()
+
+    def _busy_capability(
+        self,
+        *,
+        active_task_id: str | None,
+        waiting_count: int,
+    ) -> dict[str, Any]:
+        cached = dict(
+            self._last_capability
+            or {
+                "available": True,
+                "serial": self.serial,
+            }
+        )
+        cached.update(
+            {
+                "busy": True,
+                "active_task_id": active_task_id,
+                "waiting_count": waiting_count,
+                "detail": "云真机正在执行其他操作，健康检查使用最近一次状态",
+            }
+        )
+        return cached
+
+    def _probe_capability(self) -> dict[str, Any]:
+        """Probe device health while the caller owns the command lock."""
+        state = self._adb(["get-state"], timeout=30)
+        if state.exit_code != 0:
+            result = {
+                "available": False,
+                "state": state.stdout.strip(),
+                "serial": self.serial,
+                "detail": state.stderr.strip() or "ADB device is unavailable",
+            }
+            self._last_capability = dict(result)
+            return result
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="adb-capability") as executor:
+            version_future = executor.submit(
+                self._adb, ["shell", "getprop", "ro.build.version.release"], 30
+            )
+            sdk_future = executor.submit(
+                self._adb, ["shell", "getprop", "ro.build.version.sdk"], 30
+            )
+            root_future = executor.submit(self._adb, ["shell", "id", "-u"], 30)
+            version = version_future.result()
+            sdk = sdk_future.result()
+            root = root_future.result()
         actual_api = sdk.stdout.strip()
         ready = state.exit_code == 0 and actual_api == str(self.settings.device_android_api)
         detail = None

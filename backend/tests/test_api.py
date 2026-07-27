@@ -626,9 +626,10 @@ def test_opencode_pro_audit_records_toolless_json_transport(settings) -> None:  
         assert request["tool_boundary"]["write_enabled"] is True
         assert request["tool_boundary"]["native_write_tools_enabled"] is False
         assert request["tool_boundary"]["allowed_write_roots"] == [
-            "scan_workspace",
+            "task_attempt_workspace",
             "/tmp",
         ]
+        assert request["tool_boundary"]["shared_scan_workspace_exposed"] is False
         assert request["tool_boundary"]["adb_enabled"] is False
         assert request["tool_boundary"]["structured_output_tool_enabled"] is False
         assert "DEEPSEEK_THINKING_OUTPUT_ADAPTER" in request["prompt"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 from dataclasses import replace
 
+import pytest
 from apkscanner.device import (
     AdbDeviceAdapter,
     DeviceLeaseCancelledError,
@@ -111,6 +112,32 @@ def test_waiting_device_lease_can_be_cancelled_without_acquiring() -> None:
     assert not active.is_alive()
 
 
+def test_queue_callback_failure_does_not_poison_the_device_queue() -> None:
+    scheduler = SingleDeviceScheduler()
+
+    def fail_queue_callback(_position: int) -> None:
+        raise RuntimeError("database callback failed")
+
+    with (
+        pytest.raises(RuntimeError, match="database callback failed"),
+        scheduler.lease(
+            "failed",
+            priority=90,
+            cancel_event=threading.Event(),
+            on_queued=fail_queue_callback,
+        ),
+    ):
+        raise AssertionError("failed queue callback must not acquire the device")
+
+    assert scheduler.snapshot() == {"active_task_id": None, "waiting": []}
+    with scheduler.lease(
+        "next",
+        priority=80,
+        cancel_event=threading.Event(),
+    ):
+        assert scheduler.snapshot()["active_task_id"] == "next"
+
+
 def test_health_capability_does_not_enter_an_active_device_session(settings) -> None:  # noqa: ANN001
     class NoAdbRunner:
         @staticmethod
@@ -144,6 +171,40 @@ def test_health_capability_does_not_enter_an_active_device_session(settings) -> 
     assert capability["available"] is True
     assert capability["busy"] is True
     assert capability["active_task_id"] == "active"
+    release.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+
+
+def test_non_blocking_health_probe_does_not_wait_behind_an_adb_command(settings) -> None:  # noqa: ANN001
+    class NoAdbRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @staticmethod
+        def run(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN205
+            raise AssertionError("non-blocking capability must not run or wait for ADB")
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        NoAdbRunner(),  # type: ignore[arg-type]
+    )
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_command_lock() -> None:
+        with adapter.lease():
+            acquired.set()
+            assert release.wait(timeout=5)
+
+    worker = threading.Thread(target=hold_command_lock)
+    worker.start()
+    assert acquired.wait(timeout=5)
+    capability = adapter.capability(non_blocking=True)
+    assert capability["available"] is True
+    assert capability["busy"] is True
+    assert capability["active_task_id"] is None
     release.set()
     worker.join(timeout=5)
     assert not worker.is_alive()

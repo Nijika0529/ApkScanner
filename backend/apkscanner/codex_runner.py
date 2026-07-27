@@ -45,6 +45,7 @@ class CodexInvestigator:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._deep_capability: dict[str, Any] | None = None
+        self._capability_lock = threading.Lock()
 
     def capability(self, *, deep: bool = False) -> dict[str, Any]:
         try:
@@ -64,19 +65,22 @@ class CodexInvestigator:
         if self.settings.codex_isolation == "docker":
             return self._docker_capability(capability)
         if deep:
-            if self._deep_capability is not None:
-                return dict(self._deep_capability)
-            try:
-                with self._client() as codex:
-                    account = codex.account()
-                    models = codex.models()
-                    capability["account"] = account.model_dump(mode="json", exclude_none=True)
-                    capability["model_count"] = len(models.data)
-            except Exception as exc:  # external process/auth surface
-                capability["available"] = False
-                capability["detail"] = f"Codex capability probe failed: {exc}"
-            if capability.get("available"):
-                self._deep_capability = dict(capability)
+            with self._capability_lock:
+                if self._deep_capability is not None:
+                    return dict(self._deep_capability)
+                try:
+                    with self._client() as codex:
+                        account = codex.account()
+                        models = codex.models()
+                        capability["account"] = account.model_dump(
+                            mode="json", exclude_none=True
+                        )
+                        capability["model_count"] = len(models.data)
+                except Exception as exc:  # external process/auth surface
+                    capability["available"] = False
+                    capability["detail"] = f"Codex capability probe failed: {exc}"
+                if capability.get("available"):
+                    self._deep_capability = dict(capability)
         return capability
 
     def investigate(
