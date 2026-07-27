@@ -203,6 +203,28 @@ class TaskDeleteResult(BaseModel):
     audit_artifacts_preserved: int
 
 
+class AgentPocSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_path: str = Field(
+        pattern=r"^poc/[A-Za-z0-9][A-Za-z0-9._/-]{0,191}$",
+        max_length=196,
+    )
+    package_name: str = Field(
+        pattern=r"^io\.apkscanner\.poc\.[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$",
+        max_length=200,
+    )
+    launch_component: str = Field(
+        pattern=r"^(?:\.[A-Za-z][A-Za-z0-9_.$]*|[A-Za-z][A-Za-z0-9_.$]*(?:\.[A-Za-z][A-Za-z0-9_.$]*)+)$",
+        max_length=300,
+    )
+    log_tag: str = Field(
+        default="APKSCANNER_POC",
+        pattern=r"^[A-Z][A-Z0-9_]{2,31}$",
+    )
+    timeout_seconds: int = Field(default=60, ge=5, le=120)
+
+
 class AgentRequestedTest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -215,6 +237,7 @@ class AgentRequestedTest(BaseModel):
     uri: str | None = Field(max_length=4096)
     extras: dict[str, StrictStr | StrictInt | StrictBool] = Field(max_length=16)
     rationale: str = Field(min_length=1, max_length=1000)
+    poc: AgentPocSpec | None = None
 
 
 class AgentInvestigationResult(BaseModel):
@@ -236,7 +259,7 @@ class AgentInvestigationResult(BaseModel):
     confidence: Literal["high", "medium", "low"]
     coverage_gaps: list[str] = Field(max_length=100)
     followups: list[str] = Field(max_length=100)
-    requested_tests: list[AgentRequestedTest] = Field(max_length=100)
+    requested_tests: list[AgentRequestedTest] = Field(max_length=1000)
 
 
 class HypothesisArgumentOut(ApiModel):

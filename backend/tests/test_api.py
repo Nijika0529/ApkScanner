@@ -235,6 +235,58 @@ def test_running_task_cannot_be_deleted(settings) -> None:  # noqa: ANN001
         assert response.status_code == 409
 
 
+def test_stopping_task_can_be_deleted_without_being_restored(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    signaled: list[str] = []
+    monkeypatch.setattr(
+        app.state.orchestrator,
+        "request_task_cancellation",
+        lambda task_id: signaled.append(task_id) or True,
+    )
+    with TestClient(app) as client:
+        with app.state.database.session_factory() as session:
+            scan = Scan(
+                status="investigating",
+                filename="stopping-task.apk",
+                artifact_sha256="9" * 64,
+                artifact_path=str(settings.data_dir / "missing-stopping.apk"),
+            )
+            task = InvestigationTask(
+                scan=scan,
+                task_type="component",
+                status="cancel_requested",
+                result={
+                    "cancellation": {
+                        "requested": True,
+                        "acknowledged": False,
+                    }
+                },
+            )
+            session.add_all([scan, task])
+            session.commit()
+            scan_id = scan.id
+            task_id = task.id
+
+        deleted = client.delete(
+            f"/api/v1/tasks/{task_id}",
+            headers={"X-APKScanner-Request": "console"},
+        )
+        assert deleted.status_code == 200
+        assert signaled == [task_id]
+        assert client.get(f"/api/v1/scans/{scan_id}/tasks").json() == []
+
+    app.state.orchestrator._mark_task_canceled(scan_id, task_id)
+    with app.state.database.session_factory() as session:
+        task = session.get(InvestigationTask, task_id)
+        assert task is not None
+        assert task.status == "deleted"
+        assert task.result["deletion"]["runtime_stop_pending"] is True
+        assert task.result["cancellation"]["acknowledged"] is True
+
+
 def test_waiting_task_can_be_cancelled_before_dispatch(settings) -> None:  # noqa: ANN001
     app = create_app(settings)
     with TestClient(app) as client:
@@ -640,8 +692,8 @@ def test_opencode_audit_records_explicit_phase_execution_profile(settings) -> No
         )
         assert request["runtime_options"]["schema_validator"] == "ajv@8.20.0"
         assert request["runtime_options"]["semantic_validator"] == "apkscanner@1.0"
-        assert request["runtime_options"]["max_agent_steps"] == 100
-        assert request["runtime_options"]["max_provider_requests"] == 120
+        assert request["runtime_options"]["max_agent_steps"] == 1_000
+        assert request["runtime_options"]["max_provider_requests"] == 1_100
         assert request["tool_boundary"]["model_tools_enabled"] is True
         assert request["tool_boundary"]["workspace_tool_profile"] == "workspace_shell"
         assert request["tool_boundary"]["workspace_tools"] == [

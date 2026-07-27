@@ -40,8 +40,6 @@ from .models import (
 )
 from .opencode_runner import (
     AJV_VERSION,
-    OPENCODE_MAX_PROVIDER_REQUESTS,
-    OPENCODE_MAX_STEPS,
     OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
     OPENCODE_TOOL_PROFILE,
     OPENCODE_WORKSPACE_TOOLS,
@@ -49,6 +47,7 @@ from .opencode_runner import (
     opencode_execution_profile,
 )
 from .planner import InvestigationPlanner
+from .poc import PocBuilder, PocBuildResult
 from .repository import add_event, now
 from .rules import BuiltinRuleEngine
 from .schemas import AGENT_RESULT_JSON_SCHEMA, AgentRequestedTest
@@ -68,6 +67,7 @@ class ScanOrchestrator:
         self.evidence = EvidenceRecorder(store)
         self.hypothesis_ledger = HypothesisLedger(database)
         self.device = AdbDeviceAdapter(settings, self.runner)
+        self.poc_builder = PocBuilder(settings, self.runner, store)
         self.frida = FridaAdapter(settings, self.runner)
         self.mobsf = MobSFAdapter(settings)
         self.codex = CodexInvestigator(settings)
@@ -1198,6 +1198,7 @@ class ScanOrchestrator:
                     "device": device_capability,
                     "authentication": auth_capability,
                     "frida": frida_capability,
+                    "poc_builder": self.poc_builder.capability(),
                     "coverage_gaps": coverage_gaps,
                     "target_code_context": target_code_context,
                     "executed_agent_tests": executed_tests or [],
@@ -1384,6 +1385,12 @@ class ScanOrchestrator:
                             "entry_point_id": request.entry_point_id,
                             "state": request.state,
                             "rationale_summary": request.rationale,
+                            "poc_package": (
+                                request.poc.package_name if request.poc else None
+                            ),
+                            "poc_project_path": (
+                                request.poc.project_path if request.poc else None
+                            ),
                         },
                     )
                 return result, None
@@ -1708,6 +1715,29 @@ class ScanOrchestrator:
                             limit=self.settings.agent_tests_per_round,
                             hypothesis_ids=hypothesis_ids,
                         )
+                        poc_artifacts: dict[str, PocBuildResult] = {}
+                        if requested:
+                            agent_workspace = (
+                                self.settings.data_dir
+                                / "workspaces"
+                                / scan_id
+                                / "agent_context"
+                                / task_id
+                                / f"attempt-{task.attempts}"
+                            )
+                            (
+                                requested,
+                                poc_artifacts,
+                                poc_build_gaps,
+                            ) = self._build_requested_pocs(
+                                scan_id=scan_id,
+                                task_id=task_id,
+                                workspace=agent_workspace,
+                                requests=requested,
+                                evidence_summaries=evidence_summaries,
+                                cancel_event=cancel_event,
+                            )
+                            request_gaps.extend(poc_build_gaps)
                         coverage_gaps.extend(request_gaps)
                         for accepted in requested:
                             self._record_exploration_event(
@@ -1721,6 +1751,11 @@ class ScanOrchestrator:
                                     "entry_point_id": accepted.entry_point_id,
                                     "state": accepted.state,
                                     "rationale_summary": accepted.rationale,
+                                    "poc_package": (
+                                        accepted.poc.package_name
+                                        if accepted.poc
+                                        else None
+                                    ),
                                 },
                             )
                         if request_gaps or len(requested) < len(submitted_tests):
@@ -1798,6 +1833,7 @@ class ScanOrchestrator:
                                             budget=budget,
                                             evidence_summaries=evidence_summaries,
                                             round_index=completed_rounds + 1,
+                                            poc_artifacts=poc_artifacts,
                                         )
                                 finally:
                                     cleanup = self.device.cleanup(package_name)
@@ -2129,6 +2165,44 @@ class ScanOrchestrator:
             task = session.get(InvestigationTask, task_id)
             if task is None:
                 return
+            if task.status == TaskStatus.DELETED.value:
+                task.result = {
+                    **dict(task.result or {}),
+                    "cancellation": {
+                        **dict((task.result or {}).get("cancellation") or {}),
+                        "requested": True,
+                        "acknowledged": True,
+                        "completed_at": now().isoformat(),
+                    },
+                }
+                coverage = list(
+                    session.scalars(
+                        select(CoverageItem).where(
+                            CoverageItem.scan_id == scan_id,
+                            CoverageItem.entry_point_id.in_(task.target_entry_ids),
+                        )
+                    )
+                )
+                for item in coverage:
+                    item.status = "partial"
+                    item.gap_reason = "入口探索由用户主动停止并从任务列表删除，未形成最终判断。"
+                    item.stages = {
+                        **item.stages,
+                        "agent": "cancelled",
+                    }
+                add_event(
+                    session,
+                    scan_id,
+                    "task.cancelled_after_deletion",
+                    "已删除任务的后台运行时完成停止确认",
+                    {
+                        "task_id": task_id,
+                        "status": TaskStatus.DELETED.value,
+                        "hidden": True,
+                    },
+                )
+                session.commit()
+                return
             task.status = TaskStatus.CANCELED.value
             task.error = "用户已停止本次分析"
             task.completed_at = now()
@@ -2181,7 +2255,7 @@ class ScanOrchestrator:
         entries: list[EntryPoint],
         *,
         auth_available: bool,
-        limit: int = 100,
+        limit: int = 800,
         hypothesis_ids: set[str] | None = None,
     ) -> tuple[list[AgentRequestedTest], list[str]]:
         entries_by_id = {entry.id: entry for entry in entries}
@@ -2214,7 +2288,7 @@ class ScanOrchestrator:
                 for value in request.extras.values()
             ):
                 reason = "an extra value exceeds its safety bound"
-            elif entry.kind == "provider" and request.extras:
+            elif entry.kind == "provider" and request.extras and request.poc is None:
                 reason = "provider probes do not accept Intent extras"
             elif request.uri is not None:
                 reason = ScanOrchestrator._validate_requested_uri(entry, request.uri)
@@ -2234,6 +2308,117 @@ class ScanOrchestrator:
                 f"per-round limit of {limit}."
             )
         return accepted, gaps
+
+    @staticmethod
+    def _poc_request_key(request: AgentRequestedTest) -> str:
+        if request.poc is None:
+            return ""
+        return json.dumps(request.poc.model_dump(mode="json"), sort_keys=True)
+
+    def _build_requested_pocs(
+        self,
+        *,
+        scan_id: str,
+        task_id: str,
+        workspace: Path,
+        requests: list[AgentRequestedTest],
+        evidence_summaries: list[dict[str, Any]],
+        cancel_event: threading.Event,
+    ) -> tuple[list[AgentRequestedTest], dict[str, PocBuildResult], list[str]]:
+        accepted: list[AgentRequestedTest] = []
+        artifacts: dict[str, PocBuildResult] = {}
+        gaps: list[str] = []
+        for request in requests:
+            if request.poc is None:
+                accepted.append(request)
+                continue
+            key = self._poc_request_key(request)
+            outcome = artifacts.get(key)
+            if outcome is None:
+                self._record_exploration_event(
+                    scan_id,
+                    task_id,
+                    "poc.build.started",
+                    "开始构建 Agent 生成的受控 PoC APK",
+                    {
+                        "source": "platform",
+                        "hypothesis_id": request.hypothesis_id,
+                        "entry_point_id": request.entry_point_id,
+                        "package": request.poc.package_name,
+                        "project_path": request.poc.project_path,
+                    },
+                )
+                outcome = self.poc_builder.build(
+                    workspace,
+                    request.poc,
+                    cancel_event=cancel_event,
+                )
+                artifacts[key] = outcome
+                if outcome.commands:
+                    self._record_commands(
+                        scan_id,
+                        task_id,
+                        outcome.commands,
+                        evidence_summaries,
+                    )
+                if outcome.ok:
+                    with self.database.session_factory() as session:
+                        evidence = self.evidence.json(
+                            session,
+                            scan_id=scan_id,
+                            task_id=task_id,
+                            kind="poc.build_artifact",
+                            value={
+                                "schema_version": "1.0",
+                                "spec": request.poc.model_dump(mode="json"),
+                                **outcome.metadata,
+                            },
+                            summary=(
+                                "Platform built and signed an Agent PoC APK "
+                                f"{outcome.apk_sha256}"
+                            ),
+                            metadata={
+                                **outcome.metadata,
+                                "hypothesis_id": request.hypothesis_id,
+                                "entry_point_id": request.entry_point_id,
+                            },
+                        )
+                        session.commit()
+                        evidence_summaries.append(self._evidence_summary(evidence))
+                        outcome.metadata["build_evidence_id"] = evidence.id
+                    self._record_exploration_event(
+                        scan_id,
+                        task_id,
+                        "poc.build.completed",
+                        "Agent PoC 已完成受控构建、签名和哈希登记",
+                        {
+                            "source": "platform",
+                            "package": request.poc.package_name,
+                            "apk_sha256": outcome.apk_sha256,
+                            "source_sha256": outcome.source_sha256,
+                            "evidence_id": outcome.metadata.get("build_evidence_id"),
+                        },
+                    )
+                else:
+                    self._record_exploration_event(
+                        scan_id,
+                        task_id,
+                        "poc.build.failed",
+                        "Agent PoC 构建失败，未进入设备队列",
+                        {
+                            "source": "platform",
+                            "package": request.poc.package_name,
+                            "error": outcome.error,
+                        },
+                    )
+            if outcome.ok:
+                accepted.append(request)
+            else:
+                gaps.append(
+                    "Rejected Agent PoC test for "
+                    f"{request.entry_point_id}: {outcome.error or 'build failed'}."
+                )
+        return accepted, artifacts, gaps
 
     @staticmethod
     def _validate_requested_uri(entry: EntryPoint, value: str) -> str | None:
@@ -2285,7 +2470,9 @@ class ScanOrchestrator:
         budget: TimeBudget,
         evidence_summaries: list[dict[str, Any]],
         round_index: int,
+        poc_artifacts: dict[str, PocBuildResult] | None = None,
     ) -> tuple[list[dict[str, Any]], list[str], bool]:
+        poc_artifacts = poc_artifacts or {}
         entries_by_id = {entry.id: entry for entry in entries}
         indexed = [
             (f"agent-r{round_index}-{index + 1}", request)
@@ -2321,6 +2508,9 @@ class ScanOrchestrator:
                         "entry_point_id": request.entry_point_id,
                         "state": state,
                         "rationale_summary": request.rationale,
+                        "poc_package": (
+                            request.poc.package_name if request.poc else None
+                        ),
                     },
                 )
 
@@ -2381,15 +2571,43 @@ class ScanOrchestrator:
                     )
                 execution_error: Exception | None = None
                 try:
-                    probe = self.device.probe(
-                        entries_by_id[request.entry_point_id],
-                        package_name,
-                        state=state,
-                        budget=budget,
-                        uri_override=request.uri,
-                        extras=dict(request.extras),
-                        test_case_id=test_case_id,
-                    )
+                    if request.poc is not None:
+                        artifact = poc_artifacts.get(self._poc_request_key(request))
+                        if artifact is None or not artifact.ok or artifact.apk_path is None:
+                            raise RuntimeError(
+                                "Agent PoC was not built by the platform before execution"
+                            )
+                        probe = self.device.execute_poc(
+                            artifact.apk_path,
+                            request.poc,
+                            state=state,
+                            budget=budget,
+                            extras=dict(request.extras),
+                            test_case_id=test_case_id,
+                        )
+                        for index, (kind, result, metadata) in enumerate(probe.commands):
+                            probe.commands[index] = (
+                                kind,
+                                result,
+                                {
+                                    **metadata,
+                                    "poc_apk_sha256": artifact.apk_sha256,
+                                    "poc_source_sha256": artifact.source_sha256,
+                                    "poc_build_evidence_id": artifact.metadata.get(
+                                        "build_evidence_id"
+                                    ),
+                                },
+                            )
+                    else:
+                        probe = self.device.probe(
+                            entries_by_id[request.entry_point_id],
+                            package_name,
+                            state=state,
+                            budget=budget,
+                            uri_override=request.uri,
+                            extras=dict(request.extras),
+                            test_case_id=test_case_id,
+                        )
                     self._record_commands(
                         scan_id, task_id, probe.commands, evidence_summaries
                     )
@@ -2610,10 +2828,12 @@ class ScanOrchestrator:
                     else None
                 ),
                 "max_agent_steps": (
-                    OPENCODE_MAX_STEPS if backend == "opencode" else None
+                    self.settings.opencode_agent_steps
+                    if backend == "opencode"
+                    else None
                 ),
                 "max_provider_requests": (
-                    OPENCODE_MAX_PROVIDER_REQUESTS
+                    self.settings.opencode_agent_steps + 100
                     if backend == "opencode"
                     else None
                 ),

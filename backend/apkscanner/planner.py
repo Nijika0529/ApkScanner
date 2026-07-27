@@ -36,6 +36,9 @@ class InvestigationPlanner:
             "allowed_side_effects": [
                 "install_target_apk",
                 "install_probe_apk",
+                "build_agent_poc_apk",
+                "install_agent_poc_apk",
+                "uninstall_agent_poc_apk",
                 "clear_application_data",
                 "test_backend_mutations_with_cleanup",
                 "root_and_frida_observation",

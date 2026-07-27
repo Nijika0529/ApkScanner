@@ -32,10 +32,10 @@ flowchart LR
 平台而不是 Codex/OpenCode 负责 fan-out。默认有 3 个全局入口探索 worker，可通过
 `APKSCANNER_AGENT_CONCURRENCY` 调整为 1–8；多个扫描也共享这一上限。一个导出组件对应
 一个任务；同一 handler 的 Deep Links 合并成一个任务。Agent 不能创建子 Agent，也不能
-直接把自己的文字当作复现证据。默认最多进行 3 个自适应测试轮次、每轮接受 100 个受限
+直接把自己的文字当作复现证据。默认最多进行 3 个自适应测试轮次、每轮接受 800 个受限
 测试：只能使用当前任务的入口 ID；Deep Link 和 Provider URI 必须保持 Manifest 声明的
 scheme、host/authority 和 port；额外参数有数量、键名、类型和长度上限。每轮证据都会回灌
-下一次判断，最终再执行禁止申请新动作的证据总结。轮次和单轮测试数可在 1–5 / 1–100 的
+下一次判断，最终再执行禁止申请新动作的证据总结。轮次和单轮测试数可在 1–5 / 1–1000 的
 范围内配置。每次扫描在创建时记录初始 `codex`、`opencode` 或 `none`；服务默认值的后续
 变更不会静默改变它，只有用户在扫描控制台显式调整才会影响后续任务。
 
@@ -220,7 +220,8 @@ Web 把任务明确区分为等待判断、正在分析、已判断、未形成�
 Codex `turn/interrupt`，或终止 OpenCode 的一次性进程/容器。设备清理仍在 `finally` 中
 执行。运行时确认后任务进入 `canceled`，Coverage 标为 partial，并把取消原因写入事件和
 `agent.cancellation` Evidence。停止不会删除已经产生的证据，也不会把半成品模型文本落为
-Finding；用户可显式重试或删除已经终止的任务。
+Finding；用户可显式重试或删除已经终止的任务。处于 `cancel_requested` 的任务也允许
+立即软删除：后台仍完成中止与设备清理，随后只更新取消确认审计，不会把任务恢复到列表。
 
 ## 扫描删除
 

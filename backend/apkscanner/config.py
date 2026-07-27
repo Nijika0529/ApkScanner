@@ -27,7 +27,7 @@ class Settings:
     task_max_attempts: int = 2
     agent_concurrency: int = 3
     agent_max_rounds: int = 3
-    agent_tests_per_round: int = 100
+    agent_tests_per_round: int = 800
     investigator_backend: str = "codex"
     codex_enabled: bool = False
     codex_worker_model: str = "gpt-5.6-terra"
@@ -42,9 +42,14 @@ class Settings:
     opencode_isolation: str = "docker"
     opencode_docker_image: str = "apk-scanner-opencode-worker:0.1.0"
     opencode_reasoning_effort: str = "high"
+    opencode_agent_steps: int = 1_000
     deepseek_base_url: str | None = None
     adb_serial: str | None = None
     probe_apk_path: Path | None = None
+    android_sdk_root: Path | None = None
+    poc_enabled: bool = True
+    poc_build_timeout_seconds: int = 180
+    poc_max_source_bytes: int = 512 * 1024
     device_android_version: str = "16"
     device_android_api: int = 36
     auth_flow_path: Path | None = None
@@ -79,7 +84,7 @@ class Settings:
                 1, min(5, int(os.getenv("APKSCANNER_AGENT_MAX_ROUNDS", 3)))
             ),
             agent_tests_per_round=max(
-                1, min(100, int(os.getenv("APKSCANNER_AGENT_TESTS_PER_ROUND", 100)))
+                1, min(1_000, int(os.getenv("APKSCANNER_AGENT_TESTS_PER_ROUND", 800)))
             ),
             investigator_backend=os.getenv(
                 "APKSCANNER_INVESTIGATOR_BACKEND", "codex"
@@ -116,12 +121,40 @@ class Settings:
             opencode_reasoning_effort=os.getenv(
                 "APKSCANNER_OPENCODE_REASONING_EFFORT", "high"
             ).lower(),
+            opencode_agent_steps=max(
+                50,
+                min(1_000, int(os.getenv("APKSCANNER_OPENCODE_AGENT_STEPS", 1_000))),
+            ),
             deepseek_base_url=os.getenv("APKSCANNER_DEEPSEEK_BASE_URL"),
             adb_serial=os.getenv("APKSCANNER_ADB_SERIAL"),
             probe_apk_path=(
                 Path(os.environ["APKSCANNER_PROBE_APK"]).resolve()
                 if os.getenv("APKSCANNER_PROBE_APK")
                 else None
+            ),
+            android_sdk_root=(
+                Path(
+                    os.environ.get("APKSCANNER_ANDROID_SDK_ROOT")
+                    or os.environ.get("ANDROID_SDK_ROOT")
+                    or os.environ["ANDROID_HOME"]
+                ).resolve()
+                if (
+                    os.getenv("APKSCANNER_ANDROID_SDK_ROOT")
+                    or os.getenv("ANDROID_SDK_ROOT")
+                    or os.getenv("ANDROID_HOME")
+                )
+                else None
+            ),
+            poc_enabled=_env_bool("APKSCANNER_POC_ENABLED", True),
+            poc_build_timeout_seconds=max(
+                30, min(600, int(os.getenv("APKSCANNER_POC_BUILD_TIMEOUT", 180)))
+            ),
+            poc_max_source_bytes=max(
+                64 * 1024,
+                min(
+                    2 * 1024 * 1024,
+                    int(os.getenv("APKSCANNER_POC_MAX_SOURCE_BYTES", 512 * 1024)),
+                ),
             ),
             device_android_version=os.getenv("APKSCANNER_ANDROID_VERSION", "16"),
             device_android_api=int(os.getenv("APKSCANNER_ANDROID_API", 36)),

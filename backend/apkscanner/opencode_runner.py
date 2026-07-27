@@ -36,8 +36,9 @@ OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE = "analyze_then_finalize"
 OPENCODE_OUTPUT_MODE_EXPLORE_THEN_FINALIZE = "explore_then_finalize"
 OPENCODE_TOOL_PROFILE = "workspace_shell"
 OPENCODE_WORKSPACE_TOOLS = ("read", "glob", "grep", "bash")
-OPENCODE_MAX_STEPS = 100
-OPENCODE_MAX_PROVIDER_REQUESTS = OPENCODE_MAX_STEPS + 20
+OPENCODE_DEFAULT_MAX_STEPS = 1_000
+OPENCODE_MAX_STEPS = OPENCODE_DEFAULT_MAX_STEPS
+OPENCODE_MAX_PROVIDER_REQUESTS = OPENCODE_MAX_STEPS + 100
 OPENCODE_PROFILE_STABLE_ANALYZER = "stable_analyzer"
 OPENCODE_PROFILE_THINKING_EXPLORER = "thinking_explorer_then_finalizer"
 OPENCODE_PROFILE_STRUCTURED_FINALIZER = "structured_finalizer"
@@ -224,8 +225,8 @@ class OpenCodeInvestigator:
             ],
             "tool_profile": OPENCODE_TOOL_PROFILE,
             "workspace_tools": list(OPENCODE_WORKSPACE_TOOLS),
-            "max_steps": OPENCODE_MAX_STEPS,
-            "max_provider_requests": OPENCODE_MAX_PROVIDER_REQUESTS,
+            "max_steps": self.settings.opencode_agent_steps,
+            "max_provider_requests": self.settings.opencode_agent_steps + 100,
         }
         detail = self._configuration_error()
         if detail:
@@ -250,6 +251,7 @@ class OpenCodeInvestigator:
                         "live_probe": True,
                         "tool_profile": OPENCODE_TOOL_PROFILE,
                         "execution_profile": default_profile.as_payload(),
+                        "max_agent_steps": self.settings.opencode_agent_steps,
                     },
                     timeout_seconds=45,
                 )
@@ -371,6 +373,7 @@ class OpenCodeInvestigator:
             "output_schema": AGENT_RESULT_JSON_SCHEMA,
             "tool_profile": OPENCODE_TOOL_PROFILE,
             "execution_profile": execution_profile.as_payload(),
+            "max_agent_steps": self.settings.opencode_agent_steps,
             "timeout_ms": max(1, timeout) * 1000,
         }
         response = self._invoke_investigation_with_retry(

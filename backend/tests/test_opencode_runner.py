@@ -81,8 +81,8 @@ def test_host_capability_requires_key_and_pinned_packages(
     assert available["provider"] == "deepseek"
     assert available["model"] == "deepseek-v4-flash"
     assert available["output_mode"] == OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE
-    assert available["max_steps"] == 100
-    assert available["max_provider_requests"] == 120
+    assert available["max_steps"] == 1_000
+    assert available["max_provider_requests"] == 1_100
 
     package = worker / "node_modules" / "@opencode-ai" / "sdk" / "package.json"
     package.write_text(json.dumps({"version": "0.0.0"}), encoding="utf-8")
@@ -275,7 +275,7 @@ def test_investigate_builds_a_workspace_shell_prompt_and_validates_result(
         assert payload["execution_profile"]["stages"][1]["wire_tool_choice"] == "required"
         assert payload["output_schema"]["title"] == "AgentInvestigationResult"
         assert payload["output_schema"]["additionalProperties"] is False
-        assert payload["output_schema"]["properties"]["requested_tests"]["maxItems"] == 100
+        assert payload["output_schema"]["properties"]["requested_tests"]["maxItems"] == 1_000
         serialized_schema = json.dumps(payload["output_schema"])
         assert '"$defs"' not in serialized_schema
         assert '"$ref"' not in serialized_schema
