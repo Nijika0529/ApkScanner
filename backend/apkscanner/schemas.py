@@ -221,7 +221,7 @@ class AgentInvestigationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: Literal["1.0"] = "1.0"
-    summary: str
+    summary: str = Field(min_length=1, max_length=8000)
     result: Literal[
         "supported_static",
         "reproduced_blackbox",
@@ -229,13 +229,13 @@ class AgentInvestigationResult(BaseModel):
         "not_reproduced",
         "inconclusive",
     ]
-    hypotheses_tested: list[str]
-    test_cases: list[dict[str, Any]]
-    evidence_ids: list[str]
+    hypotheses_tested: list[str] = Field(max_length=100)
+    test_cases: list[dict[str, Any]] = Field(max_length=200)
+    evidence_ids: list[str] = Field(max_length=500)
     severity_proposal: Literal["critical", "high", "medium", "low", "info"]
     confidence: Literal["high", "medium", "low"]
-    coverage_gaps: list[str]
-    followups: list[str]
+    coverage_gaps: list[str] = Field(max_length=100)
+    followups: list[str] = Field(max_length=100)
     requested_tests: list[AgentRequestedTest] = Field(max_length=100)
 
 

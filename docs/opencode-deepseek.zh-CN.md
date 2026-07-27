@@ -1,199 +1,216 @@
 # OpenCode + DeepSeek 接入设计
 
-## 调研结论
+## 结论
 
-OpenCode 官方提供的是 JS/TS SDK。SDK 通过 `createOpencodeServer` 启动本地 server，再用
-`createOpencodeClient` 创建类型化客户端；会话主路径是 `session.create`，Flash 使用
-`session.prompt`，Pro 使用 `session.promptAsync` 加短连接消息与 session 状态轮询。
-只有完整工具循环进入 idle 后才读取最终 assistant 文本。SDK 支持给同步
-prompt 传 JSON Schema，并通过内部 `StructuredOutput` 工具收集结构化结果。官方资料：
+项目不再把“是否思考、是否开放工具、怎样结构化输出”绑定到模型名称，而是由扫描阶段
+显式选择执行协议。这样 `deepseek-v4-flash` 和 `deepseek-v4-pro` 可以共用同一套编排，
+也不会因为供应商调整模型默认行为而悄悄切换调用语义。
+
+当前稳定基线是 `deepseek-v4-flash`。真实 API 已验证三条路径：
+
+1. 非思考分析器使用 workspace 工具，再由独立定稿器输出结构化结果；
+2. 思考型 Explorer 连续调用工具并完整回放 `reasoning_content`，再由独立定稿器收敛；
+3. 最终裁决只运行非思考定稿器。
+
+`deepseek-v4-pro` 保留为显式兼容测试项，不会在 Flash 失败后自动启用，也不会被平台
+静默替换为 Flash。
+
+参考资料：
 
 - [OpenCode SDK](https://opencode.ai/docs/sdk/)
 - [OpenCode Providers / DeepSeek](https://opencode.ai/docs/providers)
 - [DeepSeek Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode/)
-- [DeepSeek Tool Calls](https://api-docs.deepseek.com/guides/tool_calls)
-- [DeepSeek Agent Integration Compatibility](https://api-docs.deepseek.com/quick_start/agent_integrations/oh_my_pi)
-- [DeepSeek JSON Output](https://api-docs.deepseek.com/guides/json_mode/)
-- [DeepSeek API 更新记录](https://api-docs.deepseek.com/updates/)
+- [DeepSeek Tool Calls](https://api-docs.deepseek.com/guides/tool_calls/)
+- [DeepSeek Agent Integration Compatibility](https://api-docs.deepseek.com/quick_start/agent_integrations/oh_my_pi/)
+- [DeepSeek API](https://api-docs.deepseek.com/api/create-chat-completion)
 
-截至 2026-07-23，项目锁定 `@opencode-ai/sdk==1.18.4` 与 `opencode-ai==1.18.4`。DeepSeek
-当前正式模型使用 `deepseek-v4-pro` 和 `deepseek-v4-flash`；旧的 `deepseek-chat` /
-`deepseek-reasoner` 将于 2026-07-24 停用，因此没有把旧别名作为默认值。
+项目固定 `@opencode-ai/sdk==1.18.4`、`opencode-ai==1.18.4` 和 `ajv==8.20.0`。已退役的
+`deepseek-chat`、`deepseek-reasoner` 会在启动检查时直接拒绝。
 
-这里存在一个必须显式处理的协议差异：
+## 为什么之前容易失败
 
-- OpenCode 1.18.4 的 `format: json_schema` 会注册内部 `StructuredOutput` 工具，并固定
-  向 provider 下发 `tool_choice: required`；
-- DeepSeek V4 Pro 默认使用思考模式。它可以返回 JSON 文本，但思考模式拒绝
-  `tool_choice` 参数，因此不能直接使用 OpenCode 这条工具型 StructuredOutput 通道；
-- V4 Flash 继续使用 OpenCode 原生 `json_schema` 通道。
+问题不是“Agent 必须关闭思考才能调用工具”。DeepSeek 思考模式可以调用普通工具，真正
+冲突的是 `tool_choice`：
 
-因此平台按模型选择输出适配器，而不是在 Pro 失败后静默换成 Flash：
+- DeepSeek thinking 请求不接受 `tool_choice`；
+- OpenCode 1.18.4 的普通工具路径会注入 `tool_choice: auto`；
+- OpenCode `StructuredOutput` 又会强制 `tool_choice: required`；
+- 思考型工具循环的下一轮还必须原样带回上一轮 `reasoning_content`；
+- `promptAsync` 只表示异步下发。如果 Worker 看到第一条 `finish=tool-calls` 消息就返回，
+  得到的是空文本，而不是完整 Agent 结果；
+- 禁用工具后让模型“修 JSON”并不能消除前一轮工具上下文，模型可能继续输出 DSML
+  tool-call 标记；
+- 单纯通过模型目录探测只能证明配置存在，不能证明认证、余额、参数和真实结构化调用可用。
 
-| 模型 | OpenCode format / 传输 | 发给模型的工具 / `tool_choice` | 结果校验 |
+旧实现把上述问题混在一个会话内处理，因而会交替出现：
+
+- `Thinking mode does not support this tool_choice`；
+- `Unexpected end of JSON input`；
+- DSML/XML 工具标记无法被 JSON parser 解析；
+- `fetch failed` 或长响应链路断开；
+- Schema 合法，但“证据不足 + 高危/高置信度”在业务语义上自相矛盾。
+
+## 三种执行配置
+
+| 扫描阶段 | 执行配置 | 思考与工具 | 输出 |
 | --- | --- | --- | --- |
-| `deepseek-v4-pro`（及其版本后缀） | `text`；`promptAsync` + `session.messages/status` 短轮询，等待 idle | 首轮允许 `read/glob/grep/bash`，使用普通自动工具选择，不使用 `required` | prompt 携带精确 Schema 和最小示例；Ajv 8.20.0 本地校验，纠正轮关闭工具，最多 2 次 |
-| `deepseek-v4-flash` | `json_schema`；同步 `prompt` | `read/glob/grep/bash` + `StructuredOutput`；`required` | OpenCode 内部校验，最多 2 次重试 |
+| `static_only` 及未识别阶段 | `stable_analyzer` | Analyzer 关闭思考，允许 `read/glob/grep/bash`，普通 `auto` 工具循环 | 全新 Finalizer 关闭思考，以 `StructuredOutput` 定稿 |
+| `test_planning`、`adversarial_review`、`exploration_round` | `thinking_explorer_then_finalizer` | Explorer 开启思考，允许 workspace 工具；线上不发送 `tool_choice` | 全新 Finalizer 关闭思考，以 `StructuredOutput` 定稿 |
+| `final_evaluation`、`recovery_evaluation` | `structured_finalizer` | 不开放 workspace 工具 | 直接用非思考 `StructuredOutput` 定稿 |
 
-Pro 通道不会把思考模式关掉，也不会绕过 OpenCode session/provider。它只避开
-OpenCode 当前由工具实现的 StructuredOutput。普通文件工具仍按 OpenCode CLI 的常规
-tool-call 循环工作；模型完成探索后返回 JSON 文本，再由本地确定性校验器收敛为同一份
-`AgentInvestigationResult`。
+思考强度通过 `APKSCANNER_OPENCODE_REASONING_EFFORT=high|max` 配置，默认 `high`。模型 ID
+只选择供应商模型，不决定执行配置。
 
-本地克隆的 OpenCode `dev` 源码与 npm 发布包均为 1.18.4。调研同时发现官网示例、生成
-类型和发布包运行时可能短暂不同步，所以不能只依赖文档片段：本项目固定 SDK/CLI 同版，
-并使用真实发布包的无计费 capability probe 与本地协议测试守住升级边界。
-
-## 为什么使用 Node bridge
-
-主控制面是 Python，而官方 OpenCode SDK 是 JavaScript。直接从 Python 重写 HTTP 调用会
-绕过 SDK 的 provider、session、消息转换和结构化输出语义。因此增加一个很薄的一次性
-Node worker：
+## 调用链
 
 ```mermaid
 sequenceDiagram
     participant P as Python Orchestrator
-    participant W as Node bridge
-    participant O as OpenCode server
+    participant W as Node Worker
+    participant O as OpenCode Server
+    participant X as Loopback Compatibility Proxy
     participant D as DeepSeek API
 
-    P->>W: stdin: bounded task JSON + JSON Schema
-    W->>O: createOpencodeServer(127.0.0.1, random port)
-    W->>O: session.create
-    alt deepseek-v4-flash
-        W->>O: session.prompt(format=json_schema)
-        O->>D: tools=[StructuredOutput], tool_choice=required
-        D-->>O: StructuredOutput tool call
-        O-->>W: OpenCode-validated result
-    else deepseek-v4-pro
-        W->>O: session.promptAsync(text)
-        O-->>W: 204 accepted
-        O->>D: tools=[read,glob,grep,bash], ordinary tool selection
-        D->>O: inspect and run commands in the isolated task attempt workspace
-        D-->>O: JSON text
-        loop bounded short polling until session idle
-            W->>O: session.messages
-            W->>O: session.status
-            O-->>W: current messages and turn state
+    P->>W: task context + schema + explicit execution profile
+    W->>O: start authenticated loopback server
+    opt Analyzer / Explorer
+        W->>O: promptAsync(text)
+        O->>X: chat/completions + tools
+        X->>X: thinking enabled 时仅删除 tool_choice
+        X->>D: compatible request
+        loop OpenCode tool loop
+            D-->>O: reasoning + tool call / next response
+            O->>O: execute read/glob/grep/bash
         end
-        W->>W: Ajv validate
-        opt invalid, at most 2 corrections
-            W->>O: promptAsync(exact validation errors)
-        end
+        W->>O: poll messages + session status until idle
+        O-->>W: final analysis memo
     end
-    W-->>P: stdout NDJSON: event* + terminal result
-    W->>O: session.delete + server.close
+    W->>O: new session + prompt(format=json_schema)
+    O->>X: thinking disabled + StructuredOutput + tool_choice required
+    X->>D: unchanged request
+    D-->>O: StructuredOutput call
+    O-->>W: structured value
+    W->>W: Ajv + semantic validation
+    opt invalid, at most two retries
+        W->>O: new session + exact validation errors
+    end
+    W-->>P: NDJSON events + one terminal result
 ```
 
-bridge 不参与任务规划、证据判定或设备操作。Python 仍然负责：
+兼容代理只监听 `127.0.0.1`，只做协议修正和审计：
 
-1. 静态工具覆盖面和入口枚举；
-2. 生成每个入口的任务与证据摘要；
-3. 在每个自适应轮次校验 Agent 提出的受限测试（默认每轮最多接受 100 个）；
-4. 在云真机上执行允许的 Probe/ADB/Frida 操作；
-5. 验证 Evidence ID，并把不满足条件的结论降级。
+- 只接受带随机一次性凭据的 `POST /chat/completions`，其他路径、无认证请求和超过单
+  Worker 上限的请求会被拒绝；
+- 仅当 `thinking.type=enabled` 时删除 OpenCode 注入的 `tool_choice`；
+- 非思考请求原样转发，所以 StructuredOutput 仍使用 `required`；
+- 不修改消息数组，因此 OpenCode 能完整回放 `reasoning_content` 和工具结果；
+- 不记录 Authorization/API Key；
+- 记录实际思考模式、收到/转发的 `tool_choice`、是否修正、模型与 HTTP 状态码。
 
-## 安全边界
+## 工具循环与长任务
 
-OpenCode 本身是 coding agent，默认会暴露读文件、Shell、编辑、Web、MCP 和 task 工具。
-本接入恢复接近本地 CLI 的代码探索和命令执行能力，同时保留设备动作边界：
+Analyzer/Explorer 使用 `promptAsync` 下发，再以短连接轮询 `session.messages` 和
+`session.status`。Worker 只有同时看到会话 idle 和已完成 assistant 消息才会读取结果；
+`finish=tool-calls` 只表示中间步骤，不再被误当成最终输出。
 
-- OpenCode 的全局和专用 Agent permission 先 `* = deny`，只允许
-  `read/glob/grep/bash`；
-  Flash 通道另外允许内部 `StructuredOutput`。
-- 平台按 `task_id + attempt` 创建隔离 workspace，只物化当前入口的代码上下文和不可变
-  Evidence；Docker 将它挂载到 `/workspace`，Host 模式以它为 cwd。Bash 可以在该
-  workspace 和 `/tmp` 创建脚本或分析产物，容器根文件系统保持只读，并发任务之间不共享
-  可写扫描目录。
-- 原生 write/edit/patch、Web、MCP、task/subagent 均保持禁用。ADB 同时通过 Bash
-  permission、PATH 阻断程序、无设备参数/Socket 三层禁用；不挂载认证流或宿主机其他目录。
-  外部目录访问由 OpenCode `external_directory` permission 拒绝。
-- 设置 `OPENCODE_PURE=1`，禁用外部插件；禁用 project config、Claude 配置、模型目录
-  自动刷新和自动升级。
-- 每次调用使用新 session、新 OpenCode server 和临时 HOME/XDG 数据目录。
-- worker 在发送 prompt 前订阅 `event.subscribe()` SSE，并把会话状态、步骤、响应、
-  重试、校验和错误归一化为 NDJSON 事件；Python 按 `task_id` 写入实时扫描时间线。
-- Pro 不再让 SDK 到 loopback server 的一个同步 HTTP 请求覆盖整段深度推理；异步下发
-  后只用短 GET 读取消息状态。安全的本地读取遇到连接重置会指数退避重试 3 次；worker
-  本身若因 `fetch failed`、`ECONNRESET` 或 Undici socket/header timeout 退出，Python
-  只在剩余任务预算内重建一次 worker/session，不切换模型。
-- loopback server 使用随机端口与随机 Basic Auth；进程超时后终止整个进程组。
-- Docker 模式使用只读 rootfs、无 capabilities、`no-new-privileges`、PID/CPU/内存限制
-  和临时 HOME。
-- API Key 不进入 payload、命令参数、日志或数据库；只通过 `DEEPSEEK_API_KEY` 环境变量
-  传给 worker。
-- 自定义 base URL 不接受凭据、查询参数或 fragment；远程网关必须使用 HTTPS，明文 HTTP
-  只允许指向 loopback。
+本地读取遇到短暂 `fetch failed`、`ECONNRESET`、Undici socket/header timeout 时会有限
+退避重试；整个 Worker 仍失败时，Python 只会在原任务剩余预算内重建一次，不延长总预算、
+不切换模型。单任务的 OpenCode 最大步骤数保持为 100，平台的 AI 总超时和手动续跑机制
+仍是外层硬边界；每个一次性 Worker 最多向 provider 转发 120 个经过认证的
+`chat/completions` 请求，为 100 个 Agent 步骤、定稿和少量传输重试留出空间。
 
-这能收窄主机侧权限，但模型仍会收到任务上下文和证据摘要。启用前必须确认公司对
-DeepSeek 或企业代理的区域、保留、训练使用、日志和敏感数据策略；生产部署还应把容器
-出口限制到获批端点。
+## 结构化结果与危害约束
 
-## 配置和选择
+Explorer 只生成证据备忘录，不负责最终 JSON。Finalizer 位于全新 session，关闭思考且只
+允许内部 `StructuredOutput`，避免工具标记、隐藏推理和旧会话状态污染定稿。
 
-服务默认后端由以下变量决定：
+OpenCode 返回后还要经过本地 Ajv 8.20.0 和业务语义校验：
 
-```bash
-export APKSCANNER_INVESTIGATOR_BACKEND=opencode
-export APKSCANNER_OPENCODE_ENABLED=true
-export APKSCANNER_OPENCODE_MODEL=deepseek-v4-flash
-export DEEPSEEK_API_KEY=...
-```
+- `inconclusive` 必须使用 `severity_proposal=info`、`confidence=low`；
+- `supported_static`、`reproduced_blackbox`、`observed_instrumented`、
+  `not_reproduced` 必须至少引用一个平台 Evidence ID；
+- `final_evaluation`、`recovery_evaluation` 不允许再产生 `requested_tests`；
+- 数组数量和文本长度均有上限；
+- 纠正最多两次，每次使用全新 session，并把精确校验错误交给定稿器。
 
-`deepseek-v4-flash` 是当前稳定基线和默认值。`deepseek-v4-pro` 的 prompted-JSON
-兼容通道保留为显式选择，待 Flash 全链路基线稳定后再单独回归，不会由平台自动切换。
+这解决“信息不全但给低危/高危”的概念混乱：`info` 表示尚无风险等级，不能把未知风险
+伪装成已经确认的 Low。
 
-Web 上传框和 CLI 的 `--investigator` 可以为单个扫描选择：
+最终仍由 Python 控制面验证 Evidence ID、普通 App UID 攻击者模型、到达性、缺失防护和
+具体未授权影响。模型文字本身不能把候选项升级为已复现漏洞。
 
-- `configured`：创建时解析并记录服务默认值，后续只能由用户在扫描控制台显式修改；
-- `codex`：使用 Codex；
-- `opencode`：使用 OpenCode + DeepSeek；
-- `none`：只执行静态规则与确定性动态测试。
+## 权限和审计
 
-不会在一次任务失败后静默切换模型。静默 fallback 会导致同一报告混合不同供应商的
-行为、费用和数据边界，也会让结果不可复现。需要切换时应创建新扫描，或明确修改扫描
-选择后重跑。
+- OpenCode Agent 默认 `* = deny`，只给 Analyzer/Explorer 开放
+  `read/glob/grep/bash`；Finalizer 只允许 `StructuredOutput`。
+- 平台按 `task_id + attempt` 物化独立 workspace；提示词要求 Bash 只在该目录和 `/tmp`
+  创建分析产物。
+- 原生 write/edit/patch、Web、MCP、task/subagent 禁用。
+- ADB 同时由 OpenCode permission 和 PATH shim 阻断；Agent 只能通过 `requested_tests`
+  向 Python 申请设备动作。
+- 每次调用使用临时 HOME/XDG、全新 OpenCode server 和随机 Basic Auth。
+- `OPENCODE_PURE=1`，并关闭项目配置、Claude 配置、模型目录刷新和自动升级。
+- API Key 只通过 Worker 启动环境传递；Worker 立即把它转移到兼容代理的内存中并从
+  子进程环境删除，OpenCode provider 配置只拿到无权限的 loopback 占位 Key。因此即使
+  Bash 输出完整 `env` 也看不到真实凭据。专用 Bash wrapper 同时删除
+  `OPENCODE_CONFIG_CONTENT`、loopback Server 认证信息和代理环境变量。密钥不进入
+  payload、数据库、事件或错误消息。
 
-每次调用的审计记录会写明 `output_mode`、`workspace_shell` 工具档位、可写根目录以及
-实际工具列表。`agent.events` 保存每次 `read/glob/grep/bash` 的开始、完成、受限参数
-摘要和状态。Pro 的
-`output_transport.model_calls` 还会保存
-每一轮实际 prompt、原始文本响应、解析错误、Schema 校验错误、是否被接受和单轮 usage；
-`request_mode=prompt_async_poll` 与 `worker_transport_attempts` 记录实际传输路径及是否重建；
-即使 3 次都失败，这些内容也进入 `agent.error` 的不可变 Evidence。API Key 和隐藏思考
-内容不进入审计。规范化 SDK 关键事件另存为 `agent.events` Evidence。
+每次 AI 调用审计以下内容：
 
-## 验证与升级
+- 精确 prompt、执行阶段、profile、思考模式和 reasoning effort；
+- OpenCode thread/turn ID、工具名称与受限参数摘要、步骤状态；
+- 兼容代理看到的实际 wire 语义和 HTTP 状态；
+- Explorer 备忘录、Finalizer 结构化值、Ajv/语义错误及各次是否接受；
+- provider/model、token、cache、reasoning、cost 和调用次数；
+- 401、402、422、429、5xx、工具选择冲突、reasoning 回放错误等归一化类别。
+
+隐藏思考内容和 API Key 不进入业务审计。
+
+## 配置
 
 ```bash
 npm ci --prefix opencode-worker
-npm run check --prefix opencode-worker
-npm test --prefix opencode-worker
 
-DEEPSEEK_API_KEY=... \
-APKSCANNER_OPENCODE_ENABLED=true \
-APKSCANNER_OPENCODE_ISOLATION=host \
+export DEEPSEEK_API_KEY=...
+export APKSCANNER_INVESTIGATOR_BACKEND=opencode
+export APKSCANNER_OPENCODE_ENABLED=true
+export APKSCANNER_OPENCODE_ISOLATION=host
+export APKSCANNER_OPENCODE_MODEL=deepseek-v4-flash
+export APKSCANNER_OPENCODE_REASONING_EFFORT=high
+
 scanctl capabilities --deep
 ```
 
-`npm test` 启动本地假的 DeepSeek OpenAI-compatible SSE 服务，不访问外网、不产生模型
-费用。协议测试分别确认：
+`capabilities --deep` 会发起一笔很小但真实、会计费的非思考 StructuredOutput 请求，用于
+同时验证 API Key、模型、参数、结构化输出和网络。成功结果会在当前进程内缓存；失败结果
+不会缓存。
 
-1. Flash 暴露 workspace 工具和 `StructuredOutput`，并使用 `tool_choice: required`；
-2. Pro 首轮暴露 `read/glob/grep/bash`，不发送冲突的 `tool_choice: required`；
-3. Pro 能真实调用 `read`、接收文件结果并继续生成 JSON；
-4. Pro 能在 workspace 和 `/tmp` 执行 Bash 并继续生成 JSON；
-5. PATH 中的 ADB 阻断程序固定返回 126；
-6. Pro 首次返回不合格 JSON 时，Ajv 拒绝结果，关闭工具并通过同一 session 下发纠正提示；
-7. Pro 使用 `prompt_async_poll`，避免长推理占用一个同步 loopback HTTP 请求；
-8. worker 在两种模式下都输出可增量消费的事件 envelope 和唯一 terminal result；
-9. 通过本地 Schema 校验后，两个通道归一化为相同的 worker 响应。
+企业网关通过 `APKSCANNER_DEEPSEEK_BASE_URL` 配置。远程地址必须为 HTTPS，HTTP 只允许
+loopback；URL 不能包含凭据、查询参数或 fragment。官方地址必须写
+`https://api.deepseek.com`，不能附加 `/v1`。
 
-升级时必须：
+## 验证和升级
 
-1. SDK 与 CLI 使用同一精确版本；
-2. 更新 `opencode-worker/package.json`、lockfile、Python 版本常量和 Docker labels；
-3. 跑本地 bridge 协议测试；
-4. 跑无计费 `capabilities --deep`，确认目标模型存在；
-5. 用非生产测试账号执行一个真实 DeepSeek smoke scan，核对 usage、超时和错误脱敏；
-6. 重新评审 OpenCode permission、provider 转换和结构化输出源码。
+```bash
+npm run check --prefix opencode-worker
+npm test --prefix opencode-worker
+ruff check backend
+pytest -q backend/tests
+```
+
+Worker 协议测试覆盖：
+
+1. ADB shim 固定拒绝；
+2. `read` 与 `bash` 均不能读取 workspace 和 `/tmp` 之外的哨兵文件；
+3. Bash 环境读取不到 API Key，但 provider 上游认证仍然成功；
+4. 非思考 Finalizer 使用 `required` StructuredOutput；
+5. 稳定 Analyzer 完成真实工具循环后进入隔离 Finalizer；
+6. Thinking Explorer 删除 wire `tool_choice`，并回放 reasoning/tool result；
+7. deep capability 发起真实 provider 请求；
+8. 401 等 provider 错误被分类且不泄露密钥；
+9. Schema 合法但语义矛盾的结果被拒绝，并用新 session 纠正。
+
+升级 OpenCode 时必须同步更新 SDK、CLI、lockfile、Python 常量、Docker protocol label，
+再执行协议测试和非生产 DeepSeek smoke test。重点复核 provider 的 thinking 参数映射、
+`tool_choice` 注入、reasoning 回放、StructuredOutput 实现及 session message/status API。

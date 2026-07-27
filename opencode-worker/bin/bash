@@ -1,0 +1,8 @@
+#!/bin/sh
+unset DEEPSEEK_API_KEY
+unset OPENCODE_CONFIG_CONTENT
+unset OPENCODE_SERVER_USERNAME
+unset OPENCODE_SERVER_PASSWORD
+unset HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY
+unset http_proxy https_proxy no_proxy all_proxy
+exec /bin/bash "$@"

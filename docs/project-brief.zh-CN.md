@@ -53,7 +53,7 @@ APK Scanner 是一个运行在安全人员本地电脑上的 Android 上线前�
 | AI 审计证据 | 7 类：request、events、response、test validation、result validation、error、cancellation |
 | 报告出口 | 4 种：Web、JSON、HTML、SARIF |
 | 任务视觉状态 | 5 组：等待判断、正在分析、已判断、未形成判断、已停止 |
-| 自动化回归 | 后端 77 项测试；OpenCode Worker 5 项 Pro/Flash/工具/ADB 阻断集成测试；前端 lint + production build |
+| 自动化回归 | 后端 80 项测试；OpenCode Worker 9 项思考/非思考、目录与凭据边界、工具、结构化语义、错误分类和 ADB 阻断集成测试；前端 lint + production build |
 
 规则数量按当前代码统计：4 条 Manifest、2 条 Deep Link、4 条 APK/签名、7 条代码模式，以及
 Activity、Activity Alias、Service、Receiver、Provider 5 类按入口动态生成的导出规则。
@@ -66,9 +66,9 @@ Activity、Activity Alias、Service、Receiver、Provider 5 类按入口动态�
 - **结论有证据**：黑盒复现必须包含普通 App UID 的请求与结果证据；`adb shell` 成功不等价于漏洞。
 - **全过程可审计**：保留精确 prompt、模型/SDK、关键事件、原始结构化响应、token usage、
   平台接受/拒绝的证据和用户中止记录，但不展示或持久化隐藏思维链。
-- **模型可替换**：同一任务与证据协议可选择 Codex 或 OpenCode + DeepSeek；V4 Pro 使用
-  `read/glob/grep/bash` 普通工具循环，最终以文本 JSON + Ajv 校验，避开思考模式与
-  `tool_choice: required` 冲突。
+- **模型可替换**：同一任务与证据协议可选择 Codex 或 OpenCode + DeepSeek；OpenCode
+  按扫描阶段显式选择稳定 Analyzer、Thinking Explorer 或独立 StructuredOutput
+  Finalizer，不依赖模型名猜测调用方式，并用 Ajv/语义规则统一收敛结论。
 
 ## 当前状态与上线前工作
 

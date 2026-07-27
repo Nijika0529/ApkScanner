@@ -1,27 +1,52 @@
 import { randomBytes } from "node:crypto"
+import { createServer as createHttpServer } from "node:http"
 import { createServer } from "node:net"
 import { stdin, stderr, stdout } from "node:process"
+import { Readable } from "node:stream"
+import { pipeline } from "node:stream/promises"
+import { fileURLToPath } from "node:url"
 import { createOpencodeClient, createOpencodeServer } from "@opencode-ai/sdk"
 import Ajv from "ajv"
 
 const MAX_INPUT_BYTES = 32 * 1024 * 1024
 const PROVIDER_ID = "deepseek"
 const OPENCODE_VERSION = "1.18.4"
-const OUTPUT_MODE_PROMPTED_JSON = "prompted_json"
 const OUTPUT_MODE_STRUCTURED_TOOL = "structured_output_tool"
-const PROMPTED_JSON_RETRY_COUNT = 2
+const OUTPUT_MODE_ANALYZE_THEN_FINALIZE = "analyze_then_finalize"
+const OUTPUT_MODE_EXPLORE_THEN_FINALIZE = "explore_then_finalize"
+const PROFILE_STABLE_ANALYZER = "stable_analyzer"
+const PROFILE_THINKING_EXPLORER = "thinking_explorer_then_finalizer"
+const PROFILE_STRUCTURED_FINALIZER = "structured_finalizer"
+const STRUCTURED_RETRY_COUNT = 2
 const WORKSPACE_TOOL_PROFILE = "workspace_shell"
 const WORKSPACE_TOOLS = ["read", "glob", "grep", "bash"]
 const MAX_AGENT_STEPS = 100
+const MAX_PROVIDER_REQUESTS = MAX_AGENT_STEPS + 20
+const MAX_EXPLORER_MEMO_BYTES = 128 * 1024
 const LOCAL_POLL_INTERVAL_MS = 250
 const LOCAL_READ_RETRY_COUNT = 3
+const SANITIZED_BASH = fileURLToPath(new URL("./bin/bash", import.meta.url))
 
 let server
 let sessionID
 let workerDeadline
+let localServerURL
+let localAuthorization
+let providerProxy
+let providerProxyURL
+let providerWireAudit = []
+let providerAPIKey
+let loopbackProxyAPIKey
+let providerRequestCount = 0
 
 async function main() {
   const payload = validatePayload(await readPayload())
+  providerAPIKey = process.env.DEEPSEEK_API_KEY?.trim()
+  if (!providerAPIKey) {
+    throw new Error("DEEPSEEK_API_KEY is not configured")
+  }
+  delete process.env.DEEPSEEK_API_KEY
+  loopbackProxyAPIKey = randomBytes(32).toString("hex")
   workerDeadline = Date.now() + payload.timeout_ms
   const controller = new AbortController()
   const timeout = setTimeout(
@@ -34,6 +59,7 @@ async function main() {
   process.env.OPENCODE_SERVER_PASSWORD = password
 
   try {
+    providerProxy = await startProviderCompatibilityProxy(payload)
     server = await createOpencodeServer({
       hostname: "127.0.0.1",
       port: await reservePort(),
@@ -48,6 +74,8 @@ async function main() {
         Authorization: `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`,
       },
     })
+    localServerURL = server.url
+    localAuthorization = `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`
     if (payload.action === "capability") {
       return await capability(client, payload)
     }
@@ -55,6 +83,7 @@ async function main() {
   } finally {
     clearTimeout(timeout)
     server?.close()
+    providerProxy?.close()
   }
 }
 
@@ -65,223 +94,411 @@ async function capability(client, payload) {
   if (!provider) {
     throw new Error("DeepSeek provider is unavailable")
   }
+  const liveProbe = payload.live_probe
+    ? await runLiveProbe(client, payload)
+    : undefined
   return {
     schema_version: "1.0",
     server_version: OPENCODE_VERSION,
     provider: PROVIDER_ID,
     models: Object.keys(provider.models ?? {}).sort(),
-    output_mode: outputModeForModel(payload.model),
+    output_mode: executionProfile(payload).output_mode,
     tool_profile: WORKSPACE_TOOL_PROFILE,
     workspace_tools: WORKSPACE_TOOLS,
     max_steps: MAX_AGENT_STEPS,
+    max_provider_requests: MAX_PROVIDER_REQUESTS,
+    ...(liveProbe ? { live_probe: liveProbe } : {}),
+  }
+}
+
+async function runLiveProbe(client, payload) {
+  const schema = {
+    type: "object",
+    properties: { ok: { type: "boolean", const: true } },
+    required: ["ok"],
+    additionalProperties: false,
+  }
+  const stage = {
+    name: "finalizer",
+    thinking_mode: "disabled",
+    reasoning_effort: null,
+    output_mode: OUTPUT_MODE_STRUCTURED_TOOL,
+    workspace_tools: false,
+    wire_tool_choice: "required",
+  }
+  const outcome = await runStructuredStage(client, payload, {
+    stage,
+    promptText: "Return the structured value with ok set to true.",
+    schema,
+    title: "APK Scanner DeepSeek capability probe",
+    maxRetries: 0,
+  })
+  if (!outcome.ok) {
+    throw new Error(`DeepSeek live probe failed: ${outcome.error.message}`)
+  }
+  return {
+    ok: true,
+    model: outcome.response.info?.modelID ?? payload.model,
+    provider: outcome.response.info?.providerID ?? PROVIDER_ID,
+    thinking_mode: "disabled",
+    output_mode: OUTPUT_MODE_STRUCTURED_TOOL,
+    wire_tool_choice: "required",
+    usage: aggregateUsage(outcome.responses, payload),
+    provider_wire_requests: providerWireAudit.map((item) => ({ ...item })),
   }
 }
 
 async function investigate(client, payload) {
-  const session = unwrap(
-    await client.session.create({
-      body: { title: "APK Scanner security investigation" },
-    }),
-    "session.create",
-  )
-  sessionID = session.id
-  emitRuntimeEvent("model.session.started", "OpenCode SDK 会话已建立", {
-    session_id: sessionID,
-  })
-  const eventPump = await startEventPump(client)
-  try {
-    if (outputModeForModel(payload.model) === OUTPUT_MODE_PROMPTED_JSON) {
-      return await investigatePromptedJson(client, payload)
-    }
-    return await investigateStructuredOutput(client, payload)
-  } finally {
-    await eventPump.stop()
-    await client.session.delete({ path: { id: sessionID } }).catch(() => undefined)
-  }
-}
-
-async function investigateStructuredOutput(client, payload) {
-  emitRuntimeEvent("model.turn.started", "OpenCode 开始生成结构化判断", {
-    attempt: 1,
-    output_mode: OUTPUT_MODE_STRUCTURED_TOOL,
-  })
-  const response = await prompt(client, payload, payload.prompt, {
-    type: "json_schema",
-    schema: payload.output_schema,
-    retryCount: 2,
-  }, workspaceToolFlags(payload))
-  if (response.info?.error) {
-    throw new Error(`OpenCode model error: ${formatError(response.info.error)}`)
-  }
-  emitRuntimeEvent("model.response.received", "OpenCode 已返回模型响应", {
-    attempt: 1,
-    turn_id: response.info?.id ?? null,
-  })
-  const result =
-    response.info?.structured ??
-    response.info?.structured_output ??
-    parseTextJson(responseText(response.parts ?? [])).value
-  if (!result || typeof result !== "object" || Array.isArray(result)) {
-    throw new Error("OpenCode returned no structured investigation result")
-  }
-  emitRuntimeEvent("model.output.validated", "OpenCode 结构化输出已通过校验", {
-    attempt: 1,
-    turn_id: response.info?.id ?? null,
-  })
-  return {
-    schema_version: "1.0",
-    thread_id: sessionID,
-    turn_id: response.info?.id ?? randomBytes(16).toString("hex"),
-    result,
-    usage: aggregateUsage([response], payload),
-    output_transport: {
-      mode: OUTPUT_MODE_STRUCTURED_TOOL,
-      format: "json_schema",
-      tool_choice: "required",
-      tools: [...workspaceToolNames(payload), "StructuredOutput"],
-      schema_validator: "opencode",
-      retry_count: 2,
-      model_calls: [
-        modelCallAudit({
-          attempt: 1,
-          promptText: payload.prompt,
-          response,
-          responseTextValue: responseText(response.parts ?? []),
-          parseError: null,
-          validationErrors: [],
-          accepted: true,
-          tools: [...workspaceToolNames(payload), "StructuredOutput"],
-        }),
-      ],
-    },
-  }
-}
-
-async function investigatePromptedJson(client, payload) {
-  const validate = new Ajv({ allErrors: true, strict: false }).compile(payload.output_schema)
+  const profile = executionProfile(payload)
   const calls = []
   const responses = []
-  let promptText = payload.prompt
+  let explorerMemo
+  let explorerSessionID
 
-  for (let index = 0; index <= PROMPTED_JSON_RETRY_COUNT; index += 1) {
-    emitRuntimeEvent("model.turn.started", "DeepSeek Pro 开始生成纯文本 JSON", {
-      attempt: index + 1,
-      output_mode: OUTPUT_MODE_PROMPTED_JSON,
+  const analysisStage = profile.stages.find((stage) => stage.output_mode === "text")
+  if (analysisStage) {
+    const explored = await runTextStage(client, payload, {
+      stage: analysisStage,
+      promptText: payload.explorer_prompt,
+      title:
+        analysisStage.thinking_mode === "enabled"
+          ? "APK Scanner thinking exploration"
+          : "APK Scanner stable analysis",
     })
-    const enabledTools = index === 0 ? workspaceToolFlags(payload) : disabledWorkspaceToolFlags()
-    const response = await promptAsyncAndWait(
+    calls.push(explored.call)
+    responses.push(...explored.responses)
+    explorerSessionID = explored.session_id
+    if (!explored.ok) {
+      return failureEnvelope(payload, {
+        response: explored.response,
+        responses,
+        calls,
+        profile,
+        error: explored.error,
+        explorerSessionID,
+      })
+    }
+    explorerMemo = explored.text
+  }
+
+  const structuredStage =
+    profile.stages.find((stage) => stage.output_mode === OUTPUT_MODE_STRUCTURED_TOOL)
+  const promptText = explorerMemo
+    ? finalizerPrompt(payload.prompt, explorerMemo)
+    : payload.prompt
+  const finalized = await runStructuredStage(client, payload, {
+    stage: structuredStage,
+    promptText,
+    schema: payload.output_schema,
+    title:
+      profile.name === PROFILE_STABLE_ANALYZER
+        ? "APK Scanner stable analysis"
+        : "APK Scanner structured finalization",
+    maxRetries: STRUCTURED_RETRY_COUNT,
+  })
+  calls.push(...finalized.calls)
+  responses.push(...finalized.responses)
+  if (!finalized.ok) {
+    return failureEnvelope(payload, {
+      response: finalized.response,
+      responses,
+      calls,
+      profile,
+      error: finalized.error,
+      explorerSessionID,
+      explorerMemo,
+    })
+  }
+  return {
+    schema_version: "1.0",
+    thread_id: finalized.session_id,
+    turn_id: finalized.response.info?.id ?? randomBytes(16).toString("hex"),
+    result: finalized.result,
+    usage: aggregateUsage(responses, payload),
+    output_transport: outputTransport({
+      profile,
+      calls,
+      explorerSessionID,
+      explorerMemo,
+    }),
+  }
+}
+
+async function runTextStage(client, payload, { stage, promptText, title }) {
+  const responses = []
+  let response
+  let stageSessionID
+  await withSession(client, title, async (createdSessionID) => {
+    stageSessionID = createdSessionID
+    emitRuntimeEvent("model.turn.started", "DeepSeek 分析阶段开始", {
+      stage: stage.name,
+      attempt: 1,
+      thinking_mode: stage.thinking_mode,
+      reasoning_effort: stage.reasoning_effort,
+      wire_tool_choice: "omitted",
+    })
+    response = await promptAsyncAndWait(
       client,
       payload,
       promptText,
-      enabledTools,
+      workspaceToolFlags(payload),
+      undefined,
+      stage.name === "explorer" ? "apkscanner-explorer" : "apkscanner-analyzer",
+      stage,
     )
+  })
+  responses.push(response)
+  const text = responseText(response.parts ?? [])
+  emitRuntimeEvent("model.response.received", "DeepSeek 分析阶段已返回证据备忘录", {
+    stage: stage.name,
+    attempt: 1,
+    turn_id: response.info?.id ?? null,
+  })
+  const providerError = response.info?.error
+    ? normalizedProviderError(response.info.error)
+    : null
+  const memoBytes = Buffer.byteLength(text, "utf8")
+  const parseError = providerError
+    ? null
+    : !text
+      ? "explorer returned no text memo"
+      : memoBytes > MAX_EXPLORER_MEMO_BYTES
+        ? `explorer memo exceeds ${MAX_EXPLORER_MEMO_BYTES} bytes`
+        : null
+  const call = modelCallAudit({
+    stage,
+    attempt: 1,
+    promptText,
+    response,
+    responseTextValue: text,
+    parseError,
+    validationErrors: [],
+    accepted: !providerError && !parseError,
+    tools: workspaceToolNames(payload),
+  })
+  if (providerError) {
+    return {
+      ok: false,
+      response,
+      responses,
+      call,
+      session_id: stageSessionID,
+      error: providerError,
+    }
+  }
+  if (parseError) {
+    return {
+      ok: false,
+      response,
+      responses,
+      call,
+      session_id: stageSessionID,
+      error: { type: "empty_or_oversized_explorer_output", message: parseError },
+    }
+  }
+  return {
+    ok: true,
+    response,
+    responses,
+    call,
+    session_id: stageSessionID,
+    text,
+  }
+}
+
+async function runStructuredStage(
+  client,
+  payload,
+  { stage, promptText, schema, title, maxRetries },
+) {
+  const validate = new Ajv({ allErrors: true, strict: false }).compile(schema)
+  const calls = []
+  const responses = []
+  let currentPrompt = promptText
+  let response
+  let stageSessionID
+
+  for (let index = 0; index <= maxRetries; index += 1) {
+    await withSession(client, `${title} (${index + 1})`, async (createdSessionID) => {
+      stageSessionID = createdSessionID
+      emitRuntimeEvent("model.turn.started", "DeepSeek 非思考结构化阶段开始", {
+        stage: stage.name,
+        attempt: index + 1,
+        thinking_mode: "disabled",
+        wire_tool_choice: "required",
+      })
+      emitRuntimeEvent(
+        "model.transport.selected",
+        "DeepSeek 非思考定稿器使用单次同步结构化请求",
+        {
+          session_id: sessionID,
+          stage: stage.name,
+          request_mode: "prompt_sync",
+          thinking_mode: "disabled",
+          wire_tool_choice: "required",
+        },
+      )
+      response = await promptSync(
+        client,
+        payload,
+        currentPrompt,
+        {
+          type: "json_schema",
+          schema,
+        },
+      )
+    })
     responses.push(response)
     const text = responseText(response.parts ?? [])
-    emitRuntimeEvent("model.response.received", "DeepSeek Pro 已返回模型响应", {
+    emitRuntimeEvent("model.response.received", "DeepSeek 已返回结构化阶段响应", {
+      stage: stage.name,
       attempt: index + 1,
       turn_id: response.info?.id ?? null,
     })
     if (response.info?.error) {
+      const error = normalizedProviderError(response.info.error)
       calls.push(
         modelCallAudit({
+          stage,
           attempt: index + 1,
-          promptText,
+          promptText: currentPrompt,
           response,
           responseTextValue: text,
           parseError: null,
           validationErrors: [],
           accepted: false,
-          tools: enabledToolNames(enabledTools),
+          tools: structuredToolNames(payload, stage),
         }),
       )
-      return promptedJsonFailure(
-        payload,
+      return {
+        ok: false,
         response,
         responses,
         calls,
-        "provider_error",
-        `OpenCode model error: ${formatError(response.info.error)}`,
-      )
+        session_id: stageSessionID,
+        error,
+      }
     }
 
-    const parsed = parseTextJson(text)
+    const parsed = parseStructuredResult(response)
     const parsedObject =
       parsed.error === null &&
       parsed.value !== null &&
       typeof parsed.value === "object" &&
       !Array.isArray(parsed.value)
     const schemaValid = parsedObject ? validate(parsed.value) : false
-    const valid = parsedObject && schemaValid
-    const validationErrors =
+    const schemaErrors =
       parsedObject && !schemaValid ? normalizeValidationErrors(validate.errors) : []
+    const semanticErrors =
+      parsedObject && schemaValid
+        ? semanticValidationErrors(parsed.value, payload)
+        : []
+    const validationErrors = [...schemaErrors, ...semanticErrors]
     const parseError =
       parsed.error ??
-      (parsed.value === null || typeof parsed.value !== "object" || Array.isArray(parsed.value)
-        ? "top-level JSON value must be an object"
-        : null)
+      (parsedObject ? null : "top-level structured value must be an object")
+    const accepted = parsedObject && schemaValid && semanticErrors.length === 0
     calls.push(
       modelCallAudit({
+        stage,
         attempt: index + 1,
-        promptText,
+        promptText: currentPrompt,
         response,
         responseTextValue: text,
         parseError,
         validationErrors,
-        accepted: Boolean(valid),
-        tools: enabledToolNames(enabledTools),
+        accepted,
+        tools: structuredToolNames(payload, stage),
       }),
     )
-    if (valid) {
-      emitRuntimeEvent("model.output.validated", "DeepSeek Pro 输出已通过 Ajv 校验", {
+    if (accepted) {
+      emitRuntimeEvent("model.output.validated", "结构化结果已通过本地 Ajv 与语义校验", {
+        stage: stage.name,
         attempt: index + 1,
         turn_id: response.info?.id ?? null,
         validator: "ajv@8.20.0",
       })
       return {
-        schema_version: "1.0",
-        thread_id: sessionID,
-        turn_id: response.info?.id ?? randomBytes(16).toString("hex"),
+        ok: true,
+        response,
+        responses,
+        calls,
+        session_id: stageSessionID,
         result: parsed.value,
-        usage: aggregateUsage(responses, payload),
-        output_transport: promptedJsonTransport(calls),
       }
     }
-    emitRuntimeEvent("model.validation.failed", "DeepSeek Pro 输出未通过本地 JSON 校验", {
+    emitRuntimeEvent("model.validation.failed", "结构化结果未通过本地 Schema/语义校验", {
+      stage: stage.name,
       attempt: index + 1,
       turn_id: response.info?.id ?? null,
       parse_error: parseError,
       validation_error_count: validationErrors.length,
     })
-    promptText = correctionPrompt(parseError, validationErrors)
+    currentPrompt = structuredCorrectionPrompt(promptText, parseError, validationErrors)
   }
-
-  const response = responses.at(-1)
-  return promptedJsonFailure(
-    payload,
+  return {
+    ok: false,
     response,
     responses,
     calls,
-    "schema_validation_error",
-    `DeepSeek text output did not satisfy the JSON schema after ${calls.length} attempts`,
-  )
+    session_id: stageSessionID,
+    error: {
+      type: "schema_validation_error",
+      message:
+        `Structured output did not pass local schema and semantic validation ` +
+        `after ${calls.length} attempts`,
+    },
+  }
 }
 
-function prompt(client, payload, promptText, format, tools) {
+function promptSync(client, payload, promptText, format) {
   return client.session
     .prompt({
       path: { id: sessionID },
       body: {
-        ...promptBody(payload, promptText, tools),
+        ...promptBody(
+          payload,
+          promptText,
+          disabledWorkspaceToolFlags(),
+          "apkscanner-finalizer",
+        ),
         format,
       },
     })
     .then((response) => unwrap(response, "session.prompt"))
 }
 
-async function promptAsyncAndWait(client, payload, promptText, tools) {
+async function withSession(client, title, operation) {
+  const session = unwrap(
+    await client.session.create({ body: { title } }),
+    "session.create",
+  )
+  sessionID = session.id
+  emitRuntimeEvent("model.session.started", "OpenCode SDK 会话已建立", {
+    session_id: sessionID,
+    title,
+  })
+  const eventPump = await startEventPump(client)
+  try {
+    return await operation(sessionID)
+  } finally {
+    await eventPump.stop()
+    await client.session.delete({ path: { id: sessionID } }).catch(() => undefined)
+  }
+}
+
+async function promptAsyncAndWait(
+  client,
+  payload,
+  promptText,
+  tools,
+  format,
+  agent,
+  stage,
+) {
   const before = unwrap(
     await localRead(
-      () => client.session.messages({ path: { id: sessionID } }),
+      () => rawSessionMessages(sessionID),
       "session.messages.before",
     ),
     "session.messages.before",
@@ -293,17 +510,24 @@ async function promptAsyncAndWait(client, payload, promptText, tools) {
   )
   emitRuntimeEvent(
     "model.transport.selected",
-    "DeepSeek Pro 已切换为异步下发与短连接结果轮询",
+    "DeepSeek 调用使用异步下发与短连接结果轮询",
     {
       session_id: sessionID,
+      stage: stage.name,
       request_mode: "prompt_async_poll",
       poll_interval_ms: LOCAL_POLL_INTERVAL_MS,
+      thinking_mode: stage.thinking_mode,
+      reasoning_effort: stage.reasoning_effort,
+      wire_tool_choice: stage.wire_tool_choice,
     },
   )
   unwrap(
     await client.session.promptAsync({
       path: { id: sessionID },
-      body: promptBody(payload, promptText, tools),
+      body: {
+        ...promptBody(payload, promptText, tools, agent),
+        ...(format ? { format } : {}),
+      },
     }),
     "session.prompt_async",
   )
@@ -312,7 +536,7 @@ async function promptAsyncAndWait(client, payload, promptText, tools) {
   while (Date.now() < workerDeadline) {
     const messages = unwrap(
       await localRead(
-        () => client.session.messages({ path: { id: sessionID } }),
+        () => rawSessionMessages(sessionID),
         "session.messages.poll",
       ),
       "session.messages.poll",
@@ -323,10 +547,19 @@ async function promptAsyncAndWait(client, payload, promptText, tools) {
           message?.info?.role === "assistant" &&
           !knownMessageIDs.has(message.info.id),
       )
-      .sort(
-        (left, right) =>
-          (right.info.time?.created ?? 0) - (left.info.time?.created ?? 0),
-      )
+      .map((message, index) => ({ message, index }))
+      .sort((left, right) => {
+        const leftTime =
+          left.message.info.time?.completed ??
+          left.message.info.time?.created ??
+          0
+        const rightTime =
+          right.message.info.time?.completed ??
+          right.message.info.time?.created ??
+          0
+        return rightTime - leftTime || right.index - left.index
+      })
+      .map(({ message }) => message)
     const latestCompleted = assistantMessages.find(
       (message) =>
         message.info.error ||
@@ -370,14 +603,47 @@ async function promptAsyncAndWait(client, payload, promptText, tools) {
   throw new Error("OpenCode async prompt exceeded the worker deadline")
 }
 
-function promptBody(payload, promptText, tools) {
+async function rawSessionMessages(id) {
+  if (!localServerURL || !localAuthorization) {
+    throw new Error("OpenCode local transport is not initialized")
+  }
+  const remaining = Math.max(1, workerDeadline - Date.now())
+  const response = await fetch(
+    new URL(`/session/${encodeURIComponent(id)}/message`, localServerURL),
+    {
+      headers: { Authorization: localAuthorization },
+      signal: AbortSignal.timeout(remaining),
+    },
+  )
+  const text = await response.text()
+  if (!response.ok) {
+    throw new Error(
+      `session.messages raw read failed (${response.status}): ${text.slice(0, 2000)}`,
+    )
+  }
+  try {
+    return JSON.parse(text)
+  } catch (error) {
+    throw new Error(
+      `session.messages raw read returned invalid JSON: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    )
+  }
+}
+
+function promptBody(payload, promptText, tools, agent) {
+  const systemInstructions =
+    agent === "apkscanner-finalizer"
+      ? payload.developer_instructions
+      : payload.explorer_instructions ?? payload.developer_instructions
   return {
-    agent: "apkscanner",
+    agent,
     model: {
       providerID: PROVIDER_ID,
       modelID: payload.model,
     },
-    system: payload.developer_instructions,
+    system: systemInstructions,
     tools,
     parts: [{ type: "text", text: promptText }],
   }
@@ -564,36 +830,64 @@ function once(seen, key, value) {
   return value
 }
 
-function promptedJsonFailure(payload, response, responses, calls, type, message) {
+function failureEnvelope(
+  payload,
+  {
+    response,
+    responses,
+    calls,
+    profile,
+    error,
+    explorerSessionID,
+    explorerMemo,
+  },
+) {
   return {
     schema_version: "1.0",
     thread_id: sessionID,
     turn_id: response?.info?.id ?? randomBytes(16).toString("hex"),
-    error: { type, message },
+    error,
     usage: aggregateUsage(responses, payload),
-    output_transport: promptedJsonTransport(calls),
+    output_transport: outputTransport({
+      profile,
+      calls,
+      explorerSessionID,
+      explorerMemo,
+    }),
   }
 }
 
-function promptedJsonTransport(calls) {
+function outputTransport({ profile, calls, explorerSessionID, explorerMemo }) {
   return {
-    mode: OUTPUT_MODE_PROMPTED_JSON,
-    format: "text",
-    request_mode: "prompt_async_poll",
-    tool_choice: "auto",
-    tools: WORKSPACE_TOOLS,
+    mode: profile.output_mode,
+    profile: profile.name,
+    format: "json_schema",
+    request_mode: profile.stages.some((stage) => stage.output_mode === "text")
+      ? "async_analysis_then_sync_finalize"
+      : "prompt_sync",
+    stages: profile.stages.map((stage) => ({
+      name: stage.name,
+      thinking_mode: stage.thinking_mode,
+      reasoning_effort: stage.reasoning_effort,
+      output_mode: stage.output_mode,
+      workspace_tools: stage.workspace_tools,
+      wire_tool_choice: stage.wire_tool_choice,
+    })),
+    ...(explorerSessionID ? { explorer_thread_id: explorerSessionID } : {}),
+    ...(explorerMemo ? { explorer_memo: explorerMemo } : {}),
+    provider_wire_requests: providerWireAudit.map((item) => ({ ...item })),
     schema_validator: "ajv@8.20.0",
-    retry_count: PROMPTED_JSON_RETRY_COUNT,
+    semantic_validator: "apkscanner@1.0",
+    max_provider_requests: MAX_PROVIDER_REQUESTS,
+    structured_retry_count: STRUCTURED_RETRY_COUNT,
     model_calls: calls,
   }
 }
 
 function buildConfig(payload) {
   const model = `${PROVIDER_ID}/${payload.model}`
-  const structuredOutput =
-    outputModeForModel(payload.model) === OUTPUT_MODE_STRUCTURED_TOOL
   const workspaceTools = workspaceToolNames(payload)
-  const permission = {
+  const workspacePermission = {
     "*": "deny",
     ...Object.fromEntries(
       workspaceTools
@@ -616,7 +910,11 @@ function buildConfig(payload) {
           },
         }
       : {}),
-    ...(structuredOutput ? { StructuredOutput: "allow" } : {}),
+    StructuredOutput: "allow",
+  }
+  const finalizerPermission = {
+    "*": "deny",
+    StructuredOutput: "allow",
   }
   const tools = {
     "*": false,
@@ -625,34 +923,65 @@ function buildConfig(payload) {
   return {
     model,
     small_model: model,
-    default_agent: "apkscanner",
+    default_agent: "apkscanner-analyzer",
     enabled_providers: [PROVIDER_ID],
     autoupdate: false,
     share: "disabled",
     snapshot: false,
+    shell: SANITIZED_BASH,
     plugin: [],
     mcp: {},
     instructions: [],
     tools,
-    permission,
+    permission: workspacePermission,
     agent: {
-      apkscanner: {
+      "apkscanner-analyzer": {
+        mode: "primary",
+        model,
+        prompt: payload.explorer_instructions ?? payload.developer_instructions,
+        steps: MAX_AGENT_STEPS,
+        options: thinkingOptions("disabled", null),
+        permission: workspacePermission,
+      },
+      "apkscanner-explorer": {
+        mode: "primary",
+        model,
+        prompt: payload.explorer_instructions ?? payload.developer_instructions,
+        steps: MAX_AGENT_STEPS,
+        options: thinkingOptions(
+          "enabled",
+          explorerStage(payload)?.reasoning_effort ?? "high",
+        ),
+        permission: workspacePermission,
+      },
+      "apkscanner-finalizer": {
         mode: "primary",
         model,
         prompt: payload.developer_instructions,
-        steps: MAX_AGENT_STEPS,
-        permission,
+        steps: Math.min(MAX_AGENT_STEPS, 20),
+        options: thinkingOptions("disabled", null),
+        permission: finalizerPermission,
       },
     },
-    ...(payload.base_url
+    ...(providerProxyURL
       ? {
           provider: {
             [PROVIDER_ID]: {
-              options: { baseURL: payload.base_url },
+              options: {
+                baseURL: providerProxyURL,
+                apiKey: loopbackProxyAPIKey,
+              },
             },
           },
         }
       : {}),
+  }
+}
+
+function thinkingOptions(mode, effort) {
+  return {
+    thinking: { type: mode },
+    ...(mode === "enabled" && effort ? { reasoningEffort: effort } : {}),
   }
 }
 
@@ -699,12 +1028,31 @@ function validatePayload(value) {
   if (value.base_url !== null && value.base_url !== undefined) {
     validateBaseURL(value.base_url)
   }
+  value.execution_profile = validateExecutionProfile(value.execution_profile)
   if (value.action === "investigate") {
     if (typeof value.prompt !== "string" || !value.prompt) {
       throw new Error("investigation prompt is required")
     }
     if (typeof value.developer_instructions !== "string" || !value.developer_instructions) {
       throw new Error("developer instructions are required")
+    }
+    if (
+      typeof value.phase !== "string" ||
+      !/^[a-z][a-z0-9_]{0,63}$/.test(value.phase)
+    ) {
+      throw new Error("investigation phase is required")
+    }
+    if (
+      value.execution_profile.stages.some((stage) => stage.output_mode === "text") &&
+      (typeof value.explorer_prompt !== "string" || !value.explorer_prompt)
+    ) {
+      throw new Error("analysis-stage prompt is required")
+    }
+    if (
+      value.execution_profile.stages.some((stage) => stage.output_mode === "text") &&
+      (typeof value.explorer_instructions !== "string" || !value.explorer_instructions)
+    ) {
+      throw new Error("analysis-stage instructions are required")
     }
     if (
       !value.output_schema ||
@@ -744,6 +1092,126 @@ function validateBaseURL(value) {
   ) {
     throw new Error("plain HTTP DeepSeek gateways are allowed only on loopback")
   }
+  if (
+    ["api.deepseek.com", "api.deepseek.com.cn"].includes(parsed.hostname) &&
+    !["", "/"].includes(parsed.pathname)
+  ) {
+    throw new Error(
+      "the official DeepSeek base URL must not append /v1 or another path",
+    )
+  }
+}
+
+function validateExecutionProfile(value) {
+  const fallback = {
+    name: PROFILE_STABLE_ANALYZER,
+    output_mode: OUTPUT_MODE_ANALYZE_THEN_FINALIZE,
+    stages: [
+      {
+        name: "analyzer",
+        thinking_mode: "disabled",
+        reasoning_effort: null,
+        output_mode: "text",
+        workspace_tools: true,
+        wire_tool_choice: "auto",
+      },
+      {
+        name: "finalizer",
+        thinking_mode: "disabled",
+        reasoning_effort: null,
+        output_mode: OUTPUT_MODE_STRUCTURED_TOOL,
+        workspace_tools: false,
+        wire_tool_choice: "required",
+      },
+    ],
+  }
+  if (value === undefined || value === null) return fallback
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("execution_profile must be an object")
+  }
+  if (
+    ![
+      PROFILE_STABLE_ANALYZER,
+      PROFILE_THINKING_EXPLORER,
+      PROFILE_STRUCTURED_FINALIZER,
+    ].includes(value.name)
+  ) {
+    throw new Error("unsupported OpenCode execution profile")
+  }
+  if (!Array.isArray(value.stages) || value.stages.length < 1 || value.stages.length > 2) {
+    throw new Error("execution_profile stages must contain one or two stages")
+  }
+  const stages = value.stages.map((stage) => validateExecutionStage(stage))
+  const expected =
+    value.name === PROFILE_THINKING_EXPLORER
+      ? [
+          ["explorer", "enabled", "text", true, "omitted"],
+          ["finalizer", "disabled", OUTPUT_MODE_STRUCTURED_TOOL, false, "required"],
+        ]
+      : value.name === PROFILE_STRUCTURED_FINALIZER
+        ? [["finalizer", "disabled", OUTPUT_MODE_STRUCTURED_TOOL, false, "required"]]
+        : [
+            ["analyzer", "disabled", "text", true, "auto"],
+            ["finalizer", "disabled", OUTPUT_MODE_STRUCTURED_TOOL, false, "required"],
+          ]
+  if (
+    stages.length !== expected.length ||
+    stages.some(
+      (stage, index) =>
+        stage.name !== expected[index][0] ||
+        stage.thinking_mode !== expected[index][1] ||
+        stage.output_mode !== expected[index][2] ||
+        stage.workspace_tools !== expected[index][3] ||
+        stage.wire_tool_choice !== expected[index][4],
+    )
+  ) {
+    throw new Error("execution_profile stages do not match the selected profile")
+  }
+  const outputMode =
+    value.name === PROFILE_THINKING_EXPLORER
+      ? OUTPUT_MODE_EXPLORE_THEN_FINALIZE
+      : value.name === PROFILE_STABLE_ANALYZER
+        ? OUTPUT_MODE_ANALYZE_THEN_FINALIZE
+        : OUTPUT_MODE_STRUCTURED_TOOL
+  if (value.output_mode !== outputMode) {
+    throw new Error("execution_profile output_mode does not match the selected profile")
+  }
+  return { name: value.name, output_mode: outputMode, stages }
+}
+
+function validateExecutionStage(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("execution stage must be an object")
+  }
+  if (!["analyzer", "explorer", "finalizer"].includes(value.name)) {
+    throw new Error("unsupported execution stage")
+  }
+  if (!["enabled", "disabled"].includes(value.thinking_mode)) {
+    throw new Error("invalid execution stage thinking mode")
+  }
+  if (![null, undefined, "high", "max"].includes(value.reasoning_effort)) {
+    throw new Error("invalid DeepSeek reasoning effort")
+  }
+  if (value.thinking_mode === "enabled" && !["high", "max"].includes(value.reasoning_effort)) {
+    throw new Error("thinking stages require high or max reasoning effort")
+  }
+  if (!["text", OUTPUT_MODE_STRUCTURED_TOOL].includes(value.output_mode)) {
+    throw new Error("invalid execution stage output mode")
+  }
+  if (typeof value.workspace_tools !== "boolean") {
+    throw new Error("execution stage workspace_tools must be boolean")
+  }
+  if (!["auto", "omitted", "required"].includes(value.wire_tool_choice)) {
+    throw new Error("invalid execution stage wire_tool_choice")
+  }
+  return {
+    name: value.name,
+    thinking_mode: value.thinking_mode,
+    reasoning_effort: value.reasoning_effort ?? null,
+    output_mode: value.output_mode,
+    workspace_tools: value.workspace_tools,
+    wire_tool_choice: value.wire_tool_choice,
+  }
 }
 
 function unwrap(response, label) {
@@ -759,10 +1227,12 @@ function formatError(value) {
   return JSON.stringify(value) ?? String(value ?? "unknown error")
 }
 
-function outputModeForModel(model) {
-  return /^deepseek-v4-pro(?:$|[-._])/.test(model.trim().toLowerCase())
-    ? OUTPUT_MODE_PROMPTED_JSON
-    : OUTPUT_MODE_STRUCTURED_TOOL
+function executionProfile(payload) {
+  return payload.execution_profile ?? validateExecutionProfile(undefined)
+}
+
+function explorerStage(payload) {
+  return executionProfile(payload).stages.find((stage) => stage.name === "explorer")
 }
 
 function responseText(parts) {
@@ -785,6 +1255,20 @@ function parseTextJson(text) {
   }
 }
 
+function parseStructuredResult(response) {
+  const structured =
+    response.info?.structured ??
+    response.info?.structured_output
+  if (structured !== undefined) {
+    return { value: structured, error: null }
+  }
+  const text = responseText(response.parts ?? [])
+  if (!text) {
+    return { value: undefined, error: "OpenCode returned no structured result" }
+  }
+  return parseTextJson(text)
+}
+
 function normalizeValidationErrors(errors) {
   return (errors ?? []).map((error) => ({
     instance_path: error.instancePath,
@@ -795,19 +1279,149 @@ function normalizeValidationErrors(errors) {
   }))
 }
 
-function correctionPrompt(parseError, validationErrors) {
+function semanticValidationErrors(value, payload) {
+  if (!Object.prototype.hasOwnProperty.call(value, "result")) return []
+  const errors = []
+  const add = (instancePath, message) => {
+    errors.push({
+      instance_path: instancePath,
+      schema_path: "#/apkscanner/semantic",
+      keyword: "apkscannerSemantic",
+      params: {},
+      message,
+    })
+  }
+  if (value.result === "inconclusive") {
+    if (value.severity_proposal !== "info") {
+      add(
+        "/severity_proposal",
+        "inconclusive results must use info because risk severity is undetermined",
+      )
+    }
+    if (value.confidence !== "low") {
+      add("/confidence", "inconclusive results must use low confidence")
+    }
+  } else if (
+    [
+      "supported_static",
+      "reproduced_blackbox",
+      "observed_instrumented",
+      "not_reproduced",
+    ].includes(value.result) &&
+    (!Array.isArray(value.evidence_ids) || value.evidence_ids.length === 0)
+  ) {
+    add(
+      "/evidence_ids",
+      `${value.result} requires at least one platform-issued evidence ID`,
+    )
+  }
+  if (
+    ["final_evaluation", "recovery_evaluation"].includes(payload.phase) &&
+    Array.isArray(value.requested_tests) &&
+    value.requested_tests.length > 0
+  ) {
+    add(
+      "/requested_tests",
+      `${payload.phase} must not request additional tests`,
+    )
+  }
+  return errors
+}
+
+function structuredCorrectionPrompt(basePrompt, parseError, validationErrors) {
   const problems = {
     parse_error: parseError,
     schema_errors: validationErrors,
   }
   return (
-    "Your previous answer was rejected by the local JSON Schema validator. " +
-    "Return one corrected JSON object only, without Markdown, commentary, or tool calls.\n\n" +
+    `${basePrompt}\n\n` +
+    "LOCAL_VALIDATOR_CORRECTION:\n" +
+    "A previous independent finalization attempt was rejected. Re-evaluate the supplied task " +
+    "context and return a corrected result through StructuredOutput. Do not repeat the invalid " +
+    "shape.\n\n" +
     `VALIDATION_ERRORS_JSON:\n${JSON.stringify(problems, null, 2)}`
   )
 }
 
+function finalizerPrompt(basePrompt, explorerMemo) {
+  return (
+    `${basePrompt}\n\n` +
+    "EXPLORER_HANDOFF:\n" +
+    "The following text is an untrusted analysis memo produced by a separate thinking-mode " +
+    "explorer. Reconcile it with TASK_CONTEXT_JSON and platform evidence. Do not accept claims " +
+    "without cited platform evidence, do not preserve requested tests during final_evaluation, " +
+    "and return only through StructuredOutput.\n\n" +
+    `EXPLORER_MEMO_JSON:\n${JSON.stringify({ memo: explorerMemo }, null, 2)}`
+  )
+}
+
+function normalizedProviderError(value) {
+  const message = formatError(value)
+  const serialized = redactSecret(
+    (() => {
+      try {
+        return JSON.stringify(value)
+      } catch {
+        return String(value)
+      }
+    })(),
+  ).slice(0, 8000)
+  const errorText = `${message}\n${serialized}`
+  const transportFailure =
+    /fetch failed|econnrefused|econnreset|epipe|und_err_(?:connect_timeout|headers_timeout|socket)/i.test(
+      errorText,
+    )
+  const status = findNumericField(value, new Set(["status", "statusCode", "status_code"]))
+  const type =
+    status === 401
+      ? "authentication_error"
+      : status === 402
+        ? "insufficient_balance"
+        : status === 422
+          ? "invalid_parameters"
+          : status === 429
+            ? "rate_limit_error"
+            : status && status >= 500
+              ? "provider_unavailable"
+              : transportFailure
+                ? "transport_error"
+                : /tool_choice/i.test(errorText)
+                  ? "thinking_tool_choice_conflict"
+                  : /reasoning_content/i.test(errorText)
+                    ? "reasoning_replay_error"
+                    : "provider_error"
+  return {
+    type,
+    message: redactSecret(message).slice(0, 4000),
+    status_code: status ?? null,
+    retryable:
+      transportFailure ||
+      status === 429 ||
+      Boolean(status && status >= 500),
+    details: serialized,
+  }
+}
+
+function findNumericField(value, names, seen = new Set()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return undefined
+  seen.add(value)
+  for (const [key, item] of Object.entries(value)) {
+    if (names.has(key) && Number.isInteger(item)) return item
+  }
+  for (const item of Object.values(value)) {
+    const found = findNumericField(item, names, seen)
+    if (found !== undefined) return found
+  }
+  return undefined
+}
+
+function redactSecret(value) {
+  const secret = providerAPIKey
+  return secret ? String(value).replaceAll(secret, "[redacted]") : String(value)
+}
+
 function modelCallAudit({
+  stage,
   attempt,
   promptText,
   response,
@@ -819,6 +1433,7 @@ function modelCallAudit({
 }) {
   const turnMessages = response.apkscanner_turn_messages ?? [response]
   return {
+    stage: stage.name,
     attempt,
     turn_id: response.info?.id ?? null,
     prompt: promptText,
@@ -827,6 +1442,12 @@ function modelCallAudit({
     validation_errors: validationErrors,
     accepted,
     tools,
+    thinking_mode: stage.thinking_mode,
+    reasoning_effort: stage.reasoning_effort,
+    wire_tool_choice: stage.wire_tool_choice,
+    provider_error: response.info?.error
+      ? normalizedProviderError(response.info.error)
+      : null,
     usage: {
       tokens: turnMessages.reduce(
         (total, message) => mergeNumericObjects(total, message.info?.tokens ?? {}),
@@ -847,6 +1468,13 @@ function modelCallAudit({
 
 function workspaceToolNames(payload) {
   return payload.tool_profile === WORKSPACE_TOOL_PROFILE ? WORKSPACE_TOOLS : []
+}
+
+function structuredToolNames(payload, stage) {
+  return [
+    ...(stage.workspace_tools ? workspaceToolNames(payload) : []),
+    "StructuredOutput",
+  ]
 }
 
 function workspaceToolFlags(payload) {
@@ -925,6 +1553,170 @@ function mergeNumericObjects(left, right) {
   return output
 }
 
+async function startProviderCompatibilityProxy(payload) {
+  const targetBase = new URL(payload.base_url ?? "https://api.deepseek.com")
+  const proxy = createHttpServer(async (request, response) => {
+    let audit
+    try {
+      const incomingURL = new URL(request.url ?? "/", "http://127.0.0.1")
+      if (
+        request.method !== "POST" ||
+        incomingURL.pathname !== "/chat/completions" ||
+        incomingURL.search
+      ) {
+        sendProviderProxyError(response, 404, "unsupported_proxy_route")
+        return
+      }
+      if (
+        !loopbackProxyAPIKey ||
+        request.headers.authorization !== `Bearer ${loopbackProxyAPIKey}`
+      ) {
+        sendProviderProxyError(response, 401, "invalid_proxy_authentication")
+        return
+      }
+      providerRequestCount += 1
+      if (providerRequestCount > MAX_PROVIDER_REQUESTS) {
+        sendProviderProxyError(response, 429, "provider_request_limit_exceeded")
+        return
+      }
+      const bodyBuffer = await readIncomingBody(request)
+      let forwardedBody = bodyBuffer
+      if (bodyBuffer.length > 0 && request.url?.includes("/chat/completions")) {
+        const body = JSON.parse(bodyBuffer.toString("utf8"))
+        const thinkingMode = body?.thinking?.type ?? "provider_default"
+        const receivedToolChoice =
+          Object.prototype.hasOwnProperty.call(body, "tool_choice")
+            ? body.tool_choice
+            : null
+        if (thinkingMode === "enabled" && receivedToolChoice !== null) {
+          delete body.tool_choice
+          forwardedBody = Buffer.from(JSON.stringify(body))
+        }
+        audit = {
+          thinking_mode: thinkingMode,
+          received_tool_choice: receivedToolChoice,
+          forwarded_tool_choice:
+            Object.prototype.hasOwnProperty.call(body, "tool_choice")
+              ? body.tool_choice
+              : null,
+          stripped_tool_choice:
+            thinkingMode === "enabled" && receivedToolChoice !== null,
+          model: typeof body.model === "string" ? body.model : null,
+          status_code: null,
+          transport_error: null,
+        }
+        providerWireAudit.push(audit)
+      }
+
+      const target = new URL(targetBase)
+      const prefix = targetBase.pathname.replace(/\/+$/, "")
+      target.pathname = `${prefix}${incomingURL.pathname}`
+      target.search = incomingURL.search
+      const headers = {}
+      for (const [name, value] of Object.entries(request.headers)) {
+        if (
+          value === undefined ||
+          ["host", "content-length", "connection", "transfer-encoding"].includes(
+            name.toLowerCase(),
+          )
+        ) {
+          continue
+        }
+        headers[name] = Array.isArray(value) ? value.join(", ") : value
+      }
+      headers.authorization = `Bearer ${providerAPIKey}`
+      const remaining = Math.max(1, workerDeadline - Date.now())
+      const upstream = await fetch(target, {
+        method: request.method,
+        headers,
+        body:
+          request.method === "GET" || request.method === "HEAD"
+            ? undefined
+            : forwardedBody,
+        signal: AbortSignal.timeout(remaining),
+      })
+      if (audit) audit.status_code = upstream.status
+      response.statusCode = upstream.status
+      for (const [name, value] of upstream.headers.entries()) {
+        if (
+          ["content-length", "content-encoding", "transfer-encoding", "connection"].includes(
+            name.toLowerCase(),
+          )
+        ) {
+          continue
+        }
+        response.setHeader(name, value)
+      }
+      if (!upstream.body) {
+        response.end()
+        return
+      }
+      await pipeline(Readable.fromWeb(upstream.body), response)
+    } catch (error) {
+      if (audit) {
+        audit.transport_error = redactSecret(formatThrownError(error)).slice(0, 2000)
+      }
+      emitRuntimeEvent("model.provider_proxy.failed", "DeepSeek 兼容转发失败", {
+        error: redactSecret(formatThrownError(error)).slice(0, 2000),
+      })
+      if (response.headersSent) {
+        response.destroy()
+        return
+      }
+      response.writeHead(502, { "Content-Type": "application/json" })
+      response.end(
+        JSON.stringify({
+          error: {
+            type: "provider_proxy_error",
+            message: "DeepSeek compatibility proxy failed",
+          },
+        }),
+      )
+    }
+  })
+  await new Promise((resolvePromise, reject) => {
+    proxy.once("error", reject)
+    proxy.listen(0, "127.0.0.1", resolvePromise)
+  })
+  const address = proxy.address()
+  if (!address || typeof address === "string") {
+    proxy.close()
+    throw new Error("failed to start DeepSeek compatibility proxy")
+  }
+  providerProxyURL = `http://127.0.0.1:${address.port}`
+  return proxy
+}
+
+function sendProviderProxyError(response, status, type) {
+  response.writeHead(status, { "Content-Type": "application/json" })
+  response.end(
+    JSON.stringify({
+      error: {
+        type,
+        message: "DeepSeek compatibility proxy rejected the request",
+      },
+    }),
+  )
+}
+
+function readIncomingBody(request) {
+  return new Promise((resolvePromise, reject) => {
+    const chunks = []
+    let size = 0
+    request.on("data", (chunk) => {
+      size += chunk.length
+      if (size > MAX_INPUT_BYTES) {
+        reject(new Error("DeepSeek proxy request exceeds 32 MiB"))
+        request.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    request.once("error", reject)
+    request.once("end", () => resolvePromise(Buffer.concat(chunks)))
+  })
+}
+
 function reservePort() {
   return new Promise((resolve, reject) => {
     const probe = createServer()
@@ -955,9 +1747,8 @@ for (const name of ["SIGINT", "SIGTERM"]) {
 main()
   .then((result) => emitRecord({ type: "result", result }))
   .catch((error) => {
-    const secret = process.env.DEEPSEEK_API_KEY
     const message = formatThrownError(error)
-    stderr.write(secret ? message.replaceAll(secret, "[redacted]") : message)
+    stderr.write(redactSecret(message))
     process.exitCode = 1
   })
 
@@ -992,7 +1783,6 @@ function emitRuntimeEvent(eventType, message, data = {}) {
 }
 
 function emitRecord(value) {
-  const secret = process.env.DEEPSEEK_API_KEY
   const serialized = JSON.stringify(value)
-  stdout.write(`${secret ? serialized.replaceAll(secret, "[redacted]") : serialized}\n`)
+  stdout.write(`${redactSecret(serialized)}\n`)
 }

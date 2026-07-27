@@ -1,12 +1,18 @@
 import assert from "node:assert/strict"
-import { createServer } from "node:http"
+import { spawn, spawnSync } from "node:child_process"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { createServer } from "node:http"
 import { tmpdir } from "node:os"
 import { delimiter, join, resolve } from "node:path"
-import { spawn, spawnSync } from "node:child_process"
 import test from "node:test"
 
 const expected = { answer: "bounded result" }
+const resultSchema = {
+  type: "object",
+  properties: { answer: { type: "string" } },
+  required: ["answer"],
+  additionalProperties: false,
+}
 
 test("worker PATH adb shim refuses device access", () => {
   const blocked = spawnSync(resolve("bin/adb"), ["devices"], { encoding: "utf8" })
@@ -14,232 +20,48 @@ test("worker PATH adb shim refuses device access", () => {
   assert.match(blocked.stderr, /adb is disabled/)
 })
 
-test("flash can inspect the workspace before returning structured output", async () => {
+test("non-thinking finalizer uses StructuredOutput with required tool choice", async () => {
   const requests = []
   const api = createServer(async (request, response) => {
     const body = await readJSON(request)
     requests.push({ url: request.url, body })
-
-    response.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
+    sendCompletion(response, body, {
+      id: "finalizer",
+      toolCalls: [structuredOutputCall(expected)],
+      finish: "tool_calls",
     })
-    response.write(
-      event({
-        id: "chatcmpl-test",
-        object: "chat.completion.chunk",
-        created: 1,
-        model: body.model,
-        choices: [
-          {
-            index: 0,
-            delta: {
-              role: "assistant",
-              tool_calls: [
-                {
-                  index: 0,
-                  id: "call-structured",
-                  type: "function",
-                  function: {
-                    name: "StructuredOutput",
-                    arguments: JSON.stringify(expected),
-                  },
-                },
-              ],
-            },
-            finish_reason: null,
-          },
-        ],
-      }),
-    )
-    response.write(
-      event({
-        id: "chatcmpl-test",
-        object: "chat.completion.chunk",
-        created: 1,
-        model: body.model,
-        choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-        usage: {
-          prompt_tokens: 12,
-          completion_tokens: 4,
-          total_tokens: 16,
-        },
-      }),
-    )
-    response.end("data: [DONE]\n\n")
   })
   await listen(api)
   const address = api.address()
   assert(address && typeof address !== "string")
-
-  const root = await mkdtemp(join(tmpdir(), "apkscanner-opencode-test-"))
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-finalizer-test-"))
   try {
-    const completed = await runWorker(root, {
-      schema_version: "1.0",
-      action: "investigate",
-      prompt: "Return the bounded structured result.",
-      developer_instructions: "Use no external tools. Return only structured JSON.",
-      model: "deepseek-v4-flash",
-      base_url: `http://127.0.0.1:${address.port}`,
-      tool_profile: "workspace_shell",
-      output_schema: {
-        type: "object",
-        properties: { answer: { type: "string" } },
-        required: ["answer"],
-        additionalProperties: false,
-      },
-      timeout_ms: 10_000,
-    })
-    assert.equal(
-      completed.code,
-      0,
-      `${completed.stderr}\nrequests=${JSON.stringify(
-        requests.slice(0, 5).map((item) => ({
-          url: item.url,
-          model: item.body.model,
-          tool_choice: item.body.tool_choice,
-          tools: item.body.tools?.map((tool) => tool.function?.name),
-          message_count: item.body.messages?.length,
-        })),
-        null,
-        2,
-      )}`,
+    const completed = await runWorker(
+      root,
+      investigationPayload({
+        baseURL: `http://127.0.0.1:${address.port}`,
+        profile: finalizerProfile(),
+      }),
     )
+    assert.equal(completed.code, 0, completed.stderr)
     const { result, events } = parseWorkerOutput(completed.stdout)
     assert.deepEqual(result.result, expected)
-    assert.equal(result.usage.provider, "deepseek")
-    assert.equal(result.usage.model, "deepseek-v4-flash")
-    assert.equal(result.usage.calls, 1)
-    assert.equal(result.output_transport.mode, "structured_output_tool")
+    assert.equal(result.output_transport.profile, "structured_finalizer")
+    assert.equal(result.output_transport.request_mode, "prompt_sync")
+    assert.equal(result.output_transport.model_calls.length, 1)
+    assert.equal(result.output_transport.model_calls[0].thinking_mode, "disabled")
+    assert.equal(result.output_transport.model_calls[0].wire_tool_choice, "required")
     assert.equal(requests.length, 1)
-    assert.equal(requests[0].url, "/chat/completions")
-    assert.equal(requests[0].body.model, "deepseek-v4-flash")
+    assert.equal(requests[0].body.thinking.type, "disabled")
+    assert.equal(requests[0].body.reasoning_effort, undefined)
     assert.equal(requests[0].body.tool_choice, "required")
-    assert.deepEqual(
-      requests[0].body.tools.map((item) => item.function.name),
-      ["bash", "glob", "grep", "read", "StructuredOutput"],
-    )
-    assert.ok(events.some((item) => item.event_type === "model.session.started"))
-    assert.ok(events.some((item) => item.event_type === "model.output.validated"))
-  } finally {
-    api.close()
-    await rm(root, { recursive: true, force: true })
-  }
-})
-
-test("pro avoids required tool choice and retries text JSON through local validation", async () => {
-  const requests = []
-  const api = createServer(async (request, response) => {
-    const body = await readJSON(request)
-    requests.push({ url: request.url, body })
-    response.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-    })
-    const content = requests.length === 1 ? "{}" : JSON.stringify(expected)
-    response.write(
-      event({
-        id: `chatcmpl-pro-${requests.length}`,
-        object: "chat.completion.chunk",
-        created: requests.length,
-        model: body.model,
-        choices: [
-          {
-            index: 0,
-            delta: { role: "assistant", content },
-            finish_reason: null,
-          },
-        ],
-      }),
-    )
-    response.write(
-      event({
-        id: `chatcmpl-pro-${requests.length}`,
-        object: "chat.completion.chunk",
-        created: requests.length,
-        model: body.model,
-        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        usage: {
-          prompt_tokens: 10,
-          completion_tokens: 2,
-          total_tokens: 12,
-        },
-      }),
-    )
-    response.end("data: [DONE]\n\n")
-  })
-  await listen(api)
-  const address = api.address()
-  assert(address && typeof address !== "string")
-
-  const root = await mkdtemp(join(tmpdir(), "apkscanner-opencode-pro-test-"))
-  try {
-    const completed = await runWorker(root, {
-      schema_version: "1.0",
-      action: "investigate",
-      prompt:
-        "Return one JSON object matching this schema: " +
-        '{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}.',
-      developer_instructions: "Use no external tools. Return only JSON.",
-      model: "deepseek-v4-pro",
-      base_url: `http://127.0.0.1:${address.port}`,
-      tool_profile: "workspace_shell",
-      output_schema: {
-        type: "object",
-        properties: { answer: { type: "string" } },
-        required: ["answer"],
-        additionalProperties: false,
-      },
-      timeout_ms: 10_000,
-    })
-    assert.equal(
-      completed.code,
-      0,
-      `${completed.stderr}\nrequests=${JSON.stringify(requests, null, 2)}`,
-    )
-    const { result, events } = parseWorkerOutput(completed.stdout)
-    assert.deepEqual(result.result, expected)
-    assert.equal(result.usage.provider, "deepseek")
-    assert.equal(result.usage.model, "deepseek-v4-pro")
-    assert.equal(result.usage.calls, 2)
-    assert.equal(result.output_transport.mode, "prompted_json")
-    assert.equal(result.output_transport.format, "text")
-    assert.equal(result.output_transport.request_mode, "prompt_async_poll")
-    assert.equal(result.output_transport.tool_choice, "auto")
-    assert.deepEqual(result.output_transport.tools, ["read", "glob", "grep", "bash"])
-    assert.equal(result.output_transport.schema_validator, "ajv@8.20.0")
-    assert.equal(result.output_transport.model_calls.length, 2)
-    assert.equal(result.output_transport.model_calls[0].accepted, false)
-    assert.match(
-      result.output_transport.model_calls[0].validation_errors[0].message,
-      /required property/,
-    )
-    assert.equal(result.output_transport.model_calls[1].accepted, true)
-    assert.equal(requests.length, 2)
-    assert.equal(requests[0].url, "/chat/completions")
-    assert.equal(requests[0].body.model, "deepseek-v4-pro")
-    assert.notEqual(requests[0].body.tool_choice, "required")
-    assert.deepEqual(
-      requests[0].body.tools.map((item) => item.function.name).sort(),
-      ["bash", "glob", "grep", "read"],
-    )
-    assert.equal(requests[1].url, "/chat/completions")
-    assert.equal(requests[1].body.model, "deepseek-v4-pro")
-    assert.equal(requests[1].body.tool_choice, undefined)
-    assert.ok(!requests[1].body.tools || requests[1].body.tools.length === 0)
-    assert.match(
-      JSON.stringify(requests[1].body.messages),
-      /VALIDATION_ERRORS_JSON/,
-    )
-    assert.ok(events.some((item) => item.event_type === "model.validation.failed"))
+    assert.deepEqual(toolNames(requests[0].body), ["StructuredOutput"])
     assert.ok(events.some((item) => item.event_type === "model.output.validated"))
     assert.ok(
       events.some(
         (item) =>
           item.event_type === "model.transport.selected" &&
-          item.data.request_mode === "prompt_async_poll",
+          item.data.request_mode === "prompt_sync",
       ),
     )
   } finally {
@@ -248,124 +70,85 @@ test("pro avoids required tool choice and retries text JSON through local valida
   }
 })
 
-test("pro can call the read tool and then return locally validated JSON", async () => {
+test("stable analyzer uses non-thinking tools, then an isolated finalizer", async () => {
   const requests = []
   let workspaceFile
   const api = createServer(async (request, response) => {
     const body = await readJSON(request)
     requests.push({ url: request.url, body })
-    response.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-    })
     if (requests.length === 1) {
-      response.write(
-        event({
-          id: "chatcmpl-pro-tool-1",
-          object: "chat.completion.chunk",
-          created: 1,
-          model: body.model,
-          choices: [
-            {
-              index: 0,
-              delta: {
-                role: "assistant",
-                tool_calls: [
-                  {
-                    index: 0,
-                    id: "call-read",
-                    type: "function",
-                    function: {
-                      name: "read",
-                      arguments: JSON.stringify({ filePath: workspaceFile }),
-                    },
-                  },
-                ],
-              },
-              finish_reason: null,
+      sendCompletion(response, body, {
+        id: "stable-read",
+        toolCalls: [
+          {
+            index: 0,
+            id: "call-read-stable",
+            type: "function",
+            function: {
+              name: "read",
+              arguments: JSON.stringify({ filePath: workspaceFile }),
             },
-          ],
-        }),
-      )
-      response.write(
-        event({
-          id: "chatcmpl-pro-tool-1",
-          object: "chat.completion.chunk",
-          created: 1,
-          model: body.model,
-          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-          usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
-        }),
-      )
-    } else {
-      // Keep the provider's second response slower than the worker poll
-      // interval. The worker must not mistake the first tool-call assistant
-      // message for the completed OpenCode turn.
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 750))
-      response.write(
-        event({
-          id: "chatcmpl-pro-tool-2",
-          object: "chat.completion.chunk",
-          created: 2,
-          model: body.model,
-          choices: [
-            {
-              index: 0,
-              delta: { role: "assistant", content: JSON.stringify(expected) },
-              finish_reason: null,
-            },
-          ],
-        }),
-      )
-      response.write(
-        event({
-          id: "chatcmpl-pro-tool-2",
-          object: "chat.completion.chunk",
-          created: 2,
-          model: body.model,
-          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-          usage: { prompt_tokens: 12, completion_tokens: 4, total_tokens: 16 },
-        }),
-      )
+          },
+        ],
+        finish: "tool_calls",
+      })
+      return
     }
-    response.end("data: [DONE]\n\n")
+    if (requests.length === 2) {
+      sendCompletion(response, body, {
+        id: "stable-memo",
+        content: "The inspected file contains exported provider evidence.",
+      })
+      return
+    }
+    sendCompletion(response, body, {
+      id: "stable-finalizer",
+      toolCalls: [structuredOutputCall(expected)],
+      finish: "tool_calls",
+    })
   })
   await listen(api)
   const address = api.address()
   assert(address && typeof address !== "string")
-
-  const root = await mkdtemp(join(tmpdir(), "apkscanner-opencode-pro-tool-test-"))
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-stable-test-"))
   workspaceFile = join(root, "evidence.txt")
   await writeFile(workspaceFile, "exported provider evidence")
   try {
-    const completed = await runWorker(root, {
-      schema_version: "1.0",
-      action: "investigate",
-      prompt: "Read evidence.txt, then return the required JSON object.",
-      developer_instructions: "Inspect only the supplied workspace. Return only JSON.",
-      model: "deepseek-v4-pro",
-      base_url: `http://127.0.0.1:${address.port}`,
-      tool_profile: "workspace_shell",
-      output_schema: {
-        type: "object",
-        properties: { answer: { type: "string" } },
-        required: ["answer"],
-        additionalProperties: false,
-      },
-      timeout_ms: 10_000,
-    })
+    const completed = await runWorker(
+      root,
+      investigationPayload({
+        baseURL: `http://127.0.0.1:${address.port}`,
+        profile: stableProfile(),
+        explorerPrompt: "Read evidence.txt and produce an evidence memo.",
+      }),
+    )
     assert.equal(completed.code, 0, completed.stderr)
     const { result, events } = parseWorkerOutput(completed.stdout)
     assert.deepEqual(result.result, expected)
-    assert.equal(requests.length, 2)
-    assert.equal(result.usage.calls, 2)
-    assert.equal(result.output_transport.model_calls.length, 1)
+    assert.equal(result.usage.calls, 3)
+    assert.equal(result.output_transport.profile, "stable_analyzer")
+    assert.equal(result.output_transport.model_calls.length, 2)
     assert.equal(
       result.output_transport.model_calls[0].usage.provider_calls,
       2,
     )
+    assert.equal(result.output_transport.model_calls[0].thinking_mode, "disabled")
+    assert.match(result.output_transport.explorer_memo, /exported provider evidence/)
+    assert.equal(requests.length, 3)
+    assert.equal(requests[0].body.thinking.type, "disabled")
+    assert.equal(requests[0].body.tool_choice, "auto")
+    assert.deepEqual(toolNames(requests[0].body), ["bash", "glob", "grep", "read"])
+    assert.match(JSON.stringify(requests[0].body.messages), /analysis memo/)
+    assert.doesNotMatch(JSON.stringify(requests[0].body.messages), /requested structured contract/)
     assert.match(JSON.stringify(requests[1].body.messages), /exported provider evidence/)
+    assert.equal(requests[2].body.thinking.type, "disabled")
+    assert.equal(requests[2].body.tool_choice, "required")
+    assert.deepEqual(toolNames(requests[2].body), ["StructuredOutput"])
+    assert.match(
+      JSON.stringify(requests[2].body.messages),
+      /required structured contract/,
+    )
+    assert.match(JSON.stringify(requests[2].body.messages), /EXPLORER_HANDOFF/)
     assert.ok(
       events.some(
         (item) =>
@@ -374,129 +157,179 @@ test("pro can call the read tool and then return locally validated JSON", async 
           item.data.input?.filePath === workspaceFile,
       ),
     )
-    assert.ok(
-      events.some((item) => item.event_type === "model.tool_loop.waiting"),
-    )
   } finally {
     api.close()
     await rm(root, { recursive: true, force: true })
   }
 })
 
-test("pro can run bash in its workspace and /tmp", async () => {
+test("workspace tools cannot read or shell-cat files outside workspace and /tmp", async () => {
   const requests = []
+  const secret = "APKS_TEST_EXTERNAL_BOUNDARY_SECRET"
+  const outsideRoot = await mkdtemp(
+    join(resolve("."), ".apkscanner-outside-boundary-"),
+  )
+  const outsideFile = join(outsideRoot, "secret.txt")
+  await writeFile(outsideFile, secret)
   const api = createServer(async (request, response) => {
     const body = await readJSON(request)
     requests.push({ url: request.url, body })
-    response.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-    })
     if (requests.length === 1) {
-      response.write(
-        event({
-          id: "chatcmpl-pro-bash-1",
-          object: "chat.completion.chunk",
-          created: 1,
-          model: body.model,
-          choices: [
-            {
-              index: 0,
-              delta: {
-                role: "assistant",
-                tool_calls: [
-                  {
-                    index: 0,
-                    id: "call-bash",
-                    type: "function",
-                    function: {
-                      name: "bash",
-                      arguments: JSON.stringify({
-                        command:
-                          "pwd && printf workspace-ok > ./agent-note.txt && printf tmp-ok > /tmp/agent-note.txt",
-                      }),
-                    },
-                  },
-                ],
-              },
-              finish_reason: null,
+      sendCompletion(response, body, {
+        id: "boundary-read",
+        toolCalls: [
+          {
+            index: 0,
+            id: "call-read-outside",
+            type: "function",
+            function: {
+              name: "read",
+              arguments: JSON.stringify({ filePath: outsideFile }),
             },
-          ],
-        }),
-      )
-      response.write(
-        event({
-          id: "chatcmpl-pro-bash-1",
-          object: "chat.completion.chunk",
-          created: 1,
-          model: body.model,
-          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-          usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 },
-        }),
-      )
-    } else {
-      response.write(
-        event({
-          id: "chatcmpl-pro-bash-2",
-          object: "chat.completion.chunk",
-          created: 2,
-          model: body.model,
-          choices: [
-            {
-              index: 0,
-              delta: { role: "assistant", content: JSON.stringify(expected) },
-              finish_reason: null,
-            },
-          ],
-        }),
-      )
-      response.write(
-        event({
-          id: "chatcmpl-pro-bash-2",
-          object: "chat.completion.chunk",
-          created: 2,
-          model: body.model,
-          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-          usage: { prompt_tokens: 12, completion_tokens: 4, total_tokens: 16 },
-        }),
-      )
+          },
+        ],
+        finish: "tool_calls",
+      })
+      return
     }
-    response.end("data: [DONE]\n\n")
+    if (requests.length === 2) {
+      sendCompletion(response, body, {
+        id: "boundary-bash",
+        toolCalls: [
+          {
+            index: 0,
+            id: "call-bash-outside",
+            type: "function",
+            function: {
+              name: "bash",
+              arguments: JSON.stringify({
+                command: `cat ${JSON.stringify(outsideFile)}`,
+                description: "Attempt an out-of-workspace read",
+              }),
+            },
+          },
+        ],
+        finish: "tool_calls",
+      })
+      return
+    }
+    if (requests.length === 3) {
+      sendCompletion(response, body, {
+        id: "boundary-memo",
+        content: "Both external file access attempts were denied.",
+      })
+      return
+    }
+    sendCompletion(response, body, {
+      id: "boundary-finalizer",
+      toolCalls: [structuredOutputCall(expected)],
+      finish: "tool_calls",
+    })
   })
   await listen(api)
   const address = api.address()
   assert(address && typeof address !== "string")
-
-  const root = await mkdtemp(join(tmpdir(), "apkscanner-opencode-pro-bash-test-"))
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-boundary-test-"))
   try {
-    const completed = await runWorker(root, {
-      schema_version: "1.0",
-      action: "investigate",
-      prompt: "Use bash for a bounded workspace check, then return the required JSON.",
-      developer_instructions: "Run shell commands only in the workspace or /tmp.",
-      model: "deepseek-v4-pro",
-      base_url: `http://127.0.0.1:${address.port}`,
-      tool_profile: "workspace_shell",
-      output_schema: {
-        type: "object",
-        properties: { answer: { type: "string" } },
-        required: ["answer"],
-        additionalProperties: false,
-      },
-      timeout_ms: 10_000,
-    })
+    const completed = await runWorker(
+      root,
+      investigationPayload({
+        baseURL: `http://127.0.0.1:${address.port}`,
+        profile: stableProfile(),
+        explorerPrompt: "Try the assigned checks, then report whether access was denied.",
+      }),
+    )
     assert.equal(completed.code, 0, completed.stderr)
     const { result, events } = parseWorkerOutput(completed.stdout)
     assert.deepEqual(result.result, expected)
-    assert.equal(requests.length, 2)
-    assert.match(JSON.stringify(requests[1].body.messages), new RegExp(root))
+    assert.equal(requests.length, 4)
+    const providerMessages = JSON.stringify(
+      requests.slice(1, 3).flatMap((item) => item.body.messages),
+    )
+    assert.doesNotMatch(providerMessages, new RegExp(secret))
+    assert.match(providerMessages, /denied|permission/i)
+    const toolEvents = events.filter(
+      (item) =>
+        item.event_type === "model.tool.completed" &&
+        ["read", "bash"].includes(item.data.tool) &&
+        item.data.status === "error",
+    )
+    assert.equal(toolEvents.length, 2)
+    assert.ok(toolEvents.every((item) => item.data.status === "error"))
+  } finally {
+    api.close()
+    await rm(root, { recursive: true, force: true })
+    await rm(outsideRoot, { recursive: true, force: true })
+  }
+})
+
+test("bash cannot read the provider API key while upstream authentication still works", async () => {
+  const requests = []
+  const authorizationHeaders = []
+  const api = createServer(async (request, response) => {
+    const body = await readJSON(request)
+    requests.push({ url: request.url, body })
+    authorizationHeaders.push(request.headers.authorization)
+    if (requests.length === 1) {
+      sendCompletion(response, body, {
+        id: "secret-environment-check",
+        toolCalls: [
+          {
+            index: 0,
+            id: "call-bash-secret-environment",
+            type: "function",
+            function: {
+              name: "bash",
+              arguments: JSON.stringify({
+                command: "env",
+                description: "Verify provider credentials are absent from the complete tool environment",
+              }),
+            },
+          },
+        ],
+        finish: "tool_calls",
+      })
+      return
+    }
+    if (requests.length === 2) {
+      sendCompletion(response, body, {
+        id: "secret-environment-memo",
+        content: "The provider key is absent from the Bash environment.",
+      })
+      return
+    }
+    sendCompletion(response, body, {
+      id: "secret-environment-finalizer",
+      toolCalls: [structuredOutputCall(expected)],
+      finish: "tool_calls",
+    })
+  })
+  await listen(api)
+  const address = api.address()
+  assert(address && typeof address !== "string")
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-secret-env-test-"))
+  try {
+    const completed = await runWorker(
+      root,
+      investigationPayload({
+        baseURL: `http://127.0.0.1:${address.port}`,
+        profile: stableProfile(),
+      }),
+    )
+    assert.equal(completed.code, 0, completed.stderr)
+    assert.doesNotMatch(completed.stdout, /integration-test-only/)
+    assert.doesNotMatch(completed.stderr, /integration-test-only/)
+    const { result } = parseWorkerOutput(completed.stdout)
+    assert.deepEqual(result.result, expected)
+    assert.equal(requests.length, 3)
+    const toolReplay = JSON.stringify(requests[1].body.messages)
+    assert.doesNotMatch(toolReplay, /integration-test-only/)
+    assert.doesNotMatch(toolReplay, /DEEPSEEK_API_KEY=/)
+    assert.doesNotMatch(toolReplay, /OPENCODE_CONFIG_CONTENT=/)
+    assert.doesNotMatch(toolReplay, /OPENCODE_SERVER_PASSWORD=/)
     assert.ok(
-      events.some(
-        (item) =>
-          item.event_type === "model.tool.completed" &&
-          item.data.tool === "bash" &&
-          item.data.input?.command?.includes("agent-note.txt"),
+      authorizationHeaders.every(
+        (value) => value === "Bearer integration-test-only",
       ),
     )
   } finally {
@@ -504,6 +337,452 @@ test("pro can run bash in its workspace and /tmp", async () => {
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test("thinking explorer omits tool_choice and replays reasoning_content", async () => {
+  const requests = []
+  let workspaceFile
+  const api = createServer(async (request, response) => {
+    const body = await readJSON(request)
+    requests.push({ url: request.url, body })
+    if (requests.length === 1) {
+      sendCompletion(response, body, {
+        id: "thinking-read",
+        reasoningContent: "I need to inspect the assigned evidence file.",
+        content: "",
+        toolCalls: [
+          {
+            index: 0,
+            id: "call-read-thinking",
+            type: "function",
+            function: {
+              name: "read",
+              arguments: JSON.stringify({ filePath: workspaceFile }),
+            },
+          },
+        ],
+        finish: "tool_calls",
+      })
+      return
+    }
+    if (requests.length === 2) {
+      // Keep the provider turn slower than one worker poll so the worker must
+      // wait through the intermediate tool-call message instead of treating it
+      // as the final memo.
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 750))
+      sendCompletion(response, body, {
+        id: "thinking-memo",
+        reasoningContent: "The tool result supports a bounded memo.",
+        content: "Evidence memo: exported provider evidence was inspected.",
+      })
+      return
+    }
+    sendCompletion(response, body, {
+      id: "thinking-finalizer",
+      toolCalls: [structuredOutputCall(expected)],
+      finish: "tool_calls",
+    })
+  })
+  await listen(api)
+  const address = api.address()
+  assert(address && typeof address !== "string")
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-thinking-test-"))
+  workspaceFile = join(root, "evidence.txt")
+  await writeFile(workspaceFile, "exported provider evidence")
+  try {
+    const completed = await runWorker(
+      root,
+      investigationPayload({
+        baseURL: `http://127.0.0.1:${address.port}`,
+        profile: thinkingProfile(),
+        explorerPrompt: "Read evidence.txt before producing the analysis memo.",
+      }),
+    )
+    assert.equal(completed.code, 0, completed.stderr)
+    const { result, events } = parseWorkerOutput(completed.stdout)
+    assert.deepEqual(result.result, expected)
+    assert.equal(result.usage.calls, 3)
+    assert.equal(
+      result.output_transport.profile,
+      "thinking_explorer_then_finalizer",
+    )
+    assert.equal(result.output_transport.stages[0].thinking_mode, "enabled")
+    assert.equal(result.output_transport.stages[0].wire_tool_choice, "omitted")
+    assert.equal(
+      result.output_transport.provider_wire_requests[0].received_tool_choice,
+      "auto",
+    )
+    assert.equal(
+      result.output_transport.provider_wire_requests[0].forwarded_tool_choice,
+      null,
+    )
+    assert.equal(
+      result.output_transport.provider_wire_requests[0].stripped_tool_choice,
+      true,
+    )
+    assert.equal(requests.length, 3)
+    assert.equal(requests[0].body.thinking.type, "enabled")
+    assert.equal(requests[0].body.reasoning_effort, "high")
+    assert.equal(requests[0].body.tool_choice, undefined)
+    assert.deepEqual(toolNames(requests[0].body), ["bash", "glob", "grep", "read"])
+    const replay = JSON.stringify(requests[1].body.messages)
+    assert.match(replay, /I need to inspect the assigned evidence file/)
+    assert.match(replay, /exported provider evidence/)
+    assert.equal(requests[1].body.tool_choice, undefined)
+    assert.equal(requests[2].body.thinking.type, "disabled")
+    assert.equal(requests[2].body.reasoning_effort, undefined)
+    assert.equal(requests[2].body.tool_choice, "required")
+    assert.deepEqual(toolNames(requests[2].body), ["StructuredOutput"])
+    assert.ok(events.some((item) => item.event_type === "model.tool_loop.waiting"))
+  } finally {
+    api.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("deep capability performs a real non-thinking provider probe", async () => {
+  const requests = []
+  const api = createServer(async (request, response) => {
+    const body = await readJSON(request)
+    requests.push({ url: request.url, body })
+    sendCompletion(response, body, {
+      id: "capability-probe",
+      toolCalls: [structuredOutputCall({ ok: true })],
+      finish: "tool_calls",
+    })
+  })
+  await listen(api)
+  const address = api.address()
+  assert(address && typeof address !== "string")
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-capability-test-"))
+  try {
+    const completed = await runWorker(root, {
+      schema_version: "1.0",
+      action: "capability",
+      model: "deepseek-v4-flash",
+      base_url: `http://127.0.0.1:${address.port}`,
+      timeout_ms: 10_000,
+      live_probe: true,
+      tool_profile: "workspace_shell",
+      execution_profile: finalizerProfile(),
+    })
+    assert.equal(completed.code, 0, completed.stderr)
+    const { result } = parseWorkerOutput(completed.stdout)
+    assert.equal(result.live_probe.ok, true)
+    assert.equal(result.live_probe.thinking_mode, "disabled")
+    assert.equal(result.max_steps, 100)
+    assert.equal(result.max_provider_requests, 120)
+    assert.equal(requests.length, 1)
+    assert.equal(requests[0].body.thinking.type, "disabled")
+    assert.equal(requests[0].body.tool_choice, "required")
+    assert.deepEqual(toolNames(requests[0].body), ["StructuredOutput"])
+  } finally {
+    api.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("provider authentication failures are returned as classified audit errors", async () => {
+  const api = createServer(async (request, response) => {
+    await readJSON(request)
+    response.writeHead(401, { "Content-Type": "application/json" })
+    response.end(
+      JSON.stringify({
+        error: {
+          message:
+            "Authentication Fails (no such user): integration-test-only",
+          type: "authentication_error",
+        },
+      }),
+    )
+  })
+  await listen(api)
+  const address = api.address()
+  assert(address && typeof address !== "string")
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-provider-error-test-"))
+  try {
+    const completed = await runWorker(
+      root,
+      investigationPayload({
+        baseURL: `http://127.0.0.1:${address.port}`,
+        profile: finalizerProfile(),
+      }),
+    )
+    assert.equal(completed.code, 0, completed.stderr)
+    assert.doesNotMatch(completed.stdout, /integration-test-only/)
+    assert.doesNotMatch(completed.stderr, /integration-test-only/)
+    const { result } = parseWorkerOutput(completed.stdout)
+    assert.equal(result.error.type, "authentication_error")
+    assert.equal(result.error.status_code, 401)
+    assert.equal(result.error.retryable, false)
+    assert.match(result.error.message, /Authentication Fails/)
+    assert.match(result.error.message, /\[redacted\]/)
+    assert.equal(
+      result.output_transport.provider_wire_requests[0].status_code,
+      401,
+    )
+  } finally {
+    api.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("semantic validation rejects inconclusive risk ratings and retries independently", async () => {
+  const requests = []
+  const semanticSchema = {
+    type: "object",
+    properties: {
+      result: {
+        type: "string",
+        enum: ["inconclusive", "supported_static"],
+      },
+      severity_proposal: {
+        type: "string",
+        enum: ["high", "info"],
+      },
+      confidence: {
+        type: "string",
+        enum: ["high", "low"],
+      },
+      evidence_ids: {
+        type: "array",
+        items: { type: "string" },
+      },
+      requested_tests: {
+        type: "array",
+        items: { type: "object" },
+      },
+    },
+    required: [
+      "result",
+      "severity_proposal",
+      "confidence",
+      "evidence_ids",
+      "requested_tests",
+    ],
+    additionalProperties: false,
+  }
+  const invalid = {
+    result: "inconclusive",
+    severity_proposal: "high",
+    confidence: "high",
+    evidence_ids: [],
+    requested_tests: [],
+  }
+  const corrected = {
+    ...invalid,
+    severity_proposal: "info",
+    confidence: "low",
+  }
+  const api = createServer(async (request, response) => {
+    const body = await readJSON(request)
+    requests.push({ url: request.url, body })
+    sendCompletion(response, body, {
+      id: `semantic-${requests.length}`,
+      toolCalls: [
+        structuredOutputCall(requests.length === 1 ? invalid : corrected),
+      ],
+      finish: "tool_calls",
+    })
+  })
+  await listen(api)
+  const address = api.address()
+  assert(address && typeof address !== "string")
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-semantic-test-"))
+  try {
+    const completed = await runWorker(
+      root,
+      investigationPayload({
+        baseURL: `http://127.0.0.1:${address.port}`,
+        profile: finalizerProfile(),
+        phase: "final_evaluation",
+        outputSchema: semanticSchema,
+      }),
+    )
+    assert.equal(completed.code, 0, completed.stderr)
+    const { result, events } = parseWorkerOutput(completed.stdout)
+    assert.deepEqual(result.result, corrected)
+    assert.equal(requests.length, 2)
+    assert.equal(result.output_transport.model_calls.length, 2)
+    assert.equal(result.output_transport.model_calls[0].accepted, false)
+    assert.equal(result.output_transport.model_calls[1].accepted, true)
+    assert.deepEqual(
+      result.output_transport.model_calls[0].validation_errors.map(
+        (item) => item.instance_path,
+      ),
+      ["/severity_proposal", "/confidence"],
+    )
+    assert.match(
+      JSON.stringify(requests[1].body.messages),
+      /apkscannerSemantic/,
+    )
+    assert.ok(events.some((item) => item.event_type === "model.validation.failed"))
+  } finally {
+    api.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+function investigationPayload({
+  baseURL,
+  profile,
+  explorerPrompt,
+  phase = "test_planning",
+  outputSchema = resultSchema,
+}) {
+  return {
+    schema_version: "1.0",
+    action: "investigate",
+    prompt: "Return the bounded structured result.",
+    explorer_prompt: explorerPrompt ?? "Produce a bounded evidence memo.",
+    developer_instructions: "Return only through the required structured contract.",
+    explorer_instructions: "Use workspace tools as needed and return only an analysis memo.",
+    model: "deepseek-v4-flash",
+    base_url: baseURL,
+    phase,
+    tool_profile: "workspace_shell",
+    output_schema: outputSchema,
+    execution_profile: profile,
+    timeout_ms: 15_000,
+  }
+}
+
+function stableProfile() {
+  return {
+    name: "stable_analyzer",
+    output_mode: "analyze_then_finalize",
+    stages: [
+      {
+        name: "analyzer",
+        thinking_mode: "disabled",
+        reasoning_effort: null,
+        output_mode: "text",
+        workspace_tools: true,
+        wire_tool_choice: "auto",
+      },
+      {
+        name: "finalizer",
+        thinking_mode: "disabled",
+        reasoning_effort: null,
+        output_mode: "structured_output_tool",
+        workspace_tools: false,
+        wire_tool_choice: "required",
+      },
+    ],
+  }
+}
+
+function thinkingProfile() {
+  return {
+    name: "thinking_explorer_then_finalizer",
+    output_mode: "explore_then_finalize",
+    stages: [
+      {
+        name: "explorer",
+        thinking_mode: "enabled",
+        reasoning_effort: "high",
+        output_mode: "text",
+        workspace_tools: true,
+        wire_tool_choice: "omitted",
+      },
+      {
+        name: "finalizer",
+        thinking_mode: "disabled",
+        reasoning_effort: null,
+        output_mode: "structured_output_tool",
+        workspace_tools: false,
+        wire_tool_choice: "required",
+      },
+    ],
+  }
+}
+
+function finalizerProfile() {
+  return {
+    name: "structured_finalizer",
+    output_mode: "structured_output_tool",
+    stages: [
+      {
+        name: "finalizer",
+        thinking_mode: "disabled",
+        reasoning_effort: null,
+        output_mode: "structured_output_tool",
+        workspace_tools: false,
+        wire_tool_choice: "required",
+      },
+    ],
+  }
+}
+
+function structuredOutputCall(value) {
+  return {
+    index: 0,
+    id: `call-structured-${Math.random().toString(16).slice(2)}`,
+    type: "function",
+    function: {
+      name: "StructuredOutput",
+      arguments: JSON.stringify(value),
+    },
+  }
+}
+
+function sendCompletion(
+  response,
+  body,
+  {
+    id,
+    content,
+    reasoningContent,
+    toolCalls,
+    finish = "stop",
+  },
+) {
+  response.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  })
+  response.write(
+    event({
+      id: `chatcmpl-${id}`,
+      object: "chat.completion.chunk",
+      created: 1,
+      model: body.model,
+      choices: [
+        {
+          index: 0,
+          delta: {
+            role: "assistant",
+            ...(content !== undefined ? { content } : {}),
+            ...(reasoningContent !== undefined
+              ? { reasoning_content: reasoningContent }
+              : {}),
+            ...(toolCalls ? { tool_calls: toolCalls } : {}),
+          },
+          finish_reason: null,
+        },
+      ],
+    }),
+  )
+  response.write(
+    event({
+      id: `chatcmpl-${id}`,
+      object: "chat.completion.chunk",
+      created: 1,
+      model: body.model,
+      choices: [{ index: 0, delta: {}, finish_reason: finish }],
+      usage: {
+        prompt_tokens: 12,
+        completion_tokens: 4,
+        total_tokens: 16,
+      },
+    }),
+  )
+  response.end("data: [DONE]\n\n")
+}
+
+function toolNames(body) {
+  return (body.tools ?? []).map((item) => item.function.name).sort()
+}
 
 function runWorker(root, payload) {
   return new Promise((resolvePromise, reject) => {
@@ -530,7 +809,7 @@ function runWorker(root, payload) {
     const timeout = setTimeout(() => {
       worker.kill("SIGKILL")
       reject(new Error("OpenCode integration worker timed out"))
-    }, 20_000)
+    }, 30_000)
     worker.stdout.setEncoding("utf8")
     worker.stderr.setEncoding("utf8")
     worker.stdout.on("data", (chunk) => {

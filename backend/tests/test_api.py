@@ -524,7 +524,7 @@ def test_ai_calls_are_exposed_as_integrity_checked_audit_records(settings) -> No
         assert download.status_code == 409
 
 
-def test_opencode_pro_audit_records_toolless_json_transport(settings) -> None:  # noqa: ANN001
+def test_opencode_audit_records_explicit_phase_execution_profile(settings) -> None:  # noqa: ANN001
     settings = replace(settings, opencode_model="deepseek-v4-pro")
     app = create_app(settings)
     orchestrator = app.state.orchestrator
@@ -566,17 +566,30 @@ def test_opencode_pro_audit_records_toolless_json_transport(settings) -> None:  
         capability={"version": "1.18.4"},
     )
     transport = {
-        "mode": "prompted_json",
-        "format": "text",
-        "tool_choice": "omitted",
-        "tools": [],
+        "mode": "analyze_then_finalize",
+        "profile": "stable_analyzer",
+        "format": "json_schema",
+        "request_mode": "async_analysis_then_sync_finalize",
+        "stages": [
+            {
+                "name": "analyzer",
+                "thinking_mode": "disabled",
+                "wire_tool_choice": "auto",
+            },
+            {
+                "name": "finalizer",
+                "thinking_mode": "disabled",
+                "wire_tool_choice": "required",
+            },
+        ],
         "schema_validator": "ajv@8.20.0",
-        "retry_count": 2,
+        "structured_retry_count": 2,
         "model_calls": [
             {
+                "stage": "analyzer",
                 "attempt": 1,
                 "prompt": "exact model prompt",
-                "response_text": '{"result":"inconclusive"}',
+                "response_text": "evidence memo",
                 "accepted": True,
             }
         ],
@@ -614,8 +627,21 @@ def test_opencode_pro_audit_records_toolless_json_transport(settings) -> None:  
         assert response.status_code == 200
         audit = response.json()[0]
         request = audit["artifacts"]["request"]["content"]
-        assert request["runtime_options"]["output_mode"] == "prompted_json"
+        assert request["runtime_options"]["output_mode"] == "analyze_then_finalize"
+        assert (
+            request["runtime_options"]["execution_profile"]["name"]
+            == "stable_analyzer"
+        )
+        assert (
+            request["runtime_options"]["execution_profile"]["stages"][0][
+                "thinking_mode"
+            ]
+            == "disabled"
+        )
         assert request["runtime_options"]["schema_validator"] == "ajv@8.20.0"
+        assert request["runtime_options"]["semantic_validator"] == "apkscanner@1.0"
+        assert request["runtime_options"]["max_agent_steps"] == 100
+        assert request["runtime_options"]["max_provider_requests"] == 120
         assert request["tool_boundary"]["model_tools_enabled"] is True
         assert request["tool_boundary"]["workspace_tool_profile"] == "workspace_shell"
         assert request["tool_boundary"]["workspace_tools"] == [
@@ -633,8 +659,9 @@ def test_opencode_pro_audit_records_toolless_json_transport(settings) -> None:  
         ]
         assert request["tool_boundary"]["shared_scan_workspace_exposed"] is False
         assert request["tool_boundary"]["adb_enabled"] is False
-        assert request["tool_boundary"]["structured_output_tool_enabled"] is False
-        assert "DEEPSEEK_THINKING_OUTPUT_ADAPTER" in request["prompt"]
+        assert request["tool_boundary"]["structured_output_tool_enabled"] is True
+        assert "DEEPSEEK_THINKING_OUTPUT_ADAPTER" not in request["prompt"]
+        assert "analysis memo" in request["explorer_prompt"]
         recorded_transport = audit["artifacts"]["response"]["content"][
             "output_transport"
         ]

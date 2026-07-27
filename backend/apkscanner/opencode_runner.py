@@ -31,18 +31,139 @@ OPENCODE_SDK_VERSION = "1.18.4"
 OPENCODE_CLI_VERSION = "1.18.4"
 AJV_VERSION = "8.20.0"
 OPENCODE_PROVIDER = "deepseek"
-OPENCODE_OUTPUT_MODE_PROMPTED_JSON = "prompted_json"
 OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL = "structured_output_tool"
+OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE = "analyze_then_finalize"
+OPENCODE_OUTPUT_MODE_EXPLORE_THEN_FINALIZE = "explore_then_finalize"
 OPENCODE_TOOL_PROFILE = "workspace_shell"
 OPENCODE_WORKSPACE_TOOLS = ("read", "glob", "grep", "bash")
 OPENCODE_MAX_STEPS = 100
+OPENCODE_MAX_PROVIDER_REQUESTS = OPENCODE_MAX_STEPS + 20
+OPENCODE_PROFILE_STABLE_ANALYZER = "stable_analyzer"
+OPENCODE_PROFILE_THINKING_EXPLORER = "thinking_explorer_then_finalizer"
+OPENCODE_PROFILE_STRUCTURED_FINALIZER = "structured_finalizer"
+OPENCODE_THINKING_PHASES = frozenset(
+    {"test_planning", "adversarial_review", "exploration_round"}
+)
+OPENCODE_FINALIZER_PHASES = frozenset({"final_evaluation", "recovery_evaluation"})
 
 
-def opencode_output_mode(model: str) -> str:
-    normalized = model.strip().lower()
-    if re.fullmatch(r"deepseek-v4-pro(?:[-._].*)?", normalized):
-        return OPENCODE_OUTPUT_MODE_PROMPTED_JSON
-    return OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
+@dataclass(frozen=True, slots=True)
+class OpenCodeExecutionStage:
+    name: str
+    thinking_mode: str
+    output_mode: str
+    workspace_tools: bool
+    reasoning_effort: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OpenCodeExecutionProfile:
+    name: str
+    output_mode: str
+    stages: tuple[OpenCodeExecutionStage, ...]
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "output_mode": self.output_mode,
+            "stages": [
+                {
+                    "name": stage.name,
+                    "thinking_mode": stage.thinking_mode,
+                    "reasoning_effort": stage.reasoning_effort,
+                    "output_mode": stage.output_mode,
+                    "workspace_tools": stage.workspace_tools,
+                    "wire_tool_choice": (
+                        "required"
+                        if stage.output_mode == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
+                        else (
+                            "omitted"
+                            if stage.thinking_mode == "enabled"
+                            else "auto"
+                        )
+                    ),
+                }
+                for stage in self.stages
+            ],
+        }
+
+
+def opencode_execution_profile(
+    phase: str | None,
+    *,
+    reasoning_effort: str = "high",
+) -> OpenCodeExecutionProfile:
+    normalized = (phase or "").strip().lower()
+    if normalized in OPENCODE_THINKING_PHASES:
+        return OpenCodeExecutionProfile(
+            name=OPENCODE_PROFILE_THINKING_EXPLORER,
+            output_mode=OPENCODE_OUTPUT_MODE_EXPLORE_THEN_FINALIZE,
+            stages=(
+                OpenCodeExecutionStage(
+                    name="explorer",
+                    thinking_mode="enabled",
+                    reasoning_effort=reasoning_effort,
+                    output_mode="text",
+                    workspace_tools=True,
+                ),
+                OpenCodeExecutionStage(
+                    name="finalizer",
+                    thinking_mode="disabled",
+                    reasoning_effort=None,
+                    output_mode=OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
+                    workspace_tools=False,
+                ),
+            ),
+        )
+    if normalized in OPENCODE_FINALIZER_PHASES:
+        return OpenCodeExecutionProfile(
+            name=OPENCODE_PROFILE_STRUCTURED_FINALIZER,
+            output_mode=OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
+            stages=(
+                OpenCodeExecutionStage(
+                    name="finalizer",
+                    thinking_mode="disabled",
+                    reasoning_effort=None,
+                    output_mode=OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
+                    workspace_tools=False,
+                ),
+            ),
+        )
+    return OpenCodeExecutionProfile(
+        name=OPENCODE_PROFILE_STABLE_ANALYZER,
+        output_mode=OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE,
+        stages=(
+            OpenCodeExecutionStage(
+                name="analyzer",
+                thinking_mode="disabled",
+                reasoning_effort=None,
+                output_mode="text",
+                workspace_tools=True,
+            ),
+            OpenCodeExecutionStage(
+                name="finalizer",
+                thinking_mode="disabled",
+                reasoning_effort=None,
+                output_mode=OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
+                workspace_tools=False,
+            ),
+        ),
+    )
+
+
+def opencode_output_mode(
+    model: str | None = None,
+    *,
+    phase: str | None = None,
+    reasoning_effort: str = "high",
+) -> str:
+    # ``model`` is retained for API compatibility, but execution semantics are
+    # deliberately selected by phase rather than inferred from a model name.
+    del model
+    return opencode_execution_profile(
+        phase,
+        reasoning_effort=reasoning_effort,
+    ).output_mode
 
 
 def opencode_prompt_for_model(
@@ -51,63 +172,10 @@ def opencode_prompt_for_model(
     model: str,
     output_schema: dict[str, Any],
 ) -> str:
-    if opencode_output_mode(model) != OPENCODE_OUTPUT_MODE_PROMPTED_JSON:
-        return prompt
-    example = _json_schema_example(output_schema)
-    return (
-        f"{prompt}\n\n"
-        "DEEPSEEK_THINKING_OUTPUT_ADAPTER:\n"
-        "Use the permitted workspace tools as needed to investigate before answering. "
-        "After tool exploration is complete, the final assistant answer must be exactly one "
-        "JSON object as plain text, without Markdown fences or commentary. The object must "
-        "validate against OUTPUT_JSON_SCHEMA. All required keys must be present and no "
-        "undeclared top-level keys are allowed.\n\n"
-        "OUTPUT_JSON_SCHEMA:\n"
-        f"{json.dumps(output_schema, ensure_ascii=False, indent=2)}\n\n"
-        "MINIMAL_JSON_EXAMPLE:\n"
-        f"{json.dumps(example, ensure_ascii=False, indent=2)}"
-    )
-
-
-def _json_schema_example(schema: dict[str, Any]) -> Any:
-    if "const" in schema:
-        return schema["const"]
-    if "default" in schema:
-        return schema["default"]
-    enum = schema.get("enum")
-    if isinstance(enum, list) and enum:
-        return enum[0]
-    variants = schema.get("anyOf") or schema.get("oneOf")
-    if isinstance(variants, list):
-        candidate = next(
-            (
-                item
-                for item in variants
-                if isinstance(item, dict) and item.get("type") != "null"
-            ),
-            variants[0] if variants else {},
-        )
-        return _json_schema_example(candidate) if isinstance(candidate, dict) else None
-    schema_type = schema.get("type")
-    if schema_type == "object":
-        properties = schema.get("properties")
-        required = schema.get("required")
-        if not isinstance(properties, dict) or not isinstance(required, list):
-            return {}
-        return {
-            key: _json_schema_example(properties[key])
-            for key in required
-            if key in properties and isinstance(properties[key], dict)
-        }
-    if schema_type == "array":
-        return []
-    if schema_type == "string":
-        return "string"
-    if schema_type in {"integer", "number"}:
-        return 0
-    if schema_type == "boolean":
-        return False
-    return None
+    # Compatibility wrapper for older audit readers. V4 output transport is now
+    # selected explicitly and no model receives a schema pasted into its prompt.
+    del model, output_schema
+    return prompt
 
 
 @dataclass(slots=True)
@@ -137,16 +205,27 @@ class OpenCodeInvestigator:
         self._capability_lock = threading.Lock()
 
     def capability(self, *, deep: bool = False) -> dict[str, Any]:
+        default_profile = opencode_execution_profile(
+            "static_only",
+            reasoning_effort=self.settings.opencode_reasoning_effort,
+        )
         capability: dict[str, Any] = {
             "available": True,
             "version": OPENCODE_SDK_VERSION,
             "provider": OPENCODE_PROVIDER,
             "model": self.settings.opencode_model,
             "isolation": self.settings.opencode_isolation,
-            "output_mode": opencode_output_mode(self.settings.opencode_model),
+            "output_mode": default_profile.output_mode,
+            "execution_profile": default_profile.as_payload(),
+            "execution_profiles": [
+                OPENCODE_PROFILE_STABLE_ANALYZER,
+                OPENCODE_PROFILE_THINKING_EXPLORER,
+                OPENCODE_PROFILE_STRUCTURED_FINALIZER,
+            ],
             "tool_profile": OPENCODE_TOOL_PROFILE,
             "workspace_tools": list(OPENCODE_WORKSPACE_TOOLS),
             "max_steps": OPENCODE_MAX_STEPS,
+            "max_provider_requests": OPENCODE_MAX_PROVIDER_REQUESTS,
         }
         detail = self._configuration_error()
         if detail:
@@ -168,6 +247,9 @@ class OpenCodeInvestigator:
                         "model": self.settings.opencode_model,
                         "base_url": self.settings.deepseek_base_url,
                         "timeout_ms": 30_000,
+                        "live_probe": True,
+                        "tool_profile": OPENCODE_TOOL_PROFILE,
+                        "execution_profile": default_profile.as_payload(),
                     },
                     timeout_seconds=45,
                 )
@@ -177,9 +259,15 @@ class OpenCodeInvestigator:
                 capability["output_mode"] = str(
                     probe.get(
                         "output_mode",
-                        opencode_output_mode(self.settings.opencode_model),
+                        default_profile.output_mode,
                     )
                 )
+                live_probe = probe.get("live_probe")
+                if not isinstance(live_probe, dict) or live_probe.get("ok") is not True:
+                    capability["available"] = False
+                    capability["detail"] = "OpenCode live DeepSeek probe did not complete"
+                else:
+                    capability["live_probe"] = live_probe
                 capability["tool_profile"] = str(
                     probe.get("tool_profile", OPENCODE_TOOL_PROFILE)
                 )
@@ -190,7 +278,16 @@ class OpenCodeInvestigator:
                 capability["max_steps"] = int(
                     probe.get("max_steps", OPENCODE_MAX_STEPS)
                 )
-                if self.settings.opencode_model not in models:
+                capability["max_provider_requests"] = int(
+                    probe.get(
+                        "max_provider_requests",
+                        OPENCODE_MAX_PROVIDER_REQUESTS,
+                    )
+                )
+                if (
+                    capability.get("available")
+                    and self.settings.opencode_model not in models
+                ):
                     capability["available"] = False
                     capability["detail"] = (
                         f"DeepSeek model {self.settings.opencode_model!r} is not exposed by OpenCode"
@@ -225,32 +322,55 @@ class OpenCodeInvestigator:
             if timeout_seconds is None
             else timeout_seconds
         )
+        context = platform_context or {}
+        phase = str(context.get("phase") or "static_only")
+        execution_profile = opencode_execution_profile(
+            phase,
+            reasoning_effort=self.settings.opencode_reasoning_effort,
+        )
         payload = {
             "schema_version": "1.0",
             "action": "investigate",
-            "prompt": opencode_prompt_for_model(
-                investigation_prompt(
-                    scan,
-                    task,
-                    entries,
-                    evidence,
-                    platform_context or {},
-                    direct_tool_access=True,
-                    shell_access=True,
-                    workspace_write=True,
-                ),
-                model=self.settings.opencode_model,
-                output_schema=AGENT_RESULT_JSON_SCHEMA,
+            "prompt": investigation_prompt(
+                scan,
+                task,
+                entries,
+                evidence,
+                context,
+                direct_tool_access=True,
+                shell_access=True,
+                workspace_write=True,
+                response_contract="structured_result",
+            ),
+            "explorer_prompt": investigation_prompt(
+                scan,
+                task,
+                entries,
+                evidence,
+                context,
+                direct_tool_access=True,
+                shell_access=True,
+                workspace_write=True,
+                response_contract="analysis_memo",
             ),
             "developer_instructions": developer_instructions(
                 direct_tool_access=True,
                 shell_access=True,
                 workspace_write=True,
+                response_contract="structured_result",
+            ),
+            "explorer_instructions": developer_instructions(
+                direct_tool_access=True,
+                shell_access=True,
+                workspace_write=True,
+                response_contract="analysis_memo",
             ),
             "model": self.settings.opencode_model,
             "base_url": self.settings.deepseek_base_url,
+            "phase": phase,
             "output_schema": AGENT_RESULT_JSON_SCHEMA,
             "tool_profile": OPENCODE_TOOL_PROFILE,
+            "execution_profile": execution_profile.as_payload(),
             "timeout_ms": max(1, timeout) * 1000,
         }
         response = self._invoke_investigation_with_retry(
@@ -297,6 +417,7 @@ class OpenCodeInvestigator:
         deadline = time.monotonic() + max(timeout_seconds, 0)
         transport_attempt = 1
         attempt_timeout = max(timeout_seconds, 0)
+        retry_history: list[dict[str, Any]] = []
         while True:
             attempt_payload = {
                 **payload,
@@ -327,6 +448,13 @@ class OpenCodeInvestigator:
                     or not self._retryable_transport_failure(exc)
                 ):
                     raise
+                retry_history.append(
+                    {
+                        "attempt": transport_attempt,
+                        "kind": "worker_transport_exception",
+                        "error": str(exc)[:4000],
+                    }
+                )
                 transport_attempt += 1
                 attempt_timeout = remaining
                 with suppress(Exception):
@@ -342,8 +470,43 @@ class OpenCodeInvestigator:
                     )
                 continue
 
+            remaining = int(deadline - time.monotonic())
+            if (
+                response.get("error")
+                and transport_attempt < 2
+                and remaining > 0
+                and self._retryable_worker_response(response)
+            ):
+                retry_history.append(
+                    {
+                        "attempt": transport_attempt,
+                        "kind": "retryable_worker_response",
+                        "error": response.get("error"),
+                        "thread_id": response.get("thread_id"),
+                        "turn_id": response.get("turn_id"),
+                        "usage": response.get("usage") or {},
+                        "output_transport": response.get("output_transport") or {},
+                    }
+                )
+                transport_attempt += 1
+                attempt_timeout = remaining
+                with suppress(Exception):
+                    emit_agent_event(
+                        event_callback,
+                        "model.worker.retry",
+                        "DeepSeek 可重试调用失败，正在用剩余任务预算重建会话",
+                        {
+                            "attempt": transport_attempt,
+                            "remaining_seconds": remaining,
+                            "error": response.get("error"),
+                        },
+                    )
+                continue
+
             transport = dict(response.get("output_transport") or {})
             transport["worker_transport_attempts"] = transport_attempt
+            if retry_history:
+                transport["worker_retry_history"] = retry_history
             response["output_transport"] = transport
             return response
 
@@ -363,11 +526,38 @@ class OpenCodeInvestigator:
             )
         )
 
+    @classmethod
+    def _retryable_worker_response(cls, response: dict[str, Any]) -> bool:
+        error = response.get("error")
+        if isinstance(error, dict):
+            if error.get("retryable") is True:
+                return True
+            if error.get("type") in {
+                "provider_unavailable",
+                "provider_proxy_error",
+                "transport_error",
+            }:
+                return True
+            message = str(error.get("message") or "")
+        else:
+            message = str(error or "")
+        return cls._retryable_transport_failure(RuntimeError(message))
+
     def _configuration_error(self) -> str | None:
         if self.settings.opencode_isolation not in {"host", "docker"}:
             return "APKSCANNER_OPENCODE_ISOLATION must be host or docker"
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", self.settings.opencode_model):
             return "APKSCANNER_OPENCODE_MODEL contains unsupported characters"
+        if self.settings.opencode_model.lower() in {
+            "deepseek-chat",
+            "deepseek-reasoner",
+        }:
+            return (
+                "deepseek-chat and deepseek-reasoner are retired; use "
+                "deepseek-v4-flash or deepseek-v4-pro"
+            )
+        if self.settings.opencode_reasoning_effort not in {"high", "max"}:
+            return "APKSCANNER_OPENCODE_REASONING_EFFORT must be high or max"
         if self.settings.deepseek_base_url:
             parsed = urlsplit(self.settings.deepseek_base_url)
             if (
@@ -388,6 +578,14 @@ class OpenCodeInvestigator:
                 "::1",
             }:
                 return "plain HTTP DeepSeek gateways are allowed only on loopback"
+            if (
+                parsed.hostname in {"api.deepseek.com", "api.deepseek.com.cn"}
+                and parsed.path.rstrip("/") not in {"", "/"}
+            ):
+                return (
+                    "the official DeepSeek base URL must not append /v1 or another path; "
+                    "use https://api.deepseek.com"
+                )
         api_key = os.getenv("DEEPSEEK_API_KEY")
         if not api_key or not api_key.strip():
             return "DEEPSEEK_API_KEY is not configured"
@@ -457,6 +655,17 @@ class OpenCodeInvestigator:
                 "available": False,
                 "detail": "the pinned OpenCode CLI executable is missing or not executable",
             }
+        for helper in ("adb", "bash"):
+            helper_path = self.worker_dir / "bin" / helper
+            if not helper_path.is_file() or not os.access(helper_path, os.X_OK):
+                return {
+                    **capability,
+                    "available": False,
+                    "detail": (
+                        f"the OpenCode {helper} boundary helper is missing or not executable: "
+                        f"{helper_path}"
+                    ),
+                }
         return capability
 
     def _docker_capability(self, capability: dict[str, Any]) -> dict[str, Any]:
@@ -503,7 +712,7 @@ class OpenCodeInvestigator:
                 "available": False,
                 "detail": f"build the OpenCode worker image first: {image}",
             }
-        expected = f"{OPENCODE_SDK_VERSION}|{OPENCODE_CLI_VERSION}|{AJV_VERSION}|4"
+        expected = f"{OPENCODE_SDK_VERSION}|{OPENCODE_CLI_VERSION}|{AJV_VERSION}|5"
         if inspected.stdout.strip() != expected:
             return {
                 **capability,

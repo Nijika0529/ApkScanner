@@ -40,14 +40,13 @@ from .models import (
 )
 from .opencode_runner import (
     AJV_VERSION,
+    OPENCODE_MAX_PROVIDER_REQUESTS,
     OPENCODE_MAX_STEPS,
-    OPENCODE_OUTPUT_MODE_PROMPTED_JSON,
     OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
     OPENCODE_TOOL_PROFILE,
     OPENCODE_WORKSPACE_TOOLS,
     OpenCodeInvestigator,
-    opencode_output_mode,
-    opencode_prompt_for_model,
+    opencode_execution_profile,
 )
 from .planner import InvestigationPlanner
 from .repository import add_event, now
@@ -2473,7 +2472,19 @@ class ScanOrchestrator:
             if backend == "codex"
             else self.settings.opencode_model
         )
-        output_mode = opencode_output_mode(model) if backend == "opencode" else "json_schema"
+        execution_profile = (
+            opencode_execution_profile(
+                phase,
+                reasoning_effort=self.settings.opencode_reasoning_effort,
+            )
+            if backend == "opencode"
+            else None
+        )
+        output_mode = (
+            execution_profile.output_mode
+            if execution_profile is not None
+            else "json_schema"
+        )
         isolation = (
             self.settings.codex_isolation
             if backend == "codex"
@@ -2499,12 +2510,6 @@ class ScanOrchestrator:
             shell_access=shell_access,
             workspace_write=workspace_write,
         )
-        if backend == "opencode":
-            prompt = opencode_prompt_for_model(
-                prompt,
-                model=model,
-                output_schema=AGENT_RESULT_JSON_SCHEMA,
-            )
         request = {
             "schema_version": "1.0",
             "backend": backend,
@@ -2526,6 +2531,35 @@ class ScanOrchestrator:
                 workspace_write=workspace_write,
             ),
             "prompt": prompt,
+            "explorer_instructions": (
+                developer_instructions(
+                    direct_tool_access=True,
+                    shell_access=True,
+                    workspace_write=True,
+                    response_contract="analysis_memo",
+                )
+                if backend == "opencode"
+                and execution_profile is not None
+                and any(stage.output_mode == "text" for stage in execution_profile.stages)
+                else None
+            ),
+            "explorer_prompt": (
+                investigation_prompt(
+                    scan,
+                    task,
+                    entries,
+                    evidence,
+                    platform_context,
+                    direct_tool_access=True,
+                    shell_access=True,
+                    workspace_write=True,
+                    response_contract="analysis_memo",
+                )
+                if backend == "opencode"
+                and execution_profile is not None
+                and any(stage.output_mode == "text" for stage in execution_profile.stages)
+                else None
+            ),
             "output_schema": AGENT_RESULT_JSON_SCHEMA,
             "tool_boundary": {
                 "direct_tool_access": direct_tool_access,
@@ -2555,32 +2589,54 @@ class ScanOrchestrator:
                 "subagents_enabled": False,
                 "structured_output_tool_enabled": (
                     backend == "opencode"
-                    and output_mode == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
+                    and execution_profile is not None
+                    and any(
+                        stage.output_mode == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
+                        for stage in execution_profile.stages
+                    )
                 ),
                 "platform_executes_requested_tests": True,
             },
             "runtime_options": {
-                "reasoning_effort": "medium" if backend == "codex" else "provider_default",
+                "reasoning_effort": (
+                    "medium"
+                    if backend == "codex"
+                    else self.settings.opencode_reasoning_effort
+                ),
                 "output_mode": output_mode,
+                "execution_profile": (
+                    execution_profile.as_payload()
+                    if execution_profile is not None
+                    else None
+                ),
                 "max_agent_steps": (
                     OPENCODE_MAX_STEPS if backend == "opencode" else None
+                ),
+                "max_provider_requests": (
+                    OPENCODE_MAX_PROVIDER_REQUESTS
+                    if backend == "opencode"
+                    else None
                 ),
                 "structured_output_retries": (
                     2
                     if backend == "opencode"
-                    and output_mode == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
-                    else None
-                ),
-                "prompted_json_retries": (
-                    2
-                    if backend == "opencode"
-                    and output_mode == OPENCODE_OUTPUT_MODE_PROMPTED_JSON
+                    and execution_profile is not None
+                    and any(
+                        stage.output_mode == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
+                        for stage in execution_profile.stages
+                    )
                     else None
                 ),
                 "schema_validator": (
                     f"ajv@{AJV_VERSION}"
                     if backend == "opencode"
-                    and output_mode == OPENCODE_OUTPUT_MODE_PROMPTED_JSON
+                    and execution_profile is not None
+                    else None
+                ),
+                "semantic_validator": (
+                    "apkscanner@1.0"
+                    if backend == "opencode"
+                    and execution_profile is not None
                     else None
                 ),
             },

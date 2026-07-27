@@ -10,11 +10,16 @@ from apkscanner.models import EntryPoint, InvestigationTask, Scan
 from apkscanner.opencode_runner import (
     AJV_VERSION,
     OPENCODE_CLI_VERSION,
-    OPENCODE_OUTPUT_MODE_PROMPTED_JSON,
+    OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE,
+    OPENCODE_OUTPUT_MODE_EXPLORE_THEN_FINALIZE,
     OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
+    OPENCODE_PROFILE_STABLE_ANALYZER,
+    OPENCODE_PROFILE_STRUCTURED_FINALIZER,
+    OPENCODE_PROFILE_THINKING_EXPLORER,
     OPENCODE_SDK_VERSION,
     OpenCodeInvestigationError,
     OpenCodeInvestigator,
+    opencode_execution_profile,
     opencode_output_mode,
     opencode_prompt_for_model,
 )
@@ -26,6 +31,7 @@ def _worker_tree(root: Path) -> Path:
     (worker / "node_modules" / "opencode-ai").mkdir(parents=True)
     (worker / "node_modules" / "ajv").mkdir(parents=True)
     (worker / "node_modules" / ".bin").mkdir(parents=True)
+    (worker / "bin").mkdir(parents=True)
     (worker / "worker.mjs").write_text("// test worker\n", encoding="utf-8")
     (worker / "node_modules" / "@opencode-ai" / "sdk" / "package.json").write_text(
         json.dumps({"version": OPENCODE_SDK_VERSION}),
@@ -44,6 +50,10 @@ def _worker_tree(root: Path) -> Path:
         encoding="utf-8",
     )
     (worker / "node_modules" / ".bin" / "opencode").chmod(0o755)
+    for helper in ("adb", "bash"):
+        path = worker / "bin" / helper
+        path.write_text("#!/bin/sh\nexit 126\n", encoding="utf-8")
+        path.chmod(0o755)
     return worker
 
 
@@ -70,8 +80,9 @@ def test_host_capability_requires_key_and_pinned_packages(
     assert available["available"] is True
     assert available["provider"] == "deepseek"
     assert available["model"] == "deepseek-v4-flash"
-    assert available["output_mode"] == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
+    assert available["output_mode"] == OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE
     assert available["max_steps"] == 100
+    assert available["max_provider_requests"] == 120
 
     package = worker / "node_modules" / "@opencode-ai" / "sdk" / "package.json"
     package.write_text(json.dumps({"version": "0.0.0"}), encoding="utf-8")
@@ -84,6 +95,15 @@ def test_host_capability_requires_key_and_pinned_packages(
     missing_ajv = investigator.capability()
     assert missing_ajv["available"] is False
     assert "missing" in missing_ajv["detail"]
+
+    (worker / "node_modules" / "ajv" / "package.json").write_text(
+        json.dumps({"version": AJV_VERSION}),
+        encoding="utf-8",
+    )
+    (worker / "bin" / "bash").unlink()
+    missing_boundary = investigator.capability()
+    assert missing_boundary["available"] is False
+    assert "boundary helper" in missing_boundary["detail"]
 
 
 def test_capability_rejects_credential_bearing_base_url(
@@ -117,21 +137,72 @@ def test_capability_rejects_credential_bearing_base_url(
     assert capability["available"] is False
     assert "only on loopback" in capability["detail"]
 
+    official_v1 = replace(
+        configured,
+        deepseek_base_url="https://api.deepseek.com/v1",
+    )
+    capability = OpenCodeInvestigator(official_v1).capability()
+    assert capability["available"] is False
+    assert "must not append /v1" in capability["detail"]
+
+
+@pytest.mark.parametrize("model", ["deepseek-chat", "deepseek-reasoner"])
+def test_capability_rejects_retired_deepseek_aliases(
+    settings, tmp_path, monkeypatch, model
+) -> None:  # noqa: ANN001
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "unit-test-only")
+    configured = replace(
+        settings,
+        opencode_model=model,
+        opencode_isolation="host",
+        opencode_node_bin="/usr/bin/node",
+        opencode_worker_dir=_worker_tree(tmp_path),
+    )
+    capability = OpenCodeInvestigator(configured).capability()
+    assert capability["available"] is False
+    assert "retired" in capability["detail"]
+
+
+def test_capability_rejects_invalid_reasoning_effort(
+    settings, tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "unit-test-only")
+    configured = replace(
+        settings,
+        opencode_reasoning_effort="medium",
+        opencode_isolation="host",
+        opencode_node_bin="/usr/bin/node",
+        opencode_worker_dir=_worker_tree(tmp_path),
+    )
+    capability = OpenCodeInvestigator(configured).capability()
+    assert capability["available"] is False
+    assert "must be high or max" in capability["detail"]
+
 
 def test_worker_response_must_be_a_json_object() -> None:
     assert OpenCodeInvestigator._parse_worker_response('{"ok": true}') == {"ok": True}
 
 
-def test_output_mode_keeps_pro_text_json_and_flash_structured() -> None:
-    assert opencode_output_mode("deepseek-v4-pro") == OPENCODE_OUTPUT_MODE_PROMPTED_JSON
+def test_output_mode_is_selected_by_phase_instead_of_model_name() -> None:
     assert (
-        opencode_output_mode("deepseek-v4-pro-202607")
-        == OPENCODE_OUTPUT_MODE_PROMPTED_JSON
+        opencode_output_mode("deepseek-v4-pro")
+        == OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE
     )
-    assert (
-        opencode_output_mode("deepseek-v4-flash")
-        == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
-    )
+    assert opencode_output_mode("deepseek-v4-flash") == OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE
+    static = opencode_execution_profile("static_only")
+    assert static.name == OPENCODE_PROFILE_STABLE_ANALYZER
+    assert static.output_mode == OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE
+    assert [stage.thinking_mode for stage in static.stages] == ["disabled", "disabled"]
+    thinking = opencode_execution_profile("exploration_round", reasoning_effort="max")
+    assert thinking.name == OPENCODE_PROFILE_THINKING_EXPLORER
+    assert thinking.output_mode == OPENCODE_OUTPUT_MODE_EXPLORE_THEN_FINALIZE
+    assert thinking.stages[0].thinking_mode == "enabled"
+    assert thinking.stages[0].reasoning_effort == "max"
+    assert thinking.stages[1].thinking_mode == "disabled"
+    finalizer = opencode_execution_profile("final_evaluation")
+    assert finalizer.name == OPENCODE_PROFILE_STRUCTURED_FINALIZER
+    assert finalizer.output_mode == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
+    assert finalizer.stages[0].workspace_tools is False
     prompt = opencode_prompt_for_model(
         "base prompt",
         model="deepseek-v4-pro",
@@ -142,10 +213,7 @@ def test_output_mode_keeps_pro_text_json_and_flash_structured() -> None:
             "additionalProperties": False,
         },
     )
-    assert prompt.startswith("base prompt")
-    assert "DEEPSEEK_THINKING_OUTPUT_ADAPTER" in prompt
-    assert "OUTPUT_JSON_SCHEMA" in prompt
-    assert '"answer": "string"' in prompt
+    assert prompt == "base prompt"
     assert (
         opencode_prompt_for_model(
             "base prompt",
@@ -192,11 +260,19 @@ def test_investigate_builds_a_workspace_shell_prompt_and_validates_result(
         assert workspace == expected_workspace
         assert payload["action"] == "investigate"
         assert payload["model"] == "deepseek-v4-flash"
+        assert payload["phase"] == "static_only"
         assert "run shell commands" in payload["prompt"]
         assert "workspace or /tmp" in payload["prompt"]
+        assert "analysis memo" in payload["explorer_prompt"]
+        assert "separate finalizer" in payload["explorer_instructions"]
         assert payload["tool_profile"] == "workspace_shell"
-        assert "DEEPSEEK_THINKING_OUTPUT_ADAPTER" not in payload["prompt"]
-        assert "OUTPUT_JSON_SCHEMA" not in payload["prompt"]
+        assert payload["execution_profile"]["name"] == OPENCODE_PROFILE_STABLE_ANALYZER
+        assert payload["execution_profile"]["output_mode"] == (
+            OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE
+        )
+        assert payload["execution_profile"]["stages"][0]["thinking_mode"] == "disabled"
+        assert payload["execution_profile"]["stages"][0]["wire_tool_choice"] == "auto"
+        assert payload["execution_profile"]["stages"][1]["wire_tool_choice"] == "required"
         assert payload["output_schema"]["title"] == "AgentInvestigationResult"
         assert payload["output_schema"]["additionalProperties"] is False
         assert payload["output_schema"]["properties"]["requested_tests"]["maxItems"] == 100
@@ -268,7 +344,50 @@ def test_investigate_builds_a_workspace_shell_prompt_and_validates_result(
     )
     assert transport_calls == 2
     assert retried.output_transport["worker_transport_attempts"] == 2
+    assert retried.output_transport["worker_retry_history"][0]["kind"] == (
+        "worker_transport_exception"
+    )
     assert any(event.event_type == "model.worker.retry" for event in runtime_events)
+
+    response_calls = 0
+
+    def retryable_response(_payload, **_kwargs):  # noqa: ANN001, ANN003
+        nonlocal response_calls
+        response_calls += 1
+        if response_calls == 1:
+            return {
+                "thread_id": "session-provider-failed",
+                "turn_id": "message-provider-failed",
+                "error": {
+                    "type": "provider_unavailable",
+                    "message": "upstream connection reset",
+                    "status_code": 502,
+                    "retryable": True,
+                },
+                "usage": {"calls": 1},
+                "output_transport": {
+                    "provider_wire_requests": [{"status_code": 502}],
+                },
+            }
+        return valid_worker_response()
+
+    monkeypatch.setattr(investigator, "_invoke", retryable_response)
+    recovered = investigator.investigate(
+        scan=scan,
+        task=task,
+        entries=[entry],
+        workspace=workspace,
+        evidence=[],
+        timeout_seconds=30,
+    )
+    assert response_calls == 2
+    assert recovered.output_transport["worker_transport_attempts"] == 2
+    response_history = recovered.output_transport["worker_retry_history"][0]
+    assert response_history["kind"] == "retryable_worker_response"
+    assert response_history["error"]["status_code"] == 502
+    assert response_history["output_transport"]["provider_wire_requests"] == [
+        {"status_code": 502}
+    ]
 
     monkeypatch.setattr(
         investigator,
@@ -282,7 +401,7 @@ def test_investigate_builds_a_workspace_shell_prompt_and_validates_result(
             },
             "usage": {"calls": 3},
             "output_transport": {
-                "mode": "prompted_json",
+                "mode": OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
                 "model_calls": [{"attempt": 1, "accepted": False}],
             },
         },

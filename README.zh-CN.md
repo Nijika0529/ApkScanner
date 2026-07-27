@@ -19,7 +19,7 @@ v1 产品是一个单用户、仅限本机（localhost）的 Web 应用。它接
 - 有限范围的 Frida 旁路追踪（URI/Query 脱敏），带独立的 instrumented 判定。
 - 可选的 MobSF 上传/报告归一化，缺失时显式标注降级覆盖。
 - 官方 `openai-codex==0.144.4` 集成：严格 JSON Schema、全新线程、无子 Agent fan-out、一轮平台介导的补充测试、证据支撑的结果降级。
-- 固定版本 `@opencode-ai/sdk`/OpenCode `1.18.4` 集成（适配 DeepSeek）：全新会话、V4 Pro 文本 JSON/Ajv 校验、workspace read/glob/grep/bash、ADB 阻断和完整工具审计。
+- 固定版本 `@opencode-ai/sdk`/OpenCode `1.18.4` 集成（适配 DeepSeek）：按阶段显式控制思考模式、完整 workspace 工具循环、独立的非思考 StructuredOutput 定稿器、Ajv/语义校验、ADB 阻断和完整调用审计。
 - 可选的每任务 Docker Worker，带隔离的 task-attempt 挂载和资源/能力限制。
 - 响应式明亮主题 React 审核控制台、人工 Finding 判定、实时事件、任务停止/删除、JSON/HTML/SARIF 导出。
 
@@ -168,13 +168,32 @@ Host Worker 为每次调用创建私有的临时 HOME/XDG 目录树以及认证�
 服务器。两种模式都只给 OpenCode 一个按 `task_id + attempt` 隔离的 workspace，其中物化
 当前入口的代码上下文和不可变 Evidence；它可使用 `read`、`glob`、`grep` 和 `bash`，
 但不会与其他并发 Agent 共享可写扫描目录。原生编辑、Web、MCP、子 Agent 和 ADB 保持
-禁用，请求的 Android 测试仍由 Python 控制面验证并执行。实验性的 `deepseek-v4-pro` 通过
-`promptAsync` 下发，并用短连接轮询消息和 session 状态直到完整工具循环进入 idle，
-再读取最终文本响应。这样可支持长推理，避免 review/自由探索阶段依赖一条长期占用的
-loopback HTTP 请求；瞬时本地连接
-失败会在剩余任务预算内重建一次 worker，不会静默切换模型。
+禁用，请求的 Android 测试仍由 Python 控制面验证并执行。
 
-当前建议先用默认的 `deepseek-v4-flash` 跑通扫描、工具调用、动态申请和最终裁决全链路。仅在单独验证 Pro 适配时设置 `APKSCANNER_OPENCODE_MODEL=deepseek-v4-pro`。可通过 `APKSCANNER_DEEPSEEK_BASE_URL` 指定企业 DeepSeek 兼容网关；远程网关必须使用 HTTPS，纯 HTTP 仅在 loopback 上接受。该 URL 中的凭据、查询参数和片段将被拒绝，API Key 仍通过 `DEEPSEEK_API_KEY` 提供。
+执行方式不再根据模型名猜测，而是由编排阶段明确选择：
+
+- `static_only`：关闭思考的分析器使用 workspace 工具，再交给全新会话中的非思考定稿器；
+- `test_planning`、`adversarial_review`、`exploration_round`：思考型 Explorer 完成
+  OpenCode 工具循环，再交给独立定稿器；
+- `final_evaluation`、`recovery_evaluation`：只运行定稿器，不开放 workspace 工具，也
+  不允许继续申请测试。
+
+DeepSeek 思考模式拒绝任何 `tool_choice`，而 OpenCode 1.18.4 会注入
+`tool_choice: auto`。一次性 Worker 内的 loopback 兼容代理只在
+`thinking.type=enabled` 时删除该字段，同时完整保留 OpenCode 工具循环以及
+`reasoning_content` 回放。定稿器始终关闭思考，使用 OpenCode `StructuredOutput`
+（`tool_choice: required`），随后再通过 Ajv 和平台语义规则校验；每次纠正都使用全新
+会话，避免 DSML/tool-call 上下文污染。
+
+当前建议先用默认的 `deepseek-v4-flash` 跑通扫描、工具调用、动态申请和最终裁决全链路。
+仅在单独验证 Pro 适配时设置 `APKSCANNER_OPENCODE_MODEL=deepseek-v4-pro`；两者使用同一
+阶段协议，失败时不会静默换模型。`scanctl capabilities --deep` 会执行一次很小但真实、
+会计费的非思考结构化请求。可通过 `APKSCANNER_DEEPSEEK_BASE_URL` 指定企业兼容网关；
+远程网关必须使用 HTTPS，纯 HTTP 仅允许 loopback。官方地址应填写
+`https://api.deepseek.com`，不要附加 `/v1`。URL 中的凭据、查询参数和片段会被拒绝，
+Worker 只在兼容代理内存中保留真实 Key，OpenCode 仅获得一次性 loopback 凭据；
+真实 Key、配置内容和本地 Server 凭据会从 Bash 子进程环境删除；已退役的
+`deepseek-chat` / `deepseek-reasoner` 也会被拒绝。
 
 实现原理、协议、安全控制及升级清单参见 [`docs/opencode-deepseek.zh-CN.md`](docs/opencode-deepseek.zh-CN.md)。
 
@@ -258,6 +277,7 @@ AI 审计中，不能被当作平台确认风险等级。
 | `APKSCANNER_CODEX_BIN` | 内置 SDK 运行时 | 显式测试过的 Codex 二进制覆盖 |
 | `APKSCANNER_OPENCODE_ENABLED` | `false` | 是否启用 OpenCode + DeepSeek 调查 |
 | `APKSCANNER_OPENCODE_MODEL` | `deepseek-v4-flash` | DeepSeek 模型 ID；Pro 适配验证时显式改为 `deepseek-v4-pro` |
+| `APKSCANNER_OPENCODE_REASONING_EFFORT` | `high` | 思考型 Explorer 强度：`high` 或 `max` |
 | `APKSCANNER_OPENCODE_ISOLATION` | `docker` | `docker` 或显式 `host` 降级 |
 | `APKSCANNER_OPENCODE_DOCKER_IMAGE` | `apk-scanner-opencode-worker:0.1.0` | Worker 镜像名称 |
 | `APKSCANNER_OPENCODE_NODE_BIN` | PATH 中的 `node` | Host 模式下的 Node.js 覆盖 |

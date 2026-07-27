@@ -41,6 +41,7 @@ class Settings:
     opencode_worker_dir: Path | None = None
     opencode_isolation: str = "docker"
     opencode_docker_image: str = "apk-scanner-opencode-worker:0.1.0"
+    opencode_reasoning_effort: str = "high"
     deepseek_base_url: str | None = None
     adb_serial: str | None = None
     probe_apk_path: Path | None = None
@@ -112,6 +113,9 @@ class Settings:
                 "APKSCANNER_OPENCODE_DOCKER_IMAGE",
                 "apk-scanner-opencode-worker:0.1.0",
             ),
+            opencode_reasoning_effort=os.getenv(
+                "APKSCANNER_OPENCODE_REASONING_EFFORT", "high"
+            ).lower(),
             deepseek_base_url=os.getenv("APKSCANNER_DEEPSEEK_BASE_URL"),
             adb_serial=os.getenv("APKSCANNER_ADB_SERIAL"),
             probe_apk_path=(

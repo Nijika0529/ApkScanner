@@ -28,9 +28,10 @@ finding without platform evidence IDs.
 - Official `openai-codex==0.144.4` integration with strict JSON Schema, streamed turn/item events,
   read-only workspace inspection, no subagent fan-out, bounded adaptive platform-mediated test
   rounds, and evidence-backed result downgrades.
-- Pinned `@opencode-ai/sdk`/OpenCode `1.18.4` integration for DeepSeek, with fresh sessions,
-  workspace tools plus Ajv-validated V4 Pro text JSON, native StructuredOutput for V4 Flash,
-  ADB/subagent denial, SSE runtime-event forwarding, and an isolated one-shot bridge.
+- Pinned `@opencode-ai/sdk`/OpenCode `1.18.4` integration for DeepSeek, with explicit
+  phase-based thinking modes, complete workspace-tool loops, an isolated non-thinking
+  StructuredOutput finalizer, local Ajv/semantic validation, ADB/subagent denial, and full
+  provider-wire/runtime audit.
 - Optional per-task Docker workers with isolated task-attempt mounts and resource/capability limits.
 - Responsive React review console, human Finding decisions, live events, JSON/HTML/SARIF exports.
 - Light review console with confirmed deletion of completed scans and shared-artifact-safe cleanup.
@@ -211,25 +212,38 @@ scanctl capabilities --deep
 
 The host worker creates a private temporary HOME/XDG tree and an authenticated loopback OpenCode
 server for each invocation. In both modes, OpenCode receives an isolated per-task/attempt workspace
-containing the relevant code context and immutable evidence, exposed through the native `read`,
-`glob`, `grep`, and `bash` tools. Bash may create analysis artifacts in that workspace or `/tmp`;
-the shared scan workspace is not writable or exposed to concurrent agents. Native editing, web,
-MCP, and subagent tools remain denied. ADB is blocked by OpenCode permissions and a PATH shim, and
-no device serial or socket is mounted. `deepseek-v4-pro` uses the normal OpenCode tool loop and returns
-text JSON without the incompatible `tool_choice: required`; the worker validates it locally with
-Ajv and can issue two tool-disabled correction turns in the same session. Pro turns are dispatched
-with `promptAsync` and observed through short message polls, so review and exploration do not depend
-on one long-lived loopback HTTP response. The worker also polls session status and only reads the
-final text after the complete tool loop becomes idle. A retryable local transport failure can rebuild the worker
-once within the original task budget without changing models. `deepseek-v4-flash` uses
-the same workspace tools plus OpenCode's internal `StructuredOutput` collector. Requested Android
-tests are always validated and executed by the Python control plane.
+containing the relevant code context and immutable evidence, exposed through native `read`, `glob`,
+`grep`, and `bash`. Bash analysis artifacts are limited by policy to that workspace or `/tmp`;
+native editing, web, MCP, subagents, and ADB remain denied. Android actions are requested as data,
+then validated and executed by the Python control plane.
+
+Execution is selected by orchestration phase, not by matching a model name:
+
+- `static_only`: non-thinking analyzer with workspace tools, followed by a fresh non-thinking
+  StructuredOutput finalizer.
+- `test_planning`, `adversarial_review`, and `exploration_round`: thinking explorer with the
+  complete OpenCode tool loop, followed by the isolated finalizer.
+- `final_evaluation` and `recovery_evaluation`: finalizer only; no workspace tools or new tests.
+
+DeepSeek thinking requests reject `tool_choice`. OpenCode 1.18.4 injects `tool_choice: auto`, so the
+one-shot worker uses a loopback compatibility proxy that removes this field only when
+`thinking.type=enabled`; it preserves OpenCode's message/tool loop and full `reasoning_content`
+replay. The finalizer always disables thinking and uses OpenCode `StructuredOutput`
+(`tool_choice: required`), then Ajv and platform semantic rules validate the result. Each retry uses
+a fresh session. A retryable local transport failure can rebuild the worker once within the original
+task budget without changing models.
 
 Use the default `deepseek-v4-flash` model to establish the end-to-end baseline. Set
-`APKSCANNER_OPENCODE_MODEL=deepseek-v4-pro` only for explicit Pro compatibility testing. An enterprise
-DeepSeek-compatible gateway can be selected with `APKSCANNER_DEEPSEEK_BASE_URL`; remote gateways
-must use HTTPS, while plain HTTP is accepted only on loopback. Credentials, query parameters, and
-fragments in that URL are rejected, and the API key remains in `DEEPSEEK_API_KEY`.
+`APKSCANNER_OPENCODE_MODEL=deepseek-v4-pro` only for explicit Pro compatibility testing. Both models
+use the same phase profile; no failure silently switches models. `scanctl capabilities --deep`
+performs a small real, billable non-thinking StructuredOutput call rather than only checking a
+catalog. An enterprise DeepSeek-compatible gateway can be selected with
+`APKSCANNER_DEEPSEEK_BASE_URL`; remote gateways must use HTTPS, while plain HTTP is accepted only on
+loopback. Credentials, query parameters, and fragments are rejected. The worker keeps the real API
+key only in the compatibility proxy's memory, gives OpenCode a one-time loopback credential, and
+removes provider/config/server credentials from the Bash child environment. For the official endpoint use
+`https://api.deepseek.com` without `/v1`. Retired `deepseek-chat` and `deepseek-reasoner` aliases are
+rejected.
 
 The implementation rationale, protocol, security controls, and upgrade checklist are documented in
 [`docs/opencode-deepseek.zh-CN.md`](docs/opencode-deepseek.zh-CN.md).
@@ -261,6 +275,7 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_CODEX_BIN` | bundled SDK runtime | Explicit tested Codex binary override |
 | `APKSCANNER_OPENCODE_ENABLED` | `false` | Allow OpenCode + DeepSeek investigations |
 | `APKSCANNER_OPENCODE_MODEL` | `deepseek-v4-flash` | DeepSeek model ID; opt into `deepseek-v4-pro` for compatibility testing |
+| `APKSCANNER_OPENCODE_REASONING_EFFORT` | `high` | Thinking explorer effort: `high` or `max` |
 | `APKSCANNER_OPENCODE_ISOLATION` | `docker` | `docker` or explicit `host` fallback |
 | `APKSCANNER_OPENCODE_DOCKER_IMAGE` | `apk-scanner-opencode-worker:0.1.0` | Worker image |
 | `APKSCANNER_OPENCODE_NODE_BIN` | `node` on PATH | Host-mode Node.js override |

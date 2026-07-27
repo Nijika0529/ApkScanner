@@ -82,7 +82,7 @@ Web 健康检查使用真正的非阻塞锁；设备繁忙时读取最近一次�
 | 本地控制面 | SQLite、APK、workspace、evidence | FastAPI 仅监听 loopback；变更 API 需要自定义请求头；内容寻址文件拒绝 symlink/摘要冲突 |
 | Codex Docker worker | 当前任务 attempt workspace、显式 Codex auth、模型网络 | 每次调用新容器、只读 bind mount/SDK sandbox/rootfs、无 ADB 参数、丢弃 capabilities、PID/CPU/内存限制；默认模式 |
 | Codex host worker | 当前任务 attempt workspace 与模型网络 | 仅作为显式 `host` 降级模式；developer instructions 禁止 ADB/目标网络请求，设备动作仍走平台 |
-| OpenCode + DeepSeek Docker worker | 当前任务 attempt workspace、`/tmp`、平台 task JSON、DeepSeek API | workspace 可写、rootfs 只读、临时 HOME、丢弃 capabilities；允许 read/glob/grep/bash，原生编辑/Web/MCP/子 Agent关闭，ADB 由 permission + PATH shim + 无设备挂载阻断；V4 Pro 使用普通工具循环 + 文本 JSON/Ajv |
+| OpenCode + DeepSeek Docker worker | 当前任务 attempt workspace、`/tmp`、平台 task JSON、DeepSeek API | workspace 可写、rootfs 只读、临时 HOME、丢弃 capabilities；Analyzer/Explorer 允许 read/glob/grep/bash，独立 Finalizer 只允许 StructuredOutput；ADB 由 permission + PATH shim + 无设备挂载阻断 |
 | OpenCode + DeepSeek host worker | 平台生成的 task JSON、DeepSeek API | 每次调用使用临时 HOME/XDG 与带随机 Basic Auth 的 loopback server；仍仅适合个人受控环境 |
 | 云真机 | 目标 APK、Probe APK、测试账号 | 固定 Android 16/API 36；串行 lease；任务前后 `pm clear`；不声称完整快照复位 |
 | Probe APK | 以普通 App UID 调用目标入口 | 只接受最初发送者为 shell/root 的调度；仍只允许安装在专用测试设备 |
@@ -195,13 +195,14 @@ Oracle 将“入口执行成功”和“实际危害”分开：普通应用 UID
 7. `agent.cancellation`：用户停止请求、运行时确认、后端和任务阶段；此前已产生的事件继续
    保留，被停止的调用不生成新的最终结论。
 
-OpenCode 审计还记录实际输出通道和只读工具事件。`deepseek-v4-pro` 保持思考模式，首轮
-使用 `read/glob/grep/bash` 探索当前任务隔离 workspace 中物化的入口代码与 Evidence，
-最终以 `format=text` 返回 JSON；worker 用
-Ajv 本地校验，失败后关闭工具并最多进行 2 次同 session 纠正。每轮 prompt、原始文本、
-校验错误、工具和 usage 都写入审计。`deepseek-v4-flash` 使用同一组只读工具和 OpenCode
-内部 StructuredOutput。这样 Pro 不会使用与思考模式冲突的
-`tool_choice: required`，两个通道最终仍进入相同的平台证据校验。
+OpenCode 审计还记录显式执行 profile、各阶段思考模式、reasoning effort、实际 wire
+`tool_choice`、HTTP 状态和工具事件。静态阶段使用关闭思考的 Analyzer；规划、Critic 和
+自由探索阶段使用 Thinking Explorer。二者都在完整工具循环结束后只输出证据备忘录，再
+由全新 session 中关闭思考且不开放 workspace 工具的 Finalizer 通过
+`StructuredOutput` 定稿。Worker 随后执行 Ajv 和业务语义校验，失败时最多使用两个全新
+session 纠正。兼容代理只对 thinking 请求删除 OpenCode 注入的 `tool_choice: auto`，
+并保留完整 `reasoning_content` 回放；每轮 prompt、备忘录、结构化响应、校验错误、wire
+审计和 usage 都进入不可变审计记录。Flash/Pro 使用同一阶段协议，失败时不会静默换模型。
 
 Codex 的 app-server notification 与 OpenCode 的 `event.subscribe()` SSE 会先归一化为
 `exploration.*` 平台事件。Web 只展示假设、阶段、动作、证据和结论等关键事件，不展示或
