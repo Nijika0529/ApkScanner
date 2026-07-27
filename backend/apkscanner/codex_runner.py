@@ -155,9 +155,12 @@ class CodexInvestigator:
 
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="codex-investigation")
             future = executor.submit(consume_turn)
-            deadline = time.monotonic() + (
-                timeout_seconds or self.settings.task_timeout_seconds
+            effective_timeout = (
+                self.settings.task_timeout_seconds
+                if timeout_seconds is None
+                else timeout_seconds
             )
+            deadline = time.monotonic() + effective_timeout
             while True:
                 if cancel_event is not None and cancel_event.is_set():
                     with suppress(Exception):
@@ -359,7 +362,11 @@ class CodexInvestigator:
             result, _stderr = consume_worker_process(
                 process,
                 payload=payload,
-                timeout_seconds=timeout_seconds or self.settings.task_timeout_seconds,
+                timeout_seconds=(
+                    self.settings.task_timeout_seconds
+                    if timeout_seconds is None
+                    else timeout_seconds
+                ),
                 event_callback=event_callback,
                 on_timeout=stop_container,
                 cancel_event=cancel_event,

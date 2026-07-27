@@ -29,7 +29,7 @@ flowchart LR
     M --> N[Web / JSON / HTML / SARIF + 人工复核]
 ```
 
-平台而不是 Codex/OpenCode 负责 fan-out。一个导出组件对应一个任务；同一 handler 的 Deep Links 合并成一个任务。Agent 不能创建子 Agent，也不能直接把自己的文字当作复现证据。默认最多进行 3 个自适应测试轮次、每轮接受 4 个受限测试：只能使用当前任务的入口 ID；Deep Link 和 Provider URI 必须保持 Manifest 声明的 scheme、host/authority 和 port；额外参数有数量、键名、类型和长度上限。每轮证据都会回灌下一次判断，最终再执行禁止申请新动作的证据总结。轮次和单轮测试数可在 1–5 / 1–12 的安全范围内配置。每次扫描在创建时记录初始 `codex`、`opencode` 或 `none`；服务默认值的后续变更不会静默改变它，只有用户在扫描控制台显式调整才会影响后续任务。
+平台而不是 Codex/OpenCode 负责 fan-out。一个导出组件对应一个任务；同一 handler 的 Deep Links 合并成一个任务。Agent 不能创建子 Agent，也不能直接把自己的文字当作复现证据。默认最多进行 3 个自适应测试轮次、每轮接受 100 个受限测试：只能使用当前任务的入口 ID；Deep Link 和 Provider URI 必须保持 Manifest 声明的 scheme、host/authority 和 port；额外参数有数量、键名、类型和长度上限。每轮证据都会回灌下一次判断，最终再执行禁止申请新动作的证据总结。轮次和单轮测试数可在 1–5 / 1–100 的范围内配置。每次扫描在创建时记录初始 `codex`、`opencode` 或 `none`；服务默认值的后续变更不会静默改变它，只有用户在扫描控制台显式调整才会影响后续任务。
 
 扫描创建后的 Agent 控制分两层：`Scan.stats.agent_control` 是总开关和后端选择；
 `InvestigationTask.preconditions.agent_enabled` 是单任务覆盖。总开关关闭时所有任务只运行
@@ -70,13 +70,13 @@ Web 健康检查在设备繁忙时读取最近一次能力结果，不会插入�
 | 本地控制面 | SQLite、APK、workspace、evidence | FastAPI 仅监听 loopback；变更 API 需要自定义请求头；内容寻址文件拒绝 symlink/摘要冲突 |
 | Codex Docker worker | 当前 scan workspace、显式 Codex auth、模型网络 | 每次调用新容器、只读 bind mount/SDK sandbox/rootfs、无 ADB 参数、丢弃 capabilities、PID/CPU/内存限制；默认模式 |
 | Codex host worker | 只读 workspace 与模型网络 | 仅作为显式 `host` 降级模式；developer instructions 禁止 ADB/目标网络请求，设备动作仍走平台 |
-| OpenCode + DeepSeek Docker worker | 平台生成的 task JSON、DeepSeek API | 不挂载 scan workspace；只读 rootfs、临时 HOME、丢弃 capabilities；禁用文件/Shell/Web/MCP/子 Agent；V4 Pro 无工具并省略 `tool_choice`，Flash 仅允许内部 StructuredOutput |
+| OpenCode + DeepSeek Docker worker | scan workspace、`/tmp`、平台 task JSON、DeepSeek API | workspace 可写、rootfs 只读、临时 HOME、丢弃 capabilities；允许 read/glob/grep/bash，原生编辑/Web/MCP/子 Agent关闭，ADB 由 permission + PATH shim + 无设备挂载阻断；V4 Pro 使用普通工具循环 + 文本 JSON/Ajv |
 | OpenCode + DeepSeek host worker | 平台生成的 task JSON、DeepSeek API | 每次调用使用临时 HOME/XDG 与带随机 Basic Auth 的 loopback server；仍仅适合个人受控环境 |
 | 云真机 | 目标 APK、Probe APK、测试账号 | 固定 Android 16/API 36；串行 lease；任务前后 `pm clear`；不声称完整快照复位 |
 | Probe APK | 以普通 App UID 调用目标入口 | 只接受最初发送者为 shell/root 的调度；仍只允许安装在专用测试设备 |
 | MobSF | 上传 APK并返回广度扫描报告 | 可选、显式 URL/API Key；失败不阻断内置基线，但标为 tool gap |
 
-APK、反编译代码、资源、日志、网页和工具输出都属于不可信数据。两个 Agent 后端的 developer instructions 都明确禁止服从这些内容中的指令。Codex Docker worker 只有只读 workspace；OpenCode worker 连 workspace 都不挂载，只接收控制面整理后的 JSON。云真机操作始终由 Python 平台校验后执行，Agent 不持有 ADB 能力。模型网络出口应分别限制到企业 Codex 或获批的 DeepSeek/代理端点。
+APK、反编译代码、资源、日志、网页和工具输出都属于不可信数据。两个 Agent 后端的 developer instructions 都明确禁止服从这些内容中的指令。Codex 只读；OpenCode 可在当前 scan workspace 和 `/tmp` 执行命令并写入临时分析产物，容器 rootfs 和宿主机其他目录不在可写范围。云真机操作始终由 Python 平台校验后执行，Agent 不持有 ADB 参数、Socket 或可用命令。模型网络出口应分别限制到企业 Codex 或获批的 DeepSeek/代理端点。
 
 ## Security IR
 
@@ -96,7 +96,7 @@ APK、反编译代码、资源、日志、网页和工具输出都属于不可�
 | `supported_static` | 引用了本 scan 的 `static.*` Evidence ID |
 | `reproduced_blackbox` | 同一随机 request ID 的 Probe APK 调用、Probe 结果日志，且 Probe 返回 success；`adb shell` 成功不等价 |
 | `observed_instrumented` | Frida 成功加载且至少产生一个非 hook-error 观察事件 |
-| `not_reproduced` | 同一 request ID 的普通 App UID 尝试与结果日志存在；它只描述已执行用例，不证明全局安全 |
+| `not_reproduced` | 同一 test-case/request ID 的普通 App UID 尝试与结果日志存在，且平台 Prover 明确产生 `oracle_refuted=true`；它只反驳该已执行用例，不证明全局安全 |
 | `inconclusive` | 证据不足、工具缺失、预算耗尽或前置条件失败 |
 
 Agent 声称但不属于本 scan/task 的 Evidence ID 会被删除。需要证据的结论不满足条件时自动降级为 `inconclusive`。重试产生不同结果时，旧 Agent Finding 不删除，但会标记为已被新 turn 取代且降级为 inconclusive。
@@ -119,6 +119,46 @@ Agent 声称但不属于本 scan/task 的 Evidence ID 会被删除。需要证�
 AI 审计；旧 Evidence 不删除。批量补扫仅允许在当前扫描已经 `final`/`failed` 时启动，避免
 与仍在运行的设备任务竞态。
 
+单任务默认预算为 20 分钟。任务进入 `timed_out` 后，Web 提供“继续深度探索”而不是普通
+重跑：控制面重新排队同一 `task_id`，分配一份新的 20 分钟预算，并将该任务历次静态、
+ADB、Probe、Frida、Agent 请求/响应和平台校验 Evidence 一并装载给新一轮 Agent。续跑轮次
+记录在 `manual_continuation.continuation_number`，旧 thread/turn 仅作为关联信息保留，新轮
+仍产生独立可审计调用。显式续跑不受原扫描 24 小时截止时间或自动尝试次数限制，但每轮仍
+重新获取设备租约、执行准备与最终清理，且只能由已经 `timed_out` 的任务触发。
+
+## 假设、反证与危害证明
+
+入口任务启动时，平台将 Planner 的安全问题固化为 `SecurityHypothesis`。稳定 fingerprint
+避免同一扫描重复创建同一主张；攻击者身份、前置条件、预期影响和 proof obligations 不再
+只存在于 Prompt。模型输出按角色写入 `HypothesisArgument`：
+
+- Hunter/Advocate 只能提供支持论证和 Evidence 引用；
+- Critic 独立寻找权限检查、调用者校验、不可达路径、认证/配置前置和无实际危害的反例；
+- Arbiter 是平台 Evidence 校验后的决定，不直接采用任一模型的自评。
+
+通过边界校验的 `requested_tests` 必须关联当前任务的 Hypothesis，并形成
+`ProofAttempt`。第一版 `android_entry_probe` Prover 复用现有 ADB/Probe/Frida 能力；
+Oracle 将“入口执行成功”和“实际危害”分开：普通应用 UID Probe 回执或 Frida 观察只能设置
+`execution_demonstrated=true`；只有领域 Prover 同时给出平台可校验的
+`security_impact_observed=true`（例如敏感数据实际返回、未授权状态确实变化或认证边界被
+绕过），才设置 `harm_demonstrated=true`。模型文字、导出声明、危险 API 名称、单独
+`adb shell` 成功以及单纯打开组件都不能让危害 Proof 通过。Web“验证链”展示候选、正反
+论证、Proof Attempt、Evidence 和最终状态。
+
+## 私有 APK 真值评测
+
+`scanctl benchmark APK --truth SPEC --investigator BACKEND` 对 APK 完整扫描并保存
+`BenchmarkEvaluation`；`scanctl evaluate --scan-id ID --truth SPEC` 可以对已有结果重复
+评分。SPEC 支持按 rule ID、CWE、入口名称和 Finding 文本关键词匹配已知漏洞，并为每项真值
+指定 `static`、`dynamic` 或 `instrumented` 最低证明等级。
+
+评分只统计平台确认的 `supported_static`、`reproduced_blackbox` 和
+`observed_instrumented`。默认真值要求 `dynamic`，因此只有静态猜测的高危描述既不能命中，
+如果已被平台确认为 Finding 但不匹配任何真值，还会计为 false positive。主指标使用 F0.5，
+精确率权重是召回率的两倍；`candidate`、`inconclusive`、人工 review 的 accepted 状态和
+没有平台证明的模型输出均不算发现，只作为 `unproven_ai_noise` 单独报告。这样可以直接比较
+不同模型在同一私有 APK 上“发现了多少真实漏洞”以及“制造了多少看似有用的噪声”。
+
 ## AI 内容审计
 
 每次实际模型调用都会形成独立 `audit_id`，并按调用阶段写入内容寻址的不可变 Evidence：
@@ -135,11 +175,12 @@ AI 审计；旧 Evidence 不删除。批量补扫仅允许在当前扫描已经 
 7. `agent.cancellation`：用户停止请求、运行时确认、后端和任务阶段；此前已产生的事件继续
    保留，被停止的调用不生成新的最终结论。
 
-OpenCode 审计还记录实际输出通道。`deepseek-v4-pro` 保持思考模式，但使用无工具的
-`format=text`：prompt 携带精确 JSON Schema，worker 用 Ajv 本地校验，失败后最多进行
-2 次同 session 纠正；每轮 prompt、原始文本、校验错误和 usage 都写入审计。
-`deepseek-v4-flash` 继续使用 OpenCode 的内部 StructuredOutput 工具。这样 Pro 请求不会
-携带与思考模式冲突的 `tool_choice`，两个通道最终仍进入相同的平台证据校验。
+OpenCode 审计还记录实际输出通道和只读工具事件。`deepseek-v4-pro` 保持思考模式，首轮
+使用 `read/glob/grep/bash` 探索完整 workspace，最终以 `format=text` 返回 JSON；worker 用
+Ajv 本地校验，失败后关闭工具并最多进行 2 次同 session 纠正。每轮 prompt、原始文本、
+校验错误、工具和 usage 都写入审计。`deepseek-v4-flash` 使用同一组只读工具和 OpenCode
+内部 StructuredOutput。这样 Pro 不会使用与思考模式冲突的
+`tool_choice: required`，两个通道最终仍进入相同的平台证据校验。
 
 Codex 的 app-server notification 与 OpenCode 的 `event.subscribe()` SSE 会先归一化为
 `exploration.*` 平台事件。Web 只展示假设、阶段、动作、证据和结论等关键事件，不展示或

@@ -10,6 +10,9 @@ const OPENCODE_VERSION = "1.18.4"
 const OUTPUT_MODE_PROMPTED_JSON = "prompted_json"
 const OUTPUT_MODE_STRUCTURED_TOOL = "structured_output_tool"
 const PROMPTED_JSON_RETRY_COUNT = 2
+const WORKSPACE_TOOL_PROFILE = "workspace_shell"
+const WORKSPACE_TOOLS = ["read", "glob", "grep", "bash"]
+const MAX_AGENT_STEPS = 100
 
 let server
 let sessionID
@@ -64,6 +67,9 @@ async function capability(client, payload) {
     provider: PROVIDER_ID,
     models: Object.keys(provider.models ?? {}).sort(),
     output_mode: outputModeForModel(payload.model),
+    tool_profile: WORKSPACE_TOOL_PROFILE,
+    workspace_tools: WORKSPACE_TOOLS,
+    max_steps: MAX_AGENT_STEPS,
   }
 }
 
@@ -99,7 +105,7 @@ async function investigateStructuredOutput(client, payload) {
     type: "json_schema",
     schema: payload.output_schema,
     retryCount: 2,
-  })
+  }, workspaceToolFlags(payload))
   if (response.info?.error) {
     throw new Error(`OpenCode model error: ${formatError(response.info.error)}`)
   }
@@ -128,7 +134,7 @@ async function investigateStructuredOutput(client, payload) {
       mode: OUTPUT_MODE_STRUCTURED_TOOL,
       format: "json_schema",
       tool_choice: "required",
-      tools: ["StructuredOutput"],
+      tools: [...workspaceToolNames(payload), "StructuredOutput"],
       schema_validator: "opencode",
       retry_count: 2,
       model_calls: [
@@ -140,6 +146,7 @@ async function investigateStructuredOutput(client, payload) {
           parseError: null,
           validationErrors: [],
           accepted: true,
+          tools: [...workspaceToolNames(payload), "StructuredOutput"],
         }),
       ],
     },
@@ -157,7 +164,14 @@ async function investigatePromptedJson(client, payload) {
       attempt: index + 1,
       output_mode: OUTPUT_MODE_PROMPTED_JSON,
     })
-    const response = await prompt(client, payload, promptText, { type: "text" })
+    const enabledTools = index === 0 ? workspaceToolFlags(payload) : disabledWorkspaceToolFlags()
+    const response = await prompt(
+      client,
+      payload,
+      promptText,
+      { type: "text" },
+      enabledTools,
+    )
     responses.push(response)
     const text = responseText(response.parts ?? [])
     emitRuntimeEvent("model.response.received", "DeepSeek Pro 已返回模型响应", {
@@ -174,6 +188,7 @@ async function investigatePromptedJson(client, payload) {
           parseError: null,
           validationErrors: [],
           accepted: false,
+          tools: enabledToolNames(enabledTools),
         }),
       )
       return promptedJsonFailure(
@@ -210,6 +225,7 @@ async function investigatePromptedJson(client, payload) {
         parseError,
         validationErrors,
         accepted: Boolean(valid),
+        tools: enabledToolNames(enabledTools),
       }),
     )
     if (valid) {
@@ -247,7 +263,7 @@ async function investigatePromptedJson(client, payload) {
   )
 }
 
-function prompt(client, payload, promptText, format) {
+function prompt(client, payload, promptText, format, tools) {
   return client.session
     .prompt({
       path: { id: sessionID },
@@ -259,6 +275,7 @@ function prompt(client, payload, promptText, format) {
         },
         system: payload.developer_instructions,
         format,
+        tools,
         parts: [{ type: "text", text: promptText }],
       },
     })
@@ -391,6 +408,8 @@ function normalizeOpenCodeEvent(event, seen) {
         part_id: part.id,
         tool: part.tool,
         status,
+        input: summarizeToolInput(part.tool, part.state?.input),
+        title: typeof part.state?.title === "string" ? part.state.title.slice(0, 500) : null,
       },
     })
   }
@@ -418,8 +437,8 @@ function promptedJsonTransport(calls) {
   return {
     mode: OUTPUT_MODE_PROMPTED_JSON,
     format: "text",
-    tool_choice: "omitted",
-    tools: [],
+    tool_choice: "auto",
+    tools: WORKSPACE_TOOLS,
     schema_validator: "ajv@8.20.0",
     retry_count: PROMPTED_JSON_RETRY_COUNT,
     model_calls: calls,
@@ -430,9 +449,36 @@ function buildConfig(payload) {
   const model = `${PROVIDER_ID}/${payload.model}`
   const structuredOutput =
     outputModeForModel(payload.model) === OUTPUT_MODE_STRUCTURED_TOOL
-  const permission = structuredOutput
-    ? { "*": "deny", StructuredOutput: "allow" }
-    : { "*": "deny" }
+  const workspaceTools = workspaceToolNames(payload)
+  const permission = {
+    "*": "deny",
+    ...Object.fromEntries(
+      workspaceTools
+        .filter((tool) => tool !== "bash")
+        .map((tool) => [tool, "allow"]),
+    ),
+    ...(workspaceTools.includes("bash")
+      ? {
+          bash: {
+            "*": "allow",
+            adb: "deny",
+            "adb *": "deny",
+            "*/adb": "deny",
+            "*/adb *": "deny",
+          },
+          external_directory: {
+            "*": "deny",
+            "/tmp": "allow",
+            "/tmp/*": "allow",
+          },
+        }
+      : {}),
+    ...(structuredOutput ? { StructuredOutput: "allow" } : {}),
+  }
+  const tools = {
+    "*": false,
+    ...Object.fromEntries(workspaceTools.map((tool) => [tool, true])),
+  }
   return {
     model,
     small_model: model,
@@ -444,14 +490,14 @@ function buildConfig(payload) {
     plugin: [],
     mcp: {},
     instructions: [],
-    tools: { "*": false },
+    tools,
     permission,
     agent: {
       apkscanner: {
         mode: "primary",
         model,
         prompt: payload.developer_instructions,
-        steps: 4,
+        steps: MAX_AGENT_STEPS,
         permission,
       },
     },
@@ -523,6 +569,9 @@ function validatePayload(value) {
       Array.isArray(value.output_schema)
     ) {
       throw new Error("output schema is required")
+    }
+    if (value.tool_profile !== WORKSPACE_TOOL_PROFILE) {
+      throw new Error("unsupported OpenCode tool profile")
     }
   }
   return value
@@ -623,6 +672,7 @@ function modelCallAudit({
   parseError,
   validationErrors,
   accepted,
+  tools,
 }) {
   return {
     attempt,
@@ -632,12 +682,54 @@ function modelCallAudit({
     parse_error: parseError,
     validation_errors: validationErrors,
     accepted,
+    tools,
     usage: {
       tokens: response.info?.tokens ?? {},
       cost: response.info?.cost ?? 0,
       finish: response.info?.finish ?? null,
     },
   }
+}
+
+function workspaceToolNames(payload) {
+  return payload.tool_profile === WORKSPACE_TOOL_PROFILE ? WORKSPACE_TOOLS : []
+}
+
+function workspaceToolFlags(payload) {
+  return Object.fromEntries(workspaceToolNames(payload).map((tool) => [tool, true]))
+}
+
+function disabledWorkspaceToolFlags() {
+  return Object.fromEntries(WORKSPACE_TOOLS.map((tool) => [tool, false]))
+}
+
+function enabledToolNames(flags) {
+  return Object.entries(flags ?? {})
+    .filter(([, enabled]) => enabled)
+    .map(([name]) => name)
+    .sort()
+}
+
+function summarizeToolInput(tool, input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null
+  const allowed =
+    tool === "read"
+      ? ["filePath", "offset", "limit"]
+      : tool === "glob"
+        ? ["pattern", "path"]
+        : tool === "grep"
+          ? ["pattern", "path", "include"]
+          : tool === "bash"
+            ? ["command", "workdir", "timeout"]
+            : []
+  return Object.fromEntries(
+    allowed
+      .filter((key) => input[key] !== undefined)
+      .map((key) => [
+        key,
+        typeof input[key] === "string" ? input[key].slice(0, 1000) : input[key],
+      ]),
+  )
 }
 
 function aggregateUsage(responses, payload) {

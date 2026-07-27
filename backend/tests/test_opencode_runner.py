@@ -71,6 +71,7 @@ def test_host_capability_requires_key_and_pinned_packages(
     assert available["provider"] == "deepseek"
     assert available["model"] == "deepseek-v4-pro"
     assert available["output_mode"] == OPENCODE_OUTPUT_MODE_PROMPTED_JSON
+    assert available["max_steps"] == 100
 
     package = worker / "node_modules" / "@opencode-ai" / "sdk" / "package.json"
     package.write_text(json.dumps({"version": "0.0.0"}), encoding="utf-8")
@@ -121,7 +122,7 @@ def test_worker_response_must_be_a_json_object() -> None:
     assert OpenCodeInvestigator._parse_worker_response('{"ok": true}') == {"ok": True}
 
 
-def test_output_mode_keeps_pro_toolless_and_flash_structured() -> None:
+def test_output_mode_keeps_pro_text_json_and_flash_structured() -> None:
     assert opencode_output_mode("deepseek-v4-pro") == OPENCODE_OUTPUT_MODE_PROMPTED_JSON
     assert (
         opencode_output_mode("deepseek-v4-pro-202607")
@@ -155,7 +156,7 @@ def test_output_mode_keeps_pro_toolless_and_flash_structured() -> None:
     )
 
 
-def test_investigate_builds_a_toolless_prompt_and_validates_result(
+def test_investigate_builds_a_workspace_shell_prompt_and_validates_result(
     settings, tmp_path, monkeypatch
 ) -> None:  # noqa: ANN001
     configured = replace(settings, opencode_isolation="host")
@@ -166,15 +167,19 @@ def test_investigate_builds_a_toolless_prompt_and_validates_result(
         lambda **_kwargs: {"available": True},
     )
 
-    def invoke(payload, *, timeout_seconds):  # noqa: ANN001
+    def invoke(payload, *, timeout_seconds, workspace):  # noqa: ANN001
         assert timeout_seconds == configured.task_timeout_seconds + 15
+        assert workspace == expected_workspace
         assert payload["action"] == "investigate"
         assert payload["model"] == "deepseek-v4-pro"
-        assert "cannot inspect files or execute commands directly" in payload["prompt"]
+        assert "run shell commands" in payload["prompt"]
+        assert "workspace or /tmp" in payload["prompt"]
+        assert payload["tool_profile"] == "workspace_shell"
         assert "DEEPSEEK_THINKING_OUTPUT_ADAPTER" in payload["prompt"]
         assert "OUTPUT_JSON_SCHEMA" in payload["prompt"]
         assert payload["output_schema"]["title"] == "AgentInvestigationResult"
         assert payload["output_schema"]["additionalProperties"] is False
+        assert payload["output_schema"]["properties"]["requested_tests"]["maxItems"] == 100
         serialized_schema = json.dumps(payload["output_schema"])
         assert '"$defs"' not in serialized_schema
         assert '"$ref"' not in serialized_schema
@@ -200,6 +205,7 @@ def test_investigate_builds_a_toolless_prompt_and_validates_result(
     monkeypatch.setattr(investigator, "_invoke", invoke)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    expected_workspace = workspace
     scan = Scan(
         id="00000000-0000-0000-0000-000000000001",
         filename="sample.apk",

@@ -1,14 +1,20 @@
 import assert from "node:assert/strict"
 import { createServer } from "node:http"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { delimiter, join, resolve } from "node:path"
-import { spawn } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 import test from "node:test"
 
 const expected = { answer: "bounded result" }
 
-test("flash uses OpenCode structured output with only the internal result tool", async () => {
+test("worker PATH adb shim refuses device access", () => {
+  const blocked = spawnSync(resolve("bin/adb"), ["devices"], { encoding: "utf8" })
+  assert.equal(blocked.status, 126)
+  assert.match(blocked.stderr, /adb is disabled/)
+})
+
+test("flash can inspect the workspace before returning structured output", async () => {
   const requests = []
   const api = createServer(async (request, response) => {
     const body = await readJSON(request)
@@ -76,6 +82,7 @@ test("flash uses OpenCode structured output with only the internal result tool",
       developer_instructions: "Use no external tools. Return only structured JSON.",
       model: "deepseek-v4-flash",
       base_url: `http://127.0.0.1:${address.port}`,
+      tool_profile: "workspace_shell",
       output_schema: {
         type: "object",
         properties: { answer: { type: "string" } },
@@ -111,7 +118,7 @@ test("flash uses OpenCode structured output with only the internal result tool",
     assert.equal(requests[0].body.tool_choice, "required")
     assert.deepEqual(
       requests[0].body.tools.map((item) => item.function.name),
-      ["StructuredOutput"],
+      ["bash", "glob", "grep", "read", "StructuredOutput"],
     )
     assert.ok(events.some((item) => item.event_type === "model.session.started"))
     assert.ok(events.some((item) => item.event_type === "model.output.validated"))
@@ -121,7 +128,7 @@ test("flash uses OpenCode structured output with only the internal result tool",
   }
 })
 
-test("pro omits tool_choice and retries text JSON through local schema validation", async () => {
+test("pro avoids required tool choice and retries text JSON through local validation", async () => {
   const requests = []
   const api = createServer(async (request, response) => {
     const body = await readJSON(request)
@@ -178,6 +185,7 @@ test("pro omits tool_choice and retries text JSON through local schema validatio
       developer_instructions: "Use no external tools. Return only JSON.",
       model: "deepseek-v4-pro",
       base_url: `http://127.0.0.1:${address.port}`,
+      tool_profile: "workspace_shell",
       output_schema: {
         type: "object",
         properties: { answer: { type: "string" } },
@@ -198,8 +206,8 @@ test("pro omits tool_choice and retries text JSON through local schema validatio
     assert.equal(result.usage.calls, 2)
     assert.equal(result.output_transport.mode, "prompted_json")
     assert.equal(result.output_transport.format, "text")
-    assert.equal(result.output_transport.tool_choice, "omitted")
-    assert.deepEqual(result.output_transport.tools, [])
+    assert.equal(result.output_transport.tool_choice, "auto")
+    assert.deepEqual(result.output_transport.tools, ["read", "glob", "grep", "bash"])
     assert.equal(result.output_transport.schema_validator, "ajv@8.20.0")
     assert.equal(result.output_transport.model_calls.length, 2)
     assert.equal(result.output_transport.model_calls[0].accepted, false)
@@ -209,12 +217,17 @@ test("pro omits tool_choice and retries text JSON through local schema validatio
     )
     assert.equal(result.output_transport.model_calls[1].accepted, true)
     assert.equal(requests.length, 2)
-    for (const item of requests) {
-      assert.equal(item.url, "/chat/completions")
-      assert.equal(item.body.model, "deepseek-v4-pro")
-      assert.equal(item.body.tool_choice, undefined)
-      assert.ok(!item.body.tools || item.body.tools.length === 0)
-    }
+    assert.equal(requests[0].url, "/chat/completions")
+    assert.equal(requests[0].body.model, "deepseek-v4-pro")
+    assert.notEqual(requests[0].body.tool_choice, "required")
+    assert.deepEqual(
+      requests[0].body.tools.map((item) => item.function.name).sort(),
+      ["bash", "glob", "grep", "read"],
+    )
+    assert.equal(requests[1].url, "/chat/completions")
+    assert.equal(requests[1].body.model, "deepseek-v4-pro")
+    assert.equal(requests[1].body.tool_choice, undefined)
+    assert.ok(!requests[1].body.tools || requests[1].body.tools.length === 0)
     assert.match(
       JSON.stringify(requests[1].body.messages),
       /VALIDATION_ERRORS_JSON/,
@@ -227,12 +240,256 @@ test("pro omits tool_choice and retries text JSON through local schema validatio
   }
 })
 
+test("pro can call the read tool and then return locally validated JSON", async () => {
+  const requests = []
+  let workspaceFile
+  const api = createServer(async (request, response) => {
+    const body = await readJSON(request)
+    requests.push({ url: request.url, body })
+    response.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    })
+    if (requests.length === 1) {
+      response.write(
+        event({
+          id: "chatcmpl-pro-tool-1",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: body.model,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                role: "assistant",
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "call-read",
+                    type: "function",
+                    function: {
+                      name: "read",
+                      arguments: JSON.stringify({ filePath: workspaceFile }),
+                    },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        }),
+      )
+      response.write(
+        event({
+          id: "chatcmpl-pro-tool-1",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: body.model,
+          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+          usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+        }),
+      )
+    } else {
+      response.write(
+        event({
+          id: "chatcmpl-pro-tool-2",
+          object: "chat.completion.chunk",
+          created: 2,
+          model: body.model,
+          choices: [
+            {
+              index: 0,
+              delta: { role: "assistant", content: JSON.stringify(expected) },
+              finish_reason: null,
+            },
+          ],
+        }),
+      )
+      response.write(
+        event({
+          id: "chatcmpl-pro-tool-2",
+          object: "chat.completion.chunk",
+          created: 2,
+          model: body.model,
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          usage: { prompt_tokens: 12, completion_tokens: 4, total_tokens: 16 },
+        }),
+      )
+    }
+    response.end("data: [DONE]\n\n")
+  })
+  await listen(api)
+  const address = api.address()
+  assert(address && typeof address !== "string")
+
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-opencode-pro-tool-test-"))
+  workspaceFile = join(root, "evidence.txt")
+  await writeFile(workspaceFile, "exported provider evidence")
+  try {
+    const completed = await runWorker(root, {
+      schema_version: "1.0",
+      action: "investigate",
+      prompt: "Read evidence.txt, then return the required JSON object.",
+      developer_instructions: "Inspect only the supplied workspace. Return only JSON.",
+      model: "deepseek-v4-pro",
+      base_url: `http://127.0.0.1:${address.port}`,
+      tool_profile: "workspace_shell",
+      output_schema: {
+        type: "object",
+        properties: { answer: { type: "string" } },
+        required: ["answer"],
+        additionalProperties: false,
+      },
+      timeout_ms: 10_000,
+    })
+    assert.equal(completed.code, 0, completed.stderr)
+    const { result, events } = parseWorkerOutput(completed.stdout)
+    assert.deepEqual(result.result, expected)
+    assert.equal(requests.length, 2)
+    assert.match(JSON.stringify(requests[1].body.messages), /exported provider evidence/)
+    assert.ok(
+      events.some(
+        (item) =>
+          item.event_type === "model.tool.completed" &&
+          item.data.tool === "read" &&
+          item.data.input?.filePath === workspaceFile,
+      ),
+    )
+  } finally {
+    api.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("pro can run bash in its workspace and /tmp", async () => {
+  const requests = []
+  const api = createServer(async (request, response) => {
+    const body = await readJSON(request)
+    requests.push({ url: request.url, body })
+    response.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    })
+    if (requests.length === 1) {
+      response.write(
+        event({
+          id: "chatcmpl-pro-bash-1",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: body.model,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                role: "assistant",
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "call-bash",
+                    type: "function",
+                    function: {
+                      name: "bash",
+                      arguments: JSON.stringify({
+                        command:
+                          "pwd && printf workspace-ok > ./agent-note.txt && printf tmp-ok > /tmp/agent-note.txt",
+                      }),
+                    },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        }),
+      )
+      response.write(
+        event({
+          id: "chatcmpl-pro-bash-1",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: body.model,
+          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+          usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 },
+        }),
+      )
+    } else {
+      response.write(
+        event({
+          id: "chatcmpl-pro-bash-2",
+          object: "chat.completion.chunk",
+          created: 2,
+          model: body.model,
+          choices: [
+            {
+              index: 0,
+              delta: { role: "assistant", content: JSON.stringify(expected) },
+              finish_reason: null,
+            },
+          ],
+        }),
+      )
+      response.write(
+        event({
+          id: "chatcmpl-pro-bash-2",
+          object: "chat.completion.chunk",
+          created: 2,
+          model: body.model,
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          usage: { prompt_tokens: 12, completion_tokens: 4, total_tokens: 16 },
+        }),
+      )
+    }
+    response.end("data: [DONE]\n\n")
+  })
+  await listen(api)
+  const address = api.address()
+  assert(address && typeof address !== "string")
+
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-opencode-pro-bash-test-"))
+  try {
+    const completed = await runWorker(root, {
+      schema_version: "1.0",
+      action: "investigate",
+      prompt: "Use bash for a bounded workspace check, then return the required JSON.",
+      developer_instructions: "Run shell commands only in the workspace or /tmp.",
+      model: "deepseek-v4-pro",
+      base_url: `http://127.0.0.1:${address.port}`,
+      tool_profile: "workspace_shell",
+      output_schema: {
+        type: "object",
+        properties: { answer: { type: "string" } },
+        required: ["answer"],
+        additionalProperties: false,
+      },
+      timeout_ms: 10_000,
+    })
+    assert.equal(completed.code, 0, completed.stderr)
+    const { result, events } = parseWorkerOutput(completed.stdout)
+    assert.deepEqual(result.result, expected)
+    assert.equal(requests.length, 2)
+    assert.match(JSON.stringify(requests[1].body.messages), new RegExp(root))
+    assert.ok(
+      events.some(
+        (item) =>
+          item.event_type === "model.tool.completed" &&
+          item.data.tool === "bash" &&
+          item.data.input?.command?.includes("agent-note.txt"),
+      ),
+    )
+  } finally {
+    api.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 function runWorker(root, payload) {
   return new Promise((resolvePromise, reject) => {
     const worker = spawn(process.execPath, [resolve("worker.mjs")], {
       cwd: root,
       env: {
-        PATH: `${resolve("node_modules/.bin")}${delimiter}${process.env.PATH ?? ""}`,
+        PATH: `${resolve("bin")}${delimiter}${resolve("node_modules/.bin")}${delimiter}${process.env.PATH ?? ""}`,
         HOME: join(root, "home"),
         XDG_DATA_HOME: join(root, "data"),
         XDG_CONFIG_HOME: join(root, "config"),

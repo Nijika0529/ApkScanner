@@ -71,12 +71,13 @@ class ToolRunner:
         command_env = os.environ.copy()
         if env:
             command_env.update(env)
+        effective_timeout = self.timeout_seconds if timeout is None else timeout
         if cancel_event is not None:
             return self._run_cancelable(
                 argv,
                 cwd=cwd,
                 env=command_env,
-                timeout=timeout or self.timeout_seconds,
+                timeout=effective_timeout,
                 cancel_event=cancel_event,
             )
         try:
@@ -88,7 +89,7 @@ class ToolRunner:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=timeout or self.timeout_seconds,
+                timeout=effective_timeout,
                 check=False,
             )
             return CommandResult(

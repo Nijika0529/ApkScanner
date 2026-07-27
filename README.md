@@ -88,6 +88,44 @@ Without ADB or the Probe APK, scans still complete and explicitly mark dynamic c
 An `adb shell` success is retained as a separate identity and is never treated as equivalent to an
 ordinary third-party application.
 
+An investigation task receives a 20-minute budget by default. A task that reaches `timed_out`
+exposes the **继续深度探索** action in the Web console. Each manual continuation receives a fresh
+20-minute budget and reloads the task's prior static, ADB, Frida, and AI Evidence instead of starting
+from an empty investigation context. Continuations are explicit and unlimited by the automatic retry
+count; every continuation still creates a new attempt, model audit, device lease, and cleanup cycle.
+
+## Private ground-truth model evaluation
+
+The scanner persists each candidate as a security hypothesis with role-separated arguments, proof
+attempts, evidence references, and a platform verdict. The Web **验证链** tab exposes that lineage.
+For a private APK with known vulnerabilities, copy
+[`config/benchmark-ground-truth.example.json`](config/benchmark-ground-truth.example.json), record
+the APK SHA-256 and matching selectors, then run:
+
+```bash
+scanctl benchmark /path/to/private.apk \
+  --truth /path/to/private-ground-truth.json \
+  --investigator opencode
+```
+
+An existing scan can be evaluated without scanning again:
+
+```bash
+scanctl evaluate --scan-id SCAN_ID --truth /path/to/private-ground-truth.json
+```
+
+The primary score is precision-weighted F0.5. A successful Probe reachability result is tracked as
+`execution_demonstrated`, but dynamic benchmark credit additionally requires a domain Prover's
+platform-verifiable `security_impact_observed` signal. `candidate`, `inconclusive`, manually accepted
+findings, and model prose without platform proof never count as discoveries. Ground-truth cases
+default to `minimum_proof: dynamic`; a merely suspicious exported declaration therefore cannot earn
+credit. Confirmed findings that do not match the private ground truth count as false positives, while
+unproven AI output is reported separately as noise.
+
+Likewise, a model may emit `not_reproduced` only when a correlated executed test case carries an
+explicit platform `oracle_refuted=true` result. Reachability logs or one failed payload alone are
+insufficient and are downgraded to `inconclusive`.
+
 Configure the single-account login replay with a non-secret JSON flow and OS-keyring references:
 
 ```bash
@@ -162,12 +200,15 @@ scanctl capabilities --deep
 ```
 
 The host worker creates a private temporary HOME/XDG tree and an authenticated loopback OpenCode
-server for each invocation. In both modes, OpenCode receives only the platform-generated task JSON:
-filesystem, shell, web, MCP, and subagent tools are denied. `deepseek-v4-pro` uses OpenCode text
-output with no tools and no `tool_choice`; the worker validates JSON locally with Ajv and can issue
-two auditable correction turns in the same session. `deepseek-v4-flash` uses OpenCode's internal
-`StructuredOutput` result collector. Requested Android tests are always validated and executed by
-the Python control plane.
+server for each invocation. In both modes, OpenCode can inspect the complete scan workspace with
+the native `read`, `glob`, `grep`, and `bash` tools. Bash may create analysis artifacts in the
+scan workspace or `/tmp`; the container root filesystem stays read-only. Native editing, web, MCP,
+and subagent tools remain denied. ADB is blocked by OpenCode permissions and a PATH shim, and no
+device serial or socket is mounted. `deepseek-v4-pro` uses the normal OpenCode tool loop and returns
+text JSON without the incompatible `tool_choice: required`; the worker validates it locally with
+Ajv and can issue two tool-disabled correction turns in the same session. `deepseek-v4-flash` uses
+the same workspace tools plus OpenCode's internal `StructuredOutput` collector. Requested Android
+tests are always validated and executed by the Python control plane.
 
 Set `APKSCANNER_OPENCODE_MODEL=deepseek-v4-flash` to prefer the lower-cost model. An enterprise
 DeepSeek-compatible gateway can be selected with `APKSCANNER_DEEPSEEK_BASE_URL`; remote gateways
@@ -217,7 +258,7 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_TASK_TIMEOUT` | 1200 s | Per-investigation budget |
 | `APKSCANNER_TASK_MAX_ATTEMPTS` | 2 | Retry budget |
 | `APKSCANNER_AGENT_MAX_ROUNDS` | 3 | Maximum adaptive AI/device rounds per task (1–5) |
-| `APKSCANNER_AGENT_TESTS_PER_ROUND` | 4 | Maximum accepted AI-requested tests per round (1–12) |
+| `APKSCANNER_AGENT_TESTS_PER_ROUND` | 100 | Maximum accepted AI-requested tests per round (1–100) |
 
 ## Verification
 

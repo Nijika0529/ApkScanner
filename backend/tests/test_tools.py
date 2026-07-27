@@ -1,10 +1,27 @@
 from __future__ import annotations
 
+import subprocess
 import sys
 import threading
 import time
 
 from apkscanner.tools import ToolRunner
+
+
+def test_explicit_zero_timeout_does_not_fall_back_to_default(monkeypatch) -> None:  # noqa: ANN001
+    observed: dict[str, int | None] = {}
+
+    def fake_run(*_args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        observed["timeout"] = kwargs.get("timeout")
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = ToolRunner(timeout_seconds=600).run(
+        [sys.executable, "-c", "pass"],
+        timeout=0,
+    )
+    assert result.exit_code == 0
+    assert observed["timeout"] == 0
 
 
 def test_tool_runner_cancels_an_active_process_group() -> None:

@@ -4,7 +4,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -52,6 +52,12 @@ class Scan(Base):
         back_populates="scan", cascade="all, delete"
     )
     events: Mapped[list[ScanEvent]] = relationship(back_populates="scan", cascade="all, delete")
+    security_hypotheses: Mapped[list[SecurityHypothesis]] = relationship(
+        back_populates="scan", cascade="all, delete"
+    )
+    benchmark_evaluations: Mapped[list[BenchmarkEvaluation]] = relationship(
+        back_populates="scan", cascade="all, delete"
+    )
 
 
 class EntryPoint(Base):
@@ -149,6 +155,121 @@ class Evidence(Base):
     summary: Mapped[str] = mapped_column(Text, default="")
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SecurityHypothesis(Base):
+    __tablename__ = "security_hypotheses"
+    __table_args__ = (
+        UniqueConstraint("scan_id", "fingerprint", name="uq_security_hypothesis_scan_fingerprint"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scan_id: Mapped[str] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("investigation_tasks.id", ondelete="CASCADE"), index=True
+    )
+    schema_version: Mapped[str] = mapped_column(String(16), default="1.0")
+    fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    category: Mapped[str] = mapped_column(String(128), index=True)
+    claim: Mapped[str] = mapped_column(Text)
+    attacker_model: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    preconditions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    impact: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(32), default="candidate", index=True)
+    confidence_score: Mapped[int] = mapped_column(Integer, default=0)
+    source_role: Mapped[str] = mapped_column(String(64), default="platform_seed")
+    entry_point_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    support_evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    refute_evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    proof_obligations: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    final_finding_id: Mapped[str | None] = mapped_column(
+        ForeignKey("findings.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    scan: Mapped[Scan] = relationship(back_populates="security_hypotheses")
+    arguments: Mapped[list[HypothesisArgument]] = relationship(
+        back_populates="hypothesis",
+        cascade="all, delete",
+        order_by="HypothesisArgument.created_at",
+    )
+    proof_attempts: Mapped[list[ProofAttempt]] = relationship(
+        back_populates="hypothesis",
+        cascade="all, delete",
+        order_by="ProofAttempt.created_at",
+    )
+
+
+class HypothesisArgument(Base):
+    __tablename__ = "hypothesis_arguments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scan_id: Mapped[str] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("investigation_tasks.id", ondelete="CASCADE"), index=True
+    )
+    hypothesis_id: Mapped[str] = mapped_column(
+        ForeignKey("security_hypotheses.id", ondelete="CASCADE"), index=True
+    )
+    schema_version: Mapped[str] = mapped_column(String(16), default="1.0")
+    role: Mapped[str] = mapped_column(String(32), index=True)
+    position: Mapped[str] = mapped_column(String(32), index=True)
+    phase: Mapped[str] = mapped_column(String(64), index=True)
+    backend: Mapped[str] = mapped_column(String(32), default="platform")
+    model: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    hypothesis: Mapped[SecurityHypothesis] = relationship(back_populates="arguments")
+
+
+class ProofAttempt(Base):
+    __tablename__ = "proof_attempts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scan_id: Mapped[str] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("investigation_tasks.id", ondelete="CASCADE"), index=True
+    )
+    hypothesis_id: Mapped[str] = mapped_column(
+        ForeignKey("security_hypotheses.id", ondelete="CASCADE"), index=True
+    )
+    schema_version: Mapped[str] = mapped_column(String(16), default="1.0")
+    test_case_id: Mapped[str] = mapped_column(String(128), index=True)
+    prover: Mapped[str] = mapped_column(String(128), default="android_entry_probe")
+    status: Mapped[str] = mapped_column(String(32), default="planned", index=True)
+    plan: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    oracle: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    harm_demonstrated: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    hypothesis: Mapped[SecurityHypothesis] = relationship(back_populates="proof_attempts")
+
+
+class BenchmarkEvaluation(Base):
+    __tablename__ = "benchmark_evaluations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scan_id: Mapped[str] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
+    schema_version: Mapped[str] = mapped_column(String(16), default="1.0")
+    name: Mapped[str] = mapped_column(String(256))
+    artifact_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    investigator_backend: Mapped[str] = mapped_column(String(32), default="none")
+    model: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    ground_truth: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    scan: Mapped[Scan] = relationship(back_populates="benchmark_evaluations")
 
 
 class CoverageItem(Base):

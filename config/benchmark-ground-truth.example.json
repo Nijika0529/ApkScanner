@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0",
+  "name": "private-apk-known-vulnerabilities",
+  "apk_sha256": null,
+  "vulnerabilities": [
+    {
+      "id": "GT-001",
+      "title": "Unauthenticated Deep Link reaches a sensitive action",
+      "harm": "A third-party application can open the declared route as a guest and trigger the protected action.",
+      "severity": "high",
+      "minimum_proof": "dynamic",
+      "match": {
+        "rule_ids": [
+          "AGENT-ENTRY-INVESTIGATION"
+        ],
+        "cwes": [],
+        "entry_names": [
+          "demo://example.test/open"
+        ],
+        "title_contains": [
+          "unauthenticated"
+        ]
+      }
+    }
+  ]
+}

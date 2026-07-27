@@ -27,11 +27,23 @@ from .enums import FindingStatus, ScanStatus, TaskStatus
 from .evidence import EvidenceRecorder
 from .instrumentation import FridaAdapter
 from .mobsf import MobSFAdapter
-from .models import CoverageItem, EntryPoint, Evidence, Finding, InvestigationTask, Scan
+from .models import (
+    CoverageItem,
+    EntryPoint,
+    Evidence,
+    Finding,
+    InvestigationTask,
+    ProofAttempt,
+    Scan,
+    SecurityHypothesis,
+)
 from .opencode_runner import (
     AJV_VERSION,
+    OPENCODE_MAX_STEPS,
     OPENCODE_OUTPUT_MODE_PROMPTED_JSON,
     OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
+    OPENCODE_TOOL_PROFILE,
+    OPENCODE_WORKSPACE_TOOLS,
     OpenCodeInvestigator,
     opencode_output_mode,
     opencode_prompt_for_model,
@@ -40,6 +52,7 @@ from .planner import InvestigationPlanner
 from .repository import add_event, now
 from .rules import BuiltinRuleEngine
 from .schemas import AGENT_RESULT_JSON_SCHEMA, AgentRequestedTest
+from .security_pipeline import HypothesisLedger
 from .static_analysis import ApkInspector
 from .tools import CommandResult, TimeBudget, ToolRunner
 
@@ -53,6 +66,7 @@ class ScanOrchestrator:
         self.inspector = ApkInspector(settings, self.runner)
         self.rules = BuiltinRuleEngine()
         self.evidence = EvidenceRecorder(store)
+        self.hypothesis_ledger = HypothesisLedger(database)
         self.device = AdbDeviceAdapter(settings, self.runner)
         self.frida = FridaAdapter(settings, self.runner)
         self.mobsf = MobSFAdapter(settings)
@@ -63,6 +77,7 @@ class ScanOrchestrator:
             "opencode": self.opencode,
         }
         self._running: set[str] = set()
+        self._resubmit_requested: set[str] = set()
         self._running_lock = asyncio.Lock()
         self._task_cancellations: dict[str, threading.Event] = {}
         self._task_cancellations_lock = threading.Lock()
@@ -120,13 +135,23 @@ class ScanOrchestrator:
     async def submit(self, scan_id: str) -> None:
         async with self._running_lock:
             if scan_id in self._running:
+                self._resubmit_requested.add(scan_id)
                 return
             self._running.add(scan_id)
         try:
-            await asyncio.to_thread(self._run_sync, scan_id)
+            while True:
+                async with self._running_lock:
+                    self._resubmit_requested.discard(scan_id)
+                await asyncio.to_thread(self._run_sync, scan_id)
+                async with self._running_lock:
+                    if scan_id in self._resubmit_requested:
+                        continue
+                    self._running.discard(scan_id)
+                    return
         finally:
             async with self._running_lock:
                 self._running.discard(scan_id)
+                self._resubmit_requested.discard(scan_id)
 
     def recover_interrupted_device_tasks(self) -> None:
         """Normalize transient single-device states after a control-plane restart."""
@@ -244,9 +269,47 @@ class ScanOrchestrator:
             with self.database.session_factory() as session:
                 scan = session.get(Scan, scan_id)
                 if scan:
+                    failed_at = now()
                     scan.status = ScanStatus.FAILED.value
                     scan.error = str(exc)
-                    scan.completed_at = now()
+                    scan.completed_at = failed_at
+                    interrupted = list(
+                        session.scalars(
+                            select(InvestigationTask).where(
+                                InvestigationTask.scan_id == scan_id,
+                                InvestigationTask.status.in_(
+                                    {
+                                        TaskStatus.QUEUED.value,
+                                        TaskStatus.AWAITING_DEVICE.value,
+                                        TaskStatus.RUNNING.value,
+                                        TaskStatus.CANCEL_REQUESTED.value,
+                                    }
+                                ),
+                            )
+                        )
+                    )
+                    for task in interrupted:
+                        cancellation_requested = (
+                            task.status == TaskStatus.CANCEL_REQUESTED.value
+                        )
+                        task.status = (
+                            TaskStatus.CANCELED.value
+                            if cancellation_requested
+                            else TaskStatus.FAILED.value
+                        )
+                        task.error = (
+                            "停止请求在扫描异常退出时已确认"
+                            if cancellation_requested
+                            else f"scan execution failed: {exc}"
+                        )
+                        task.completed_at = failed_at
+                        task.result = {
+                            **dict(task.result or {}),
+                            "scan_failure": {
+                                "error": str(exc),
+                                "failed_at": failed_at.isoformat(),
+                            },
+                        }
                     add_event(session, scan_id, "scan.failed", "Scan failed", {"error": str(exc)})
                     session.commit()
 
@@ -547,7 +610,16 @@ class ScanOrchestrator:
                 )
             if task is None:
                 return
-            remaining = int((scan_deadline - datetime.now(UTC)).total_seconds())
+            task_result = dict(task.result or {})
+            manual_dispatch = bool(
+                task_result.get("manual_rerun")
+                or task_result.get("manual_continuation")
+            )
+            remaining = (
+                self.settings.task_timeout_seconds
+                if manual_dispatch
+                else int((scan_deadline - datetime.now(UTC)).total_seconds())
+            )
             if remaining <= 0:
                 with self.database.session_factory() as session:
                     pending_tasks = list(
@@ -809,6 +881,9 @@ class ScanOrchestrator:
             entries = list(
                 session.scalars(select(EntryPoint).where(EntryPoint.id.in_(task.target_entry_ids)))
             )
+            continuation_context = dict(
+                (task.result or {}).get("manual_continuation") or {}
+            )
             agent_backend = self.resolve_task_investigator(scan, task)
             task.status = TaskStatus.RUNNING.value
             task.attempts += 1
@@ -844,13 +919,44 @@ class ScanOrchestrator:
                     ),
                     "entry_point_ids": list(task.target_entry_ids),
                     "hypotheses": list(task.hypotheses),
+                    "continuation_number": continuation_context.get(
+                        "continuation_number"
+                    ),
+                    "reusing_task_evidence": bool(continuation_context),
                 },
             )
             session.commit()
 
+        self.hypothesis_ledger.ensure_task_hypotheses(task)
+        hypothesis_context = self.hypothesis_ledger.task_context(task_id)
+        hypothesis_ids = {item["id"] for item in hypothesis_context}
         self._raise_if_cancelled(cancel_event)
-        budget = TimeBudget.from_seconds(timeout_seconds or self.settings.task_timeout_seconds)
-        evidence_summaries = self._static_evidence_summaries(scan_id)
+        task_budget_seconds = (
+            self.settings.task_timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds
+        )
+        budget = TimeBudget.from_seconds(task_budget_seconds)
+        evidence_summaries = self._evidence_summaries_for_run(
+            scan_id,
+            task_id=task_id,
+            include_task_evidence=bool(continuation_context),
+        )
+        if continuation_context:
+            self._record_exploration_event(
+                scan_id,
+                task_id,
+                "exploration.continuation.context_loaded",
+                "已装载历次静态、设备和 AI Evidence，继续深度探索",
+                {
+                    "source": "platform",
+                    "continuation_number": continuation_context.get(
+                        "continuation_number"
+                    ),
+                    "prior_evidence_count": len(evidence_summaries),
+                    "new_budget_seconds": task_budget_seconds,
+                },
+            )
         target_code_context = self._target_code_context(scan_id, entries)
         coverage_gaps: list[str] = []
         stages: dict[str, Any] = {
@@ -866,6 +972,7 @@ class ScanOrchestrator:
         agent_result = None
         agent_error = None
         executed_agent_tests: list[dict[str, Any]] = []
+        debate_context: dict[str, Any] = {}
         package_name = scan.package_name
         investigator = self.investigators.get(agent_backend)
         agent_enabled = self.settings.investigator_enabled(agent_backend)
@@ -875,6 +982,7 @@ class ScanOrchestrator:
             phase: str,
             timeout_cap: int | None = None,
             executed_tests: list[dict[str, Any]] | None = None,
+            candidate_under_review: dict[str, Any] | None = None,
             round_index: int = 0,
         ):  # noqa: ANN202
             audit_id: str | None = None
@@ -919,6 +1027,10 @@ class ScanOrchestrator:
                         "max_rounds": self.settings.agent_max_rounds,
                         "tests_per_round": self.settings.agent_tests_per_round,
                     },
+                    "continuation": continuation_context or None,
+                    "security_hypotheses": hypothesis_context,
+                    "candidate_under_review": candidate_under_review,
+                    "debate": debate_context or None,
                 }
                 self._record_exploration_event(
                     scan_id,
@@ -1004,6 +1116,25 @@ class ScanOrchestrator:
                     phase=phase,
                     attempt=task.attempts,
                     result=result,
+                )
+                role = (
+                    "critic"
+                    if phase == "adversarial_review"
+                    else "hunter"
+                    if phase in {"static_only", "test_planning"}
+                    else "advocate"
+                )
+                self.hypothesis_ledger.record_argument(
+                    task_id=task_id,
+                    role=role,
+                    phase=phase,
+                    backend=agent_backend,
+                    model=(
+                        self.settings.codex_worker_model
+                        if agent_backend == "codex"
+                        else self.settings.opencode_model
+                    ),
+                    payload=result.result.model_dump(mode="json"),
                 )
                 self._record_agent_runtime_events(
                     scan_id=scan_id,
@@ -1279,6 +1410,74 @@ class ScanOrchestrator:
                         timeout_cap=phase_one_cap,
                         round_index=0,
                     )
+                    if (
+                        agent_result is not None
+                        and not budget.expired
+                        and budget.remaining() >= 10
+                    ):
+                        candidate_payload = agent_result.result.model_dump(mode="json")
+                        critic_result, critic_error = invoke_agent(
+                            phase="adversarial_review",
+                            timeout_cap=min(180, max(1, budget.remaining() // 3)),
+                            candidate_under_review=candidate_payload,
+                            round_index=0,
+                        )
+                        if critic_result is not None:
+                            critic_payload = critic_result.result.model_dump(mode="json")
+                            debate_context = {
+                                "candidate": candidate_payload,
+                                "critic": critic_payload,
+                                "critic_thread_id": critic_result.thread_id,
+                                "critic_turn_id": critic_result.turn_id,
+                            }
+                            merged_requests: list[AgentRequestedTest] = []
+                            seen_requests: set[str] = set()
+                            for request in [
+                                *agent_result.result.requested_tests,
+                                *critic_result.result.requested_tests,
+                            ]:
+                                signature = json.dumps(
+                                    request.model_dump(mode="json"),
+                                    sort_keys=True,
+                                )
+                                if signature in seen_requests:
+                                    continue
+                                seen_requests.add(signature)
+                                merged_requests.append(request)
+                            agent_result.result = agent_result.result.model_copy(
+                                update={
+                                    "requested_tests": merged_requests[
+                                        : self.settings.agent_tests_per_round
+                                    ],
+                                    "coverage_gaps": list(
+                                        dict.fromkeys(
+                                            [
+                                                *agent_result.result.coverage_gaps,
+                                                *critic_result.result.coverage_gaps,
+                                            ]
+                                        )
+                                    ),
+                                }
+                            )
+                            self._record_exploration_event(
+                                scan_id,
+                                task_id,
+                                "debate.completed",
+                                "Hunter 候选已完成独立 Critic 质疑",
+                                {
+                                    "source": "platform",
+                                    "candidate_result": candidate_payload.get("result"),
+                                    "critic_result": critic_payload.get("result"),
+                                    "critic_objection_count": len(
+                                        critic_payload.get("coverage_gaps", [])
+                                    ),
+                                    "merged_test_count": len(merged_requests),
+                                },
+                            )
+                        elif critic_error:
+                            coverage_gaps.append(
+                                f"Adversarial review was unavailable: {critic_error}"
+                            )
                     completed_rounds = 0
                     while (
                         agent_result
@@ -1298,6 +1497,7 @@ class ScanOrchestrator:
                             entries,
                             auth_available=bool(auth_capability.get("available")),
                             limit=self.settings.agent_tests_per_round,
+                            hypothesis_ids=hypothesis_ids,
                         )
                         coverage_gaps.extend(request_gaps)
                         for accepted in requested:
@@ -1344,6 +1544,7 @@ class ScanOrchestrator:
                                 requests=requested,
                                 budget=budget,
                                 evidence_summaries=evidence_summaries,
+                                round_index=completed_rounds + 1,
                             )
                             executed_agent_tests.extend(executed_this_round)
                             coverage_gaps.extend(execution_gaps)
@@ -1401,7 +1602,7 @@ class ScanOrchestrator:
                             "Further AI-requested tests were not executed because the configured "
                             "adaptive exploration round limit was reached."
                         )
-                    if executed_agent_tests and not budget.expired:
+                    if (executed_agent_tests or debate_context) and not budget.expired:
                         final_result, final_error = invoke_agent(
                             phase="final_evaluation",
                             executed_tests=executed_agent_tests,
@@ -1453,11 +1654,53 @@ class ScanOrchestrator:
             validated_payload, validated_result_value = self._validated_agent_payload(
                 deepcopy(raw_payload), evidence_summaries
             )
+            platform_proof = self.hypothesis_ledger.task_proof_result(task_id)
+            if platform_proof is not None:
+                proof_status, proof_evidence_ids = platform_proof
+                if validated_result_value != proof_status:
+                    validated_payload["coverage_gaps"] = list(
+                        dict.fromkeys(
+                            [
+                                *validated_payload.get("coverage_gaps", []),
+                                (
+                                    "The platform Prover overrode the model conclusion because a "
+                                    "concrete harm Oracle succeeded."
+                                ),
+                            ]
+                        )
+                    )
+                validated_result_value = proof_status
+                validated_payload["result"] = proof_status
+                validated_payload["evidence_ids"] = list(
+                    dict.fromkeys(
+                        [
+                            *validated_payload.get("evidence_ids", []),
+                            *proof_evidence_ids,
+                        ]
+                    )
+                )
+                validated_payload["platform_severity"] = validated_payload.get(
+                    "severity_proposal"
+                )
+                validated_payload["severity_disposition"] = (
+                    "accepted_from_platform_harm_oracle"
+                )
             self._record_agent_validation(
                 task_id=task_id,
                 turn_id=agent_result.turn_id,
                 raw_payload=raw_payload,
                 validated_payload=validated_payload,
+            )
+            self.hypothesis_ledger.finalize(
+                task_id=task_id,
+                payload=validated_payload,
+                result_value=validated_result_value,
+                backend=agent_backend,
+                model=(
+                    self.settings.codex_worker_model
+                    if agent_backend == "codex"
+                    else self.settings.opencode_model
+                ),
             )
 
         with self.database.session_factory() as session:
@@ -1644,7 +1887,8 @@ class ScanOrchestrator:
         entries: list[EntryPoint],
         *,
         auth_available: bool,
-        limit: int = 12,
+        limit: int = 100,
+        hypothesis_ids: set[str] | None = None,
     ) -> tuple[list[AgentRequestedTest], list[str]]:
         entries_by_id = {entry.id: entry for entry in entries}
         accepted: list[AgentRequestedTest] = []
@@ -1655,6 +1899,14 @@ class ScanOrchestrator:
             reason = None
             if entry is None:
                 reason = "entry point is outside this task"
+            elif hypothesis_ids and request.hypothesis_id is None:
+                reason = "hypothesis_id is required for an auditable proof attempt"
+            elif (
+                request.hypothesis_id is not None
+                and hypothesis_ids is not None
+                and request.hypothesis_id not in hypothesis_ids
+            ):
+                reason = "hypothesis is outside this task"
             elif request.state == "authenticated" and not auth_available:
                 reason = "authenticated replay is unavailable"
             elif any(
@@ -1738,9 +1990,13 @@ class ScanOrchestrator:
         requests: list[AgentRequestedTest],
         budget: TimeBudget,
         evidence_summaries: list[dict[str, Any]],
+        round_index: int,
     ) -> tuple[list[dict[str, Any]], list[str], bool]:
         entries_by_id = {entry.id: entry for entry in entries}
-        indexed = [(f"agent-{index + 1}", request) for index, request in enumerate(requests)]
+        indexed = [
+            (f"agent-r{round_index}-{index + 1}", request)
+            for index, request in enumerate(requests)
+        ]
         executed: list[dict[str, Any]] = []
         gaps: list[str] = []
         instrumented_observed = False
@@ -1748,44 +2004,89 @@ class ScanOrchestrator:
             state_requests = [item for item in indexed if item[1].state == state]
             if not state_requests or budget.expired:
                 continue
-            reset = self.device.reset_session(package_name, budget)
-            self._record_commands(scan_id, task_id, reset, evidence_summaries)
-            if any(result.exit_code != 0 for _kind, result, _metadata in reset):
-                gaps.append(f"Could not reset the device for {state} agent-requested tests.")
-                continue
-            if state == "authenticated":
-                auth = self.device.authenticate(package_name, budget)
-                self._record_commands(scan_id, task_id, auth, evidence_summaries)
-                if any(result.exit_code != 0 for _kind, result, _metadata in auth):
-                    gaps.append("Authenticated replay failed before agent-requested tests.")
-                    continue
-            frida_session, frida_error = self.frida.start(package_name, budget)
-            if frida_error is not None:
-                self._record_commands(
+            for test_case_id, request in state_requests:
+                if budget.expired:
+                    gaps.append("Task budget expired before all agent-requested tests ran.")
+                    break
+                before = len(evidence_summaries)
+                proof_attempt_id = self.hypothesis_ledger.plan_proof(
+                    task_id=task_id,
+                    test_case_id=test_case_id,
+                    request=request,
+                )
+                self.hypothesis_ledger.start_proof(proof_attempt_id)
+                self._record_exploration_event(
                     scan_id,
                     task_id,
-                    [("instrumented.frida", frida_error, self.frida.metadata(frida_error))],
-                    evidence_summaries,
+                    "action.started",
+                    f"开始执行 AI 申请的 {state} 状态入口测试",
+                    {
+                        "source": "platform",
+                        "test_case_id": test_case_id,
+                        "hypothesis_id": request.hypothesis_id,
+                        "entry_point_id": request.entry_point_id,
+                        "state": state,
+                        "rationale_summary": request.rationale,
+                    },
                 )
-            try:
-                for test_case_id, request in state_requests:
-                    if budget.expired:
-                        gaps.append("Task budget expired before all agent-requested tests ran.")
-                        break
-                    before = len(evidence_summaries)
-                    self._record_exploration_event(
+
+                def tagged(commands, *, case_id: str = test_case_id):  # noqa: ANN001, ANN202
+                    return [
+                        (
+                            kind,
+                            result,
+                            {**dict(metadata), "test_case_id": case_id},
+                        )
+                        for kind, result, metadata in commands
+                    ]
+
+                reset = tagged(self.device.reset_session(package_name, budget))
+                self._record_commands(scan_id, task_id, reset, evidence_summaries)
+                if any(result.exit_code != 0 for _kind, result, _metadata in reset):
+                    proof_evidence = evidence_summaries[before:]
+                    error = f"Could not reset the device for {state} test {test_case_id}."
+                    self.hypothesis_ledger.complete_proof(
+                        proof_attempt_id,
+                        proof_evidence,
+                        error=error,
+                    )
+                    gaps.append(error)
+                    continue
+
+                if state == "authenticated":
+                    auth = tagged(self.device.authenticate(package_name, budget))
+                    self._record_commands(scan_id, task_id, auth, evidence_summaries)
+                    if any(result.exit_code != 0 for _kind, result, _metadata in auth):
+                        proof_evidence = evidence_summaries[before:]
+                        error = (
+                            f"Authenticated replay failed before requested test {test_case_id}."
+                        )
+                        self.hypothesis_ledger.complete_proof(
+                            proof_attempt_id,
+                            proof_evidence,
+                            error=error,
+                        )
+                        gaps.append(error)
+                        continue
+
+                frida_session, frida_error = self.frida.start(package_name, budget)
+                if frida_error is not None:
+                    self._record_commands(
                         scan_id,
                         task_id,
-                        "action.started",
-                        f"开始执行 AI 申请的 {state} 状态入口测试",
-                        {
-                            "source": "platform",
-                            "test_case_id": test_case_id,
-                            "entry_point_id": request.entry_point_id,
-                            "state": state,
-                            "rationale_summary": request.rationale,
-                        },
+                        tagged(
+                            [
+                                (
+                                    "instrumented.frida",
+                                    frida_error,
+                                    self.frida.metadata(frida_error),
+                                )
+                            ]
+                        ),
+                        evidence_summaries,
                     )
+                execution_error: Exception | None = None
+                try:
                     probe = self.device.probe(
                         entries_by_id[request.entry_point_id],
                         package_name,
@@ -1798,44 +2099,62 @@ class ScanOrchestrator:
                     self._record_commands(
                         scan_id, task_id, probe.commands, evidence_summaries
                     )
-                    evidence_ids = [
-                        item["id"]
-                        for item in evidence_summaries[before:]
-                        if item.get("metadata", {}).get("test_case_id") == test_case_id
-                    ]
-                    executed.append(
-                        {
+                except Exception as exc:
+                    execution_error = exc
+                finally:
+                    if frida_session is not None:
+                        result = self.frida.collect(frida_session)
+                        metadata = {
+                            **self.frida.metadata(result),
                             "test_case_id": test_case_id,
-                            "request": request.model_dump(mode="json"),
-                            "evidence_ids": evidence_ids,
                         }
-                    )
-                    self._record_exploration_event(
-                        scan_id,
-                        task_id,
-                        "action.completed",
-                        f"AI 申请的入口测试已完成，生成 {len(evidence_ids)} 条证据",
-                        {
-                            "source": "platform",
-                            "test_case_id": test_case_id,
-                            "entry_point_id": request.entry_point_id,
-                            "state": state,
-                            "evidence_ids": evidence_ids,
-                        },
-                    )
-            finally:
-                if frida_session is not None:
-                    result = self.frida.collect(frida_session)
-                    metadata = self.frida.metadata(result)
-                    instrumented_observed = instrumented_observed or bool(
-                        metadata["capture_success"] and metadata["observation_count"] > 0
-                    )
-                    self._record_commands(
-                        scan_id,
-                        task_id,
-                        [("instrumented.frida", result, metadata)],
-                        evidence_summaries,
-                    )
+                        instrumented_observed = instrumented_observed or bool(
+                            metadata["capture_success"]
+                            and metadata["observation_count"] > 0
+                        )
+                        self._record_commands(
+                            scan_id,
+                            task_id,
+                            [("instrumented.frida", result, metadata)],
+                            evidence_summaries,
+                        )
+
+                proof_evidence = [
+                    item
+                    for item in evidence_summaries[before:]
+                    if item.get("metadata", {}).get("test_case_id") == test_case_id
+                ]
+                self.hypothesis_ledger.complete_proof(
+                    proof_attempt_id,
+                    proof_evidence,
+                    error=str(execution_error) if execution_error else None,
+                )
+                if execution_error is not None:
+                    raise execution_error
+                evidence_ids = [item["id"] for item in proof_evidence]
+                executed.append(
+                    {
+                        "test_case_id": test_case_id,
+                        "proof_attempt_id": proof_attempt_id,
+                        "hypothesis_id": request.hypothesis_id,
+                        "request": request.model_dump(mode="json"),
+                        "evidence_ids": evidence_ids,
+                    }
+                )
+                self._record_exploration_event(
+                    scan_id,
+                    task_id,
+                    "action.completed",
+                    f"AI 申请的入口测试已完成，生成 {len(evidence_ids)} 条证据",
+                    {
+                        "source": "platform",
+                        "test_case_id": test_case_id,
+                        "hypothesis_id": request.hypothesis_id,
+                        "entry_point_id": request.entry_point_id,
+                        "state": state,
+                        "evidence_ids": evidence_ids,
+                    },
+                )
         return executed, gaps, instrumented_observed
 
     def _record_agent_request(
@@ -1850,7 +2169,9 @@ class ScanOrchestrator:
         phase: str,
         capability: dict[str, Any],
     ) -> str:
-        direct_tool_access = backend == "codex"
+        direct_tool_access = backend in {"codex", "opencode"}
+        shell_access = backend in {"codex", "opencode"}
+        workspace_write = backend == "opencode"
         provider = "openai" if backend == "codex" else "deepseek"
         model = (
             self.settings.codex_worker_model
@@ -1880,6 +2201,8 @@ class ScanOrchestrator:
             evidence,
             platform_context,
             direct_tool_access=direct_tool_access,
+            shell_access=shell_access,
+            workspace_write=workspace_write,
         )
         if backend == "opencode":
             prompt = opencode_prompt_for_model(
@@ -1903,13 +2226,37 @@ class ScanOrchestrator:
             "task_id": task.id,
             "attempt": task.attempts,
             "developer_instructions": developer_instructions(
-                direct_tool_access=direct_tool_access
+                direct_tool_access=direct_tool_access,
+                shell_access=shell_access,
+                workspace_write=workspace_write,
             ),
             "prompt": prompt,
             "output_schema": AGENT_RESULT_JSON_SCHEMA,
             "tool_boundary": {
                 "direct_tool_access": direct_tool_access,
-                "model_tools_enabled": backend == "codex",
+                "model_tools_enabled": backend in {"codex", "opencode"},
+                "workspace_tool_profile": (
+                    OPENCODE_TOOL_PROFILE if backend == "opencode" else "codex_readonly"
+                ),
+                "workspace_tools": (
+                    list(OPENCODE_WORKSPACE_TOOLS)
+                    if backend == "opencode"
+                    else ["file", "shell"]
+                ),
+                "shell_enabled": shell_access,
+                "write_enabled": workspace_write,
+                "native_write_tools_enabled": False,
+                "allowed_write_roots": (
+                    ["scan_workspace", "/tmp"] if workspace_write else []
+                ),
+                "network_enabled": backend == "opencode",
+                "network_policy": (
+                    "container_bridge; target requests prohibited by developer instructions"
+                    if backend == "opencode"
+                    else "sandbox_disabled"
+                ),
+                "adb_enabled": False,
+                "subagents_enabled": False,
                 "structured_output_tool_enabled": (
                     backend == "opencode"
                     and output_mode == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
@@ -1919,6 +2266,9 @@ class ScanOrchestrator:
             "runtime_options": {
                 "reasoning_effort": "medium" if backend == "codex" else "provider_default",
                 "output_mode": output_mode,
+                "max_agent_steps": (
+                    OPENCODE_MAX_STEPS if backend == "opencode" else None
+                ),
                 "structured_output_retries": (
                     2
                     if backend == "opencode"
@@ -2237,6 +2587,19 @@ class ScanOrchestrator:
         return None
 
     def _static_evidence_summaries(self, scan_id: str) -> list[dict[str, Any]]:
+        return self._evidence_summaries_for_run(
+            scan_id,
+            task_id=None,
+            include_task_evidence=False,
+        )
+
+    def _evidence_summaries_for_run(
+        self,
+        scan_id: str,
+        *,
+        task_id: str | None,
+        include_task_evidence: bool,
+    ) -> list[dict[str, Any]]:
         with self.database.session_factory() as session:
             items = list(
                 session.scalars(
@@ -2246,6 +2609,15 @@ class ScanOrchestrator:
                     )
                 )
             )
+            if include_task_evidence and task_id is not None:
+                items.extend(
+                    session.scalars(
+                        select(Evidence).where(
+                            Evidence.scan_id == scan_id,
+                            Evidence.task_id == task_id,
+                        )
+                    )
+                )
         return [self._evidence_summary(item) for item in items]
 
     def _target_code_context(
@@ -2533,44 +2905,95 @@ class ScanOrchestrator:
                 f"Ignored {len(unknown)} evidence ID(s) not issued for this scan and task."
             )
         cited = [evidence_by_id[value] for value in valid_ids]
-        probe_request_ids = {
-            item.get("metadata", {}).get("request_id")
+        probe_request_tests = {
+            (
+                item.get("metadata", {}).get("request_id"),
+                item.get("metadata", {}).get("test_case_id"),
+            )
             for item in cited
             if item["kind"] == "blackbox.probe_app"
             and item.get("exit_code") == 0
             and item.get("metadata", {}).get("caller_identity") == "probe_app"
         }
-        log_request_ids = {
-            item.get("metadata", {}).get("request_id")
+        log_request_tests = {
+            (
+                item.get("metadata", {}).get("request_id"),
+                item.get("metadata", {}).get("test_case_id"),
+            )
             for item in cited
             if item["kind"] == "blackbox.logcat"
             and item.get("metadata", {}).get("request_observed")
         }
-        correlated_blackbox = bool((probe_request_ids & log_request_ids) - {None})
+        correlated_request_tests = {
+            (request_id, test_case_id)
+            for request_id, test_case_id in probe_request_tests & log_request_tests
+            if request_id is not None and test_case_id is not None
+        }
+        correlated_blackbox = bool(correlated_request_tests)
+        correlated_blackbox_test_ids = {
+            test_case_id
+            for _request_id, test_case_id in correlated_request_tests
+        }
         successful_blackbox = correlated_blackbox and any(
             item["kind"] == "blackbox.logcat"
-            and item.get("metadata", {}).get("request_id") in probe_request_ids
+            and (
+                item.get("metadata", {}).get("request_id"),
+                item.get("metadata", {}).get("test_case_id"),
+            )
+            in correlated_request_tests
             and item.get("metadata", {}).get("probe_success")
             for item in cited
+        )
+        successful_blackbox_test_ids = {
+            item.get("metadata", {}).get("test_case_id")
+            for item in cited
+            if item["kind"] == "blackbox.logcat"
+            and (
+                item.get("metadata", {}).get("request_id"),
+                item.get("metadata", {}).get("test_case_id"),
+            )
+            in correlated_request_tests
+            and item.get("metadata", {}).get("probe_success")
+        } - {None}
+        instrumented_test_ids = {
+            item.get("metadata", {}).get("test_case_id")
+            for item in cited
+            if item["kind"] == "instrumented.frida"
+            and item.get("metadata", {}).get("capture_success")
+            and item.get("metadata", {}).get("observation_count", 0) > 0
+        } - {None}
+        impact_test_ids = {
+            item.get("metadata", {}).get("test_case_id")
+            for item in cited
+            if item.get("metadata", {}).get("security_impact_observed") is True
+        } - {None}
+        refuted_test_ids = {
+            item.get("metadata", {}).get("test_case_id")
+            for item in cited
+            if item.get("metadata", {}).get("oracle_refuted") is True
+        } - {None}
+        harmful_blackbox = successful_blackbox and bool(
+            successful_blackbox_test_ids & impact_test_ids
+        )
+        harmful_instrumented = bool(instrumented_test_ids & impact_test_ids)
+        explicitly_refuted = bool(
+            refuted_test_ids
+            & (correlated_blackbox_test_ids | instrumented_test_ids)
         )
         result_value = str(payload.get("result", FindingStatus.INCONCLUSIVE.value))
         evidence_valid = True
         if result_value == FindingStatus.SUPPORTED_STATIC.value:
             evidence_valid = any(item["kind"].startswith("static.") for item in cited)
         elif result_value == FindingStatus.REPRODUCED_BLACKBOX.value:
-            evidence_valid = successful_blackbox
+            evidence_valid = harmful_blackbox
         elif result_value == FindingStatus.OBSERVED_INSTRUMENTED.value:
-            evidence_valid = any(
-                item["kind"] == "instrumented.frida"
-                and item.get("metadata", {}).get("capture_success")
-                and item.get("metadata", {}).get("observation_count", 0) > 0
-                for item in cited
-            )
+            evidence_valid = harmful_instrumented
         elif result_value == FindingStatus.NOT_REPRODUCED.value:
-            evidence_valid = correlated_blackbox
+            evidence_valid = explicitly_refuted
         if not evidence_valid:
             gaps.append(
-                f"{result_value} was downgraded because its required platform evidence was absent."
+                f"{result_value} was downgraded because its required platform evidence "
+                "or correlated concrete-harm Oracle was absent."
             )
             result_value = FindingStatus.INCONCLUSIVE.value
         payload["coverage_gaps"] = gaps
@@ -2602,6 +3025,8 @@ class ScanOrchestrator:
             )
         )
         for finding in findings:
+            if bool((finding.metadata_json or {}).get("harm_demonstrated")):
+                continue
             finding.status = FindingStatus.INCONCLUSIVE.value
             finding.metadata_json = {
                 **finding.metadata_json,
@@ -2610,8 +3035,8 @@ class ScanOrchestrator:
                 "superseded_by_backend": agent_backend,
             }
 
-    @staticmethod
     def _persist_agent_finding(
+        self,
         session,  # noqa: ANN001
         scan: Scan,
         task: InvestigationTask,
@@ -2619,10 +3044,125 @@ class ScanOrchestrator:
         result_value: str,
         agent_backend: str,
     ) -> None:
-        if result_value in {FindingStatus.NOT_REPRODUCED.value, FindingStatus.INCONCLUSIVE.value}:
-            return
         payload = task.result
-        evidence_ids = payload.get("evidence_ids", [])
+        evidence_ids = list(payload.get("evidence_ids", []))
+        model = (
+            self.settings.codex_worker_model
+            if agent_backend == "codex"
+            else self.settings.opencode_model
+            if agent_backend == "opencode"
+            else None
+        )
+        hypotheses = list(
+            session.scalars(
+                select(SecurityHypothesis)
+                .where(SecurityHypothesis.task_id == task.id)
+                .order_by(SecurityHypothesis.created_at)
+            )
+        )
+        proven_hypotheses: list[
+            tuple[SecurityHypothesis, list[ProofAttempt]]
+        ] = []
+        for hypothesis in hypotheses:
+            attempts = list(
+                session.scalars(
+                    select(ProofAttempt)
+                    .where(
+                        ProofAttempt.hypothesis_id == hypothesis.id,
+                        ProofAttempt.harm_demonstrated.is_(True),
+                    )
+                    .order_by(ProofAttempt.created_at)
+                )
+            )
+            if attempts:
+                proven_hypotheses.append((hypothesis, attempts))
+
+        if proven_hypotheses:
+            for hypothesis, attempts in proven_hypotheses:
+                instrumented = any(
+                    bool((attempt.oracle or {}).get("instrumented_observation"))
+                    for attempt in attempts
+                )
+                proof_status = (
+                    FindingStatus.OBSERVED_INSTRUMENTED.value
+                    if instrumented
+                    else FindingStatus.REPRODUCED_BLACKBOX.value
+                )
+                proof_evidence_ids = list(
+                    dict.fromkeys(
+                        evidence_id
+                        for attempt in attempts
+                        for evidence_id in attempt.evidence_ids
+                    )
+                )
+                dedupe = f"agent:{task.id}:hypothesis:{hypothesis.id}"
+                finding = session.scalar(
+                    select(Finding).where(
+                        Finding.scan_id == scan.id,
+                        Finding.dedupe_key == dedupe,
+                    )
+                )
+                metadata = {
+                    "task_id": task.id,
+                    "hypothesis_id": hypothesis.id,
+                    "agent_backend": agent_backend,
+                    "model": model,
+                    "coverage_gaps": payload.get("coverage_gaps", []),
+                    "harm_demonstrated": True,
+                    "proof_attempt_ids": [attempt.id for attempt in attempts],
+                }
+                if finding is None:
+                    finding = Finding(
+                        scan_id=scan.id,
+                        dedupe_key=dedupe,
+                        rule_id="AGENT-ENTRY-INVESTIGATION",
+                        source=agent_backend,
+                        title=f"Validated hypothesis: {hypothesis.claim}",
+                        description=payload.get(
+                            "summary",
+                            hypothesis.impact or "Platform harm Oracle succeeded.",
+                        ),
+                        remediation=(
+                            "Review the affected handler and enforce input validation, "
+                            "caller authorization, and explicit trust-boundary checks."
+                        ),
+                        masvs="MASVS-PLATFORM",
+                        severity=payload.get("platform_severity")
+                        or payload.get("severity_proposal", "medium"),
+                        confidence=payload.get("confidence", "medium"),
+                        status=proof_status,
+                        entry_point_ids=list(hypothesis.entry_point_ids),
+                        evidence_ids=proof_evidence_ids,
+                        metadata_json=metadata,
+                    )
+                    session.add(finding)
+                    session.flush()
+                else:
+                    finding.source = agent_backend
+                    finding.title = f"Validated hypothesis: {hypothesis.claim}"
+                    finding.description = payload.get(
+                        "summary",
+                        hypothesis.impact or "Platform harm Oracle succeeded.",
+                    )
+                    finding.severity = payload.get("platform_severity") or payload.get(
+                        "severity_proposal", "medium"
+                    )
+                    finding.confidence = payload.get("confidence", "medium")
+                    finding.status = proof_status
+                    finding.entry_point_ids = list(hypothesis.entry_point_ids)
+                    finding.evidence_ids = proof_evidence_ids
+                    finding.metadata_json = {
+                        **dict(finding.metadata_json or {}),
+                        **metadata,
+                    }
+                hypothesis.final_finding_id = finding.id
+            return
+
+        if result_value in {
+            FindingStatus.NOT_REPRODUCED.value,
+            FindingStatus.INCONCLUSIVE.value,
+        }:
+            return
         dedupe = f"agent:{task.id}:{result_value}"
         finding = session.scalar(
             select(Finding).where(
@@ -2640,7 +3180,8 @@ class ScanOrchestrator:
                 description=payload.get("summary", "Agent investigation result"),
                 remediation="Review the affected handler and enforce validation and caller authorization.",
                 masvs="MASVS-PLATFORM",
-                severity=payload.get("severity_proposal", "medium"),
+                severity=payload.get("platform_severity")
+                or payload.get("severity_proposal", "medium"),
                 confidence=payload.get("confidence", "medium"),
                 status=result_value,
                 entry_point_ids=task.target_entry_ids,
@@ -2648,21 +3189,27 @@ class ScanOrchestrator:
                 metadata_json={
                     "task_id": task.id,
                     "agent_backend": agent_backend,
+                    "model": model,
                     "coverage_gaps": payload.get("coverage_gaps", []),
+                    "harm_demonstrated": False,
                 },
             )
             session.add(finding)
         else:
             finding.source = agent_backend
             finding.description = payload.get("summary", "Agent investigation result")
-            finding.severity = payload.get("severity_proposal", "medium")
+            finding.severity = payload.get("platform_severity") or payload.get(
+                "severity_proposal", "medium"
+            )
             finding.confidence = payload.get("confidence", "medium")
             finding.status = result_value
             finding.evidence_ids = evidence_ids
             finding.metadata_json = {
                 "task_id": task.id,
                 "agent_backend": agent_backend,
+                "model": model,
                 "coverage_gaps": payload.get("coverage_gaps", []),
+                "harm_demonstrated": False,
             }
 
     @staticmethod

@@ -35,6 +35,7 @@ class TaskStatus(StrEnum):
     INCONCLUSIVE = "inconclusive"
     TIMED_OUT = "timed_out"
     FAILED = "failed"
+    DELETED = "deleted"
 
 
 class TaskType(StrEnum):
@@ -66,6 +67,26 @@ class Confidence(StrEnum):
     HIGH = "high"
     MEDIUM = "medium"
     LOW = "low"
+
+
+class HypothesisStatus(StrEnum):
+    CANDIDATE = "candidate"
+    CHALLENGED = "challenged"
+    ACCEPTED_FOR_PROOF = "accepted_for_proof"
+    PROOF_PLANNED = "proof_planned"
+    EXECUTING = "executing"
+    PROVEN = "proven"
+    REFUTED = "refuted"
+    INCONCLUSIVE = "inconclusive"
+
+
+class ProofAttemptStatus(StrEnum):
+    PLANNED = "planned"
+    EXECUTING = "executing"
+    PROVEN = "proven"
+    REFUTED = "refuted"
+    INCONCLUSIVE = "inconclusive"
+    FAILED = "failed"
 
 
 class CoverageStatus(StrEnum):

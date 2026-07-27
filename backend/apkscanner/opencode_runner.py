@@ -32,6 +32,9 @@ AJV_VERSION = "8.20.0"
 OPENCODE_PROVIDER = "deepseek"
 OPENCODE_OUTPUT_MODE_PROMPTED_JSON = "prompted_json"
 OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL = "structured_output_tool"
+OPENCODE_TOOL_PROFILE = "workspace_shell"
+OPENCODE_WORKSPACE_TOOLS = ("read", "glob", "grep", "bash")
+OPENCODE_MAX_STEPS = 100
 
 
 def opencode_output_mode(model: str) -> str:
@@ -53,9 +56,11 @@ def opencode_prompt_for_model(
     return (
         f"{prompt}\n\n"
         "DEEPSEEK_THINKING_OUTPUT_ADAPTER:\n"
-        "Return exactly one JSON object as plain text. Do not use Markdown fences, "
-        "commentary, or tool calls. The object must validate against OUTPUT_JSON_SCHEMA. "
-        "All required keys must be present and no undeclared top-level keys are allowed.\n\n"
+        "Use the permitted workspace tools as needed to investigate before answering. "
+        "After tool exploration is complete, the final assistant answer must be exactly one "
+        "JSON object as plain text, without Markdown fences or commentary. The object must "
+        "validate against OUTPUT_JSON_SCHEMA. All required keys must be present and no "
+        "undeclared top-level keys are allowed.\n\n"
         "OUTPUT_JSON_SCHEMA:\n"
         f"{json.dumps(output_schema, ensure_ascii=False, indent=2)}\n\n"
         "MINIMAL_JSON_EXAMPLE:\n"
@@ -137,6 +142,9 @@ class OpenCodeInvestigator:
             "model": self.settings.opencode_model,
             "isolation": self.settings.opencode_isolation,
             "output_mode": opencode_output_mode(self.settings.opencode_model),
+            "tool_profile": OPENCODE_TOOL_PROFILE,
+            "workspace_tools": list(OPENCODE_WORKSPACE_TOOLS),
+            "max_steps": OPENCODE_MAX_STEPS,
         }
         detail = self._configuration_error()
         if detail:
@@ -169,6 +177,16 @@ class OpenCodeInvestigator:
                     opencode_output_mode(self.settings.opencode_model),
                 )
             )
+            capability["tool_profile"] = str(
+                probe.get("tool_profile", OPENCODE_TOOL_PROFILE)
+            )
+            capability["workspace_tools"] = [
+                str(item)
+                for item in probe.get("workspace_tools", OPENCODE_WORKSPACE_TOOLS)
+            ]
+            capability["max_steps"] = int(
+                probe.get("max_steps", OPENCODE_MAX_STEPS)
+            )
             if self.settings.opencode_model not in models:
                 capability["available"] = False
                 capability["detail"] = (
@@ -199,7 +217,11 @@ class OpenCodeInvestigator:
         capability = self.capability(deep=False)
         if not capability.get("available"):
             raise RuntimeError(str(capability.get("detail")))
-        timeout = timeout_seconds or self.settings.task_timeout_seconds
+        timeout = (
+            self.settings.task_timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds
+        )
         payload = {
             "schema_version": "1.0",
             "action": "investigate",
@@ -210,23 +232,35 @@ class OpenCodeInvestigator:
                     entries,
                     evidence,
                     platform_context or {},
-                    direct_tool_access=False,
+                    direct_tool_access=True,
+                    shell_access=True,
+                    workspace_write=True,
                 ),
                 model=self.settings.opencode_model,
                 output_schema=AGENT_RESULT_JSON_SCHEMA,
             ),
-            "developer_instructions": developer_instructions(direct_tool_access=False),
+            "developer_instructions": developer_instructions(
+                direct_tool_access=True,
+                shell_access=True,
+                workspace_write=True,
+            ),
             "model": self.settings.opencode_model,
             "base_url": self.settings.deepseek_base_url,
             "output_schema": AGENT_RESULT_JSON_SCHEMA,
+            "tool_profile": OPENCODE_TOOL_PROFILE,
             "timeout_ms": max(1, timeout) * 1000,
         }
         if event_callback is None and cancel_event is None:
-            response = self._invoke(payload, timeout_seconds=timeout + 15)
+            response = self._invoke(
+                payload,
+                timeout_seconds=timeout + 15,
+                workspace=workspace,
+            )
         else:
             response = self._invoke(
                 payload,
                 timeout_seconds=timeout + 15,
+                workspace=workspace,
                 event_callback=event_callback,
                 cancel_event=cancel_event,
             )
@@ -395,7 +429,7 @@ class OpenCodeInvestigator:
                 "available": False,
                 "detail": f"build the OpenCode worker image first: {image}",
             }
-        expected = f"{OPENCODE_SDK_VERSION}|{OPENCODE_CLI_VERSION}|{AJV_VERSION}|2"
+        expected = f"{OPENCODE_SDK_VERSION}|{OPENCODE_CLI_VERSION}|{AJV_VERSION}|4"
         if inspected.stdout.strip() != expected:
             return {
                 **capability,
@@ -421,6 +455,7 @@ class OpenCodeInvestigator:
         payload: dict[str, Any],
         *,
         timeout_seconds: int,
+        workspace: Path | None = None,
         event_callback: AgentEventCallback | None = None,
         cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
@@ -428,12 +463,14 @@ class OpenCodeInvestigator:
             return self._invoke_docker(
                 payload,
                 timeout_seconds=timeout_seconds,
+                workspace=workspace,
                 event_callback=event_callback,
                 cancel_event=cancel_event,
             )
         return self._invoke_host(
             payload,
             timeout_seconds=timeout_seconds,
+            workspace=workspace,
             event_callback=event_callback,
             cancel_event=cancel_event,
         )
@@ -443,6 +480,7 @@ class OpenCodeInvestigator:
         payload: dict[str, Any],
         *,
         timeout_seconds: int,
+        workspace: Path | None,
         event_callback: AgentEventCallback | None,
         cancel_event: threading.Event | None,
     ) -> dict[str, Any]:
@@ -453,9 +491,12 @@ class OpenCodeInvestigator:
         with tempfile.TemporaryDirectory(prefix="apkscanner-opencode-") as temporary:
             root = Path(temporary)
             env = self._worker_environment(root)
+            cwd = workspace.resolve() if workspace is not None else root
+            if workspace is not None and not cwd.is_dir():
+                raise ValueError("scan workspace is unavailable")
             process = subprocess.Popen(
                 [node, str(worker)],
-                cwd=root,
+                cwd=cwd,
                 env=env,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -503,9 +544,12 @@ class OpenCodeInvestigator:
             "NODE_EXTRA_CA_CERTS",
         }
         env = {key: value for key, value in os.environ.items() if key in allowed}
+        blocker_dir = self.worker_dir / "bin"
         bin_dir = self.worker_dir / "node_modules" / ".bin"
         env["PATH"] = os.pathsep.join(
-            value for value in (str(bin_dir), os.environ.get("PATH")) if value
+            value
+            for value in (str(blocker_dir), str(bin_dir), os.environ.get("PATH"))
+            if value
         )
         env.update(
             {
@@ -528,6 +572,7 @@ class OpenCodeInvestigator:
         payload: dict[str, Any],
         *,
         timeout_seconds: int,
+        workspace: Path | None,
         event_callback: AgentEventCallback | None,
         cancel_event: threading.Event | None,
     ) -> dict[str, Any]:
@@ -536,6 +581,8 @@ class OpenCodeInvestigator:
             raise RuntimeError("Docker is not installed")
         safe_action = re.sub(r"[^a-z0-9-]", "-", str(payload.get("action", "run")).lower())[:24]
         container_name = f"apk-scanner-opencode-{safe_action}-{uuid.uuid4().hex[:8]}"
+        worker_uid = os.getuid() if hasattr(os, "getuid") else 1000
+        worker_gid = os.getgid() if hasattr(os, "getgid") else 1000
         command = [
             executable,
             "run",
@@ -545,29 +592,43 @@ class OpenCodeInvestigator:
             "--read-only",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
+            "--user",
+            f"{worker_uid}:{worker_gid}",
             "--pids-limit=256",
             "--memory=3g",
             "--cpus=2",
             "--network=bridge",
             "--tmpfs",
-            "/tmp:rw,noexec,nosuid,nodev,size=256m",
-            "--tmpfs",
-            "/home/node:rw,nosuid,nodev,size=512m,uid=1000,gid=1000,mode=0700",
-            "--workdir",
-            "/sandbox",
+            "/tmp:rw,nosuid,nodev,size=256m",
             "--env",
-            "HOME=/home/node",
+            "HOME=/tmp/opencode-home",
             "--env",
-            "XDG_DATA_HOME=/home/node/data",
+            "XDG_DATA_HOME=/tmp/opencode-home/data",
             "--env",
-            "XDG_CONFIG_HOME=/home/node/config",
+            "XDG_CONFIG_HOME=/tmp/opencode-home/config",
             "--env",
-            "XDG_CACHE_HOME=/home/node/cache",
+            "XDG_CACHE_HOME=/tmp/opencode-home/cache",
             "--env",
-            "XDG_STATE_HOME=/home/node/state",
+            "XDG_STATE_HOME=/tmp/opencode-home/state",
             "--env",
             "DEEPSEEK_API_KEY",
         ]
+        if workspace is not None:
+            resolved_workspace = workspace.resolve()
+            if not resolved_workspace.is_dir() or "," in str(resolved_workspace):
+                raise ValueError(
+                    "scan workspace is unavailable or unsafe for a Docker bind mount"
+                )
+            command.extend(
+                [
+                    "--mount",
+                    f"type=bind,source={resolved_workspace},target=/workspace",
+                    "--workdir",
+                    "/workspace",
+                ]
+            )
+        else:
+            command.extend(["--workdir", "/sandbox"])
         for name in (
             "HTTP_PROXY",
             "HTTPS_PROXY",

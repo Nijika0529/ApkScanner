@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, model_validator
 
 
 class ApiModel(BaseModel):
@@ -206,6 +206,10 @@ class TaskDeleteResult(BaseModel):
 class AgentRequestedTest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    hypothesis_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9-]{36}$",
+    )
     entry_point_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
     state: Literal["guest", "authenticated"]
     uri: str | None = Field(max_length=4096)
@@ -232,7 +236,113 @@ class AgentInvestigationResult(BaseModel):
     confidence: Literal["high", "medium", "low"]
     coverage_gaps: list[str]
     followups: list[str]
-    requested_tests: list[AgentRequestedTest] = Field(max_length=12)
+    requested_tests: list[AgentRequestedTest] = Field(max_length=100)
+
+
+class HypothesisArgumentOut(ApiModel):
+    id: str
+    role: str
+    position: str
+    phase: str
+    backend: str
+    model: str | None
+    payload: dict[str, Any]
+    evidence_ids: list[str]
+    created_at: datetime
+
+
+class ProofAttemptOut(ApiModel):
+    id: str
+    test_case_id: str
+    prover: str
+    status: str
+    plan: dict[str, Any]
+    oracle: dict[str, Any]
+    evidence_ids: list[str]
+    harm_demonstrated: bool
+    error: str | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime
+
+
+class SecurityHypothesisOut(ApiModel):
+    id: str
+    task_id: str
+    fingerprint: str
+    category: str
+    claim: str
+    attacker_model: dict[str, Any]
+    preconditions: list[str]
+    impact: str
+    status: str
+    confidence_score: int
+    source_role: str
+    entry_point_ids: list[str]
+    support_evidence_ids: list[str]
+    refute_evidence_ids: list[str]
+    proof_obligations: list[dict[str, Any]]
+    final_finding_id: str | None
+    metadata_json: dict[str, Any]
+    arguments: list[HypothesisArgumentOut] = Field(default_factory=list)
+    proof_attempts: list[ProofAttemptOut] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+
+class GroundTruthMatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rule_ids: list[str] = Field(default_factory=list, max_length=32)
+    cwes: list[str] = Field(default_factory=list, max_length=32)
+    entry_names: list[str] = Field(default_factory=list, max_length=64)
+    title_contains: list[str] = Field(default_factory=list, max_length=32)
+
+    @model_validator(mode="after")
+    def require_selector(self) -> Self:
+        if not any((self.rule_ids, self.cwes, self.entry_names, self.title_contains)):
+            raise ValueError("at least one ground-truth matching selector is required")
+        return self
+
+
+class GroundTruthVulnerability(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=128)
+    title: str = Field(min_length=1, max_length=1000)
+    harm: str = Field(min_length=1, max_length=4000)
+    severity: Literal["critical", "high", "medium", "low", "info"]
+    minimum_proof: Literal["static", "dynamic", "instrumented"] = "dynamic"
+    match: GroundTruthMatch
+
+
+class BenchmarkSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"] = "1.0"
+    name: str = Field(min_length=1, max_length=256)
+    apk_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    vulnerabilities: list[GroundTruthVulnerability] = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def require_unique_vulnerability_ids(self) -> Self:
+        identifiers = [item.id for item in self.vulnerabilities]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("ground-truth vulnerability IDs must be unique")
+        return self
+
+
+class BenchmarkEvaluationOut(ApiModel):
+    id: str
+    scan_id: str
+    schema_version: str
+    name: str
+    artifact_sha256: str
+    investigator_backend: str
+    model: str | None
+    ground_truth: dict[str, Any]
+    result: dict[str, Any]
+    created_at: datetime
 
 
 def _inline_local_json_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:

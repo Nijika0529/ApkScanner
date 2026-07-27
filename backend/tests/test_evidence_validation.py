@@ -23,13 +23,17 @@ def test_unknown_agent_evidence_is_removed_and_reproduction_is_downgraded() -> N
     assert any("Ignored 1" in gap for gap in payload["coverage_gaps"])
 
 
-def test_blackbox_reproduction_requires_probe_identity_and_log_evidence() -> None:
+def test_blackbox_reproduction_requires_correlated_concrete_harm() -> None:
     evidence = [
         {
             "id": "probe",
             "kind": "blackbox.probe_app",
             "exit_code": 0,
-            "metadata": {"caller_identity": "probe_app", "request_id": "request-1"},
+            "metadata": {
+                "caller_identity": "probe_app",
+                "request_id": "request-1",
+                "test_case_id": "agent-r1-1",
+            },
         },
         {
             "id": "log",
@@ -39,6 +43,8 @@ def test_blackbox_reproduction_requires_probe_identity_and_log_evidence() -> Non
                 "request_id": "request-1",
                 "request_observed": True,
                 "probe_success": True,
+                "test_case_id": "agent-r1-1",
+                "security_impact_observed": True,
             },
         },
     ]
@@ -48,6 +54,111 @@ def test_blackbox_reproduction_requires_probe_identity_and_log_evidence() -> Non
     )
     assert result == "reproduced_blackbox"
     assert payload["evidence_ids"] == ["probe", "log"]
+
+
+def test_reachability_without_concrete_harm_is_inconclusive() -> None:
+    evidence = [
+        {
+            "id": "probe",
+            "kind": "blackbox.probe_app",
+            "exit_code": 0,
+            "metadata": {
+                "caller_identity": "probe_app",
+                "request_id": "request-1",
+                "test_case_id": "agent-r1-1",
+            },
+        },
+        {
+            "id": "log",
+            "kind": "blackbox.logcat",
+            "exit_code": 0,
+            "metadata": {
+                "request_id": "request-1",
+                "request_observed": True,
+                "probe_success": True,
+                "test_case_id": "agent-r1-1",
+            },
+        },
+    ]
+    payload, result = ScanOrchestrator._validated_agent_payload(
+        _payload("reproduced_blackbox", ["probe", "log"]),
+        evidence,
+    )
+    assert result == "inconclusive"
+    assert payload["platform_severity"] is None
+    assert any("concrete-harm Oracle" in gap for gap in payload["coverage_gaps"])
+
+
+def test_not_reproduced_requires_correlated_explicit_negative_oracle() -> None:
+    evidence = [
+        {
+            "id": "probe",
+            "kind": "blackbox.probe_app",
+            "exit_code": 0,
+            "metadata": {
+                "caller_identity": "probe_app",
+                "request_id": "request-1",
+                "test_case_id": "agent-r1-1",
+            },
+        },
+        {
+            "id": "log",
+            "kind": "blackbox.logcat",
+            "exit_code": 0,
+            "metadata": {
+                "request_id": "request-1",
+                "request_observed": True,
+                "probe_success": False,
+                "test_case_id": "agent-r1-1",
+            },
+        },
+    ]
+    payload, result = ScanOrchestrator._validated_agent_payload(
+        _payload("not_reproduced", ["probe", "log"]),
+        evidence,
+    )
+    assert result == "inconclusive"
+
+    evidence[1]["metadata"]["oracle_refuted"] = True
+    payload, result = ScanOrchestrator._validated_agent_payload(
+        _payload("not_reproduced", ["probe", "log"]),
+        evidence,
+    )
+    assert result == "not_reproduced"
+    assert payload["platform_severity"] is None
+
+
+def test_blackbox_evidence_must_share_request_and_test_case_ids() -> None:
+    evidence = [
+        {
+            "id": "probe",
+            "kind": "blackbox.probe_app",
+            "exit_code": 0,
+            "metadata": {
+                "caller_identity": "probe_app",
+                "request_id": "request-1",
+                "test_case_id": "agent-r1-1",
+            },
+        },
+        {
+            "id": "log",
+            "kind": "blackbox.logcat",
+            "exit_code": 0,
+            "metadata": {
+                "request_id": "request-1",
+                "request_observed": True,
+                "probe_success": True,
+                "test_case_id": "agent-r1-2",
+                "security_impact_observed": True,
+            },
+        },
+    ]
+    payload, result = ScanOrchestrator._validated_agent_payload(
+        _payload("reproduced_blackbox", ["probe", "log"]),
+        evidence,
+    )
+    assert result == "inconclusive"
+    assert payload["platform_severity"] is None
 
 
 def test_agent_requested_deep_link_must_preserve_declared_origin() -> None:

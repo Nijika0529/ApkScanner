@@ -3,8 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from apkscanner.main import create_app
-from apkscanner.models import EntryPoint, Evidence, InvestigationTask, Scan
+from apkscanner.models import EntryPoint, Evidence, Finding, InvestigationTask, Scan
 from apkscanner.schemas import AgentInvestigationResult
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -39,6 +40,22 @@ def test_local_api_requires_console_marker_for_mutations(settings) -> None:  # n
             "codex",
             "opencode_deepseek",
         }
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    ["entries", "findings", "tasks", "hypotheses", "coverage", "events"],
+)
+def test_scan_child_collections_return_not_found_for_unknown_scan(
+    settings,
+    suffix: str,
+) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/v1/scans/00000000-0000-0000-0000-000000000099/{suffix}"
+        )
+    assert response.status_code == 404
 
 
 def test_completed_scan_can_be_deleted_with_its_unshared_files(settings) -> None:  # noqa: ANN001
@@ -152,6 +169,13 @@ def test_terminal_task_can_be_deleted_while_ai_audit_is_preserved(settings) -> N
         )
         session.commit()
 
+    with app.state.database.session_factory() as session:
+        persisted_task = session.get(InvestigationTask, task.id)
+        assert persisted_task is not None
+        app.state.orchestrator.hypothesis_ledger.ensure_task_hypotheses(
+            persisted_task
+        )
+
     with TestClient(app) as client:
         blocked = client.delete(f"/api/v1/tasks/{task.id}")
         assert blocked.status_code == 403
@@ -169,13 +193,19 @@ def test_terminal_task_can_be_deleted_while_ai_audit_is_preserved(settings) -> N
         audits = client.get(f"/api/v1/scans/{scan.id}/agent-audits").json()
         assert audits[0]["task_id"] == task.id
         assert audits[0]["integrity"] == "verified"
+        hypotheses = client.get(f"/api/v1/scans/{scan.id}/hypotheses").json()
+        assert len(hypotheses) == 1
+        assert hypotheses[0]["task_id"] == task.id
 
     assert evidence_path.exists()
     with app.state.database.session_factory() as session:
-        assert session.get(InvestigationTask, task.id) is None
+        deleted_task = session.get(InvestigationTask, task.id)
+        assert deleted_task is not None
+        assert deleted_task.status == "deleted"
+        assert deleted_task.result["deletion"]["soft_deleted"] is True
         evidence = session.scalar(select(Evidence).where(Evidence.scan_id == scan.id))
         assert evidence is not None
-        assert evidence.task_id is None
+        assert evidence.task_id == task.id
 
 
 def test_running_task_cannot_be_deleted(settings) -> None:  # noqa: ANN001
@@ -584,7 +614,22 @@ def test_opencode_pro_audit_records_toolless_json_transport(settings) -> None:  
         request = audit["artifacts"]["request"]["content"]
         assert request["runtime_options"]["output_mode"] == "prompted_json"
         assert request["runtime_options"]["schema_validator"] == "ajv@8.20.0"
-        assert request["tool_boundary"]["model_tools_enabled"] is False
+        assert request["tool_boundary"]["model_tools_enabled"] is True
+        assert request["tool_boundary"]["workspace_tool_profile"] == "workspace_shell"
+        assert request["tool_boundary"]["workspace_tools"] == [
+            "read",
+            "glob",
+            "grep",
+            "bash",
+        ]
+        assert request["tool_boundary"]["shell_enabled"] is True
+        assert request["tool_boundary"]["write_enabled"] is True
+        assert request["tool_boundary"]["native_write_tools_enabled"] is False
+        assert request["tool_boundary"]["allowed_write_roots"] == [
+            "scan_workspace",
+            "/tmp",
+        ]
+        assert request["tool_boundary"]["adb_enabled"] is False
         assert request["tool_boundary"]["structured_output_tool_enabled"] is False
         assert "DEEPSEEK_THINKING_OUTPUT_ADAPTER" in request["prompt"]
         recorded_transport = audit["artifacts"]["response"]["content"][
@@ -742,3 +787,153 @@ def test_manual_task_rerun_is_not_blocked_by_automatic_attempt_budget(
         assert response.json()["status"] == "queued"
         assert response.json()["attempts"] == settings.task_max_attempts
         assert response.json()["result"]["manual_rerun"]["previous_status"] == "inconclusive"
+
+
+def test_timed_out_task_can_continue_with_a_fresh_budget_and_prior_context(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    submitted: list[str] = []
+
+    async def submit(scan_id: str) -> None:
+        submitted.append(scan_id)
+
+    monkeypatch.setattr(app.state.orchestrator, "submit", submit)
+    with TestClient(app) as client:
+        with app.state.database.session_factory() as session:
+            scan = Scan(
+                status="final",
+                filename="deep-continuation.apk",
+                artifact_sha256="8" * 64,
+                artifact_path=str(settings.data_dir / "missing.apk"),
+            )
+            task = InvestigationTask(
+                scan=scan,
+                task_type="component",
+                status="timed_out",
+                attempts=3,
+                thread_id="prior-thread",
+                turn_id="prior-turn",
+                result={
+                    "coverage_gaps": ["Task budget expired before all tests ran."],
+                    "result": "inconclusive",
+                },
+            )
+            session.add_all([scan, task])
+            session.commit()
+            scan_id = scan.id
+            task_id = task.id
+
+        response = client.post(
+            f"/api/v1/tasks/{task_id}/continue",
+            headers={"X-APKScanner-Request": "console"},
+        )
+        assert response.status_code == 202
+        payload = response.json()
+        assert payload["status"] == "queued"
+        continuation = payload["result"]["manual_continuation"]
+        assert continuation["continuation_number"] == 1
+        assert continuation["previous_attempt"] == 3
+        assert continuation["previous_thread_id"] == "prior-thread"
+        assert continuation["reuse_task_evidence"] is True
+        assert continuation["prior_result"]["result"] == "inconclusive"
+        assert submitted == [scan_id]
+
+        rejected = client.post(
+            f"/api/v1/tasks/{task_id}/continue",
+            headers={"X-APKScanner-Request": "console"},
+        )
+        assert rejected.status_code == 409
+
+
+def test_hypothesis_and_private_evaluation_endpoints(settings) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    with TestClient(app) as client:
+        with app.state.database.session_factory() as session:
+            scan = Scan(
+                status="final",
+                filename="evaluation.apk",
+                artifact_sha256="5" * 64,
+                artifact_path=str(settings.data_dir / "missing.apk"),
+                stats={"investigator": "opencode"},
+            )
+            entry = EntryPoint(
+                scan=scan,
+                kind="deep_link",
+                name="demo://example.test/open",
+                exported=True,
+            )
+            task = InvestigationTask(
+                scan=scan,
+                task_type="deep_link",
+                target_entry_ids=[],
+                hypotheses=["Guest route may trigger protected behavior."],
+            )
+            session.add_all([scan, entry, task])
+            session.flush()
+            task.target_entry_ids = [entry.id]
+            session.add(
+                Finding(
+                    scan=scan,
+                    dedupe_key="agent:proven",
+                    rule_id="AGENT-ENTRY-INVESTIGATION",
+                    source="opencode",
+                    title="Agent investigation: route",
+                    description="Guest route triggers protected behavior.",
+                    masvs="MASVS-PLATFORM",
+                    severity="high",
+                    status="reproduced_blackbox",
+                    entry_point_ids=[entry.id],
+                    evidence_ids=["probe", "log"],
+                    metadata_json={"harm_demonstrated": True},
+                )
+            )
+            session.commit()
+            scan_id = scan.id
+            task_id = task.id
+
+        with app.state.database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            assert task is not None
+            app.state.orchestrator.hypothesis_ledger.ensure_task_hypotheses(task)
+
+        hypotheses = client.get(f"/api/v1/scans/{scan_id}/hypotheses")
+        assert hypotheses.status_code == 200
+        assert len(hypotheses.json()) == 1
+        assert hypotheses.json()[0]["status"] == "candidate"
+
+        evaluation = client.post(
+            f"/api/v1/scans/{scan_id}/evaluations",
+            headers={"X-APKScanner-Request": "console"},
+            json={
+                "schema_version": "1.0",
+                "name": "private-evaluation",
+                "apk_sha256": "5" * 64,
+                "vulnerabilities": [
+                    {
+                        "id": "GT-1",
+                        "title": "Route authorization bypass",
+                        "harm": "Guest triggers protected behavior.",
+                        "severity": "high",
+                        "minimum_proof": "dynamic",
+                        "match": {
+                            "rule_ids": ["AGENT-ENTRY-INVESTIGATION"],
+                            "entry_names": ["demo://example.test/open"],
+                            "title_contains": ["protected behavior"],
+                        },
+                    }
+                ],
+            },
+        )
+        assert evaluation.status_code == 200
+        assert evaluation.json()["result"]["metrics"]["score_100"] == 100.0
+        listed = client.get(f"/api/v1/scans/{scan_id}/evaluations")
+        assert listed.status_code == 200
+        assert len(listed.json()) == 1
+        report = client.get(f"/api/v1/scans/{scan_id}/report/json")
+        assert report.status_code == 200
+        assert report.json()["security_hypotheses"][0]["task_id"] == task_id
+        assert report.json()["benchmark_evaluations"][0]["name"] == "private-evaluation"
+        html_report = client.get(f"/api/v1/scans/{scan_id}/report/html")
+        assert "验证链" in html_report.text

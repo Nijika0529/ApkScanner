@@ -31,12 +31,13 @@ OpenCode 官方提供的是 JS/TS SDK。SDK 通过 `createOpencodeServer` 启动
 
 | 模型 | OpenCode format | 发给模型的工具 / `tool_choice` | 结果校验 |
 | --- | --- | --- | --- |
-| `deepseek-v4-pro`（及其版本后缀） | `text` | 无工具；不发送 `tool_choice` | prompt 携带精确 Schema 和最小示例；Ajv 8.20.0 本地校验，最多 2 次同 session 纠正 |
-| `deepseek-v4-flash` | `json_schema` | 仅 `StructuredOutput`；`required` | OpenCode 内部校验，最多 2 次重试 |
+| `deepseek-v4-pro`（及其版本后缀） | `text` | 首轮允许 `read/glob/grep/bash`，使用普通自动工具选择，不使用 `required` | prompt 携带精确 Schema 和最小示例；Ajv 8.20.0 本地校验，纠正轮关闭工具，最多 2 次 |
+| `deepseek-v4-flash` | `json_schema` | `read/glob/grep/bash` + `StructuredOutput`；`required` | OpenCode 内部校验，最多 2 次重试 |
 
 Pro 通道不会把思考模式关掉，也不会绕过 OpenCode session/provider。它只避开
-OpenCode 当前由工具实现的 StructuredOutput，再由本地确定性校验器把 JSON 文本收敛为
-同一份 `AgentInvestigationResult`。
+OpenCode 当前由工具实现的 StructuredOutput。普通文件工具仍按 OpenCode CLI 的常规
+tool-call 循环工作；模型完成探索后返回 JSON 文本，再由本地确定性校验器收敛为同一份
+`AgentInvestigationResult`。
 
 本地克隆的 OpenCode `dev` 源码与 npm 发布包均为 1.18.4。调研同时发现官网示例、生成
 类型和发布包运行时可能短暂不同步，所以不能只依赖文档片段：本项目固定 SDK/CLI 同版，
@@ -65,7 +66,8 @@ sequenceDiagram
         O-->>W: OpenCode-validated result
     else deepseek-v4-pro
         W->>O: session.prompt(format=text)
-        O->>D: no tools, no tool_choice
+        O->>D: tools=[read,glob,grep,bash], ordinary tool selection
+        D->>O: inspect and run commands in the scan workspace
         D-->>O: JSON text
         O-->>W: text response
         W->>W: Ajv validate
@@ -88,12 +90,16 @@ bridge 不参与任务规划、证据判定或设备操作。Python 仍然负责
 ## 安全边界
 
 OpenCode 本身是 coding agent，默认会暴露读文件、Shell、编辑、Web、MCP 和 task 工具。
-在 APK 扫描场景里，这些能力不应直接交给模型。本接入采用以下约束：
+本接入恢复接近本地 CLI 的代码探索和命令执行能力，同时保留设备动作边界：
 
-- OpenCode 的全局和专用 Agent permission 先 `* = deny`。Flash 通道只额外允许内部
-  `StructuredOutput`；Pro 通道不允许任何工具。
-- 不给 OpenCode 挂载 APK、反编译 workspace、认证流或 ADB socket；prompt 只包含平台
-  生成的 JSON。
+- OpenCode 的全局和专用 Agent permission 先 `* = deny`，只允许
+  `read/glob/grep/bash`；
+  Flash 通道另外允许内部 `StructuredOutput`。
+- Docker 将当前 scan workspace 挂载到 `/workspace`，Host 模式以该 workspace 为 cwd；
+  Bash 可以在 workspace 和 `/tmp` 创建脚本或分析产物，容器根文件系统保持只读。
+- 原生 write/edit/patch、Web、MCP、task/subagent 均保持禁用。ADB 同时通过 Bash
+  permission、PATH 阻断程序、无设备参数/Socket 三层禁用；不挂载认证流或宿主机其他目录。
+  外部目录访问由 OpenCode `external_directory` permission 拒绝。
 - 设置 `OPENCODE_PURE=1`，禁用外部插件；禁用 project config、Claude 配置、模型目录
   自动刷新和自动升级。
 - 每次调用使用新 session、新 OpenCode server 和临时 HOME/XDG 数据目录。
@@ -133,7 +139,10 @@ Web 上传框和 CLI 的 `--investigator` 可以为单个扫描选择：
 行为、费用和数据边界，也会让结果不可复现。需要切换时应创建新扫描，或明确修改扫描
 选择后重跑。
 
-每次调用的审计记录会写明 `output_mode`。Pro 的 `output_transport.model_calls` 还会保存
+每次调用的审计记录会写明 `output_mode`、`workspace_shell` 工具档位、可写根目录以及
+实际工具列表。`agent.events` 保存每次 `read/glob/grep/bash` 的开始、完成、受限参数
+摘要和状态。Pro 的
+`output_transport.model_calls` 还会保存
 每一轮实际 prompt、原始文本响应、解析错误、Schema 校验错误、是否被接受和单轮 usage；
 即使 3 次都失败，这些内容也进入 `agent.error` 的不可变 Evidence。API Key 和隐藏思考
 内容不进入审计。规范化 SDK 关键事件另存为 `agent.events` Evidence。
@@ -154,11 +163,14 @@ scanctl capabilities --deep
 `npm test` 启动本地假的 DeepSeek OpenAI-compatible SSE 服务，不访问外网、不产生模型
 费用。协议测试分别确认：
 
-1. Flash 请求只暴露 `StructuredOutput` 且使用 `tool_choice: required`；
-2. Pro 的所有请求都没有 `tools` 和 `tool_choice`；
-3. Pro 首次返回不合格 JSON 时，Ajv 拒绝结果并通过同一 session 下发可审计纠正提示；
-4. worker 在两种模式下都输出可增量消费的事件 envelope 和唯一 terminal result；
-5. 通过本地 Schema 校验后，两个通道归一化为相同的 worker 响应。
+1. Flash 暴露 workspace 工具和 `StructuredOutput`，并使用 `tool_choice: required`；
+2. Pro 首轮暴露 `read/glob/grep/bash`，不发送冲突的 `tool_choice: required`；
+3. Pro 能真实调用 `read`、接收文件结果并继续生成 JSON；
+4. Pro 能在 workspace 和 `/tmp` 执行 Bash 并继续生成 JSON；
+5. PATH 中的 ADB 阻断程序固定返回 126；
+6. Pro 首次返回不合格 JSON 时，Ajv 拒绝结果，关闭工具并通过同一 session 下发纠正提示；
+7. worker 在两种模式下都输出可增量消费的事件 envelope 和唯一 terminal result；
+8. 通过本地 Schema 校验后，两个通道归一化为相同的 worker 响应。
 
 升级时必须：
 

@@ -42,13 +42,16 @@ APK Scanner 是一个运行在安全人员本地电脑上的 Android 上线前�
 | AI 后端 | 2 套：Codex SDK；OpenCode SDK + DeepSeek V4 Pro/Flash |
 | AI 运行控制 | 扫描级总开关与后端选择；逐任务开关；运行中配置冻结 |
 | 增量补扫 | ADB/模型能力恢复后批量补扫信息不全项，或单入口重新分析；不重复反编译 |
-| AI 探索预算 | 默认最多 3 轮、每轮接受 4 个测试；安全可配范围分别为 1–5 轮、1–12 个 |
-| 单任务预算 | 默认 20 分钟；最多 2 次尝试 |
+| 深度续跑 | 单任务超时后可手动追加新的 20 分钟，并复用历次静态/ADB/Frida/AI Evidence |
+| 漏洞验证链 | 持久化 Hypothesis、Hunter/Critic 论证、Proof Attempt、危害 Oracle 与平台 Verdict |
+| 私有真值评测 | final Finding 对照已知漏洞；默认要求动态证明；F0.5 精确率权重为召回率两倍 |
+| AI 探索预算 | 默认最多 3 轮、每轮接受 100 个测试；可配范围分别为 1–5 轮、1–100 个 |
+| 单任务预算 | 默认 20 分钟；自动尝试最多 2 次，人工续跑不受此限制 |
 | 整单时限 | preliminary 目标 4 小时；整单截止 24 小时 |
 | AI 审计证据 | 7 类：request、events、response、test validation、result validation、error、cancellation |
 | 报告出口 | 4 种：Web、JSON、HTML、SARIF |
 | 任务视觉状态 | 5 组：等待判断、正在分析、已判断、未形成判断、已停止 |
-| 自动化回归 | 后端 46 项测试；OpenCode Worker 2 项 Pro/Flash 集成测试；前端 lint + production build |
+| 自动化回归 | 后端 52 项测试；OpenCode Worker 5 项 Pro/Flash/工具/ADB 阻断集成测试；前端 lint + production build |
 
 规则数量按当前代码统计：4 条 Manifest、2 条 Deep Link、4 条 APK/签名、7 条代码模式，以及
 Activity、Activity Alias、Service、Receiver、Provider 5 类按入口动态生成的导出规则。
@@ -61,7 +64,8 @@ Activity、Activity Alias、Service、Receiver、Provider 5 类按入口动态�
 - **全过程可审计**：保留精确 prompt、模型/SDK、关键事件、原始结构化响应、token usage、
   平台接受/拒绝的证据和用户中止记录，但不展示或持久化隐藏思维链。
 - **模型可替换**：同一任务与证据协议可选择 Codex 或 OpenCode + DeepSeek；V4 Pro 使用
-  无工具文本 JSON + Ajv 校验，避开思考模式与 `tool_choice` 冲突。
+  `read/glob/grep/bash` 普通工具循环，最终以文本 JSON + Ajv 校验，避开思考模式与
+  `tool_choice: required` 冲突。
 
 ## 当前状态与上线前工作
 

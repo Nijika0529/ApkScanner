@@ -7,20 +7,33 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
-from sqlalchemy import case, desc, select, update
-from sqlalchemy.orm import Session
+from sqlalchemy import case, desc, select
+from sqlalchemy.orm import Session, selectinload
 
 from . import __version__
 from .agent_audit import AGENT_AUDIT_KINDS, build_agent_audits
 from .artifacts import ArtifactStore, ArtifactTooLargeError
+from .benchmark import BenchmarkEvaluator
 from .db import Database
 from .enums import FindingStatus, ScanStatus, TaskStatus
-from .models import CoverageItem, EntryPoint, Evidence, Finding, InvestigationTask, Scan, ScanEvent
+from .models import (
+    BenchmarkEvaluation,
+    CoverageItem,
+    EntryPoint,
+    Evidence,
+    Finding,
+    InvestigationTask,
+    Scan,
+    ScanEvent,
+    SecurityHypothesis,
+)
 from .orchestrator import ScanOrchestrator
 from .reports import ReportBuilder
 from .repository import add_event, now
 from .schemas import (
     AgentAuditOut,
+    BenchmarkEvaluationOut,
+    BenchmarkSpec,
     Capability,
     CoverageItemOut,
     EntryPointOut,
@@ -35,6 +48,7 @@ from .schemas import (
     ScanDetail,
     ScanRerunResult,
     ScanSummary,
+    SecurityHypothesisOut,
     TaskAgentControl,
     TaskDeleteResult,
 )
@@ -58,6 +72,13 @@ def get_orchestrator(request: Request) -> ScanOrchestrator:
 def get_session(database: Database = Depends(get_database)):
     with database.session_factory() as session:
         yield session
+
+
+def require_scan(session: Session, scan_id: str) -> Scan:
+    scan = session.get(Scan, scan_id)
+    if scan is None:
+        raise HTTPException(404, "Scan not found")
+    return scan
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -269,6 +290,7 @@ def delete_scan(
 
 @router.get("/scans/{scan_id}/entries", response_model=list[EntryPointOut])
 def list_entries(scan_id: str, session: Session = Depends(get_session)) -> list[EntryPoint]:
+    require_scan(session, scan_id)
     return list(
         session.scalars(
             select(EntryPoint)
@@ -280,6 +302,7 @@ def list_entries(scan_id: str, session: Session = Depends(get_session)) -> list[
 
 @router.get("/scans/{scan_id}/findings", response_model=list[FindingOut])
 def list_findings(scan_id: str, session: Session = Depends(get_session)) -> list[Finding]:
+    require_scan(session, scan_id)
     return list(
         session.scalars(
             select(Finding)
@@ -300,11 +323,77 @@ def list_findings(scan_id: str, session: Session = Depends(get_session)) -> list
 
 @router.get("/scans/{scan_id}/tasks", response_model=list[InvestigationTaskOut])
 def list_tasks(scan_id: str, session: Session = Depends(get_session)) -> list[InvestigationTask]:
+    require_scan(session, scan_id)
     return list(
         session.scalars(
             select(InvestigationTask)
-            .where(InvestigationTask.scan_id == scan_id)
+            .where(
+                InvestigationTask.scan_id == scan_id,
+                InvestigationTask.status != TaskStatus.DELETED.value,
+            )
             .order_by(InvestigationTask.priority.desc(), InvestigationTask.created_at)
+        )
+    )
+
+
+@router.get(
+    "/scans/{scan_id}/hypotheses",
+    response_model=list[SecurityHypothesisOut],
+)
+def list_security_hypotheses(
+    scan_id: str,
+    session: Session = Depends(get_session),
+) -> list[SecurityHypothesis]:
+    require_scan(session, scan_id)
+    return list(
+        session.scalars(
+            select(SecurityHypothesis)
+            .where(SecurityHypothesis.scan_id == scan_id)
+            .options(
+                selectinload(SecurityHypothesis.arguments),
+                selectinload(SecurityHypothesis.proof_attempts),
+            )
+            .order_by(SecurityHypothesis.created_at)
+        )
+    )
+
+
+@router.post(
+    "/scans/{scan_id}/evaluations",
+    response_model=BenchmarkEvaluationOut,
+)
+def evaluate_scan_against_ground_truth(
+    scan_id: str,
+    spec: BenchmarkSpec,
+    session: Session = Depends(get_session),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> BenchmarkEvaluation:
+    if session.get(Scan, scan_id) is None:
+        raise HTTPException(404, "Scan not found")
+    try:
+        return BenchmarkEvaluator(
+            orchestrator.settings,
+            orchestrator.database,
+        ).evaluate(scan_id, spec)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.get(
+    "/scans/{scan_id}/evaluations",
+    response_model=list[BenchmarkEvaluationOut],
+)
+def list_benchmark_evaluations(
+    scan_id: str,
+    session: Session = Depends(get_session),
+) -> list[BenchmarkEvaluation]:
+    if session.get(Scan, scan_id) is None:
+        raise HTTPException(404, "Scan not found")
+    return list(
+        session.scalars(
+            select(BenchmarkEvaluation)
+            .where(BenchmarkEvaluation.scan_id == scan_id)
+            .order_by(BenchmarkEvaluation.created_at.desc())
         )
     )
 
@@ -322,6 +411,7 @@ def list_agent_audits(
 
 @router.get("/scans/{scan_id}/coverage", response_model=list[CoverageItemOut])
 def list_coverage(scan_id: str, session: Session = Depends(get_session)) -> list[CoverageItem]:
+    require_scan(session, scan_id)
     return list(
         session.scalars(
             select(CoverageItem)
@@ -337,6 +427,7 @@ def list_events(
     after: int = Query(0, ge=0),
     session: Session = Depends(get_session),
 ) -> list[ScanEvent]:
+    require_scan(session, scan_id)
     return list(
         session.scalars(
             select(ScanEvent)
@@ -352,8 +443,14 @@ async def stream_events(
     request: Request,
     database: Database = Depends(get_database),
 ) -> StreamingResponse:
+    with database.session_factory() as session:
+        if session.get(Scan, scan_id) is None:
+            raise HTTPException(404, "Scan not found")
+    last_event_id = request.headers.get("last-event-id", "")
+    initial_cursor = int(last_event_id) if last_event_id.isdigit() else 0
+
     async def generate():  # noqa: ANN202
-        cursor = 0
+        cursor = initial_cursor
         while not await request.is_disconnected():
             with database.session_factory() as session:
                 events = list(
@@ -519,6 +616,61 @@ def _reset_task_for_manual_rerun(
     )
 
 
+def _reset_timed_out_task_for_continuation(
+    session: Session,
+    task: InvestigationTask,
+) -> None:
+    previous_result = dict(task.result or {})
+    previous_continuation = dict(previous_result.get("manual_continuation") or {})
+    continuation_number = int(previous_continuation.get("continuation_number") or 0) + 1
+    requested_at = now()
+    prior_result = {
+        key: previous_result[key]
+        for key in (
+            "result",
+            "summary",
+            "confidence",
+            "severity_proposal",
+            "platform_severity",
+            "coverage_gaps",
+            "platform_context",
+        )
+        if key in previous_result
+    }
+    task.status = TaskStatus.QUEUED.value
+    task.error = None
+    task.result = {
+        "manual_continuation": {
+            "requested_at": requested_at.isoformat(),
+            "previous_status": TaskStatus.TIMED_OUT.value,
+            "previous_attempt": task.attempts,
+            "previous_thread_id": task.thread_id,
+            "previous_turn_id": task.turn_id,
+            "continuation_number": continuation_number,
+            "reuse_task_evidence": True,
+            "prior_result": prior_result,
+        }
+    }
+    task.thread_id = None
+    task.turn_id = None
+    task.started_at = None
+    task.completed_at = None
+    add_event(
+        session,
+        task.scan_id,
+        "exploration.continuation.requested",
+        f"超时任务已进入第 {continuation_number} 次深度续跑队列",
+        {
+            "task_id": task.id,
+            "source": "platform",
+            "previous_attempt": task.attempts,
+            "continuation_number": continuation_number,
+            "reuse_static_artifacts": True,
+            "reuse_task_evidence": True,
+        },
+    )
+
+
 def _task_needs_supplemental_rerun(task: InvestigationTask) -> bool:
     if task.status in {
         TaskStatus.BLOCKED_DEVICE.value,
@@ -605,6 +757,33 @@ async def rerun_task(
     _resume_scan(session, scan)
     session.commit()
     background = asyncio.create_task(orchestrator.submit(task.scan_id), name=f"rerun-{task.id}")
+    request.app.state.background_tasks.add(background)
+    background.add_done_callback(request.app.state.background_tasks.discard)
+    return task
+
+
+@router.post("/tasks/{task_id}/continue", response_model=InvestigationTaskOut, status_code=202)
+async def continue_timed_out_task(
+    task_id: str,
+    request: Request,
+    session: Session = Depends(get_session),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> InvestigationTask:
+    task = session.get(InvestigationTask, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    if task.status != TaskStatus.TIMED_OUT.value:
+        raise HTTPException(409, "Only a timed-out task can continue from prior evidence")
+    scan = session.get(Scan, task.scan_id)
+    if scan is None:
+        raise HTTPException(404, "Scan not found")
+    _reset_timed_out_task_for_continuation(session, task)
+    _resume_scan(session, scan)
+    session.commit()
+    background = asyncio.create_task(
+        orchestrator.submit(task.scan_id),
+        name=f"continue-{task.id}",
+    )
     request.app.state.background_tasks.add(background)
     background.add_done_callback(request.app.state.background_tasks.discard)
     return task
@@ -780,6 +959,8 @@ def delete_task(
     task = session.get(InvestigationTask, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
+    if task.status == TaskStatus.DELETED.value:
+        raise HTTPException(404, "Task not found")
     if task.status not in {
         TaskStatus.BLOCKED_DEVICE.value,
         TaskStatus.COMPLETED.value,
@@ -799,12 +980,31 @@ def delete_task(
             )
         )
     )
-    # Evidence and findings are scan-level security records. Detach them from the
-    # execution row before deleting the task so AI audits remain available.
-    session.execute(
-        update(Evidence).where(Evidence.task_id == task_id).values(task_id=None)
+    deleted_at = now()
+    task.status = TaskStatus.DELETED.value
+    task.error = None
+    task.result = {
+        **dict(task.result or {}),
+        "deletion": {
+            "soft_deleted": True,
+            "deleted_at": deleted_at.isoformat(),
+            "reason": (
+                "Execution row hidden while evidence, hypotheses, proof attempts, and AI audit "
+                "lineage remain preserved."
+            ),
+        },
+    }
+    add_event(
+        session,
+        task.scan_id,
+        "task.deleted",
+        "任务已从执行列表移除，验证链与 AI 审计继续保留",
+        {
+            "task_id": task.id,
+            "soft_deleted": True,
+            "audit_artifacts_preserved": len(audit_artifacts),
+        },
     )
-    session.delete(task)
     session.commit()
     return TaskDeleteResult(
         id=task_id,

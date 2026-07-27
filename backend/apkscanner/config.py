@@ -26,7 +26,7 @@ class Settings:
     task_timeout_seconds: int = 20 * 60
     task_max_attempts: int = 2
     agent_max_rounds: int = 3
-    agent_tests_per_round: int = 4
+    agent_tests_per_round: int = 100
     investigator_backend: str = "codex"
     codex_enabled: bool = False
     codex_worker_model: str = "gpt-5.6-terra"
@@ -74,7 +74,7 @@ class Settings:
                 1, min(5, int(os.getenv("APKSCANNER_AGENT_MAX_ROUNDS", 3)))
             ),
             agent_tests_per_round=max(
-                1, min(12, int(os.getenv("APKSCANNER_AGENT_TESTS_PER_ROUND", 4)))
+                1, min(100, int(os.getenv("APKSCANNER_AGENT_TESTS_PER_ROUND", 100)))
             ),
             investigator_backend=os.getenv(
                 "APKSCANNER_INVESTIGATOR_BACKEND", "codex"

@@ -49,6 +49,8 @@ def terminal_task_statuses() -> set[str]:
         "not_reproduced",
         "inconclusive",
         "failed",
+        "canceled",
+        "deleted",
     }
 
 

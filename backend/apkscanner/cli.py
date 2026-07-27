@@ -9,15 +9,18 @@ import shutil
 import sys
 from pathlib import Path
 
+import yaml
 from sqlalchemy import select
 
 from .artifacts import ArtifactStore
 from .auth import CredentialStore, load_auth_flow
+from .benchmark import BenchmarkEvaluator
 from .config import Settings
 from .db import Database
 from .models import EntryPoint, InvestigationTask, Scan
 from .orchestrator import ScanOrchestrator
 from .reports import ReportBuilder
+from .schemas import BenchmarkSpec
 from .tools import discover_tools
 
 
@@ -50,7 +53,9 @@ def _import_apk(source: Path, settings: Settings) -> tuple[str, Path, int]:
     return sha256, target, size
 
 
-def scan_command(args: argparse.Namespace) -> int:
+def _create_and_run_scan(
+    args: argparse.Namespace,
+) -> tuple[Settings, Database, ScanOrchestrator, str]:
     settings, database, _store, orchestrator = _runtime()
     investigator = orchestrator.resolve_investigator(args.investigator)
     source = Path(args.apk).resolve()
@@ -70,12 +75,60 @@ def scan_command(args: argparse.Namespace) -> int:
         session.commit()
         scan_id = scan.id
     orchestrator._run_sync(scan_id)  # CLI owns this foreground worker.
+    return settings, database, orchestrator, scan_id
+
+
+def scan_command(args: argparse.Namespace) -> int:
+    _settings, database, _orchestrator, scan_id = _create_and_run_scan(args)
     with database.session_factory() as session:
         scan = session.get(Scan, scan_id)
         assert scan is not None
         report = ReportBuilder().build(session, scan)
     print(json.dumps({"scan_id": scan_id, "status": report["scan"]["status"], "stats": report["scan"]["stats"]}, ensure_ascii=False, indent=2))
     return 0 if report["scan"]["status"] == "final" else 1
+
+
+def _load_benchmark_spec(path: str) -> BenchmarkSpec:
+    source = Path(path).resolve()
+    if not source.is_file():
+        raise ValueError("ground-truth file does not exist")
+    with source.open(encoding="utf-8") as stream:
+        value = (
+            yaml.safe_load(stream)
+            if source.suffix.lower() in {".yaml", ".yml"}
+            else json.load(stream)
+        )
+    return BenchmarkSpec.model_validate(value)
+
+
+def evaluate_command(args: argparse.Namespace) -> int:
+    settings, database, _store, _orchestrator = _runtime()
+    evaluation = BenchmarkEvaluator(settings, database).evaluate(
+        args.scan_id,
+        _load_benchmark_spec(args.truth),
+    )
+    print(json.dumps(evaluation.result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def benchmark_command(args: argparse.Namespace) -> int:
+    settings, database, _orchestrator, scan_id = _create_and_run_scan(args)
+    evaluation = BenchmarkEvaluator(settings, database).evaluate(
+        scan_id,
+        _load_benchmark_spec(args.truth),
+    )
+    print(
+        json.dumps(
+            {
+                "scan_id": scan_id,
+                "evaluation_id": evaluation.id,
+                **evaluation.result,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
 
 
 def capabilities_command(args: argparse.Namespace) -> int:
@@ -220,6 +273,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="AI investigator backend for this scan",
     )
     scan.set_defaults(handler=scan_command)
+    benchmark = subparsers.add_parser(
+        "benchmark",
+        help="Scan an APK and score only evidence-confirmed findings against private ground truth",
+    )
+    benchmark.add_argument("apk")
+    benchmark.add_argument("--truth", required=True)
+    benchmark.add_argument(
+        "--investigator",
+        choices=("configured", "codex", "opencode", "none"),
+        default="configured",
+    )
+    benchmark.set_defaults(handler=benchmark_command)
+    evaluate = subparsers.add_parser(
+        "evaluate",
+        help="Score an existing scan against a private ground-truth JSON or YAML file",
+    )
+    evaluate.add_argument("--scan-id", required=True)
+    evaluate.add_argument("--truth", required=True)
+    evaluate.set_defaults(handler=evaluate_command)
     capabilities = subparsers.add_parser("capabilities", help="Inspect scanner capabilities")
     capabilities.add_argument(
         "--deep",

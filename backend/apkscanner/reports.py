@@ -5,9 +5,18 @@ import json
 from typing import Any
 
 from sqlalchemy import case, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
-from .models import CoverageItem, EntryPoint, Evidence, Finding, InvestigationTask, Scan
+from .models import (
+    BenchmarkEvaluation,
+    CoverageItem,
+    EntryPoint,
+    Evidence,
+    Finding,
+    InvestigationTask,
+    Scan,
+    SecurityHypothesis,
+)
 
 
 class ReportBuilder:
@@ -42,7 +51,10 @@ class ReportBuilder:
         tasks = list(
             session.scalars(
                 select(InvestigationTask)
-                .where(InvestigationTask.scan_id == scan.id)
+                .where(
+                    InvestigationTask.scan_id == scan.id,
+                    InvestigationTask.status != "deleted",
+                )
                 .order_by(InvestigationTask.priority.desc())
             )
         )
@@ -58,6 +70,24 @@ class ReportBuilder:
                 select(Evidence)
                 .where(Evidence.scan_id == scan.id)
                 .order_by(Evidence.created_at, Evidence.id)
+            )
+        )
+        hypotheses = list(
+            session.scalars(
+                select(SecurityHypothesis)
+                .where(SecurityHypothesis.scan_id == scan.id)
+                .options(
+                    selectinload(SecurityHypothesis.arguments),
+                    selectinload(SecurityHypothesis.proof_attempts),
+                )
+                .order_by(SecurityHypothesis.created_at)
+            )
+        )
+        evaluations = list(
+            session.scalars(
+                select(BenchmarkEvaluation)
+                .where(BenchmarkEvaluation.scan_id == scan.id)
+                .order_by(BenchmarkEvaluation.created_at)
             )
         )
         return {
@@ -87,6 +117,12 @@ class ReportBuilder:
             "entry_points": [self._entry(item) for item in entries],
             "findings": [self._finding(item) for item in findings],
             "tasks": [self._task(item) for item in tasks],
+            "security_hypotheses": [
+                self._security_hypothesis(item) for item in hypotheses
+            ],
+            "benchmark_evaluations": [
+                self._benchmark_evaluation(item) for item in evaluations
+            ],
             "agent_audits": agent_audits or [],
             "coverage": [self._coverage(item) for item in coverage],
             "evidence": [self._evidence(item) for item in evidence],
@@ -143,6 +179,75 @@ class ReportBuilder:
             "turn_id": item.turn_id,
             "attempts": item.attempts,
             "error": item.error,
+        }
+
+    @staticmethod
+    def _security_hypothesis(item: SecurityHypothesis) -> dict[str, Any]:
+        return {
+            "id": item.id,
+            "task_id": item.task_id,
+            "fingerprint": item.fingerprint,
+            "category": item.category,
+            "claim": item.claim,
+            "attacker_model": item.attacker_model,
+            "preconditions": item.preconditions,
+            "impact": item.impact,
+            "status": item.status,
+            "confidence_score": item.confidence_score,
+            "source_role": item.source_role,
+            "entry_point_ids": item.entry_point_ids,
+            "support_evidence_ids": item.support_evidence_ids,
+            "refute_evidence_ids": item.refute_evidence_ids,
+            "proof_obligations": item.proof_obligations,
+            "final_finding_id": item.final_finding_id,
+            "metadata": item.metadata_json,
+            "arguments": [
+                {
+                    "id": argument.id,
+                    "role": argument.role,
+                    "position": argument.position,
+                    "phase": argument.phase,
+                    "backend": argument.backend,
+                    "model": argument.model,
+                    "payload": argument.payload,
+                    "evidence_ids": argument.evidence_ids,
+                    "created_at": argument.created_at.isoformat(),
+                }
+                for argument in item.arguments
+            ],
+            "proof_attempts": [
+                {
+                    "id": proof.id,
+                    "test_case_id": proof.test_case_id,
+                    "prover": proof.prover,
+                    "status": proof.status,
+                    "plan": proof.plan,
+                    "oracle": proof.oracle,
+                    "evidence_ids": proof.evidence_ids,
+                    "harm_demonstrated": proof.harm_demonstrated,
+                    "error": proof.error,
+                    "started_at": (
+                        proof.started_at.isoformat() if proof.started_at else None
+                    ),
+                    "completed_at": (
+                        proof.completed_at.isoformat() if proof.completed_at else None
+                    ),
+                }
+                for proof in item.proof_attempts
+            ],
+        }
+
+    @staticmethod
+    def _benchmark_evaluation(item: BenchmarkEvaluation) -> dict[str, Any]:
+        return {
+            "id": item.id,
+            "name": item.name,
+            "artifact_sha256": item.artifact_sha256,
+            "investigator_backend": item.investigator_backend,
+            "model": item.model,
+            "ground_truth": item.ground_truth,
+            "result": item.result,
+            "created_at": item.created_at.isoformat(),
         }
 
     @staticmethod
@@ -260,6 +365,16 @@ class ReportBuilder:
             "</tr>"
             for item in report["agent_audits"]
         )
+        hypothesis_rows = "".join(
+            "<tr>"
+            f"<td><code>{html.escape(item['id'])}</code></td>"
+            f"<td>{html.escape(item['status'])}</td>"
+            f"<td>{html.escape(item['claim'])}</td>"
+            f"<td>{len(item['proof_attempts'])}</td>"
+            f"<td>{sum(1 for proof in item['proof_attempts'] if proof['harm_demonstrated'])}</td>"
+            "</tr>"
+            for item in report["security_hypotheses"]
+        )
         limitations = "".join(f"<li>{html.escape(item)}</li>" for item in scan["limitations"])
         report_json = (
             json.dumps(report, ensure_ascii=False)
@@ -276,6 +391,8 @@ th{{background:#eef4f7}}code{{background:#eef4f7;padding:2px 5px}}</style></head
  · {html.escape(scan['status'])} · <code>{scan['artifact_sha256']}</code></p>
 <h2>Finding</h2><table><thead><tr><th>Severity</th><th>Status</th><th>Title</th><th>MASVS</th></tr></thead>
 <tbody>{finding_rows}</tbody></table>
+<h2>验证链</h2><table><thead><tr><th>Hypothesis ID</th><th>Status</th><th>Claim</th>
+<th>Proof Attempts</th><th>Harm Proven</th></tr></thead><tbody>{hypothesis_rows}</tbody></table>
 <h2>AI 审计</h2><table><thead><tr><th>Phase</th><th>Backend</th><th>Model</th><th>Status</th>
 <th>Integrity</th><th>Turn</th></tr></thead><tbody>{audit_rows}</tbody></table>
 <p>精确输入、结构化输出和平台校验内容保存在下方 <code>report-data</code> JSON 中。</p>

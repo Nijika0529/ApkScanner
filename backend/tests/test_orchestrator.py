@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import shutil
 import threading
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
 from apkscanner.agent_audit import build_agent_audits
 from apkscanner.agent_events import AgentCancelledError, AgentRuntimeEvent
 from apkscanner.artifacts import ArtifactStore
@@ -17,12 +20,14 @@ from apkscanner.models import (
     Evidence,
     Finding,
     InvestigationTask,
+    ProofAttempt,
     Scan,
     ScanEvent,
 )
 from apkscanner.orchestrator import ScanOrchestrator
 from apkscanner.reports import ReportBuilder
-from apkscanner.schemas import AgentInvestigationResult
+from apkscanner.schemas import AgentInvestigationResult, AgentRequestedTest
+from apkscanner.tools import CommandResult, TimeBudget
 from sqlalchemy import select
 
 
@@ -72,6 +77,101 @@ def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(setting
             '<script type="application/json" id="report-data">', 1
         )[1].split("</script>", 1)[0]
         assert json.loads(embedded)["scan"]["id"] == scan_id
+
+
+def test_continuation_context_includes_prior_task_evidence(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="continuation.apk",
+            artifact_sha256="7" * 64,
+            artifact_path=str(settings.data_dir / "missing.apk"),
+        )
+        task = InvestigationTask(scan=scan, task_type="component")
+        session.add_all([scan, task])
+        session.flush()
+        global_evidence = orchestrator.evidence.json(
+            session,
+            scan_id=scan.id,
+            task_id=None,
+            kind="static.manifest",
+            value={"exported": True},
+            summary="Manifest evidence",
+        )
+        prior_task_evidence = orchestrator.evidence.json(
+            session,
+            scan_id=scan.id,
+            task_id=task.id,
+            kind="blackbox.logcat",
+            value={"observed": True},
+            summary="Prior dynamic evidence",
+        )
+        session.commit()
+        scan_id = scan.id
+        task_id = task.id
+        global_evidence_id = global_evidence.id
+        prior_task_evidence_id = prior_task_evidence.id
+
+    initial = orchestrator._evidence_summaries_for_run(
+        scan_id,
+        task_id=task_id,
+        include_task_evidence=False,
+    )
+    continued = orchestrator._evidence_summaries_for_run(
+        scan_id,
+        task_id=task_id,
+        include_task_evidence=True,
+    )
+    assert {item["id"] for item in initial} == {global_evidence_id}
+    assert {item["id"] for item in continued} == {
+        global_evidence_id,
+        prior_task_evidence_id,
+    }
+
+
+def test_manual_continuation_gets_a_fresh_budget_after_scan_deadline(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="late-continuation.apk",
+            artifact_sha256="6" * 64,
+            artifact_path=str(settings.data_dir / "missing.apk"),
+            created_at=datetime.now(UTC)
+            - timedelta(seconds=settings.scan_deadline_seconds + 60),
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="queued",
+            result={"manual_continuation": {"continuation_number": 1}},
+        )
+        session.add_all([scan, task])
+        session.commit()
+        scan_id = scan.id
+        task_id = task.id
+
+    dispatched: list[tuple[str, str, int | None]] = []
+
+    def run_task(actual_scan_id: str, actual_task_id: str, timeout: int | None) -> None:
+        dispatched.append((actual_scan_id, actual_task_id, timeout))
+        with database.session_factory() as session:
+            persisted = session.get(InvestigationTask, actual_task_id)
+            assert persisted is not None
+            persisted.status = "completed"
+            session.commit()
+
+    monkeypatch.setattr(orchestrator, "_run_task", run_task)
+    orchestrator._run_tasks(scan_id)
+    assert dispatched == [(scan_id, task_id, settings.task_timeout_seconds)]
 
 
 def test_orchestrator_persists_audit_evidence_for_every_ai_call(
@@ -353,6 +453,238 @@ def test_canceled_task_selected_before_dispatch_is_not_restarted(settings) -> No
         assert task is not None
         assert task.status == "canceled"
         assert task.attempts == 0
+
+
+def test_unexpected_scan_failure_terminalizes_transient_tasks(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    store = ArtifactStore(settings)
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="unexpected-failure.apk",
+            artifact_sha256="e" * 64,
+            artifact_path=str(settings.data_dir / "missing.apk"),
+        )
+        queued = InvestigationTask(scan=scan, task_type="component", status="queued")
+        running = InvestigationTask(scan=scan, task_type="component", status="running")
+        canceling = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="cancel_requested",
+        )
+        completed = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="completed",
+        )
+        session.add_all([scan, queued, running, canceling, completed])
+        session.commit()
+        identifiers = {
+            "scan": scan.id,
+            "queued": queued.id,
+            "running": running.id,
+            "canceling": canceling.id,
+            "completed": completed.id,
+        }
+
+    orchestrator = ScanOrchestrator(settings, database, store)
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_static",
+        lambda _scan_id: (_ for _ in ()).throw(RuntimeError("unexpected failure")),
+    )
+    orchestrator._run_sync(identifiers["scan"])
+
+    with database.session_factory() as session:
+        scan = session.get(Scan, identifiers["scan"])
+        assert scan is not None and scan.status == "failed"
+        assert session.get(InvestigationTask, identifiers["queued"]).status == "failed"
+        assert session.get(InvestigationTask, identifiers["running"]).status == "failed"
+        assert session.get(InvestigationTask, identifiers["canceling"]).status == "canceled"
+        assert session.get(InvestigationTask, identifiers["completed"]).status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_submit_coalesces_a_rerun_requested_during_active_scan(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    def run(scan_id: str) -> None:
+        calls.append(scan_id)
+        if len(calls) == 1:
+            started.set()
+            assert release.wait(timeout=5)
+
+    monkeypatch.setattr(orchestrator, "_run_sync", run)
+    first = asyncio.create_task(orchestrator.submit("scan-race"))
+    assert await asyncio.to_thread(started.wait, 5)
+    await orchestrator.submit("scan-race")
+    release.set()
+    await first
+    assert calls == ["scan-race", "scan-race"]
+
+
+def test_requested_test_binds_frida_evidence_to_its_proof_attempt(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    store = ArtifactStore(settings)
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="frida-proof.apk",
+            artifact_sha256="f" * 64,
+            artifact_path=str(settings.data_dir / "frida-proof.apk"),
+        )
+        entry = EntryPoint(
+            scan=scan,
+            kind="activity",
+            name="com.example.ExportedActivity",
+            exported=True,
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="running",
+            hypotheses=["The activity performs an unauthorized action."],
+        )
+        session.add_all([scan, entry, task])
+        session.flush()
+        task.target_entry_ids = [entry.id]
+        session.commit()
+
+    orchestrator = ScanOrchestrator(settings, database, store)
+    hypothesis = orchestrator.hypothesis_ledger.ensure_task_hypotheses(task)[0]
+    request = AgentRequestedTest(
+        hypothesis_id=hypothesis.id,
+        entry_point_id=entry.id,
+        state="guest",
+        uri=None,
+        extras={},
+        rationale="Prove the unauthorized action.",
+    )
+    monkeypatch.setattr(
+        orchestrator.device,
+        "reset_session",
+        lambda *_args, **_kwargs: [
+            ("device.clear", CommandResult(["adb"], 0, "", ""), {})
+        ],
+    )
+
+    def probe(*_args, test_case_id=None, **_kwargs):  # noqa: ANN001, ANN202
+        return SimpleNamespace(
+            commands=[
+                (
+                    "blackbox.probe_app",
+                    CommandResult(["probe"], 0, "", ""),
+                    {
+                        "caller_identity": "probe_app",
+                        "request_id": "request-1",
+                        "test_case_id": test_case_id,
+                    },
+                ),
+                (
+                    "blackbox.logcat",
+                    CommandResult(["logcat"], 0, "", ""),
+                    {
+                        "request_id": "request-1",
+                        "request_observed": True,
+                        "probe_success": True,
+                        "security_impact_observed": True,
+                        "test_case_id": test_case_id,
+                    },
+                ),
+            ]
+        )
+
+    monkeypatch.setattr(orchestrator.device, "probe", probe)
+    monkeypatch.setattr(orchestrator.frida, "start", lambda *_args, **_kwargs: (object(), None))
+    monkeypatch.setattr(
+        orchestrator.frida,
+        "collect",
+        lambda _session: CommandResult(["frida"], 0, "APKSCANNER_READY\nAPKSCANNER_TRACE", ""),
+    )
+    monkeypatch.setattr(
+        orchestrator.frida,
+        "metadata",
+        lambda _result: {
+            "capture_success": True,
+            "observation_count": 1,
+            "hook_error_count": 0,
+        },
+    )
+    evidence_summaries: list[dict] = []
+    executed, gaps, observed = orchestrator._execute_requested_tests(
+        scan_id=scan.id,
+        task_id=task.id,
+        package_name="com.example",
+        entries=[entry],
+        requests=[request],
+        budget=TimeBudget.from_seconds(30),
+        evidence_summaries=evidence_summaries,
+        round_index=2,
+    )
+    assert not gaps
+    assert observed is True
+    assert executed[0]["test_case_id"] == "agent-r2-1"
+    with database.session_factory() as session:
+        proof = session.get(ProofAttempt, executed[0]["proof_attempt_id"])
+        assert proof is not None
+        assert proof.status == "proven"
+        assert proof.oracle["instrumented_observation"] is True
+        assert any(
+            item["kind"] == "instrumented.frida"
+            for item in evidence_summaries
+            if item["id"] in proof.evidence_ids
+        )
+        persisted_scan = session.get(Scan, scan.id)
+        persisted_task = session.get(InvestigationTask, task.id)
+        persisted_entry = session.get(EntryPoint, entry.id)
+        assert persisted_scan is not None
+        assert persisted_task is not None
+        assert persisted_entry is not None
+        persisted_task.result = {
+            "summary": "The platform observed an unauthorized action.",
+            "severity_proposal": "high",
+            "platform_severity": "high",
+            "confidence": "high",
+            "coverage_gaps": [],
+            "evidence_ids": proof.evidence_ids,
+        }
+        orchestrator._persist_agent_finding(
+            session,
+            persisted_scan,
+            persisted_task,
+            [persisted_entry],
+            "observed_instrumented",
+            "opencode",
+        )
+        session.commit()
+        finding = session.scalar(
+            select(Finding).where(Finding.scan_id == persisted_scan.id)
+        )
+        assert finding is not None
+        assert finding.metadata_json["hypothesis_id"] == hypothesis.id
+        assert finding.metadata_json["harm_demonstrated"] is True
+        persisted_hypothesis = session.get(
+            type(hypothesis),
+            hypothesis.id,
+        )
+        assert persisted_hypothesis.final_finding_id == finding.id
 
 
 def test_restart_recovery_normalizes_transient_device_states(settings) -> None:  # noqa: ANN001

@@ -96,6 +96,69 @@ export interface InvestigationTask {
   created_at: string
 }
 
+export interface HypothesisArgument {
+  id: string
+  role: string
+  position: string
+  phase: string
+  backend: string
+  model: string | null
+  payload: Record<string, unknown>
+  evidence_ids: string[]
+  created_at: string
+}
+
+export interface ProofAttempt {
+  id: string
+  test_case_id: string
+  prover: string
+  status: string
+  plan: Record<string, unknown>
+  oracle: Record<string, unknown>
+  evidence_ids: string[]
+  harm_demonstrated: boolean
+  error: string | null
+  started_at: string | null
+  completed_at: string | null
+  created_at: string
+}
+
+export interface SecurityHypothesis {
+  id: string
+  task_id: string
+  fingerprint: string
+  category: string
+  claim: string
+  attacker_model: Record<string, unknown>
+  preconditions: string[]
+  impact: string
+  status: string
+  confidence_score: number
+  source_role: string
+  entry_point_ids: string[]
+  support_evidence_ids: string[]
+  refute_evidence_ids: string[]
+  proof_obligations: Array<Record<string, unknown>>
+  final_finding_id: string | null
+  metadata_json: Record<string, unknown>
+  arguments: HypothesisArgument[]
+  proof_attempts: ProofAttempt[]
+  created_at: string
+  updated_at: string
+}
+
+export interface BenchmarkEvaluation {
+  id: string
+  scan_id: string
+  name: string
+  artifact_sha256: string
+  investigator_backend: string
+  model: string | null
+  ground_truth: Record<string, unknown>
+  result: Record<string, unknown>
+  created_at: string
+}
+
 export interface ScanEvent {
   id: number
   event_type: string

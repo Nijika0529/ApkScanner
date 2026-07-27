@@ -12,11 +12,13 @@ v1 产品是一个单用户、仅限本机（localhost）的 Web 应用。它接
 - 内置面向 MASVS 的 Manifest、代码模式、归档文件、原生库和加固规则。
 - Apktool 基线分析，支持可选的 JADX 增强和显式的降级覆盖状态。
 - 持久化的 SQLite Scan/Task/Finding/Evidence/Coverage/Event 模型。
+- 持久化 Hypothesis、Hunter/Critic 论证、Proof Attempt、危害 Oracle 和平台 Verdict；模型文字不能自证漏洞成立。
+- 私有 APK ground-truth 评测：只对平台确认的最终 Finding 计分，默认要求动态证明，并用 F0.5 重罚不匹配真值的高危结论。
 - 远程 ADB 适配器、串行设备租约、普通 App UID 的 Probe APK 协议、日志证据、访客/认证回放、`pm clear` 清理和 App Link 状态检查/重置。
 - 有限范围的 Frida 旁路追踪（URI/Query 脱敏），带独立的 instrumented 判定。
 - 可选的 MobSF 上传/报告归一化，缺失时显式标注降级覆盖。
 - 官方 `openai-codex==0.144.4` 集成：严格 JSON Schema、全新线程、无子 Agent fan-out、一轮平台介导的补充测试、证据支撑的结果降级。
-- 固定版本 `@opencode-ai/sdk`/OpenCode `1.18.4` 集成（适配 DeepSeek）：全新会话、Schema 校验输出、拒绝所有可执行 Agent 工具、隔离的一次性桥接。
+- 固定版本 `@opencode-ai/sdk`/OpenCode `1.18.4` 集成（适配 DeepSeek）：全新会话、V4 Pro 文本 JSON/Ajv 校验、workspace read/glob/grep/bash、ADB 阻断和完整工具审计。
 - 可选的每任务 Docker Worker，带只读扫描挂载和资源/能力限制。
 - 响应式明亮主题 React 审核控制台、人工 Finding 判定、实时事件、任务停止/删除、JSON/HTML/SARIF 导出。
 
@@ -50,6 +52,25 @@ scanctl serve
 scanctl scan /absolute/path/to/application.apk --investigator configured
 scanctl capabilities
 ```
+
+对已有已知漏洞结论的私有 APK，可复制
+[`config/benchmark-ground-truth.example.json`](config/benchmark-ground-truth.example.json)
+填写真值，然后直接比较不同模型：
+
+```bash
+scanctl benchmark /absolute/path/to/application.apk \
+  --truth /absolute/path/to/ground-truth.json \
+  --investigator opencode
+
+scanctl evaluate --scan-id SCAN_ID \
+  --truth /absolute/path/to/ground-truth.json
+```
+
+`candidate`、`inconclusive`、人工 accepted 和没有平台证明的模型描述都不算“发现”。普通
+Probe 成功只记录 `execution_demonstrated`；动态真值还要求领域 Prover 给出平台可校验的
+`security_impact_observed`。真值默认使用 `minimum_proof: dynamic`；仅仅发现导出声明、
+危险 API 或成功打开组件不能得分。平台已确认但无法匹配任何真值的 Finding 会计为 false
+positive，未证明的 AI 输出则单独列为噪声。
 
 Web 上传对话框和 CLI 均可将每次扫描锁定为 `codex`、`opencode` 或 `none`；`configured` 在扫描创建时解析服务默认值，并随该扫描持久化。
 
@@ -196,7 +217,7 @@ Apktool、JADX/Smali、代码索引和静态 Evidence，不再次反编译。
 | `supported_static` | 至少引用一个 `static.*` Evidence ID |
 | `reproduced_blackbox` | 同一随机 request ID 的 Probe APK 调用 + Probe 结果日志，且 Probe 返回 success |
 | `observed_instrumented` | Frida 成功加载且至少产生一个非 hook-error 的观察事件 |
-| `not_reproduced` | 同一 request ID 的普通 App UID 尝试 + 结果日志存在；仅描述已执行的测试用例，不证明全局安全 |
+| `not_reproduced` | 同一 test-case/request ID 的普通 App UID 尝试 + 结果日志存在，且平台 Prover 明确产生 `oracle_refuted=true`；仅反驳已执行用例，不证明全局安全 |
 | `inconclusive` | 证据不足、工具缺失、预算耗尽或前置条件失败 |
 
 Agent 声称的、不属于当前 Scan/Task 的 Evidence ID 会被移除。需要特定证据的判定在不满足条件时会自动降级为 `inconclusive`。重试时，旧的 Agent Finding 不删除，但会被标记为已被新 turn 取代并降级。
