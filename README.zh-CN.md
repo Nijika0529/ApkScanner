@@ -138,7 +138,7 @@ scanctl capabilities --deep
 
 ## OpenCode + DeepSeek 配置
 
-OpenCode 同样为可选功能，Docker 是默认模式。集成将 SDK 和 CLI 一同固定至 `1.18.4` 版本；使用 DeepSeek 内置 provider，默认模型为 `deepseek-v4-pro`。
+OpenCode 同样为可选功能，Docker 是默认模式。集成将 SDK 和 CLI 一同固定至 `1.18.4` 版本；使用 DeepSeek 内置 provider，稳定基线与默认模型为 `deepseek-v4-flash`。
 
 ```bash
 docker build \
@@ -168,12 +168,13 @@ Host Worker 为每次调用创建私有的临时 HOME/XDG 目录树以及认证�
 服务器。两种模式都只给 OpenCode 一个按 `task_id + attempt` 隔离的 workspace，其中物化
 当前入口的代码上下文和不可变 Evidence；它可使用 `read`、`glob`、`grep` 和 `bash`，
 但不会与其他并发 Agent 共享可写扫描目录。原生编辑、Web、MCP、子 Agent 和 ADB 保持
-禁用，请求的 Android 测试仍由 Python 控制面验证并执行。`deepseek-v4-pro` 通过
-`promptAsync` 和短连接消息轮询完成
-长推理，避免 review/自由探索阶段依赖一条长期占用的 loopback HTTP 请求；瞬时本地连接
+禁用，请求的 Android 测试仍由 Python 控制面验证并执行。实验性的 `deepseek-v4-pro` 通过
+`promptAsync` 下发，并用短连接轮询消息和 session 状态直到完整工具循环进入 idle，
+再读取最终文本响应。这样可支持长推理，避免 review/自由探索阶段依赖一条长期占用的
+loopback HTTP 请求；瞬时本地连接
 失败会在剩余任务预算内重建一次 worker，不会静默切换模型。
 
-设置 `APKSCANNER_OPENCODE_MODEL=deepseek-v4-flash` 可选用成本更低的模型。可通过 `APKSCANNER_DEEPSEEK_BASE_URL` 指定企业 DeepSeek 兼容网关；远程网关必须使用 HTTPS，纯 HTTP 仅在 loopback 上接受。该 URL 中的凭据、查询参数和片段将被拒绝，API Key 仍通过 `DEEPSEEK_API_KEY` 提供。
+当前建议先用默认的 `deepseek-v4-flash` 跑通扫描、工具调用、动态申请和最终裁决全链路。仅在单独验证 Pro 适配时设置 `APKSCANNER_OPENCODE_MODEL=deepseek-v4-pro`。可通过 `APKSCANNER_DEEPSEEK_BASE_URL` 指定企业 DeepSeek 兼容网关；远程网关必须使用 HTTPS，纯 HTTP 仅在 loopback 上接受。该 URL 中的凭据、查询参数和片段将被拒绝，API Key 仍通过 `DEEPSEEK_API_KEY` 提供。
 
 实现原理、协议、安全控制及升级清单参见 [`docs/opencode-deepseek.zh-CN.md`](docs/opencode-deepseek.zh-CN.md)。
 
@@ -256,7 +257,7 @@ AI 审计中，不能被当作平台确认风险等级。
 | `APKSCANNER_CODEX_AUTH_FILE` | 未设置 | 仅挂载到 Worker 中的认证文件 |
 | `APKSCANNER_CODEX_BIN` | 内置 SDK 运行时 | 显式测试过的 Codex 二进制覆盖 |
 | `APKSCANNER_OPENCODE_ENABLED` | `false` | 是否启用 OpenCode + DeepSeek 调查 |
-| `APKSCANNER_OPENCODE_MODEL` | `deepseek-v4-pro` | DeepSeek 模型 ID |
+| `APKSCANNER_OPENCODE_MODEL` | `deepseek-v4-flash` | DeepSeek 模型 ID；Pro 适配验证时显式改为 `deepseek-v4-pro` |
 | `APKSCANNER_OPENCODE_ISOLATION` | `docker` | `docker` 或显式 `host` 降级 |
 | `APKSCANNER_OPENCODE_DOCKER_IMAGE` | `apk-scanner-opencode-worker:0.1.0` | Worker 镜像名称 |
 | `APKSCANNER_OPENCODE_NODE_BIN` | PATH 中的 `node` | Host 模式下的 Node.js 覆盖 |

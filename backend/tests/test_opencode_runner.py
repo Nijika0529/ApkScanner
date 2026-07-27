@@ -69,8 +69,8 @@ def test_host_capability_requires_key_and_pinned_packages(
     available = investigator.capability()
     assert available["available"] is True
     assert available["provider"] == "deepseek"
-    assert available["model"] == "deepseek-v4-pro"
-    assert available["output_mode"] == OPENCODE_OUTPUT_MODE_PROMPTED_JSON
+    assert available["model"] == "deepseek-v4-flash"
+    assert available["output_mode"] == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
     assert available["max_steps"] == 100
 
     package = worker / "node_modules" / "@opencode-ai" / "sdk" / "package.json"
@@ -191,12 +191,12 @@ def test_investigate_builds_a_workspace_shell_prompt_and_validates_result(
         assert timeout_seconds == configured.task_timeout_seconds + 15
         assert workspace == expected_workspace
         assert payload["action"] == "investigate"
-        assert payload["model"] == "deepseek-v4-pro"
+        assert payload["model"] == "deepseek-v4-flash"
         assert "run shell commands" in payload["prompt"]
         assert "workspace or /tmp" in payload["prompt"]
         assert payload["tool_profile"] == "workspace_shell"
-        assert "DEEPSEEK_THINKING_OUTPUT_ADAPTER" in payload["prompt"]
-        assert "OUTPUT_JSON_SCHEMA" in payload["prompt"]
+        assert "DEEPSEEK_THINKING_OUTPUT_ADAPTER" not in payload["prompt"]
+        assert "OUTPUT_JSON_SCHEMA" not in payload["prompt"]
         assert payload["output_schema"]["title"] == "AgentInvestigationResult"
         assert payload["output_schema"]["additionalProperties"] is False
         assert payload["output_schema"]["properties"]["requested_tests"]["maxItems"] == 100

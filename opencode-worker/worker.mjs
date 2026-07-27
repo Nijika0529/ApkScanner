@@ -308,6 +308,7 @@ async function promptAsyncAndWait(client, payload, promptText, tools) {
     "session.prompt_async",
   )
 
+  let toolLoopWaitReported = false
   while (Date.now() < workerDeadline) {
     const messages = unwrap(
       await localRead(
@@ -316,20 +317,52 @@ async function promptAsyncAndWait(client, payload, promptText, tools) {
       ),
       "session.messages.poll",
     )
-    const completed = messages
+    const assistantMessages = messages
       .filter(
         (message) =>
           message?.info?.role === "assistant" &&
-          !knownMessageIDs.has(message.info.id) &&
-          (message.info.error ||
-            message.info.time?.completed ||
-            message.info.finish),
+          !knownMessageIDs.has(message.info.id),
       )
       .sort(
         (left, right) =>
           (right.info.time?.created ?? 0) - (left.info.time?.created ?? 0),
-      )[0]
-    if (completed) return completed
+      )
+    const latestCompleted = assistantMessages.find(
+      (message) =>
+        message.info.error ||
+        message.info.time?.completed ||
+        message.info.finish,
+    )
+    const statuses = unwrap(
+      await localRead(
+        () => client.session.status(),
+        "session.status.poll",
+      ),
+      "session.status.poll",
+    )
+    const status = statuses?.[sessionID]
+    const idle = !status || status.type === "idle"
+    if (idle && latestCompleted) {
+      return {
+        ...latestCompleted,
+        apkscanner_turn_messages: assistantMessages,
+      }
+    }
+    if (
+      !toolLoopWaitReported &&
+      latestCompleted?.info?.finish === "tool-calls"
+    ) {
+      toolLoopWaitReported = true
+      emitRuntimeEvent(
+        "model.tool_loop.waiting",
+        "OpenCode 已收到工具调用，继续等待工具执行与最终文本响应",
+        {
+          session_id: sessionID,
+          message_id: latestCompleted.info.id,
+          session_status: status?.type ?? "idle",
+        },
+      )
+    }
     const remaining = workerDeadline - Date.now()
     if (remaining <= 0) break
     await delay(Math.min(LOCAL_POLL_INTERVAL_MS, remaining))
@@ -784,6 +817,7 @@ function modelCallAudit({
   accepted,
   tools,
 }) {
+  const turnMessages = response.apkscanner_turn_messages ?? [response]
   return {
     attempt,
     turn_id: response.info?.id ?? null,
@@ -794,10 +828,20 @@ function modelCallAudit({
     accepted,
     tools,
     usage: {
-      tokens: response.info?.tokens ?? {},
-      cost: response.info?.cost ?? 0,
+      tokens: turnMessages.reduce(
+        (total, message) => mergeNumericObjects(total, message.info?.tokens ?? {}),
+        {},
+      ),
+      cost: turnMessages.reduce(
+        (total, message) => total + (message.info?.cost ?? 0),
+        0,
+      ),
       finish: response.info?.finish ?? null,
+      provider_calls: turnMessages.length,
     },
+    turn_message_ids: turnMessages
+      .map((message) => message.info?.id)
+      .filter((value) => typeof value === "string"),
   }
 }
 
@@ -843,17 +887,23 @@ function summarizeToolInput(tool, input) {
 }
 
 function aggregateUsage(responses, payload) {
+  const modelResponses = responses.flatMap(
+    (response) => response.apkscanner_turn_messages ?? [response],
+  )
   const final = responses.at(-1)
   return {
-    tokens: responses.reduce(
+    tokens: modelResponses.reduce(
       (total, response) => mergeNumericObjects(total, response.info?.tokens ?? {}),
       {},
     ),
-    cost: responses.reduce((total, response) => total + (response.info?.cost ?? 0), 0),
+    cost: modelResponses.reduce(
+      (total, response) => total + (response.info?.cost ?? 0),
+      0,
+    ),
     finish: final?.info?.finish ?? null,
     provider: final?.info?.providerID ?? PROVIDER_ID,
     model: final?.info?.modelID ?? payload.model,
-    calls: responses.length,
+    calls: modelResponses.length,
   }
 }
 

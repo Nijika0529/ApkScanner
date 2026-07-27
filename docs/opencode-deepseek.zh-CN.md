@@ -4,7 +4,8 @@
 
 OpenCode 官方提供的是 JS/TS SDK。SDK 通过 `createOpencodeServer` 启动本地 server，再用
 `createOpencodeClient` 创建类型化客户端；会话主路径是 `session.create`，Flash 使用
-`session.prompt`，Pro 使用 `session.promptAsync` 加短连接消息轮询。SDK 支持给同步
+`session.prompt`，Pro 使用 `session.promptAsync` 加短连接消息与 session 状态轮询。
+只有完整工具循环进入 idle 后才读取最终 assistant 文本。SDK 支持给同步
 prompt 传 JSON Schema，并通过内部 `StructuredOutput` 工具收集结构化结果。官方资料：
 
 - [OpenCode SDK](https://opencode.ai/docs/sdk/)
@@ -31,7 +32,7 @@ prompt 传 JSON Schema，并通过内部 `StructuredOutput` 工具收集结构�
 
 | 模型 | OpenCode format / 传输 | 发给模型的工具 / `tool_choice` | 结果校验 |
 | --- | --- | --- | --- |
-| `deepseek-v4-pro`（及其版本后缀） | `text`；`promptAsync` + `session.messages` 短轮询 | 首轮允许 `read/glob/grep/bash`，使用普通自动工具选择，不使用 `required` | prompt 携带精确 Schema 和最小示例；Ajv 8.20.0 本地校验，纠正轮关闭工具，最多 2 次 |
+| `deepseek-v4-pro`（及其版本后缀） | `text`；`promptAsync` + `session.messages/status` 短轮询，等待 idle | 首轮允许 `read/glob/grep/bash`，使用普通自动工具选择，不使用 `required` | prompt 携带精确 Schema 和最小示例；Ajv 8.20.0 本地校验，纠正轮关闭工具，最多 2 次 |
 | `deepseek-v4-flash` | `json_schema`；同步 `prompt` | `read/glob/grep/bash` + `StructuredOutput`；`required` | OpenCode 内部校验，最多 2 次重试 |
 
 Pro 通道不会把思考模式关掉，也不会绕过 OpenCode session/provider。它只避开
@@ -70,9 +71,10 @@ sequenceDiagram
         O->>D: tools=[read,glob,grep,bash], ordinary tool selection
         D->>O: inspect and run commands in the isolated task attempt workspace
         D-->>O: JSON text
-        loop bounded short polling
+        loop bounded short polling until session idle
             W->>O: session.messages
-            O-->>W: current message state
+            W->>O: session.status
+            O-->>W: current messages and turn state
         end
         W->>W: Ajv validate
         opt invalid, at most 2 corrections
@@ -134,9 +136,12 @@ DeepSeek 或企业代理的区域、保留、训练使用、日志和敏感数�
 ```bash
 export APKSCANNER_INVESTIGATOR_BACKEND=opencode
 export APKSCANNER_OPENCODE_ENABLED=true
-export APKSCANNER_OPENCODE_MODEL=deepseek-v4-pro
+export APKSCANNER_OPENCODE_MODEL=deepseek-v4-flash
 export DEEPSEEK_API_KEY=...
 ```
+
+`deepseek-v4-flash` 是当前稳定基线和默认值。`deepseek-v4-pro` 的 prompted-JSON
+兼容通道保留为显式选择，待 Flash 全链路基线稳定后再单独回归，不会由平台自动切换。
 
 Web 上传框和 CLI 的 `--investigator` 可以为单个扫描选择：
 

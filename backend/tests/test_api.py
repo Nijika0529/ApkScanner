@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -524,6 +525,7 @@ def test_ai_calls_are_exposed_as_integrity_checked_audit_records(settings) -> No
 
 
 def test_opencode_pro_audit_records_toolless_json_transport(settings) -> None:  # noqa: ANN001
+    settings = replace(settings, opencode_model="deepseek-v4-pro")
     app = create_app(settings)
     orchestrator = app.state.orchestrator
     with app.state.database.session_factory() as session:

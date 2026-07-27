@@ -181,7 +181,8 @@ does not provide the worker filesystem boundary and should not be the team-deplo
 ## OpenCode + DeepSeek configuration
 
 OpenCode is also opt-in and Docker is the default. The integration pins the SDK and CLI together at
-`1.18.4`; it uses DeepSeek's built-in provider and defaults to `deepseek-v4-pro`.
+`1.18.4`; it uses DeepSeek's built-in provider and defaults to the stable
+`deepseek-v4-flash` baseline.
 
 ```bash
 docker build \
@@ -218,12 +219,14 @@ no device serial or socket is mounted. `deepseek-v4-pro` uses the normal OpenCod
 text JSON without the incompatible `tool_choice: required`; the worker validates it locally with
 Ajv and can issue two tool-disabled correction turns in the same session. Pro turns are dispatched
 with `promptAsync` and observed through short message polls, so review and exploration do not depend
-on one long-lived loopback HTTP response. A retryable local transport failure can rebuild the worker
+on one long-lived loopback HTTP response. The worker also polls session status and only reads the
+final text after the complete tool loop becomes idle. A retryable local transport failure can rebuild the worker
 once within the original task budget without changing models. `deepseek-v4-flash` uses
 the same workspace tools plus OpenCode's internal `StructuredOutput` collector. Requested Android
 tests are always validated and executed by the Python control plane.
 
-Set `APKSCANNER_OPENCODE_MODEL=deepseek-v4-flash` to prefer the lower-cost model. An enterprise
+Use the default `deepseek-v4-flash` model to establish the end-to-end baseline. Set
+`APKSCANNER_OPENCODE_MODEL=deepseek-v4-pro` only for explicit Pro compatibility testing. An enterprise
 DeepSeek-compatible gateway can be selected with `APKSCANNER_DEEPSEEK_BASE_URL`; remote gateways
 must use HTTPS, while plain HTTP is accepted only on loopback. Credentials, query parameters, and
 fragments in that URL are rejected, and the API key remains in `DEEPSEEK_API_KEY`.
@@ -257,7 +260,7 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_CODEX_AUTH_FILE` | unset | Auth file mounted only into the worker |
 | `APKSCANNER_CODEX_BIN` | bundled SDK runtime | Explicit tested Codex binary override |
 | `APKSCANNER_OPENCODE_ENABLED` | `false` | Allow OpenCode + DeepSeek investigations |
-| `APKSCANNER_OPENCODE_MODEL` | `deepseek-v4-pro` | DeepSeek model ID |
+| `APKSCANNER_OPENCODE_MODEL` | `deepseek-v4-flash` | DeepSeek model ID; opt into `deepseek-v4-pro` for compatibility testing |
 | `APKSCANNER_OPENCODE_ISOLATION` | `docker` | `docker` or explicit `host` fallback |
 | `APKSCANNER_OPENCODE_DOCKER_IMAGE` | `apk-scanner-opencode-worker:0.1.0` | Worker image |
 | `APKSCANNER_OPENCODE_NODE_BIN` | `node` on PATH | Host-mode Node.js override |

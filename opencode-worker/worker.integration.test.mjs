@@ -299,6 +299,10 @@ test("pro can call the read tool and then return locally validated JSON", async 
         }),
       )
     } else {
+      // Keep the provider's second response slower than the worker poll
+      // interval. The worker must not mistake the first tool-call assistant
+      // message for the completed OpenCode turn.
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 750))
       response.write(
         event({
           id: "chatcmpl-pro-tool-2",
@@ -355,6 +359,12 @@ test("pro can call the read tool and then return locally validated JSON", async 
     const { result, events } = parseWorkerOutput(completed.stdout)
     assert.deepEqual(result.result, expected)
     assert.equal(requests.length, 2)
+    assert.equal(result.usage.calls, 2)
+    assert.equal(result.output_transport.model_calls.length, 1)
+    assert.equal(
+      result.output_transport.model_calls[0].usage.provider_calls,
+      2,
+    )
     assert.match(JSON.stringify(requests[1].body.messages), /exported provider evidence/)
     assert.ok(
       events.some(
@@ -363,6 +373,9 @@ test("pro can call the read tool and then return locally validated JSON", async 
           item.data.tool === "read" &&
           item.data.input?.filePath === workspaceFile,
       ),
+    )
+    assert.ok(
+      events.some((item) => item.event_type === "model.tool_loop.waiting"),
     )
   } finally {
     api.close()
