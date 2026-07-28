@@ -284,18 +284,28 @@ def test_platform_proof_result_is_independent_from_model_verdict(settings) -> No
         proof_id,
         [
             {
-                "id": "frida-proof",
-                "kind": "instrumented.frida",
+                "id": "probe-proof",
+                "kind": "blackbox.probe_app",
                 "exit_code": 0,
                 "metadata": {
-                    "capture_success": True,
-                    "observation_count": 1,
+                    "caller_identity": "probe_app",
+                    "request_id": "request-proof",
+                },
+            },
+            {
+                "id": "log-proof",
+                "kind": "blackbox.logcat",
+                "exit_code": 0,
+                "metadata": {
+                    "request_id": "request-proof",
+                    "request_observed": True,
+                    "probe_success": True,
                     "security_impact_observed": True,
                 },
-            }
+            },
         ],
     )
     assert ledger.task_proof_result(task.id) == (
-        "observed_instrumented",
-        ["frida-proof"],
+        "reproduced_blackbox",
+        ["probe-proof", "log-proof"],
     )

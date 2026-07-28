@@ -1,16 +1,19 @@
 package io.apkscanner.probe;
 
 import android.content.BroadcastReceiver;
+import android.content.ContentValues;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Process;
+import android.os.Bundle;
 import android.util.Base64;
 import android.util.Log;
 
 import org.json.JSONObject;
+import org.json.JSONArray;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Iterator;
@@ -44,9 +47,10 @@ public final class ProbeReceiver extends BroadcastReceiver {
             switch (kind) {
                 case "activity":
                 case "activity_alias": {
-                    Intent target = new Intent();
+                    Intent target = newIntent(request);
                     target.setComponent(new ComponentName(packageName, component));
                     applyExtras(target, request.optJSONObject("extras"));
+                    applyCategories(target, request.optJSONArray("categories"));
                     target.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                     context.startActivity(target);
                     result.put("delivered", true);
@@ -91,29 +95,85 @@ public final class ProbeReceiver extends BroadcastReceiver {
                     break;
                 }
                 case "service": {
-                    Intent target = new Intent();
+                    Intent target = newIntent(request);
                     target.setComponent(new ComponentName(packageName, component));
                     applyExtras(target, request.optJSONObject("extras"));
+                    applyCategories(target, request.optJSONArray("categories"));
                     ComponentName started = context.startService(target);
                     result.put("delivered", started != null);
                     break;
                 }
                 case "receiver": {
-                    Intent target = new Intent();
+                    Intent target = newIntent(request);
                     target.setComponent(new ComponentName(packageName, component));
                     applyExtras(target, request.optJSONObject("extras"));
+                    applyCategories(target, request.optJSONArray("categories"));
                     context.sendBroadcast(target);
                     result.put("delivered", true);
                     break;
                 }
                 case "provider": {
                     Uri uri = Uri.parse(request.getString("uri"));
-                    try (Cursor cursor = context.getContentResolver().query(uri, null, null, null, null)) {
-                        result.put("delivered", true);
-                        result.put("rowCount", cursor == null ? -1 : cursor.getCount());
-                        if (cursor != null) {
-                            result.put("columns", String.join(",", cursor.getColumnNames()));
+                    String operation = request.optString("operation", "query");
+                    switch (operation) {
+                        case "auto":
+                        case "query":
+                            try (Cursor cursor = context.getContentResolver().query(
+                                uri, null, null, null, null
+                            )) {
+                                result.put("delivered", true);
+                                result.put("rowCount", cursor == null ? -1 : cursor.getCount());
+                                if (cursor != null) {
+                                    result.put("columns", String.join(",", cursor.getColumnNames()));
+                                }
+                            }
+                            break;
+                        case "call": {
+                            Bundle returned = context.getContentResolver().call(
+                                uri,
+                                request.getString("method"),
+                                request.optString("argument", null),
+                                toBundle(request.optJSONObject("extras"))
+                            );
+                            result.put("delivered", true);
+                            result.put("bundleKeyCount", returned == null ? -1 : returned.keySet().size());
+                            result.put(
+                                "bundleKeys",
+                                returned == null ? "" : String.join(",", returned.keySet())
+                            );
+                            break;
                         }
+                        case "insert": {
+                            Uri inserted = context.getContentResolver().insert(
+                                uri, toContentValues(request.optJSONObject("extras"))
+                            );
+                            result.put("delivered", true);
+                            result.put("returnedUri", inserted == null ? JSONObject.NULL : inserted.toString());
+                            break;
+                        }
+                        case "update":
+                            result.put(
+                                "affectedRows",
+                                context.getContentResolver().update(
+                                    uri,
+                                    toContentValues(request.optJSONObject("extras")),
+                                    null,
+                                    null
+                                )
+                            );
+                            result.put("delivered", true);
+                            break;
+                        case "delete":
+                            result.put(
+                                "affectedRows",
+                                context.getContentResolver().delete(uri, null, null)
+                            );
+                            result.put("delivered", true);
+                            break;
+                        default:
+                            throw new IllegalArgumentException(
+                                "unsupported provider operation: " + operation
+                            );
                     }
                     break;
                 }
@@ -155,5 +215,71 @@ public final class ProbeReceiver extends BroadcastReceiver {
                 throw new IllegalArgumentException("unsupported extra value for " + key);
             }
         }
+    }
+
+    private static Intent newIntent(JSONObject request) {
+        Intent intent = new Intent();
+        String action = request.optString("intent_action", "");
+        if (!action.isEmpty()) {
+            intent.setAction(action);
+        }
+        return intent;
+    }
+
+    private static void applyCategories(Intent intent, JSONArray categories) throws Exception {
+        if (categories == null) {
+            return;
+        }
+        for (int index = 0; index < categories.length(); index++) {
+            intent.addCategory(categories.getString(index));
+        }
+    }
+
+    private static ContentValues toContentValues(JSONObject extras) throws Exception {
+        ContentValues values = new ContentValues();
+        if (extras == null) {
+            return values;
+        }
+        Iterator<String> keys = extras.keys();
+        while (keys.hasNext()) {
+            String key = keys.next();
+            Object value = extras.get(key);
+            if (value instanceof Boolean) {
+                values.put(key, (Boolean) value);
+            } else if (value instanceof Integer) {
+                values.put(key, (Integer) value);
+            } else if (value instanceof Long) {
+                values.put(key, (Long) value);
+            } else if (value instanceof String) {
+                values.put(key, (String) value);
+            } else {
+                throw new IllegalArgumentException("unsupported provider value for " + key);
+            }
+        }
+        return values;
+    }
+
+    private static Bundle toBundle(JSONObject extras) throws Exception {
+        Bundle values = new Bundle();
+        if (extras == null) {
+            return values;
+        }
+        Iterator<String> keys = extras.keys();
+        while (keys.hasNext()) {
+            String key = keys.next();
+            Object value = extras.get(key);
+            if (value instanceof Boolean) {
+                values.putBoolean(key, (Boolean) value);
+            } else if (value instanceof Integer) {
+                values.putInt(key, (Integer) value);
+            } else if (value instanceof Long) {
+                values.putLong(key, (Long) value);
+            } else if (value instanceof String) {
+                values.putString(key, (String) value);
+            } else {
+                throw new IllegalArgumentException("unsupported bundle value for " + key);
+            }
+        }
+        return values;
     }
 }

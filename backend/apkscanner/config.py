@@ -30,6 +30,7 @@ class Settings:
     agent_concurrency: int = 3
     agent_max_rounds: int = 3
     agent_tests_per_round: int = 8
+    agent_permission_profile: str = "personal_lab"
     investigator_backend: str = "codex"
     codex_enabled: bool = False
     codex_worker_model: str = "gpt-5.6-terra"
@@ -53,12 +54,13 @@ class Settings:
     poc_enabled: bool = True
     poc_build_timeout_seconds: int = 180
     poc_max_source_bytes: int = 512 * 1024
+    poc_max_apk_bytes: int = 128 * 1024 * 1024
     device_android_version: str = "16"
     device_android_api: int = 36
-    auth_flow_path: Path | None = None
-    frida_device: str | None = None
-    frida_host: str | None = None
-    frida_capture_seconds: int = 20
+    device_min_api: int = 21
+    device_max_api: int = 99
+    device_install_policy: str = "install_or_reuse"
+    device_reset_policy: str = "per_round"
     mobsf_url: str | None = None
     mobsf_api_key: str | None = None
     mobsf_timeout_seconds: int = 900
@@ -89,6 +91,9 @@ class Settings:
             agent_tests_per_round=max(
                 1, min(1_000, int(os.getenv("APKSCANNER_AGENT_TESTS_PER_ROUND", 8)))
             ),
+            agent_permission_profile=os.getenv(
+                "APKSCANNER_AGENT_PERMISSION_PROFILE", "personal_lab"
+            ).lower(),
             investigator_backend=os.getenv(
                 "APKSCANNER_INVESTIGATOR_BACKEND", "codex"
             ).lower(),
@@ -158,20 +163,27 @@ class Settings:
             poc_max_source_bytes=max(
                 64 * 1024,
                 min(
-                    2 * 1024 * 1024,
+                    16 * 1024 * 1024,
                     int(os.getenv("APKSCANNER_POC_MAX_SOURCE_BYTES", 512 * 1024)),
+                ),
+            ),
+            poc_max_apk_bytes=max(
+                1024 * 1024,
+                min(
+                    512 * 1024 * 1024,
+                    int(os.getenv("APKSCANNER_POC_MAX_APK_BYTES", 128 * 1024 * 1024)),
                 ),
             ),
             device_android_version=os.getenv("APKSCANNER_ANDROID_VERSION", "16"),
             device_android_api=int(os.getenv("APKSCANNER_ANDROID_API", 36)),
-            auth_flow_path=(
-                Path(os.environ["APKSCANNER_AUTH_FLOW"]).resolve()
-                if os.getenv("APKSCANNER_AUTH_FLOW")
-                else None
-            ),
-            frida_device=os.getenv("APKSCANNER_FRIDA_DEVICE"),
-            frida_host=os.getenv("APKSCANNER_FRIDA_HOST"),
-            frida_capture_seconds=int(os.getenv("APKSCANNER_FRIDA_CAPTURE_SECONDS", 20)),
+            device_min_api=max(1, int(os.getenv("APKSCANNER_DEVICE_MIN_API", 21))),
+            device_max_api=max(1, int(os.getenv("APKSCANNER_DEVICE_MAX_API", 99))),
+            device_install_policy=os.getenv(
+                "APKSCANNER_DEVICE_INSTALL_POLICY", "install_or_reuse"
+            ).lower(),
+            device_reset_policy=os.getenv(
+                "APKSCANNER_DEVICE_RESET_POLICY", "per_round"
+            ).lower(),
             mobsf_url=os.getenv("APKSCANNER_MOBSF_URL"),
             mobsf_api_key=os.getenv("APKSCANNER_MOBSF_API_KEY"),
             mobsf_timeout_seconds=int(os.getenv("APKSCANNER_MOBSF_TIMEOUT", 900)),

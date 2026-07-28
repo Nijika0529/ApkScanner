@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from apkscanner.models import EntryPoint
 from apkscanner.orchestrator import ScanOrchestrator
 from apkscanner.schemas import AgentRequestedTest
@@ -14,13 +15,11 @@ def _payload(result: str, evidence_ids: list[str]) -> dict:  # noqa: ANN401
 
 
 def test_unknown_agent_evidence_is_removed_and_reproduction_is_downgraded() -> None:
-    payload, result = ScanOrchestrator._validated_agent_payload(
-        _payload("reproduced_blackbox", ["invented"]),
-        [],
-    )
-    assert result == "inconclusive"
-    assert payload["evidence_ids"] == []
-    assert any("Ignored 1" in gap for gap in payload["coverage_gaps"])
+    with pytest.raises(ValueError, match="did not cite"):
+        ScanOrchestrator._validated_agent_payload(
+            _payload("reproduced_blackbox", ["invented"]),
+            [],
+        )
 
 
 def test_blackbox_reproduction_requires_correlated_concrete_harm() -> None:
@@ -56,8 +55,45 @@ def test_blackbox_reproduction_requires_correlated_concrete_harm() -> None:
     assert payload["evidence_ids"] == ["probe", "log"]
 
 
-def test_reachability_without_concrete_harm_is_inconclusive() -> None:
+def test_optional_jadx_absence_is_not_preserved_as_a_verdict_gap() -> None:
+    payload = _payload("refuted_static", ["static"])
+    payload["coverage_gaps"] = [
+        "JADX decompilation was unavailable; Smali fallback was sufficient.",
+        "No device available; static permission evidence is definitive.",
+        "A device replay could validate the negative path.",
+    ]
+
+    validated, result = ScanOrchestrator._validated_agent_payload(
+        payload,
+        [{"id": "static", "kind": "static.apktool", "metadata": {}}],
+    )
+
+    assert result == "refuted_static"
+    assert validated["coverage_gaps"] == [
+        "A device replay could validate the negative path."
+    ]
+
+
+def test_unique_evidence_uuid_prefix_is_normalized_to_full_platform_id() -> None:
+    evidence_id = "509102d0-1111-2222-3333-444444444444"
+
+    validated, result = ScanOrchestrator._validated_agent_payload(
+        _payload("refuted_static", ["509102d0"]),
+        [{"id": evidence_id, "kind": "static.apktool", "metadata": {}}],
+    )
+
+    assert result == "refuted_static"
+    assert validated["evidence_ids"] == [evidence_id]
+
+
+def test_reachability_without_concrete_harm_keeps_a_static_positive_verdict() -> None:
     evidence = [
+        {
+            "id": "static",
+            "kind": "static.apktool",
+            "exit_code": 0,
+            "metadata": {},
+        },
         {
             "id": "probe",
             "kind": "blackbox.probe_app",
@@ -81,16 +117,21 @@ def test_reachability_without_concrete_harm_is_inconclusive() -> None:
         },
     ]
     payload, result = ScanOrchestrator._validated_agent_payload(
-        _payload("reproduced_blackbox", ["probe", "log"]),
+        _payload("reproduced_blackbox", ["static", "probe", "log"]),
         evidence,
     )
-    assert result == "inconclusive"
-    assert payload["platform_severity"] is None
-    assert any("concrete-harm Oracle" in gap for gap in payload["coverage_gaps"])
+    assert result == "supported_static"
+    assert any("static-evidence strength" in gap for gap in payload["coverage_gaps"])
 
 
 def test_not_reproduced_requires_correlated_explicit_negative_oracle() -> None:
     evidence = [
+        {
+            "id": "static",
+            "kind": "static.apktool",
+            "exit_code": 0,
+            "metadata": {},
+        },
         {
             "id": "probe",
             "kind": "blackbox.probe_app",
@@ -114,14 +155,14 @@ def test_not_reproduced_requires_correlated_explicit_negative_oracle() -> None:
         },
     ]
     payload, result = ScanOrchestrator._validated_agent_payload(
-        _payload("not_reproduced", ["probe", "log"]),
+        _payload("not_reproduced", ["static", "probe", "log"]),
         evidence,
     )
-    assert result == "inconclusive"
+    assert result == "refuted_static"
 
     evidence[1]["metadata"]["oracle_refuted"] = True
     payload, result = ScanOrchestrator._validated_agent_payload(
-        _payload("not_reproduced", ["probe", "log"]),
+        _payload("not_reproduced", ["static", "probe", "log"]),
         evidence,
     )
     assert result == "not_reproduced"
@@ -130,6 +171,12 @@ def test_not_reproduced_requires_correlated_explicit_negative_oracle() -> None:
 
 def test_blackbox_evidence_must_share_request_and_test_case_ids() -> None:
     evidence = [
+        {
+            "id": "static",
+            "kind": "static.apktool",
+            "exit_code": 0,
+            "metadata": {},
+        },
         {
             "id": "probe",
             "kind": "blackbox.probe_app",
@@ -154,11 +201,10 @@ def test_blackbox_evidence_must_share_request_and_test_case_ids() -> None:
         },
     ]
     payload, result = ScanOrchestrator._validated_agent_payload(
-        _payload("reproduced_blackbox", ["probe", "log"]),
+        _payload("reproduced_blackbox", ["static", "probe", "log"]),
         evidence,
     )
-    assert result == "inconclusive"
-    assert payload["platform_severity"] is None
+    assert result == "supported_static"
 
 
 def test_agent_requested_deep_link_must_preserve_declared_origin() -> None:
@@ -191,7 +237,7 @@ def test_agent_requested_deep_link_must_preserve_declared_origin() -> None:
         rationale="Should not leave scope",
     )
     accepted, gaps = ScanOrchestrator._validate_requested_tests(
-        [allowed, rejected], [entry], auth_available=False
+        [allowed, rejected], [entry]
     )
     assert accepted == [allowed]
     assert any("preserve" in gap for gap in gaps)
@@ -233,7 +279,6 @@ def test_activity_request_accepts_its_declared_deep_link_and_android_extra_key()
     accepted, gaps = ScanOrchestrator._validate_requested_tests(
         [allowed, rejected],
         [entry],
-        auth_available=False,
         hypothesis_ids={allowed.hypothesis_id},
     )
 
@@ -267,9 +312,47 @@ def test_requested_test_deduplication_ignores_rationale_only_changes() -> None:
     accepted, gaps = ScanOrchestrator._validate_requested_tests(
         [first, duplicate],
         [entry],
-        auth_available=False,
         hypothesis_ids={first.hypothesis_id},
     )
 
     assert accepted == [first]
+    assert gaps == []
+
+
+def test_personal_lab_accepts_typed_provider_call_and_objective_oracle() -> None:
+    entry = EntryPoint(
+        id="11111111-1111-1111-1111-111111111111",
+        scan_id="scan",
+        kind="provider",
+        name="com.example.ExportedProvider",
+        owner_component="com.example.ExportedProvider",
+        exported=True,
+        metadata_json={"authorities": "com.example.provider"},
+    )
+    request = AgentRequestedTest(
+        hypothesis_id="22222222-2222-2222-2222-222222222222",
+        entry_point_id=entry.id,
+        state="guest",
+        uri="content://com.example.provider/items",
+        extras={"account": "victim"},
+        operation="call",
+        method="getPrivateItems",
+        argument="all",
+        reset="preserve",
+        oracle={
+            "kind": "log_contains",
+            "expected_text": "private-item",
+            "impact": "unauthorized_data_access",
+        },
+        rationale="Call the exported provider as an ordinary application UID.",
+    )
+
+    accepted, gaps = ScanOrchestrator._validate_requested_tests(
+        [request],
+        [entry],
+        hypothesis_ids={request.hypothesis_id},
+        permission_profile="personal_lab",
+    )
+
+    assert accepted == [request]
     assert gaps == []

@@ -111,7 +111,7 @@ def _transition_task(
 def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> HealthResponse:
     tool_versions = {
         name: orchestrator.runner.version(name)
-        for name in ("aapt2", "apksigner", "apktool", "apkanalyzer", "jadx", "adb", "frida")
+        for name in ("aapt2", "apksigner", "apktool", "apkanalyzer", "jadx", "adb")
     }
     capabilities = [
         Capability(name=name, available=version is not None, version=version)
@@ -144,29 +144,12 @@ def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> Health
             detail=device.get("detail"),
         )
     )
-    frida = orchestrator.frida.capability(deep=False)
-    capabilities.append(
-        Capability(
-            name="frida_device",
-            available=bool(frida.get("available")),
-            version=frida.get("version"),
-            detail=frida.get("detail"),
-        )
-    )
     mobsf = orchestrator.mobsf.capability()
     capabilities.append(
         Capability(
             name="mobsf",
             available=bool(mobsf.get("available")),
             detail=mobsf.get("detail"),
-        )
-    )
-    auth = orchestrator.device.auth_capability()
-    capabilities.append(
-        Capability(
-            name="authenticated_replay",
-            available=bool(auth.get("available")),
-            detail=auth.get("detail"),
         )
     )
     poc_builder = orchestrator.poc_builder.capability()

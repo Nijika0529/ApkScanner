@@ -163,6 +163,25 @@ class ToolRunner:
 
     @staticmethod
     def _terminate(process: subprocess.Popen[str]) -> tuple[str, str]:
+        def wait_for_process_group_exit(timeout: float = 0.5) -> None:
+            if os.name != "posix":
+                return
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                try:
+                    os.killpg(process.pid, 0)
+                except OSError:
+                    return
+                time.sleep(0.01)
+
+        def finalize(stdout: str, stderr: str) -> tuple[str, str]:
+            # The direct child may exit on SIGTERM before its descendants have
+            # transitioned out of a running state. Kill any remaining members
+            # of the original session before reporting cleanup as complete.
+            signal_process_group(force=True)
+            wait_for_process_group_exit()
+            return stdout, stderr
+
         def signal_process_group(*, force: bool) -> None:
             if os.name == "posix":
                 requested_signal = signal.SIGKILL if force else signal.SIGTERM
@@ -182,11 +201,13 @@ class ToolRunner:
 
         signal_process_group(force=False)
         try:
-            return process.communicate(timeout=2)
+            stdout, stderr = process.communicate(timeout=2)
+            return finalize(stdout, stderr)
         except subprocess.TimeoutExpired:
             signal_process_group(force=True)
             try:
-                return process.communicate(timeout=2)
+                stdout, stderr = process.communicate(timeout=2)
+                return finalize(stdout, stderr)
             except subprocess.TimeoutExpired as exc:
                 stdout = ToolRunner._decode_timeout(exc.stdout)
                 stderr = ToolRunner._decode_timeout(exc.stderr)
@@ -201,7 +222,7 @@ class ToolRunner:
                         process.stderr.close()
                 with suppress(Exception):
                     process.wait(timeout=1)
-                return stdout, stderr
+                return finalize(stdout, stderr)
 
     @staticmethod
     def _decode_timeout(value: str | bytes | None) -> str:
@@ -221,7 +242,7 @@ class ToolRunner:
         return "available"
 
 
-TOOL_NAMES = ("aapt2", "apksigner", "apktool", "apkanalyzer", "jadx", "adb", "frida")
+TOOL_NAMES = ("aapt2", "apksigner", "apktool", "apkanalyzer", "jadx", "adb")
 
 
 def discover_tools(runner: ToolRunner) -> dict[str, str | None]:

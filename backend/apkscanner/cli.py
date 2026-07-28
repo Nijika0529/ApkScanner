@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import getpass
 import hashlib
 import json
-import re
 import shutil
 import sys
 from pathlib import Path
@@ -13,7 +11,6 @@ import yaml
 from sqlalchemy import select
 
 from .artifacts import ArtifactStore
-from .auth import CredentialStore, load_auth_flow
 from .benchmark import BenchmarkEvaluator
 from .config import Settings
 from .db import Database
@@ -144,8 +141,6 @@ def capabilities_command(args: argparse.Namespace) -> int:
         "codex": orchestrator.codex.capability(deep=args.deep),
         "opencode": orchestrator.opencode.capability(deep=args.deep),
         "device": orchestrator.device.capability(),
-        "authentication": orchestrator.device.auth_capability(),
-        "frida": orchestrator.frida.capability(deep=args.deep),
         "mobsf": orchestrator.mobsf.capability(),
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -192,62 +187,6 @@ def context_command(args: argparse.Namespace) -> int:
         }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
-
-
-def auth_status_command(args: argparse.Namespace) -> int:
-    settings = Settings.from_env()
-    flow = load_auth_flow(settings.auth_flow_path)
-    if flow is None:
-        print(
-            json.dumps(
-                {"available": False, "detail": "APKSCANNER_AUTH_FLOW is not configured"},
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
-        return 1
-    store = CredentialStore()
-    secrets = {name: store.get(flow.profile, name) is not None for name in flow.required_secrets}
-    print(
-        json.dumps(
-            {
-                "available": all(secrets.values()),
-                "profile": flow.profile,
-                "package": flow.package,
-                "steps": len(flow.steps),
-                "secrets": secrets,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-    return 0 if all(secrets.values()) else 1
-
-
-def auth_set_secret_command(args: argparse.Namespace) -> int:
-    _validate_secret_name(args.profile, args.name)
-    if args.stdin:
-        value = sys.stdin.read().removesuffix("\n").removesuffix("\r")
-    else:
-        value = getpass.getpass(f"Value for {args.profile}/{args.name}: ")
-    if not value:
-        raise ValueError("secret value cannot be empty")
-    CredentialStore().set(args.profile, args.name, value)
-    print(f"Stored {args.profile}/{args.name} in the operating-system keyring.")
-    return 0
-
-
-def auth_delete_secret_command(args: argparse.Namespace) -> int:
-    _validate_secret_name(args.profile, args.name)
-    CredentialStore().delete(args.profile, args.name)
-    print(f"Deleted {args.profile}/{args.name} from the operating-system keyring, if present.")
-    return 0
-
-
-def _validate_secret_name(profile: str, name: str) -> None:
-    pattern = r"[A-Za-z0-9_.-]{1,128}"
-    if not re.fullmatch(pattern, profile) or not re.fullmatch(pattern, name):
-        raise ValueError("profile and secret name may contain only letters, digits, _ . and -")
 
 
 def serve_command(args: argparse.Namespace) -> int:
@@ -302,23 +241,6 @@ def build_parser() -> argparse.ArgumentParser:
     context = subparsers.add_parser("context", help="Print a task's bounded investigation context")
     context.add_argument("--task-id", required=True)
     context.set_defaults(handler=context_command)
-    auth_status = subparsers.add_parser(
-        "auth-status", help="Check the configured login flow and keyring references"
-    )
-    auth_status.set_defaults(handler=auth_status_command)
-    auth_set = subparsers.add_parser(
-        "auth-set-secret", help="Store a login-flow secret in the OS keyring"
-    )
-    auth_set.add_argument("name")
-    auth_set.add_argument("--profile", default="default-single-account")
-    auth_set.add_argument("--stdin", action="store_true", help="Read the value from standard input")
-    auth_set.set_defaults(handler=auth_set_secret_command)
-    auth_delete = subparsers.add_parser(
-        "auth-delete-secret", help="Delete a login-flow secret from the OS keyring"
-    )
-    auth_delete.add_argument("name")
-    auth_delete.add_argument("--profile", default="default-single-account")
-    auth_delete.set_defaults(handler=auth_delete_secret_command)
     return parser
 
 

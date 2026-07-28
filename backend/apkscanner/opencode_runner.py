@@ -31,7 +31,7 @@ from .worker_protocol import (
 OPENCODE_SDK_VERSION = "1.18.4"
 OPENCODE_CLI_VERSION = "1.18.4"
 AJV_VERSION = "8.20.0"
-OPENCODE_WORKER_PROTOCOL_VERSION = "6"
+OPENCODE_WORKER_PROTOCOL_VERSION = "7"
 OPENCODE_PROVIDER = "deepseek"
 OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL = "structured_output_tool"
 OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE = "analyze_then_finalize"
@@ -97,6 +97,7 @@ def opencode_execution_profile(
     *,
     reasoning_effort: str = "high",
     enable_thinking_explorer: bool = False,
+    enable_workspace_analyzer: bool = False,
 ) -> OpenCodeExecutionProfile:
     normalized = (phase or "").strip().lower()
     if enable_thinking_explorer and normalized in OPENCODE_THINKING_PHASES:
@@ -108,6 +109,27 @@ def opencode_execution_profile(
                     name="explorer",
                     thinking_mode="enabled",
                     reasoning_effort=reasoning_effort,
+                    output_mode="text",
+                    workspace_tools=True,
+                ),
+                OpenCodeExecutionStage(
+                    name="finalizer",
+                    thinking_mode="disabled",
+                    reasoning_effort=None,
+                    output_mode=OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
+                    workspace_tools=False,
+                ),
+            ),
+        )
+    if enable_workspace_analyzer:
+        return OpenCodeExecutionProfile(
+            name=OPENCODE_PROFILE_STABLE_ANALYZER,
+            output_mode=OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE,
+            stages=(
+                OpenCodeExecutionStage(
+                    name="analyzer",
+                    thinking_mode="disabled",
+                    reasoning_effort=None,
                     output_mode="text",
                     workspace_tools=True,
                 ),
@@ -146,6 +168,7 @@ def opencode_output_mode(
     phase: str | None = None,
     reasoning_effort: str = "high",
     enable_thinking_explorer: bool = False,
+    enable_workspace_analyzer: bool = False,
 ) -> str:
     # ``model`` is retained for API compatibility, but execution semantics are
     # deliberately selected by phase rather than inferred from a model name.
@@ -154,6 +177,7 @@ def opencode_output_mode(
         phase,
         reasoning_effort=reasoning_effort,
         enable_thinking_explorer=enable_thinking_explorer,
+        enable_workspace_analyzer=enable_workspace_analyzer,
     ).output_mode
 
 
@@ -199,10 +223,12 @@ class OpenCodeInvestigator:
         self._shutting_down = threading.Event()
 
     def capability(self, *, deep: bool = False) -> dict[str, Any]:
+        personal_lab = self.settings.agent_permission_profile == "personal_lab"
         default_profile = opencode_execution_profile(
             "static_only",
             reasoning_effort=self.settings.opencode_reasoning_effort,
             enable_thinking_explorer=self.settings.opencode_thinking_explorer,
+            enable_workspace_analyzer=personal_lab,
         )
         capability: dict[str, Any] = {
             "available": True,
@@ -324,6 +350,9 @@ class OpenCodeInvestigator:
             phase,
             reasoning_effort=self.settings.opencode_reasoning_effort,
             enable_thinking_explorer=self.settings.opencode_thinking_explorer,
+            enable_workspace_analyzer=(
+                self.settings.agent_permission_profile == "personal_lab"
+            ),
         )
         workspace_tools_enabled = any(
             stage.workspace_tools for stage in execution_profile.stages
@@ -337,14 +366,38 @@ class OpenCodeInvestigator:
             direct_tool_access=workspace_tools_enabled,
             shell_access=workspace_tools_enabled,
             workspace_write=workspace_tools_enabled,
+            adb_access=(
+                self.settings.agent_permission_profile == "personal_lab"
+                and self.settings.opencode_isolation == "host"
+                and bool(self.settings.adb_serial)
+            ),
+            network_access=self.settings.agent_permission_profile == "personal_lab",
             response_contract="structured_result",
         )
         instructions = developer_instructions(
             direct_tool_access=workspace_tools_enabled,
             shell_access=workspace_tools_enabled,
             workspace_write=workspace_tools_enabled,
+            adb_access=(
+                self.settings.agent_permission_profile == "personal_lab"
+                and self.settings.opencode_isolation == "host"
+                and bool(self.settings.adb_serial)
+            ),
+            network_access=self.settings.agent_permission_profile == "personal_lab",
             response_contract="structured_result",
         )
+        scan_workspace = (self.settings.data_dir / "workspaces" / scan.id).resolve()
+        shared_names = [
+            name
+            for name in ("jadx", "apktool", "archive")
+            if (scan_workspace / name).is_dir()
+        ]
+        if self.settings.opencode_isolation == "docker":
+            external_read_roots = [f"/scan-workspace/{name}" for name in shared_names]
+        else:
+            external_read_roots = [
+                str((scan_workspace / name).resolve()) for name in shared_names
+            ]
         payload = {
             "schema_version": "1.0",
             "action": "investigate",
@@ -357,6 +410,21 @@ class OpenCodeInvestigator:
             "tool_profile": OPENCODE_TOOL_PROFILE,
             "execution_profile": execution_profile.as_payload(),
             "max_agent_steps": self.settings.opencode_agent_steps,
+            "permission_profile": self.settings.agent_permission_profile,
+            "allow_adb": (
+                self.settings.agent_permission_profile == "personal_lab"
+                and self.settings.opencode_isolation == "host"
+                and bool(self.settings.adb_serial)
+            ),
+            "allow_network": self.settings.agent_permission_profile == "personal_lab",
+            "external_read_roots": external_read_roots,
+            "_readonly_mounts": [
+                {
+                    "source": str((scan_workspace / name).resolve()),
+                    "target": f"/scan-workspace/{name}",
+                }
+                for name in shared_names
+            ],
             "timeout_ms": max(1, timeout) * 1000,
             "allowed_hypothesis_ids": sorted(
                 str(item["id"])
@@ -364,6 +432,11 @@ class OpenCodeInvestigator:
                 if isinstance(item, dict) and isinstance(item.get("id"), str)
             ),
             "allowed_entry_point_ids": sorted(entry.id for entry in entries),
+            "allowed_evidence_ids": sorted(
+                str(item["id"])
+                for item in evidence
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            ),
         }
         if workspace_tools_enabled:
             payload["explorer_prompt"] = investigation_prompt(
@@ -375,12 +448,16 @@ class OpenCodeInvestigator:
                 direct_tool_access=True,
                 shell_access=True,
                 workspace_write=True,
+                adb_access=bool(payload["allow_adb"]),
+                network_access=bool(payload["allow_network"]),
                 response_contract="analysis_memo",
             )
             payload["explorer_instructions"] = developer_instructions(
                 direct_tool_access=True,
                 shell_access=True,
                 workspace_write=True,
+                adb_access=bool(payload["allow_adb"]),
+                network_access=bool(payload["allow_network"]),
                 response_contract="analysis_memo",
             )
         response = self._invoke_investigation_with_retry(
@@ -554,6 +631,10 @@ class OpenCodeInvestigator:
         return cls._retryable_transport_failure(RuntimeError(message))
 
     def _configuration_error(self) -> str | None:
+        if self.settings.agent_permission_profile not in {"strict", "personal_lab"}:
+            return (
+                "APKSCANNER_AGENT_PERMISSION_PROFILE must be strict or personal_lab"
+            )
         if self.settings.opencode_isolation not in {"host", "docker"}:
             return "APKSCANNER_OPENCODE_ISOLATION must be host or docker"
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", self.settings.opencode_model):
@@ -802,13 +883,17 @@ class OpenCodeInvestigator:
         event_callback: AgentEventCallback | None,
         cancel_event: threading.Event | None,
     ) -> dict[str, Any]:
+        payload.pop("_readonly_mounts", None)
         node = self.settings.opencode_node_bin or shutil.which("node")
         if node is None:
             raise RuntimeError("Node.js is not installed")
         worker = self.worker_dir / "worker.mjs"
         with tempfile.TemporaryDirectory(prefix="apkscanner-opencode-") as temporary:
             root = Path(temporary)
-            env = self._worker_environment(root)
+            env = self._worker_environment(
+                root,
+                allow_adb=bool(payload.get("allow_adb")),
+            )
             cwd = workspace.resolve() if workspace is not None else root
             if workspace is not None and not cwd.is_dir():
                 raise ValueError("scan workspace is unavailable")
@@ -852,7 +937,7 @@ class OpenCodeInvestigator:
                 self._unregister_process(process)
         return response
 
-    def _worker_environment(self, root: Path) -> dict[str, str]:
+    def _worker_environment(self, root: Path, *, allow_adb: bool = False) -> dict[str, str]:
         allowed = {
             "HTTP_PROXY",
             "HTTPS_PROXY",
@@ -869,11 +954,15 @@ class OpenCodeInvestigator:
             "NODE_EXTRA_CA_CERTS",
         }
         env = {key: value for key, value in os.environ.items() if key in allowed}
-        blocker_dir = self.worker_dir / "bin"
         bin_dir = self.worker_dir / "node_modules" / ".bin"
+        blocker_dir = self.worker_dir / "bin"
         env["PATH"] = os.pathsep.join(
             value
-            for value in (str(blocker_dir), str(bin_dir), os.environ.get("PATH"))
+            for value in (
+                None if allow_adb else str(blocker_dir),
+                str(bin_dir),
+                os.environ.get("PATH"),
+            )
             if value
         )
         env.update(
@@ -901,6 +990,7 @@ class OpenCodeInvestigator:
         event_callback: AgentEventCallback | None,
         cancel_event: threading.Event | None,
     ) -> dict[str, Any]:
+        readonly_mounts = payload.pop("_readonly_mounts", [])
         executable = shutil.which("docker")
         if executable is None:
             raise RuntimeError("Docker is not installed")
@@ -954,6 +1044,23 @@ class OpenCodeInvestigator:
             )
         else:
             command.extend(["--workdir", "/sandbox"])
+        for mount in readonly_mounts:
+            if not isinstance(mount, dict):
+                continue
+            source = Path(str(mount.get("source", ""))).resolve()
+            target = str(mount.get("target", ""))
+            if (
+                not source.is_dir()
+                or "," in str(source)
+                or not re.fullmatch(r"/scan-workspace/[A-Za-z0-9_.-]+", target)
+            ):
+                raise ValueError("read-only scan workspace mount is unsafe")
+            command.extend(
+                [
+                    "--mount",
+                    f"type=bind,source={source},target={target},readonly",
+                ]
+            )
         for name in (
             "HTTP_PROXY",
             "HTTPS_PROXY",

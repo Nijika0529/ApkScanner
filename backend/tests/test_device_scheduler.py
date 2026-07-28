@@ -11,6 +11,7 @@ from apkscanner.device import (
     SingleDeviceScheduler,
 )
 from apkscanner.models import EntryPoint
+from apkscanner.schemas import AgentOracleSpec
 from apkscanner.tools import CommandResult
 
 
@@ -287,9 +288,64 @@ def test_device_prepare_stops_after_failed_install(settings) -> None:  # noqa: A
 
     assert [kind for kind, _result, _metadata in commands] == [
         "device.health",
+        "device.package_status",
         "device.install",
     ]
-    assert len(calls) == 2
+    assert len(calls) == 3
+
+
+def test_device_prepare_reuses_an_installed_system_package_after_install_failure(
+    settings,
+) -> None:  # noqa: ANN001
+    class SystemPackageRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @staticmethod
+        def run(argv, **_kwargs):  # noqa: ANN001, ANN205
+            if argv[-1] == "get-state":
+                return CommandResult(argv, 0, "device", "")
+            if argv[-3:] == ["pm", "path", "com.vendor.system"]:
+                return CommandResult(argv, 0, "package:/system/app/System.apk", "")
+            if "install" in argv:
+                return CommandResult(argv, 1, "", "INSTALL_FAILED_UPDATE_INCOMPATIBLE")
+            return CommandResult(argv, 0, "", "")
+
+    adapter = AdbDeviceAdapter(
+        replace(
+            settings,
+            adb_serial="cloud-device:5555",
+            device_install_policy="install_or_reuse",
+        ),
+        SystemPackageRunner(),  # type: ignore[arg-type]
+    )
+
+    commands = adapter.prepare(Path("/tmp/system.apk"), "com.vendor.system")
+    by_kind = {kind: (result, metadata) for kind, result, metadata in commands}
+
+    assert by_kind["device.install_attempt"][0].exit_code == 1
+    assert by_kind["device.install"][0].exit_code == 0
+    assert by_kind["device.install"][1]["install_mode"] == "reuse_after_install_failure"
+    assert "device.clear" in by_kind
+
+
+def test_typed_provider_oracle_emits_platform_impact_signal() -> None:
+    oracle = AgentOracleSpec(
+        kind="provider_rows",
+        minimum_rows=1,
+        impact="unauthorized_data_access",
+    )
+
+    metadata = AdbDeviceAdapter._evaluate_probe_oracle(
+        oracle,
+        probe_payload={"success": True, "rowCount": 3},
+        output="",
+    )
+
+    assert metadata["security_impact_observed"] is True
+    assert metadata["oracle"]["matched"] is True
+    assert metadata["oracle"]["observation"]["row_count"] == 3
 
 
 def test_activity_deep_link_probe_preserves_uri_and_expected_component() -> None:

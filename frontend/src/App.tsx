@@ -74,7 +74,7 @@ function statusTone(status: string): "neutral" | "good" | "warning" | "danger" |
   if (["final", "completed", "covered", "accepted", "reproduced_blackbox", "proven"].includes(status)) return "good"
   if (["failed", "critical", "high", "tool_failed"].includes(status)) return "danger"
   if (["inconclusive", "timed_out", "blocked_device", "partial", "degraded", "preliminary_ready", "cancel_requested", "challenged"].includes(status)) return "warning"
-  if (["investigating", "static_running", "observed_instrumented", "running", "queued", "accepted_for_proof", "proof_planned", "executing"].includes(status)) return "info"
+  if (["investigating", "static_running", "running", "queued", "accepted_for_proof", "proof_planned", "executing"].includes(status)) return "info"
   return "neutral"
 }
 
@@ -369,7 +369,7 @@ function ScanDetailView({ data, health, onRefresh, onDelete }: { data: DetailDat
           </TabsList>
           <TabsContent value="overview"><Overview scan={scan} events={events} health={health} coverage={coverage} /></TabsContent>
           <TabsContent value="entries"><EntryPoints entries={entries} /></TabsContent>
-          <TabsContent value="findings"><Findings findings={findings} onRefresh={onRefresh} /></TabsContent>
+          <TabsContent value="findings"><Findings findings={findings} scanStatus={scan.status} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="coverage"><CoverageMatrix coverage={coverage} /></TabsContent>
           <TabsContent value="tasks"><Tasks scan={scan} tasks={tasks} entries={entries} audits={audits} events={events} health={health} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="proofs"><HypothesisPipeline scanId={scan.id} scanStatus={scan.status} hypotheses={hypotheses} evaluations={evaluations} entries={entries} onRefresh={onRefresh} /></TabsContent>
@@ -396,9 +396,10 @@ function EntryPoints({ entries }: { entries: EntryPoint[] }) {
   return <div><div className="mb-5 flex flex-col gap-3 sm:flex-row"><label className="flex-1"><span className="sr-only">搜索入口</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索组件、URI 或 authority" className="field" /></label><label><span className="sr-only">入口类型</span><select value={kind} onChange={(event) => setKind(event.target.value)} className="field sm:w-48"><option value="all">全部入口</option><option value="activity">Activity</option><option value="service">Service</option><option value="receiver">Receiver</option><option value="provider">Provider</option><option value="deep_link">Deep Link</option></select></label></div><div className="overflow-x-auto rounded-xl border border-slate-200"><table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-slate-50 text-xs text-slate-500"><tr><th className="px-4 py-3 font-medium">类型</th><th className="px-4 py-3 font-medium">入口</th><th className="px-4 py-3 font-medium">可达性</th><th className="px-4 py-3 font-medium">权限</th><th className="px-4 py-3 font-medium">判定依据</th></tr></thead><tbody className="divide-y divide-slate-200">{filtered.map((entry) => <tr key={entry.id} className="hover:bg-slate-100"><td className="px-4 py-3"><EntryIcon kind={entry.kind} /></td><td className="max-w-md px-4 py-3"><p className="truncate font-mono text-xs text-slate-800" title={entry.name}>{entry.name}</p>{entry.owner_component && entry.owner_component !== entry.name && <p className="mt-1 truncate text-xs text-slate-600">handler · {entry.owner_component}</p>}</td><td className="px-4 py-3"><Badge tone={entry.exported ? "warning" : "good"}>{entry.exported ? "外部可达" : "私有"}</Badge></td><td className="px-4 py-3 text-xs text-slate-600">{entry.permission ?? "无"}{entry.permission_protection && <span className="block text-slate-600">{entry.permission_protection}</span>}</td><td className="px-4 py-3 text-xs text-slate-500">{entry.exported_reason}</td></tr>)}</tbody></table>{!filtered.length && <EmptyRow text="没有匹配的入口" />}</div></div>
 }
 
-function Findings({ findings, onRefresh }: { findings: Finding[]; onRefresh: () => Promise<void> }) {
+function Findings({ findings, scanStatus, onRefresh }: { findings: Finding[]; scanStatus: string; onRefresh: () => Promise<void> }) {
   const sorted = [...findings].sort((a, b) => ["critical", "high", "medium", "low", "info"].indexOf(a.severity) - ["critical", "high", "medium", "low", "info"].indexOf(b.severity))
-  return <div className="space-y-3">{sorted.map((finding) => <FindingCard key={finding.id} finding={finding} onRefresh={onRefresh} />)}{!findings.length && <EmptyRow text="尚未产生 Finding" />}</div>
+  const isFinal = ["final", "failed"].includes(scanStatus)
+  return <div className="space-y-3">{!isFinal && <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-900">以下是扫描过程中逐任务落库的阶段性结论，便于实时观察；在扫描完成前仍可能被补充、降级或判为信息不全，最终报告以扫描状态变为“完成”后为准。</div>}{sorted.map((finding) => <FindingCard key={finding.id} finding={finding} onRefresh={onRefresh} />)}{!findings.length && <EmptyRow text="尚未产生 Finding" />}</div>
 }
 
 function FindingCard({ finding, onRefresh }: { finding: Finding; onRefresh: () => Promise<void> }) {
@@ -436,7 +437,7 @@ function ReviewDialog({ finding, open, onOpenChange, onReviewed }: { finding: Fi
 function CoverageMatrix({ coverage }: { coverage: CoverageItem[] }) {
   const baseline = coverage.filter((item) => item.control_id.endsWith("-BASELINE"))
   const entryCoverage = coverage.filter((item) => item.entry_point_id)
-  const stages = ["static", "deterministic_dynamic", "agent", "blackbox", "instrumented"]
+  const stages = ["static", "deterministic_dynamic", "agent", "blackbox"]
   return <div className="space-y-8"><div><SectionTitle icon={ShieldCheck} title="MASVS 域覆盖" description="覆盖不代表无漏洞；缺口必须进入报告" /><div className="mt-4 overflow-x-auto rounded-xl border border-slate-200"><table className="w-full min-w-[850px] text-sm"><thead className="bg-slate-50 text-xs text-slate-500"><tr><th className="px-4 py-3 text-left font-medium">Domain</th>{stages.map((stage) => <th key={stage} className="px-3 py-3 text-center font-medium">{stage.replace("deterministic_dynamic", "确定性动态")}</th>)}<th className="px-4 py-3 text-left font-medium">缺口</th></tr></thead><tbody className="divide-y divide-slate-200">{baseline.map((item) => <tr key={item.id}><td className="px-4 py-3 font-semibold text-slate-700">{item.domain}</td>{stages.map((stage) => <td key={stage} className="px-3 py-3 text-center"><StageState value={String(item.stages[stage] ?? "pending")} /></td>)}<td className="max-w-xs px-4 py-3 text-xs leading-relaxed text-slate-500">{item.gap_reason ?? "—"}</td></tr>)}</tbody></table></div></div><div><SectionTitle icon={CircleDot} title="入口覆盖" description={`${entryCoverage.length} 个入口的逐项状态`} /><div className="mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-3">{entryCoverage.map((item) => <div key={item.id} className="rounded-xl border border-slate-200 p-3"><div className="mb-2 flex items-center justify-between gap-3"><p className="truncate font-mono text-xs text-slate-700" title={item.title}>{item.title.replace("Entry point: ", "")}</p><Badge tone={statusTone(item.status)}>{statusLabel(item.status)}</Badge></div><p className="line-clamp-2 text-xs text-slate-600">{item.gap_reason ?? "全部计划阶段已记录"}</p></div>)}</div></div></div>
 }
 
@@ -622,7 +623,7 @@ function Tasks({ scan, tasks, entries, audits, events, health, onRefresh }: { sc
                   )}
                   {session && <p className="mt-3 truncate font-mono text-[11px] text-slate-500">session · {session}</p>}
                   {task.error && <p className="mt-3 text-xs text-amber-700">{task.error}</p>}
-                  {task.status === "timed_out" && <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950">本轮 20 分钟预算已用尽。可以继续深度探索；下一轮会获得新的 20 分钟预算，并装载该任务历次静态、ADB、Frida 和 AI Evidence。</div>}
+                  {task.status === "timed_out" && <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950">本轮 20 分钟预算已用尽。可以继续深度探索；下一轮会获得新的 20 分钟预算，并装载该任务历次静态、ADB 和 AI Evidence。</div>}
                 </div>
                 <div className="flex shrink-0 items-center gap-3 text-xs text-slate-600">
                   <span>attempt {task.attempts}</span>
@@ -874,7 +875,9 @@ function AuditConclusion({ audit }: { audit: AgentAudit }) {
   const claimedResult = textValue(validation?.claimed_result)
   const summary = textValue(validatedOutput.summary) ?? "模型未提供结论摘要。"
   const proposedSeverity = textValue(validatedOutput.severity_proposal) ?? "—"
-  const severity = result === "inconclusive"
+  const severity = result === "refuted_static"
+    ? "不适用"
+    : result === "inconclusive"
     ? "未定"
     : (textValue(validation?.final_severity) ?? proposedSeverity).toUpperCase()
   const confidence = textValue(validatedOutput.confidence) ?? "—"
@@ -927,8 +930,9 @@ function ConclusionMetric({ label, value }: { label: string; value: string }) {
 }
 
 function auditResultPresentation(result: string) {
-  if (["reproduced_blackbox", "observed_instrumented"].includes(result)) return { label: result === "reproduced_blackbox" ? "已完成黑盒复现" : "已观察到插桩证据", container: "border-rose-200 bg-rose-50/80", iconContainer: "bg-rose-100 text-rose-700 ring-rose-200", eyebrow: "text-rose-700" }
+  if (result === "reproduced_blackbox") return { label: "已完成黑盒复现", container: "border-rose-200 bg-rose-50/80", iconContainer: "bg-rose-100 text-rose-700 ring-rose-200", eyebrow: "text-rose-700" }
   if (result === "supported_static") return { label: "静态证据支持风险", container: "border-orange-200 bg-orange-50/80", iconContainer: "bg-orange-100 text-orange-700 ring-orange-200", eyebrow: "text-orange-700" }
+  if (result === "refuted_static") return { label: "静态证据已反驳风险", container: "border-emerald-200 bg-emerald-50/80", iconContainer: "bg-emerald-100 text-emerald-700 ring-emerald-200", eyebrow: "text-emerald-700" }
   if (result === "not_reproduced") return { label: "当前测试未能复现", container: "border-emerald-200 bg-emerald-50/80", iconContainer: "bg-emerald-100 text-emerald-700 ring-emerald-200", eyebrow: "text-emerald-700" }
   return { label: "证据不足，暂无法定论", container: "border-amber-200 bg-amber-50/80", iconContainer: "bg-amber-100 text-amber-800 ring-amber-200", eyebrow: "text-amber-800" }
 }

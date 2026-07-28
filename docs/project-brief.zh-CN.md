@@ -21,7 +21,7 @@ APK Scanner 是一个运行在安全人员本地电脑上的 Android 上线前�
    生成 Security IR、内置规则发现和 8 个 MASVS 域覆盖状态；可并入 MobSF 广度结果。
 4. 静态阶段先发布 preliminary 报告，再为每个导出组件创建一个任务；同一 handler 的
    Deep Links 合并为一个任务并按风险优先级调度。
-5. 若配置云真机，平台完成安装、访客/登录态探测、普通 App UID 的 Probe 调用和可选 Frida
+5. 若配置云真机，平台完成安装、普通 App UID 的 Probe 调用和客观 Oracle
    观察；AI 只能申请受限测试，不能直接操作 ADB。
 6. Codex 或 OpenCode + DeepSeek 根据累计证据自适应探索；平台验证每个 Evidence ID，
    不满足证据门槛的“已复现”自动降级为证据不足。
@@ -39,11 +39,11 @@ APK Scanner 是一个运行在安全人员本地电脑上的 Android 上线前�
 | 单设备调度 | 并发 worker 共享 1 条 ADB 通道；优先级队列 + FIFO；只在设备操作期间持有租约 |
 | 入口类型 | 6 类：Activity、Activity Alias、Service、Receiver、Provider、Deep Link |
 | 内置规则 | 17 条固定规则 + 5 类导出组件动态规则，共 22 个规则 ID 类型 |
-| 覆盖模型 | 8 个 MASVS 域；static、deterministic、blackbox、authenticated、agent、instrumented 多阶段记录 |
+| 覆盖模型 | 8 个 MASVS 域；static、deterministic、blackbox、agent 多阶段记录 |
 | AI 后端 | 2 套：Codex SDK；OpenCode SDK + DeepSeek V4 Pro/Flash |
 | AI 运行控制 | 扫描级总开关与后端选择；逐任务开关；运行中配置冻结 |
 | 增量补扫 | ADB/模型能力恢复后批量补扫信息不全项，或单入口重新分析；不重复反编译 |
-| 深度续跑 | 单任务超时后可手动追加新的 20 分钟，并复用历次静态/ADB/Frida/AI Evidence |
+| 深度续跑 | 单任务超时后可手动追加新的 20 分钟，并复用历次静态/ADB/AI Evidence |
 | 漏洞验证链 | 持久化 Hypothesis、Hunter/Critic 论证、Proof Attempt、危害 Oracle 与平台 Verdict |
 | 私有真值评测 | final Finding 对照已知漏洞；默认要求动态证明；F0.5 精确率权重为召回率两倍 |
 | AI 探索预算 | 默认最多 3 轮、每轮接受 8 个测试；可配范围分别为 1–5 轮、1–1000 个 |

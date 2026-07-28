@@ -224,6 +224,50 @@ class AgentPocSpec(BaseModel):
         pattern=r"^[A-Z][A-Z0-9_]{2,31}$",
     )
     timeout_seconds: int = Field(default=60, ge=5, le=120)
+    prebuilt_apk_path: str | None = Field(
+        default=None,
+        pattern=r"^poc/[A-Za-z0-9][A-Za-z0-9._/-]{0,220}\.apk$",
+        max_length=256,
+    )
+
+
+class AgentOracleSpec(BaseModel):
+    """An objective observation the platform can evaluate after a requested test."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal[
+        "reachability",
+        "provider_rows",
+        "ui_text",
+        "log_contains",
+        "process_crash",
+    ] = "reachability"
+    expected_text: str | None = Field(default=None, min_length=1, max_length=500)
+    minimum_rows: int | None = Field(default=None, ge=1, le=1_000_000)
+    impact: Literal[
+        "none",
+        "unauthorized_data_access",
+        "unauthorized_state_change",
+        "privileged_action",
+        "denial_of_service",
+    ] = "none"
+    refute_on_miss: bool = False
+
+    @model_validator(mode="after")
+    def validate_predicate(self) -> Self:
+        if self.kind in {"ui_text", "log_contains"} and not self.expected_text:
+            raise ValueError(f"{self.kind} requires expected_text")
+        if self.kind == "provider_rows" and self.minimum_rows is None:
+            self.minimum_rows = 1
+        if self.kind == "process_crash" and self.impact not in {
+            "none",
+            "denial_of_service",
+        }:
+            raise ValueError("process_crash only supports denial_of_service impact")
+        if self.kind == "reachability" and self.impact != "none":
+            raise ValueError("reachability alone cannot claim security impact")
+        return self
 
 
 class AgentRequestedTest(BaseModel):
@@ -231,11 +275,43 @@ class AgentRequestedTest(BaseModel):
 
     hypothesis_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
     entry_point_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
-    state: Literal["guest", "authenticated"]
+    state: Literal["guest"] = "guest"
     uri: str | None = Field(max_length=4096)
     extras: dict[str, StrictStr | StrictInt | StrictBool] = Field(max_length=16)
+    operation: Literal[
+        "auto",
+        "query",
+        "call",
+        "insert",
+        "update",
+        "delete",
+    ] = "auto"
+    method: str | None = Field(default=None, min_length=1, max_length=200)
+    argument: str | None = Field(default=None, max_length=1000)
+    intent_action: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z][A-Za-z0-9_.]{0,254}$",
+    )
+    categories: list[str] = Field(default_factory=list, max_length=8)
+    reset: Literal["inherit", "clean", "preserve"] = "inherit"
+    oracle: AgentOracleSpec = Field(default_factory=AgentOracleSpec)
     rationale: str = Field(min_length=1, max_length=1000)
     poc: AgentPocSpec | None = None
+
+    @model_validator(mode="after")
+    def validate_action(self) -> Self:
+        if self.operation == "call" and not self.method:
+            raise ValueError("provider call requires method")
+        if self.operation != "call" and (self.method is not None or self.argument is not None):
+            raise ValueError("method and argument are only valid for provider call")
+        if any(
+            not 1 <= len(category) <= 255
+            or not category[0].isalpha()
+            or any(not (character.isalnum() or character in "_.") for character in category)
+            for category in self.categories
+        ):
+            raise ValueError("intent category is unsafe")
+        return self
 
 
 class AgentInvestigationResult(BaseModel):
@@ -245,10 +321,9 @@ class AgentInvestigationResult(BaseModel):
     summary: str = Field(min_length=1, max_length=8000)
     result: Literal[
         "supported_static",
+        "refuted_static",
         "reproduced_blackbox",
-        "observed_instrumented",
         "not_reproduced",
-        "inconclusive",
     ]
     hypotheses_tested: list[str] = Field(max_length=100)
     test_cases: list[dict[str, Any]] = Field(max_length=200)
@@ -258,6 +333,12 @@ class AgentInvestigationResult(BaseModel):
     coverage_gaps: list[str] = Field(max_length=100)
     followups: list[str] = Field(max_length=100)
     requested_tests: list[AgentRequestedTest] = Field(max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_explicit_verdict(self) -> Self:
+        if self.result == "refuted_static" and self.severity_proposal != "info":
+            raise ValueError("refuted_static must use info severity")
+        return self
 
 
 class HypothesisArgumentOut(ApiModel):
@@ -333,7 +414,7 @@ class GroundTruthVulnerability(BaseModel):
     title: str = Field(min_length=1, max_length=1000)
     harm: str = Field(min_length=1, max_length=4000)
     severity: Literal["critical", "high", "medium", "low", "info"]
-    minimum_proof: Literal["static", "dynamic", "instrumented"] = "dynamic"
+    minimum_proof: Literal["static", "dynamic"] = "dynamic"
     match: GroundTruthMatch
 
 

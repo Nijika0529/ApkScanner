@@ -31,11 +31,7 @@ class InvestigationPlanner:
     def _base(self) -> dict:
         return {
             "status": TaskStatus.QUEUED.value,
-            "preconditions": {
-                "guest_first": True,
-                "authenticated_second": True,
-                "auth_profile": "default-single-account",
-            },
+            "preconditions": {"ordinary_app_caller": True},
             "allowed_side_effects": [
                 "install_target_apk",
                 "install_probe_apk",
@@ -44,7 +40,7 @@ class InvestigationPlanner:
                 "uninstall_agent_poc_apk",
                 "clear_application_data",
                 "test_backend_mutations_with_cleanup",
-                "root_and_frida_observation",
+                "adb_exploration",
             ],
             "device_profile": {
                 "android_version": self.android_version,
@@ -105,7 +101,7 @@ class InvestigationPlanner:
             hypotheses=[
                 f"Deep links handled by {owner} are reachable from an untrusted application.",
                 "URI path, query, fragment, encoding, and duplicate parameters are not strictly validated.",
-                "Guest and authenticated states expose different privileged behavior.",
+                "Different URI forms or caller-controlled parameters expose privileged behavior.",
                 "App Link verification, redirects, or custom schemes allow link interception.",
                 "A link can reach nested intents, file access, WebView script, or an open redirect.",
             ],

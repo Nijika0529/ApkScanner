@@ -13,8 +13,10 @@ from apkscanner.models import EntryPoint, InvestigationTask, Scan
 from apkscanner.opencode_runner import (
     AJV_VERSION,
     OPENCODE_CLI_VERSION,
+    OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE,
     OPENCODE_OUTPUT_MODE_EXPLORE_THEN_FINALIZE,
     OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
+    OPENCODE_PROFILE_STABLE_ANALYZER,
     OPENCODE_PROFILE_STRUCTURED_FINALIZER,
     OPENCODE_PROFILE_THINKING_EXPLORER,
     OPENCODE_PROVIDER_KEY_FIELD,
@@ -82,7 +84,8 @@ def test_host_capability_requires_key_and_pinned_packages(
     assert available["available"] is True
     assert available["provider"] == "deepseek"
     assert available["model"] == "deepseek-v4-flash"
-    assert available["output_mode"] == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
+    assert available["output_mode"] == OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE
+    assert available["execution_profile"]["name"] == OPENCODE_PROFILE_STABLE_ANALYZER
     assert available["max_steps"] == 1_000
     assert available["max_provider_requests"] == 1_100
 
@@ -314,7 +317,7 @@ def test_structured_output_is_default_and_thinking_explorer_requires_opt_in() ->
     )
 
 
-def test_investigate_builds_a_single_structured_prompt_and_validates_result(
+def test_personal_lab_investigate_uses_workspace_analysis_then_validates_result(
     settings, tmp_path, monkeypatch
 ) -> None:  # noqa: ANN001
     configured = replace(settings, opencode_isolation="host")
@@ -331,8 +334,8 @@ def test_investigate_builds_a_single_structured_prompt_and_validates_result(
             "turn_id": "message-test",
             "result": {
                 "schema_version": "1.0",
-                "summary": "No platform evidence was supplied.",
-                "result": "inconclusive",
+                "summary": "Static review refuted the attacker path.",
+                "result": "refuted_static",
                 "hypotheses_tested": [],
                 "test_cases": [],
                 "evidence_ids": [],
@@ -351,20 +354,36 @@ def test_investigate_builds_a_single_structured_prompt_and_validates_result(
         assert payload["action"] == "investigate"
         assert payload["model"] == "deepseek-v4-flash"
         assert payload["phase"] == "static_only"
-        assert "cannot inspect files or execute commands directly" in payload["prompt"]
-        assert "explorer_prompt" not in payload
-        assert "explorer_instructions" not in payload
+        assert "Inspect context.json first" in payload["prompt"]
+        assert "explorer_prompt" in payload
+        assert "explorer_instructions" in payload
         assert payload["tool_profile"] == "workspace_shell"
-        assert payload["execution_profile"]["name"] == OPENCODE_PROFILE_STRUCTURED_FINALIZER
-        assert payload["execution_profile"]["output_mode"] == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
-        assert payload["execution_profile"]["stages"][0]["thinking_mode"] == "disabled"
-        assert payload["execution_profile"]["stages"][0]["wire_tool_choice"] == "required"
+        assert payload["permission_profile"] == "personal_lab"
+        assert payload["allow_network"] is True
+        assert payload["execution_profile"]["name"] == OPENCODE_PROFILE_STABLE_ANALYZER
+        assert (
+            payload["execution_profile"]["output_mode"]
+            == OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE
+        )
+        assert [stage["thinking_mode"] for stage in payload["execution_profile"]["stages"]] == [
+            "disabled",
+            "disabled",
+        ]
+        assert payload["execution_profile"]["stages"][0]["workspace_tools"] is True
+        assert payload["execution_profile"]["stages"][1]["wire_tool_choice"] == "required"
         assert payload["allowed_entry_point_ids"] == [
             "00000000-0000-0000-0000-000000000003"
         ]
         assert payload["allowed_hypothesis_ids"] == []
         assert payload["output_schema"]["title"] == "AgentInvestigationResult"
         assert payload["output_schema"]["additionalProperties"] is False
+        result_values = payload["output_schema"]["properties"]["result"]["enum"]
+        assert result_values == [
+            "supported_static",
+            "refuted_static",
+            "reproduced_blackbox",
+            "not_reproduced",
+        ]
         assert payload["output_schema"]["properties"]["requested_tests"]["maxItems"] == 1_000
         requested_test_schema = payload["output_schema"]["properties"][
             "requested_tests"
@@ -410,7 +429,7 @@ def test_investigate_builds_a_single_structured_prompt_and_validates_result(
     )
     assert result.thread_id == "session-test"
     assert result.turn_id == "message-test"
-    assert result.result.result == "inconclusive"
+    assert result.result.result == "refuted_static"
     assert result.output_transport["worker_transport_attempts"] == 1
 
     transport_calls = 0

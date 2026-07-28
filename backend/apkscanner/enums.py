@@ -47,8 +47,8 @@ class TaskType(StrEnum):
 class FindingStatus(StrEnum):
     CANDIDATE = "candidate"
     SUPPORTED_STATIC = "supported_static"
+    REFUTED_STATIC = "refuted_static"
     REPRODUCED_BLACKBOX = "reproduced_blackbox"
-    OBSERVED_INSTRUMENTED = "observed_instrumented"
     NOT_REPRODUCED = "not_reproduced"
     INCONCLUSIVE = "inconclusive"
     ACCEPTED = "accepted"

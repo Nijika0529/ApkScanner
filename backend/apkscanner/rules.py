@@ -452,7 +452,6 @@ class BuiltinRuleEngine:
                         "deterministic_dynamic": "pending",
                         "agent": "pending",
                         "blackbox": "pending",
-                        "instrumented": "pending",
                         "finding_count": sum(item.masvs == domain for item in findings),
                     },
                     gap_reason=gap,

@@ -13,9 +13,8 @@ from .schemas import BenchmarkSpec, GroundTruthVulnerability
 _PROOF_RANK = {
     FindingStatus.SUPPORTED_STATIC.value: 1,
     FindingStatus.REPRODUCED_BLACKBOX.value: 2,
-    FindingStatus.OBSERVED_INSTRUMENTED.value: 3,
 }
-_MINIMUM_PROOF_RANK = {"static": 1, "dynamic": 2, "instrumented": 3}
+_MINIMUM_PROOF_RANK = {"static": 1, "dynamic": 2}
 
 
 class BenchmarkEvaluator:
@@ -269,10 +268,7 @@ class BenchmarkEvaluator:
     def _confirmed(finding: Finding) -> bool:
         if finding.status == FindingStatus.SUPPORTED_STATIC.value:
             return True
-        if finding.status in {
-            FindingStatus.REPRODUCED_BLACKBOX.value,
-            FindingStatus.OBSERVED_INSTRUMENTED.value,
-        }:
+        if finding.status == FindingStatus.REPRODUCED_BLACKBOX.value:
             return finding.metadata_json.get("harm_demonstrated") is True
         return False
 
@@ -285,7 +281,7 @@ class BenchmarkEvaluator:
         required_rank = _MINIMUM_PROOF_RANK[truth.minimum_proof]
         if _PROOF_RANK.get(finding.status, 0) < required_rank:
             return False
-        if truth.minimum_proof in {"dynamic", "instrumented"} and not bool(
+        if truth.minimum_proof == "dynamic" and not bool(
             finding.metadata_json.get("harm_demonstrated")
         ):
             return False

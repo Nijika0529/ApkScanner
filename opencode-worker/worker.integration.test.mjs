@@ -650,14 +650,14 @@ test("provider authentication failures are returned as classified audit errors",
   }
 })
 
-test("semantic validation rejects inconclusive risk ratings and retries independently", async () => {
+test("semantic validation rejects unknown evidence IDs and retries independently", async () => {
   const requests = []
   const semanticSchema = {
     type: "object",
     properties: {
       result: {
         type: "string",
-        enum: ["inconclusive", "supported_static"],
+        enum: ["refuted_static", "supported_static"],
       },
       severity_proposal: {
         type: "string",
@@ -686,16 +686,15 @@ test("semantic validation rejects inconclusive risk ratings and retries independ
     additionalProperties: false,
   }
   const invalid = {
-    result: "inconclusive",
+    result: "supported_static",
     severity_proposal: "high",
     confidence: "high",
-    evidence_ids: [],
+    evidence_ids: ["ffffffff"],
     requested_tests: [],
   }
   const corrected = {
     ...invalid,
-    severity_proposal: "info",
-    confidence: "low",
+    evidence_ids: ["00000000-0000-0000-0000-000000000001"],
   }
   const api = createServer(async (request, response) => {
     const body = await readJSON(request)
@@ -720,6 +719,7 @@ test("semantic validation rejects inconclusive risk ratings and retries independ
         profile: finalizerProfile(),
         phase: "final_evaluation",
         outputSchema: semanticSchema,
+        allowedEvidenceIDs: ["00000000-0000-0000-0000-000000000001"],
       }),
     )
     assert.equal(completed.code, 0, completed.stderr)
@@ -733,7 +733,7 @@ test("semantic validation rejects inconclusive risk ratings and retries independ
       result.output_transport.model_calls[0].validation_errors.map(
         (item) => item.instance_path,
       ),
-      ["/severity_proposal", "/confidence"],
+      ["/evidence_ids/0"],
     )
     assert.match(
       JSON.stringify(requests[1].body.messages),
@@ -857,6 +857,7 @@ function investigationPayload({
   timeoutMs = 30_000,
   allowedHypothesisIDs = [],
   allowedEntryPointIDs = [],
+  allowedEvidenceIDs = [],
 }) {
   return {
     schema_version: "1.0",
@@ -874,6 +875,7 @@ function investigationPayload({
     timeout_ms: timeoutMs,
     allowed_hypothesis_ids: allowedHypothesisIDs,
     allowed_entry_point_ids: allowedEntryPointIDs,
+    allowed_evidence_ids: allowedEvidenceIDs,
   }
 }
 

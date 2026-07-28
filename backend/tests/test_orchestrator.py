@@ -22,15 +22,13 @@ from apkscanner.models import (
     Finding,
     HypothesisArgument,
     InvestigationTask,
-    ProofAttempt,
     Scan,
     ScanEvent,
     SecurityHypothesis,
 )
 from apkscanner.orchestrator import ScanOrchestrator
 from apkscanner.reports import ReportBuilder
-from apkscanner.schemas import AgentInvestigationResult, AgentRequestedTest
-from apkscanner.tools import CommandResult, TimeBudget
+from apkscanner.schemas import AgentInvestigationResult
 from sqlalchemy import select
 
 
@@ -390,7 +388,10 @@ def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # no
     first_context = json.loads((first / "context.json").read_text(encoding="utf-8"))
     second_context = json.loads((second / "context.json").read_text(encoding="utf-8"))
     assert first_context["task_id"] != second_context["task_id"]
-    assert first_context["workspace_policy"]["shared_scan_workspace_exposed"] is False
+    assert first_context["workspace_policy"]["shared_scan_workspace_exposed"] is True
+    assert str(source.parents[2]) in first_context["workspace_policy"][
+        "decompiled_roots"
+    ]["host"]
     assert first_context["evidence"][0]["artifact"] == (
         f"evidence/{evidence.id}.json"
     )
@@ -947,11 +948,11 @@ def test_terminal_write_yields_to_cancel_or_delete_without_completion_side_effec
                 usage={"input_tokens": 1, "output_tokens": 1},
                 result=AgentInvestigationResult(
                     summary="No conclusive dynamic evidence.",
-                    result="inconclusive",
+                    result="refuted_static",
                     hypotheses_tested=[],
                     test_cases=[],
                     evidence_ids=[],
-                    severity_proposal="low",
+                        severity_proposal="info",
                     confidence="low",
                     coverage_gaps=["No device evidence"],
                     followups=[],
@@ -980,6 +981,11 @@ def test_terminal_write_yields_to_cancel_or_delete_without_completion_side_effec
 
     orchestrator = ScanOrchestrator(configured, database, store)
     orchestrator.investigators["codex"] = FakeInvestigator()
+    monkeypatch.setattr(
+        orchestrator,
+        "_validated_agent_payload",
+        lambda payload, _evidence: (payload, "refuted_static"),
+    )
     monkeypatch.setattr(
         orchestrator,
         "_record_agent_validation",
@@ -1282,158 +1288,6 @@ async def test_submit_coalesces_a_rerun_requested_during_active_scan(
     assert calls == ["scan-race", "scan-race"]
 
 
-def test_requested_test_binds_frida_evidence_to_its_proof_attempt(
-    settings,
-    monkeypatch,
-) -> None:  # noqa: ANN001
-    settings.ensure_directories()
-    database = Database(settings)
-    database.create_all()
-    store = ArtifactStore(settings)
-    with database.session_factory() as session:
-        scan = Scan(
-            status="investigating",
-            filename="frida-proof.apk",
-            artifact_sha256="f" * 64,
-            artifact_path=str(settings.data_dir / "frida-proof.apk"),
-        )
-        entry = EntryPoint(
-            scan=scan,
-            kind="activity",
-            name="com.example.ExportedActivity",
-            exported=True,
-        )
-        task = InvestigationTask(
-            scan=scan,
-            task_type="component",
-            status="running",
-            hypotheses=["The activity performs an unauthorized action."],
-        )
-        session.add_all([scan, entry, task])
-        session.flush()
-        task.target_entry_ids = [entry.id]
-        session.commit()
-
-    orchestrator = ScanOrchestrator(settings, database, store)
-    hypothesis = orchestrator.hypothesis_ledger.ensure_task_hypotheses(task)[0]
-    request = AgentRequestedTest(
-        hypothesis_id=hypothesis.id,
-        entry_point_id=entry.id,
-        state="guest",
-        uri=None,
-        extras={},
-        rationale="Prove the unauthorized action.",
-    )
-    monkeypatch.setattr(
-        orchestrator.device,
-        "reset_session",
-        lambda *_args, **_kwargs: [
-            ("device.clear", CommandResult(["adb"], 0, "", ""), {})
-        ],
-    )
-
-    def probe(*_args, test_case_id=None, **_kwargs):  # noqa: ANN001, ANN202
-        return SimpleNamespace(
-            commands=[
-                (
-                    "blackbox.probe_app",
-                    CommandResult(["probe"], 0, "", ""),
-                    {
-                        "caller_identity": "probe_app",
-                        "request_id": "request-1",
-                        "test_case_id": test_case_id,
-                    },
-                ),
-                (
-                    "blackbox.logcat",
-                    CommandResult(["logcat"], 0, "", ""),
-                    {
-                        "request_id": "request-1",
-                        "request_observed": True,
-                        "probe_success": True,
-                        "security_impact_observed": True,
-                        "test_case_id": test_case_id,
-                    },
-                ),
-            ]
-        )
-
-    monkeypatch.setattr(orchestrator.device, "probe", probe)
-    monkeypatch.setattr(orchestrator.frida, "start", lambda *_args, **_kwargs: (object(), None))
-    monkeypatch.setattr(
-        orchestrator.frida,
-        "collect",
-        lambda _session: CommandResult(["frida"], 0, "APKSCANNER_READY\nAPKSCANNER_TRACE", ""),
-    )
-    monkeypatch.setattr(
-        orchestrator.frida,
-        "metadata",
-        lambda _result: {
-            "capture_success": True,
-            "observation_count": 1,
-            "hook_error_count": 0,
-        },
-    )
-    evidence_summaries: list[dict] = []
-    executed, gaps, observed = orchestrator._execute_requested_tests(
-        scan_id=scan.id,
-        task_id=task.id,
-        package_name="com.example",
-        entries=[entry],
-        requests=[request],
-        budget=TimeBudget.from_seconds(30),
-        evidence_summaries=evidence_summaries,
-        round_index=2,
-    )
-    assert not gaps
-    assert observed is True
-    assert executed[0]["test_case_id"] == "agent-r2-1"
-    with database.session_factory() as session:
-        proof = session.get(ProofAttempt, executed[0]["proof_attempt_id"])
-        assert proof is not None
-        assert proof.status == "proven"
-        assert proof.oracle["instrumented_observation"] is True
-        assert any(
-            item["kind"] == "instrumented.frida"
-            for item in evidence_summaries
-            if item["id"] in proof.evidence_ids
-        )
-        persisted_scan = session.get(Scan, scan.id)
-        persisted_task = session.get(InvestigationTask, task.id)
-        persisted_entry = session.get(EntryPoint, entry.id)
-        assert persisted_scan is not None
-        assert persisted_task is not None
-        assert persisted_entry is not None
-        persisted_task.result = {
-            "summary": "The platform observed an unauthorized action.",
-            "severity_proposal": "high",
-            "platform_severity": "high",
-            "confidence": "high",
-            "coverage_gaps": [],
-            "evidence_ids": proof.evidence_ids,
-        }
-        orchestrator._persist_agent_finding(
-            session,
-            persisted_scan,
-            persisted_task,
-            [persisted_entry],
-            "observed_instrumented",
-            "opencode",
-        )
-        session.commit()
-        finding = session.scalar(
-            select(Finding).where(Finding.scan_id == persisted_scan.id)
-        )
-        assert finding is not None
-        assert finding.metadata_json["hypothesis_id"] == hypothesis.id
-        assert finding.metadata_json["harm_demonstrated"] is True
-        persisted_hypothesis = session.get(
-            type(hypothesis),
-            hypothesis.id,
-        )
-        assert persisted_hypothesis.final_finding_id == finding.id
-
-
 def test_restart_recovery_normalizes_transient_device_states(settings) -> None:  # noqa: ANN001
     database = Database(settings)
     database.create_all()
@@ -1513,26 +1367,26 @@ def test_restart_recovery_normalizes_transient_device_states(settings) -> None: 
         assert canceled.result["cancellation"]["acknowledged"] is True
 
 
-def test_inconclusive_agent_result_has_no_platform_risk_severity() -> None:
+def test_refuted_static_agent_result_has_no_platform_risk_severity() -> None:
     payload = AgentInvestigationResult(
-        summary="Dynamic evidence is missing.",
-        result="inconclusive",
+        summary="Static evidence refutes the attacker path.",
+        result="refuted_static",
         hypotheses_tested=["Exported provider may expose data"],
         test_cases=[],
-        evidence_ids=[],
-        severity_proposal="low",
+        evidence_ids=["static"],
+        severity_proposal="info",
         confidence="low",
-        coverage_gaps=["ADB unavailable"],
+        coverage_gaps=[],
         followups=[],
         requested_tests=[],
     ).model_dump(mode="json")
 
-    validated, result = ScanOrchestrator._validated_agent_payload(payload, [])
-
-    assert result == "inconclusive"
-    assert validated["severity_proposal"] == "low"
-    assert validated["platform_severity"] is None
-    assert (
-        validated["severity_disposition"]
-        == "undetermined_due_to_incomplete_evidence"
+    validated, result = ScanOrchestrator._validated_agent_payload(
+        payload,
+        [{"id": "static", "kind": "static.apktool", "metadata": {}}],
     )
+
+    assert result == "refuted_static"
+    assert validated["severity_proposal"] == "info"
+    assert validated["platform_severity"] is None
+    assert validated["severity_disposition"] == "not_applicable_refuted"

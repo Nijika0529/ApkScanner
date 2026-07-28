@@ -2,10 +2,14 @@
 
 ## 结论
 
-稳定路径不再依赖“Explorer 先产出文本 memo、Finalizer 再定稿”的双阶段协议。所有扫描
-阶段默认直接运行一次关闭思考、禁用 workspace 工具的 StructuredOutput 定稿器；完整的
-入口、代码片段、假设和 Evidence 都由 Python 控制面放进结构化上下文。这消除了模型停在
-`finish=tool-calls`、最终文本为空以及第三阶段挤占任务预算的问题。
+默认 `personal_lab` 路径运行关闭思考的工具分析器，再由隔离的 StructuredOutput 定稿器
+输出结果。工具分析器可以读取完整 JADX、apktool 和 archive 目录，并在每个任务自己的
+可写工作区内搜索、写脚本、构建源码型或预编译 APK。它不再依赖 thinking 模式，因而避免
+模型长期停在 `finish=tool-calls`；最终定稿仍关闭工具并由 Ajv 校验。
+
+设置 `APKSCANNER_AGENT_PERMISSION_PROFILE=strict` 可回到单次、无 workspace 工具的
+StructuredOutput 路径。`personal_lab` 的 host 模式还可开放原始 ADB 做探索，但
+adb-shell 输出不能冒充普通 App UID 证据，最终复现仍通过平台 Probe/PoC 和 Evidence ID。
 
 当前稳定基线是 `deepseek-v4-flash`。思考型 Explorer 仅作为显式实验选项保留，通过
 `APKSCANNER_OPENCODE_THINKING_EXPLORER=true` 开启，而且不会影响最终或恢复裁决。
@@ -51,7 +55,8 @@
 
 | 扫描阶段 | 执行配置 | 思考与工具 | 输出 |
 | --- | --- | --- | --- |
-| 所有阶段（默认） | `structured_finalizer` | 关闭思考，不开放 workspace 工具 | 单次 `StructuredOutput` |
+| 所有阶段（`personal_lab` 默认） | `stable_analyzer` | 关闭思考，开放任务 workspace 工具 | 文本 memo 后接隔离的 `StructuredOutput` |
+| 所有阶段（`strict`） | `structured_finalizer` | 关闭思考，不开放 workspace 工具 | 单次 `StructuredOutput` |
 | `test_planning`、`adversarial_review`、`exploration_round`（显式实验） | `thinking_explorer_then_finalizer` | Explorer 开启思考并允许受限 workspace 工具；定稿器关闭思考 | 文本 memo 后接隔离的 `StructuredOutput` |
 | `final_evaluation`、`recovery_evaluation` | `structured_finalizer` | 始终关闭思考且不开放 workspace 工具 | 单次 `StructuredOutput` |
 
@@ -70,7 +75,7 @@ sequenceDiagram
 
     P->>W: task context + schema + explicit execution profile
     W->>O: start authenticated loopback server
-    opt Explicit experimental Explorer only
+    opt personal_lab Analyzer or explicit experimental Explorer
         W->>O: promptAsync(text)
         O->>X: chat/completions + tools
         X->>X: thinking enabled 时仅删除 tool_choice
@@ -126,29 +131,29 @@ JSON。
 
 OpenCode 返回后还要经过本地 Ajv 8.20.0 和业务语义校验：
 
-- `inconclusive` 必须使用 `severity_proposal=info`、`confidence=low`；
-- `supported_static`、`reproduced_blackbox`、`observed_instrumented`、
+- `supported_static`、`refuted_static`、`reproduced_blackbox`、
   `not_reproduced` 必须至少引用一个平台 Evidence ID；
 - `final_evaluation`、`recovery_evaluation` 不允许再产生 `requested_tests`；
 - `requested_tests[].hypothesis_id` 必填，且 Hypothesis/EntryPoint ID 必须属于当前任务；
 - 数组数量和文本长度均有上限；
 - 纠正最多两次，每次使用全新 session，并把精确校验错误交给定稿器。
 
-这解决“信息不全但给低危/高危”的概念混乱：`info` 表示尚无风险等级，不能把未知风险
-伪装成已经确认的 Low。
+Agent 不再允许返回通用的 `inconclusive`。JADX、动态插桩或登录回放等可选能力缺失不能
+替代安全判断；Agent 必须基于 Manifest、Apktool/Smali、归档和已有动态证据给出明确的
+静态支持或静态反驳结论，证据较弱时通过置信度和具体 follow-up 表达。
 
 最终仍由 Python 控制面验证 Evidence ID、普通 App UID 攻击者模型、到达性、缺失防护和
 具体未授权影响。模型文字本身不能把候选项升级为已复现漏洞。
 
 ## 权限和审计
 
-- OpenCode Agent 默认 `* = deny`；稳定 Finalizer 只允许 `StructuredOutput`。仅显式
-  实验性 Explorer 开放 `read/glob/grep/bash`。
+- `personal_lab` Analyzer 开放 `read/glob/grep/bash`、独立任务工作区写入、网络和
+  host 模式 ADB；稳定 Finalizer 仍只允许 `StructuredOutput`。
 - 平台按 `task_id + attempt` 物化独立 workspace；提示词要求 Bash 只在该目录和 `/tmp`
   创建分析产物。
-- 原生 write/edit/patch、Web、MCP、task/subagent 禁用。
-- ADB 同时由 OpenCode permission 和 PATH shim 阻断；Agent 只能通过 `requested_tests`
-  向 Python 申请设备动作。
+- MCP、task/subagent 禁用；Agent 可用 shell 创建脚本、Android 工程和预编译 PoC APK。
+- `strict` 或 Docker 无设备模式仍阻断 ADB；`personal_lab + host + ADB_SERIAL` 允许原始
+  ADB 探索，但能计入复现证明的动作仍通过 `requested_tests` 由平台关联 Probe/PoC 证据。
 - 每次调用使用临时 HOME/XDG、全新 OpenCode server 和随机 Basic Auth。
 - `OPENCODE_PURE=1`，并关闭项目配置、Claude 配置、模型目录刷新和自动升级。
 - API Key 通过 Worker 的一次性 stdin 请求传递，不进入 Worker 初始环境。Worker 在

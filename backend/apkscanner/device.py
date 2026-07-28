@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import heapq
 import json
 import re
@@ -13,10 +14,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .auth import CredentialStore, load_auth_flow
 from .config import Settings
 from .models import EntryPoint
-from .schemas import AgentPocSpec
+from .schemas import AgentOracleSpec, AgentPocSpec
 from .tools import CommandResult, TimeBudget, ToolRunner
 
 
@@ -146,13 +146,7 @@ class AdbDeviceAdapter:
         self._last_capability: dict[str, Any] | None = None
         self._last_capability_at: float | None = None
         self._active_cancel_event: threading.Event | None = None
-        self.credentials = CredentialStore()
-        self.auth_flow_error: str | None = None
-        try:
-            self.auth_flow = load_auth_flow(settings.auth_flow_path)
-        except (OSError, ValueError) as exc:
-            self.auth_flow = None
-            self.auth_flow_error = str(exc)
+        self._probe_apk_sha256: str | None = None
 
     @property
     def configured(self) -> bool:
@@ -290,12 +284,22 @@ class AdbDeviceAdapter:
             sdk = sdk_future.result()
             root = root_future.result()
         actual_api = sdk.stdout.strip()
-        ready = state.exit_code == 0 and actual_api == str(self.settings.device_android_api)
+        try:
+            actual_api_number = int(actual_api)
+        except ValueError:
+            actual_api_number = None
+        ready = (
+            state.exit_code == 0
+            and actual_api_number is not None
+            and self.settings.device_min_api
+            <= actual_api_number
+            <= self.settings.device_max_api
+        )
         detail = None
-        if actual_api != str(self.settings.device_android_api):
+        if not ready:
             detail = (
-                f"expected Android {self.settings.device_android_version} / API "
-                f"{self.settings.device_android_api}, found {version.stdout.strip()} / API "
+                f"expected Android API {self.settings.device_min_api}.."
+                f"{self.settings.device_max_api}, found {version.stdout.strip()} / API "
                 f"{actual_api or 'unknown'}"
             )
         result = {
@@ -311,38 +315,6 @@ class AdbDeviceAdapter:
         self._last_capability_at = time.monotonic()
         return result
 
-    def auth_capability(self, package_name: str | None = None) -> dict[str, Any]:
-        if self.auth_flow_error:
-            return {"available": False, "detail": self.auth_flow_error}
-        if self.auth_flow is None:
-            return {"available": False, "detail": "APKSCANNER_AUTH_FLOW is not configured"}
-        if self.auth_flow.steps[-1].action != "assert_text":
-            return {
-                "available": False,
-                "detail": (
-                    "auth flow must end with an assert_text step to prove login succeeded"
-                ),
-            }
-        if package_name and self.auth_flow.package and self.auth_flow.package != package_name:
-            return {
-                "available": False,
-                "detail": f"auth flow targets {self.auth_flow.package}, not {package_name}",
-            }
-        missing: list[str] = []
-        try:
-            for name in sorted(self.auth_flow.required_secrets):
-                if self.credentials.get(self.auth_flow.profile, name) is None:
-                    missing.append(name)
-        except Exception as exc:  # host keyring surface
-            return {"available": False, "detail": f"keyring unavailable: {exc}"}
-        if missing:
-            return {"available": False, "detail": f"missing keyring secrets: {', '.join(missing)}"}
-        return {
-            "available": True,
-            "profile": self.auth_flow.profile,
-            "step_count": len(self.auth_flow.steps),
-        }
-
     def prepare(
         self, apk_path: Path, package_name: str, budget: TimeBudget | None = None
     ) -> list[tuple[str, CommandResult, dict]]:
@@ -352,33 +324,140 @@ class AdbDeviceAdapter:
         commands.append(("device.health", health, {}))
         if health.exit_code != 0:
             return commands
-        install = self._adb_budget(["install", "-r", "-t", str(apk_path)], budget, 300)
+        installed = self._adb_budget(
+            ["shell", "pm", "path", package_name],
+            budget,
+            45,
+        )
         commands.append(
             (
-                "device.install",
-                install,
-                {"package": package_name},
+                "device.package_status",
+                installed,
+                {
+                    "package": package_name,
+                    "installed_before_prepare": installed.exit_code == 0,
+                },
             )
         )
+        policy = self.settings.device_install_policy
+        if policy not in {"replace", "install_or_reuse", "reuse_installed"}:
+            raise ValueError(
+                "APKSCANNER_DEVICE_INSTALL_POLICY must be replace, "
+                "install_or_reuse, or reuse_installed"
+            )
+        if policy == "reuse_installed" and installed.exit_code == 0:
+            install = CommandResult(
+                ["adb", "-s", self.serial or "", "reuse-installed", package_name],
+                0,
+                installed.stdout,
+                "",
+            )
+            commands.append(
+                (
+                    "device.install",
+                    install,
+                    {"package": package_name, "install_mode": "reuse_installed"},
+                )
+            )
+        else:
+            attempted = self._adb_budget(
+                ["install", "-r", "-t", str(apk_path)],
+                budget,
+                300,
+            )
+            if (
+                attempted.exit_code != 0
+                and policy == "install_or_reuse"
+                and installed.exit_code == 0
+            ):
+                commands.append(
+                    (
+                        "device.install_attempt",
+                        attempted,
+                        {"package": package_name, "fallback": "reuse_installed"},
+                    )
+                )
+                install = CommandResult(
+                    ["adb", "-s", self.serial or "", "reuse-installed", package_name],
+                    0,
+                    installed.stdout,
+                    "",
+                )
+                commands.append(
+                    (
+                        "device.install",
+                        install,
+                        {
+                            "package": package_name,
+                            "install_mode": "reuse_after_install_failure",
+                            "install_error": attempted.stderr[-4000:],
+                        },
+                    )
+                )
+            else:
+                install = attempted
+                commands.append(
+                    (
+                        "device.install",
+                        install,
+                        {"package": package_name, "install_mode": "replace"},
+                    )
+                )
         if install.exit_code != 0:
             return commands
         if self.settings.probe_apk_path and self.settings.probe_apk_path.is_file():
+            probe_sha256 = self._file_sha256(self.settings.probe_apk_path)
+            probe_status = self._adb_budget(
+                ["shell", "pm", "path", "io.apkscanner.probe"],
+                budget,
+                45,
+            )
+            if (
+                self._probe_apk_sha256 == probe_sha256
+                and probe_status.exit_code == 0
+            ):
+                probe_install = CommandResult(
+                    ["adb", "-s", self.serial or "", "reuse-probe"],
+                    0,
+                    probe_status.stdout,
+                    "",
+                )
+                commands.append(
+                    (
+                        "device.probe_cached",
+                        probe_install,
+                        {
+                            "package": "io.apkscanner.probe",
+                            "apk_sha256": probe_sha256,
+                        },
+                    )
+                )
+            else:
+                probe_install = self._adb_budget(
+                    ["install", "-r", "-t", str(self.settings.probe_apk_path)],
+                    budget,
+                    300,
+                )
+                commands.append(
+                    (
+                        "device.install_probe",
+                        probe_install,
+                        {
+                            "package": "io.apkscanner.probe",
+                            "apk_sha256": probe_sha256,
+                        },
+                    )
+                )
+                if probe_install.exit_code == 0:
+                    self._probe_apk_sha256 = probe_sha256
+        if self.settings.device_reset_policy != "never":
             commands.append(
                 (
-                    "device.install_probe",
-                    self._adb_budget(
-                        ["install", "-r", "-t", str(self.settings.probe_apk_path)], budget, 300
-                    ),
-                    {"package": "io.apkscanner.probe"},
+                    "device.clear",
+                    self._adb_budget(["shell", "pm", "clear", package_name], budget, 60),
+                    {"package": package_name, "reason": "prepare"},
                 )
             )
-        commands.append(
-            (
-                "device.clear",
-                self._adb_budget(["shell", "pm", "clear", package_name], budget, 60),
-                {"package": package_name},
-            )
-        )
         commands.append(("device.logcat_clear", self._adb_budget(["logcat", "-c"], budget, 30), {}))
         commands.append(
             (
@@ -433,6 +512,20 @@ class AdbDeviceAdapter:
             ),
         ]
 
+    def reset_observation_window(
+        self,
+        budget: TimeBudget | None = None,
+    ) -> list[tuple[str, CommandResult, dict[str, Any]]]:
+        """Isolate per-test logs without destroying application state."""
+
+        return [
+            (
+                "device.logcat_clear",
+                self._adb_budget(["logcat", "-c"], budget, 30),
+                {"reason": "agent_requested_test_observation_window"},
+            )
+        ]
+
     def probe(
         self,
         entry: EntryPoint,
@@ -442,6 +535,12 @@ class AdbDeviceAdapter:
         budget: TimeBudget | None = None,
         uri_override: str | None = None,
         extras: dict[str, str | int | bool] | None = None,
+        operation: str = "auto",
+        method: str | None = None,
+        argument: str | None = None,
+        intent_action: str | None = None,
+        categories: list[str] | None = None,
+        oracle: AgentOracleSpec | None = None,
         test_case_id: str | None = None,
     ) -> DeviceProbeResult:
         if not self.configured:
@@ -451,7 +550,13 @@ class AdbDeviceAdapter:
         with self._lease:
             direct_argv = (
                 self._direct_probe_args(entry, package_name)
-                if uri_override is None and extras is None
+                if (
+                    uri_override is None
+                    and extras is None
+                    and operation == "auto"
+                    and intent_action is None
+                    and not categories
+                )
                 else None
             )
             if direct_argv:
@@ -468,7 +573,15 @@ class AdbDeviceAdapter:
                     )
                 )
             probe_request = self._probe_request(
-                entry, package_name, uri_override=uri_override, extras=extras
+                entry,
+                package_name,
+                uri_override=uri_override,
+                extras=extras,
+                operation=operation,
+                method=method,
+                argument=argument,
+                intent_action=intent_action,
+                categories=categories,
             )
             request_id = secrets.token_hex(8) if probe_request else None
             if probe_request:
@@ -510,6 +623,12 @@ class AdbDeviceAdapter:
             matching_log = [
                 line for line in log_result.stdout.splitlines() if request_id and request_id in line
             ]
+            probe_payload = self._last_json_payload(matching_log)
+            oracle_metadata = self._evaluate_probe_oracle(
+                oracle,
+                probe_payload=probe_payload,
+                output=log_result.stdout,
+            )
             commands.append(
                 (
                     "blackbox.logcat",
@@ -524,22 +643,44 @@ class AdbDeviceAdapter:
                             '"success":true' in line.replace('\\"', '"')
                             for line in matching_log
                         ),
+                        "probe_result": probe_payload,
+                        **oracle_metadata,
                     },
                 )
+            )
+            ui_result = self._adb_budget(
+                ["shell", "uiautomator", "dump", "/dev/tty"], budget, 45
             )
             commands.append(
                 (
                     "blackbox.ui_dump",
-                    self._adb_budget(
-                        ["shell", "uiautomator", "dump", "/dev/tty"], budget, 45
-                    ),
+                    ui_result,
                     {
                         "entry_point": entry.id,
                         "session_state": state,
                         "test_case_id": test_case_id,
+                        **self._evaluate_ui_oracle(oracle, ui_result.stdout),
                     },
                 )
             )
+            if oracle and oracle.kind in {"log_contains", "process_crash"}:
+                target_log = self._adb_budget(["logcat", "-d", "-t", "800"], budget, 60)
+                commands.append(
+                    (
+                        "blackbox.target_logcat",
+                        target_log,
+                        {
+                            "entry_point": entry.id,
+                            "session_state": state,
+                            "test_case_id": test_case_id,
+                            **self._evaluate_target_log_oracle(
+                                oracle,
+                                target_log.stdout,
+                                package_name,
+                            ),
+                        },
+                    )
+                )
         return DeviceProbeResult(
             stage="blackbox",
             commands=commands,
@@ -668,106 +809,6 @@ class AdbDeviceAdapter:
             },
         )
 
-    def authenticate(
-        self, package_name: str, budget: TimeBudget | None = None
-    ) -> list[tuple[str, CommandResult, dict[str, Any]]]:
-        self._validate_package(package_name)
-        capability = self.auth_capability(package_name)
-        if not capability.get("available") or self.auth_flow is None:
-            return [
-                (
-                    "auth.unavailable",
-                    CommandResult(
-                        argv=["auth-flow"],
-                        exit_code=125,
-                        stdout="",
-                        stderr=str(capability.get("detail", "authentication unavailable")),
-                    ),
-                    {"profile": self.auth_flow.profile if self.auth_flow else "unconfigured"},
-                )
-            ]
-        commands: list[tuple[str, CommandResult, dict[str, Any]]] = []
-        for index, step in enumerate(self.auth_flow.steps):
-            if budget and budget.expired:
-                commands.append(
-                    (
-                        "auth.timeout",
-                        self._budget_exhausted(["auth-flow", str(index)]),
-                        {"step": index, "action": step.action},
-                    )
-                )
-                break
-            metadata = {
-                "profile": self.auth_flow.profile,
-                "step": index,
-                "action": step.action,
-                "redacted": step.action == "text",
-            }
-            if step.action == "wait":
-                seconds = min(step.seconds or 0, budget.remaining() if budget else 30)
-                time.sleep(seconds)
-                result = CommandResult(["wait", str(seconds)], 0, f"waited {seconds}s", "")
-            elif step.action == "start":
-                if step.component:
-                    args = ["shell", "am", "start", "-W", "-n", f"{package_name}/{step.component}"]
-                else:
-                    args = [
-                        "shell",
-                        "monkey",
-                        "-p",
-                        package_name,
-                        "-c",
-                        "android.intent.category.LAUNCHER",
-                        "1",
-                    ]
-                result = self._adb_budget(args, budget, 60)
-            elif step.action == "tap":
-                result = self._adb_budget(
-                    ["shell", "input", "tap", str(step.x), str(step.y)], budget, 30
-                )
-            elif step.action == "keyevent":
-                result = self._adb_budget(
-                    ["shell", "input", "keyevent", str(step.keycode)], budget, 30
-                )
-            elif step.action == "assert_text":
-                observed = self._adb_budget(
-                    ["shell", "uiautomator", "dump", "/dev/tty"], budget, 45
-                )
-                if observed.exit_code == 0 and step.value not in observed.stdout:
-                    result = CommandResult(
-                        argv=observed.argv,
-                        exit_code=3,
-                        stdout=observed.stdout,
-                        stderr="authentication verification text was not observed",
-                    )
-                else:
-                    result = observed
-            else:
-                value = step.value
-                if step.secret:
-                    value = self.credentials.get(self.auth_flow.profile, step.secret)
-                assert value is not None
-                encoded = self._safe_input_text(value)
-                actual = self._adb_budget(["shell", "input", "text", encoded], budget, 30)
-                stdout = actual.stdout.replace(value, "<redacted>").replace(
-                    encoded, "<redacted>"
-                )
-                stderr = actual.stderr.replace(value, "<redacted>").replace(
-                    encoded, "<redacted>"
-                )
-                result = CommandResult(
-                    argv=["adb", "-s", self.serial or "", "shell", "input", "text", "<redacted>"],
-                    exit_code=actual.exit_code,
-                    stdout=stdout,
-                    stderr=stderr,
-                    timed_out=actual.timed_out,
-                    canceled=actual.canceled,
-                )
-            commands.append(("auth.step", result, metadata))
-            if result.exit_code != 0:
-                break
-        return commands
-
     def _direct_probe_args(self, entry: EntryPoint, package_name: str) -> list[str] | None:
         if entry.kind in {"activity", "activity_alias"}:
             if not re.fullmatch(r"[A-Za-z0-9_.$]+", entry.name):
@@ -799,6 +840,11 @@ class AdbDeviceAdapter:
         *,
         uri_override: str | None = None,
         extras: dict[str, str | int | bool] | None = None,
+        operation: str = "auto",
+        method: str | None = None,
+        argument: str | None = None,
+        intent_action: str | None = None,
+        categories: list[str] | None = None,
     ) -> dict[str, Any] | None:
         request: dict[str, Any] = {
             "kind": entry.kind,
@@ -827,7 +873,131 @@ class AdbDeviceAdapter:
             request["uri"] = uri_override or f"content://{authority}"
         if extras:
             request["extras"] = extras
+        if operation != "auto":
+            request["operation"] = operation
+        if method is not None:
+            request["method"] = method
+        if argument is not None:
+            request["argument"] = argument
+        if intent_action is not None:
+            request["intent_action"] = intent_action
+        if categories:
+            request["categories"] = categories
         return request
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _last_json_payload(lines: list[str]) -> dict[str, Any] | None:
+        for line in reversed(lines):
+            start = line.find("{")
+            if start < 0:
+                continue
+            try:
+                value = json.loads(line[start:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                return value
+        return None
+
+    @staticmethod
+    def _oracle_metadata(
+        oracle: AgentOracleSpec,
+        *,
+        matched: bool,
+        observation: dict[str, Any],
+    ) -> dict[str, Any]:
+        impact = oracle.impact != "none" and matched
+        return {
+            "oracle": {
+                "kind": oracle.kind,
+                "impact": oracle.impact,
+                "matched": matched,
+                "observation": observation,
+            },
+            "security_impact_observed": impact,
+            "oracle_refuted": bool(oracle.refute_on_miss and not matched),
+        }
+
+    @classmethod
+    def _evaluate_probe_oracle(
+        cls,
+        oracle: AgentOracleSpec | None,
+        *,
+        probe_payload: dict[str, Any] | None,
+        output: str,
+    ) -> dict[str, Any]:
+        if oracle is None:
+            return {}
+        success = bool(probe_payload and probe_payload.get("success") is True)
+        if oracle.kind == "reachability":
+            return cls._oracle_metadata(
+                oracle,
+                matched=success,
+                observation={"probe_success": success},
+            )
+        if oracle.kind == "provider_rows":
+            rows = (
+                probe_payload.get("rowCount")
+                if isinstance(probe_payload, dict)
+                else None
+            )
+            matched = (
+                success
+                and isinstance(rows, int)
+                and rows >= int(oracle.minimum_rows or 1)
+            )
+            return cls._oracle_metadata(
+                oracle,
+                matched=matched,
+                observation={"row_count": rows, "minimum_rows": oracle.minimum_rows or 1},
+            )
+        if oracle.kind == "log_contains" and oracle.expected_text:
+            matched = oracle.expected_text in output
+            return cls._oracle_metadata(
+                oracle,
+                matched=matched,
+                observation={"expected_text": oracle.expected_text},
+            )
+        return {}
+
+    @classmethod
+    def _evaluate_ui_oracle(
+        cls,
+        oracle: AgentOracleSpec | None,
+        output: str,
+    ) -> dict[str, Any]:
+        if oracle is None or oracle.kind != "ui_text" or not oracle.expected_text:
+            return {}
+        return cls._oracle_metadata(
+            oracle,
+            matched=oracle.expected_text in output,
+            observation={"expected_text": oracle.expected_text},
+        )
+
+    @classmethod
+    def _evaluate_target_log_oracle(
+        cls,
+        oracle: AgentOracleSpec,
+        output: str,
+        package_name: str,
+    ) -> dict[str, Any]:
+        if oracle.kind == "log_contains" and oracle.expected_text:
+            matched = oracle.expected_text in output
+            observation = {"expected_text": oracle.expected_text}
+        elif oracle.kind == "process_crash":
+            matched = "FATAL EXCEPTION" in output and package_name in output
+            observation = {"package": package_name, "fatal_exception": matched}
+        else:
+            return {}
+        return cls._oracle_metadata(oracle, matched=matched, observation=observation)
 
     def _adb(
         self,
@@ -862,21 +1032,6 @@ class AdbDeviceAdapter:
             timed_out=True,
         )
 
-    @staticmethod
-    def _safe_input_text(value: str) -> str:
-        if not value or len(value) > 500:
-            raise ValueError("auth text must contain between 1 and 500 characters")
-        if "%s" in value:
-            raise ValueError(
-                "auth text cannot contain the adb input-text space escape sequence %s"
-            )
-        encoded = value.replace(" ", "%s")
-        if not re.fullmatch(r"[A-Za-z0-9@._+%=-]+", encoded):
-            raise ValueError(
-                "auth text contains characters unsafe for adb shell input; use a test credential "
-                "containing only letters, digits, spaces, and @._+%=-"
-            )
-        return encoded
 
     @staticmethod
     def _validate_package(package_name: str) -> None:

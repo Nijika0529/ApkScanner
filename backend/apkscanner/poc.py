@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import json
+import re
 import shutil
 import tempfile
 import threading
@@ -51,29 +53,38 @@ class PocBuilder:
             return {"available": False, "detail": "Agent PoC building is disabled"}
         android_jar = self._android_jar()
         d8 = self._build_tool("d8")
-        missing = [
+        source_missing = [
             name
             for name, value in {
                 "Android SDK platform android.jar": android_jar,
                 "d8": d8,
                 "java compiler": shutil.which("javac"),
-                "aapt2": shutil.which("aapt2") or self._build_tool("aapt2"),
                 "zipalign": shutil.which("zipalign") or self._build_tool("zipalign"),
-                "apksigner": shutil.which("apksigner") or self._build_tool("apksigner"),
                 "keytool": shutil.which("keytool"),
             }.items()
             if value is None
         ]
-        if missing:
+        ingest_missing = [
+            name
+            for name, value in {
+                "aapt2": shutil.which("aapt2") or self._build_tool("aapt2"),
+                "apksigner": shutil.which("apksigner") or self._build_tool("apksigner"),
+            }.items()
+            if value is None
+        ]
+        if ingest_missing:
             return {
                 "available": False,
-                "detail": f"PoC builder is missing: {', '.join(missing)}",
+                "detail": f"PoC APK ingestion is missing: {', '.join(ingest_missing)}",
             }
         return {
             "available": True,
             "android_api": self.settings.device_android_api,
-            "source_contract": "manifest_and_java",
+            "source_contract": "manifest_and_java_or_prebuilt_apk",
+            "source_build_available": not source_missing,
+            "source_build_missing": source_missing,
             "max_source_bytes": self.settings.poc_max_source_bytes,
+            "max_prebuilt_apk_bytes": self.settings.poc_max_apk_bytes,
             "max_source_files": 64,
         }
 
@@ -87,6 +98,23 @@ class PocBuilder:
         capability = self.capability()
         if not capability.get("available"):
             return PocBuildResult(ok=False, error=str(capability.get("detail")))
+        if spec.prebuilt_apk_path is not None:
+            return self._ingest_prebuilt(
+                workspace,
+                spec,
+                cancel_event=cancel_event,
+            )
+        if not capability.get("source_build_available"):
+            return PocBuildResult(
+                ok=False,
+                error=(
+                    "platform-managed source build is unavailable: "
+                    + ", ".join(
+                        str(item)
+                        for item in capability.get("source_build_missing", [])
+                    )
+                ),
+            )
         try:
             project, sources, manifest = self._validate_project(workspace, spec)
             source_bytes = self._source_archive(project, sources, manifest)
@@ -299,6 +327,126 @@ class PocBuilder:
             source_path=source_path,
             metadata={
                 **self._command_metadata(spec, source_sha256),
+                "apk_sha256": apk_sha256,
+                "apk_path": str(apk_path),
+                "source_path": str(source_path),
+            },
+        )
+
+    def _ingest_prebuilt(
+        self,
+        workspace: Path,
+        spec: AgentPocSpec,
+        *,
+        cancel_event: threading.Event | None,
+    ) -> PocBuildResult:
+        root = workspace.resolve()
+        candidate = (root / str(spec.prebuilt_apk_path)).resolve()
+        poc_root = (root / "poc").resolve()
+        if (
+            not candidate.is_relative_to(poc_root)
+            or candidate.is_symlink()
+            or not candidate.is_file()
+            or candidate.suffix.lower() != ".apk"
+        ):
+            return PocBuildResult(
+                ok=False,
+                error="prebuilt_apk_path must resolve to a regular APK under poc/",
+            )
+        size = candidate.stat().st_size
+        if size < 1 or size > self.settings.poc_max_apk_bytes:
+            return PocBuildResult(
+                ok=False,
+                error=(
+                    f"prebuilt Agent APK must contain between 1 and "
+                    f"{self.settings.poc_max_apk_bytes} bytes"
+                ),
+            )
+        metadata = {
+            "poc_package": spec.package_name,
+            "poc_project_path": spec.project_path,
+            "poc_prebuilt_apk_path": spec.prebuilt_apk_path,
+            "platform_managed_build": False,
+        }
+        commands: list[tuple[str, CommandResult, dict[str, object]]] = []
+        checks = [
+            (
+                "poc.prebuilt.verify_signature",
+                [self._required_tool("apksigner"), "verify", "--verbose", str(candidate)],
+            ),
+            (
+                "poc.prebuilt.inspect_manifest",
+                [self._required_tool("aapt2"), "dump", "badging", str(candidate)],
+            ),
+        ]
+        inspection: CommandResult | None = None
+        for kind, argv in checks:
+            result = self.runner.run(
+                argv,
+                cwd=poc_root,
+                timeout=self.settings.poc_build_timeout_seconds,
+                cancel_event=cancel_event,
+            )
+            commands.append((kind, result, dict(metadata)))
+            if result.exit_code != 0:
+                return PocBuildResult(
+                    ok=False,
+                    commands=commands,
+                    error=f"{kind} failed with exit {result.exit_code}",
+                )
+            if kind == "poc.prebuilt.inspect_manifest":
+                inspection = result
+        assert inspection is not None
+        package_match = re.search(r"package: name='([^']+)'", inspection.stdout)
+        if package_match is None or package_match.group(1) != spec.package_name:
+            return PocBuildResult(
+                ok=False,
+                commands=commands,
+                error="prebuilt Agent APK package does not match the requested package",
+            )
+        component = (
+            f"{spec.package_name}{spec.launch_component}"
+            if spec.launch_component.startswith(".")
+            else spec.launch_component
+        )
+        launchable = {
+            value
+            for value in re.findall(
+                r"launchable-activity: name='([^']+)'",
+                inspection.stdout,
+            )
+        }
+        if launchable and component not in launchable:
+            return PocBuildResult(
+                ok=False,
+                commands=commands,
+                error="prebuilt Agent APK launch component does not match its manifest",
+            )
+        apk_sha256, apk_path = self.store.put_bytes(
+            "poc_artifacts",
+            candidate.read_bytes(),
+            suffix=".apk",
+        )
+        provenance = {
+            "schema_version": "1.0",
+            "spec": spec.model_dump(mode="json"),
+            "apk_sha256": apk_sha256,
+            "size": size,
+        }
+        source_sha256, source_path = self.store.put_bytes(
+            "poc_sources",
+            json.dumps(provenance, sort_keys=True, indent=2).encode(),
+            suffix=".json",
+        )
+        return PocBuildResult(
+            ok=True,
+            commands=commands,
+            apk_sha256=apk_sha256,
+            apk_path=apk_path,
+            source_sha256=source_sha256,
+            source_path=source_path,
+            metadata={
+                **metadata,
                 "apk_sha256": apk_sha256,
                 "apk_path": str(apk_path),
                 "source_path": str(source_path),

@@ -737,7 +737,7 @@ def test_ai_calls_are_exposed_as_integrity_checked_audit_records(settings) -> No
         usage={"input_tokens": 12, "output_tokens": 4},
         result=AgentInvestigationResult(
             summary="Static evidence is insufficient.",
-            result="inconclusive",
+            result="refuted_static",
             hypotheses_tested=["Check exported reachability"],
             test_cases=[],
             evidence_ids=[],
@@ -778,7 +778,7 @@ def test_ai_calls_are_exposed_as_integrity_checked_audit_records(settings) -> No
             payload[0]["artifacts"]["response"]["content"]["structured_output"][
                 "result"
             ]
-            == "inconclusive"
+                == "refuted_static"
         )
         assert (
             payload[0]["artifacts"]["validation"]["content"]["downgraded"]
@@ -881,7 +881,7 @@ def test_opencode_audit_records_explicit_phase_execution_profile(settings) -> No
         output_transport=transport,
         result=AgentInvestigationResult(
             summary="Static evidence is insufficient.",
-            result="inconclusive",
+            result="refuted_static",
             hypotheses_tested=["Check exported reachability"],
             test_cases=[],
             evidence_ids=[],
@@ -907,10 +907,10 @@ def test_opencode_audit_records_explicit_phase_execution_profile(settings) -> No
         assert response.status_code == 200
         audit = response.json()[0]
         request = audit["artifacts"]["request"]["content"]
-        assert request["runtime_options"]["output_mode"] == "structured_output_tool"
+        assert request["runtime_options"]["output_mode"] == "analyze_then_finalize"
         assert (
             request["runtime_options"]["execution_profile"]["name"]
-            == "structured_finalizer"
+            == "stable_analyzer"
         )
         assert (
             request["runtime_options"]["execution_profile"]["stages"][0][
@@ -922,18 +922,22 @@ def test_opencode_audit_records_explicit_phase_execution_profile(settings) -> No
         assert request["runtime_options"]["semantic_validator"] == "apkscanner@1.0"
         assert request["runtime_options"]["max_agent_steps"] == 1_000
         assert request["runtime_options"]["max_provider_requests"] == 1_100
-        assert request["tool_boundary"]["model_tools_enabled"] is False
+        assert request["tool_boundary"]["model_tools_enabled"] is True
         assert request["tool_boundary"]["workspace_tool_profile"] == "workspace_shell"
-        assert request["tool_boundary"]["workspace_tools"] == []
-        assert request["tool_boundary"]["shell_enabled"] is False
-        assert request["tool_boundary"]["write_enabled"] is False
+        assert request["tool_boundary"]["workspace_tools"] == ["read", "glob", "grep", "bash"]
+        assert request["tool_boundary"]["shell_enabled"] is True
+        assert request["tool_boundary"]["write_enabled"] is True
         assert request["tool_boundary"]["native_write_tools_enabled"] is False
-        assert request["tool_boundary"]["allowed_write_roots"] == []
-        assert request["tool_boundary"]["shared_scan_workspace_exposed"] is False
+        assert request["tool_boundary"]["allowed_write_roots"] == [
+            "task_attempt_workspace",
+            "/tmp",
+        ]
+        assert request["tool_boundary"]["shared_scan_workspace_exposed"] is True
         assert request["tool_boundary"]["adb_enabled"] is False
         assert request["tool_boundary"]["structured_output_tool_enabled"] is True
         assert "DEEPSEEK_THINKING_OUTPUT_ADAPTER" not in request["prompt"]
-        assert request["explorer_prompt"] is None
+        assert request["explorer_prompt"] is not None
+        assert "Inspect context.json first" in request["explorer_prompt"]
         recorded_transport = audit["artifacts"]["response"]["content"][
             "output_transport"
         ]

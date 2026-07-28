@@ -110,8 +110,7 @@ class ReportBuilder:
                 "completed_at": scan.completed_at.isoformat() if scan.completed_at else None,
                 "limitations": [
                     "APK-only analysis; source code and backend authorization are not available.",
-                    "Dynamic baseline is Android 16 only.",
-                    "Only one authenticated account profile is supported.",
+                    "Dynamic behavior depends on the connected dedicated Android test device.",
                     "Cloud-device cleanup uses pm clear and cannot restore a full snapshot.",
                 ],
             },

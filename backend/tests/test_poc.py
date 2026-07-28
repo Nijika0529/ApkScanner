@@ -63,6 +63,57 @@ def test_poc_builder_accepts_only_source_projects_under_workspace(
         builder._validate_project(workspace, poc_spec())
 
 
+def test_personal_lab_ingests_an_agent_built_prebuilt_apk(
+    settings,
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    workspace = tmp_path / "workspace"
+    apk = workspace / "poc" / "provider_probe" / "build" / "probe.apk"
+    apk.parent.mkdir(parents=True)
+    apk.write_bytes(b"signed-agent-apk")
+
+    class VerifyingRunner:
+        @staticmethod
+        def run(argv, **_kwargs):  # noqa: ANN001, ANN205
+            stdout = (
+                "package: name='io.apkscanner.poc.providerprobe'\n"
+                "launchable-activity: name='io.apkscanner.poc.providerprobe.MainActivity'\n"
+                if "badging" in argv
+                else "Verified"
+            )
+            return CommandResult(argv, 0, stdout, "")
+
+    builder = PocBuilder(
+        settings,
+        VerifyingRunner(),  # type: ignore[arg-type]
+        ArtifactStore(settings),
+    )
+    monkeypatch.setattr(
+        builder,
+        "capability",
+        lambda: {
+            "available": True,
+            "source_build_available": True,
+        },
+    )
+    monkeypatch.setattr(builder, "_required_tool", lambda name: name)
+    spec = poc_spec().model_copy(
+        update={"prebuilt_apk_path": "poc/provider_probe/build/probe.apk"}
+    )
+
+    result = builder.build(workspace, spec)
+
+    assert result.ok is True
+    assert result.apk_path is not None and result.apk_path.is_file()
+    assert result.metadata["platform_managed_build"] is False
+    assert [kind for kind, _result, _metadata in result.commands] == [
+        "poc.prebuilt.verify_signature",
+        "poc.prebuilt.inspect_manifest",
+    ]
+
+
 def test_platform_builds_poc_before_device_queue_and_records_artifact(
     settings,
     monkeypatch,
@@ -231,13 +282,8 @@ def test_poc_execution_is_correlated_into_the_hypothesis_proof(
             ]
         ),
     )
-    monkeypatch.setattr(
-        orchestrator.frida,
-        "start",
-        lambda *_args, **_kwargs: (None, None),
-    )
     evidence: list[dict] = []
-    executed, gaps, observed = orchestrator._execute_requested_tests(
+    executed, gaps = orchestrator._execute_requested_tests(
         scan_id=scan.id,
         task_id=task.id,
         package_name="com.example.target",
@@ -249,7 +295,6 @@ def test_poc_execution_is_correlated_into_the_hypothesis_proof(
         poc_artifacts={orchestrator._poc_request_key(request): artifact},
     )
     assert not gaps
-    assert observed is False
     assert len(executed) == 1
     with database.session_factory() as session:
         proof = session.get(ProofAttempt, executed[0]["proof_attempt_id"])

@@ -106,7 +106,7 @@ MVP 优先使用新增关联表，避免把跨版本生命周期强塞进 `Scan`
 | `match_quality` | `strong / weak / legacy` |
 | `title`, `description`, `harm`, `remediation` | 人工维护内容 |
 | `severity`, `cwe`, `masvs` | 分类 |
-| `minimum_proof` | `static / dynamic / instrumented` |
+| `minimum_proof` | `static / dynamic` |
 | `lifecycle` | `active / accepted_risk / retired` |
 | `source_scan_id`, `source_finding_id` | 可空来源，删除来源时 `SET NULL` |
 | `created_at`, `updated_at` | 审计时间 |
@@ -297,7 +297,7 @@ MVP 自动重放仅支持：
 - 入口强匹配；
 - 已终态的来源 Proof。
 
-authenticated、PoC、账号数据 fixture 和有持久副作用的用例放到后续阶段。
+PoC、账号数据 fixture 和有持久副作用的用例放到后续阶段。
 
 ## 7. API 草案
 
@@ -399,7 +399,7 @@ Hypothesis 关系足够时回填，否则保守标记为 `candidate + legacy rev
 
 ### Phase 4：扩展
 
-- authenticated fixture。
+- 业务账号态 fixture（后续专项能力）。
 - 类型化 Provider/Receiver/Service/Deep Link Oracle。
 - PoC 源码快照与内容寻址构建。
 - 趋势、批量导出和可选 CI 集成。

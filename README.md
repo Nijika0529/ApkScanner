@@ -14,23 +14,23 @@ finding without platform evidence IDs.
 - Manifest-effective Activity, Service, Receiver, Provider, permission, and Deep Link analysis.
 - Correct cross-product expansion of split `<data>` attributes in intent filters.
 - Built-in MASVS-oriented manifest, code-pattern, archive, native-library, and hardening rules.
-- Apktool baseline with optional JADX enhancement and explicit degraded-coverage states.
+- Apktool/Smali baseline with optional JADX convenience output; partial JADX output never blocks a verdict.
 - Persistent SQLite scan/task/finding/evidence/coverage/event models.
 - Tamper-evident AI audit trail for exact prompts, normalized SDK runtime events, structured
   outputs, test-policy decisions, evidence downgrades, provider/model identity, thread/turn IDs,
   and usage.
 - Three concurrent entry-investigation workers by default, with one global serialized ADB queue;
   model/review turns release the device between validated device-action phases.
-- Remote ADB adapter, ordinary-app-UID Probe APK protocol, log evidence, guest/authenticated replay,
-  `pm clear` cleanup, and App Link state inspection/reset.
-- Bounded Frida side-channel tracing with URI/query redaction and a distinct instrumented verdict.
+- Remote ADB adapter, ordinary-app-UID Probe APK protocol, objective Oracles, `pm clear` cleanup,
+  and App Link state inspection/reset.
 - Optional MobSF upload/report normalization with explicit degraded coverage when absent.
 - Official `openai-codex==0.144.4` integration with strict JSON Schema, streamed turn/item events,
   read-only workspace inspection, no subagent fan-out, bounded adaptive platform-mediated test
   rounds, and evidence-backed result downgrades.
 - Pinned `@opencode-ai/sdk`/OpenCode `1.18.4` integration for DeepSeek, with a stable
   single-stage non-thinking StructuredOutput path, local Ajv/semantic and platform-ID validation,
-  ADB/subagent denial, bounded phase budgets, and full provider-wire/runtime audit.
+  explicit personal-lab workspace/ADB capabilities, bounded phase budgets, and full
+  provider-wire/runtime audit.
 - Optional per-task Docker workers with isolated task-attempt mounts and resource/capability limits.
 - Responsive React review console, human Finding decisions, live events, JSON/HTML/SARIF exports.
 - Light review console with confirmed deletion of completed scans and shared-artifact-safe cleanup.
@@ -93,16 +93,16 @@ An `adb shell` success is retained as a separate identity and is never treated a
 ordinary third-party application.
 
 When `APKSCANNER_ANDROID_SDK_ROOT` points to an SDK containing platform API 36 and build-tools,
-an OpenCode Agent may create a source-only PoC under its isolated `poc/` directory. The control
-plane rejects build scripts, binaries, symlinks, escaped paths, package collisions, oversized
-projects, and undeclared launch activities. It then builds and signs the APK itself, records the
-source/APK SHA-256 values, enters the same ADB queue, installs and launches the PoC as an ordinary
-application UID, correlates its nonce-tagged log result, and uninstalls it. The Agent never receives
-ADB access. A PoC's own impact boolean is retained as a claim and cannot by itself satisfy the
-platform harm oracle.
+an OpenCode Agent may create a source-only PoC or build its own signed APK under the isolated
+`poc/` directory. The control plane validates paths, size, signature, package and launch metadata,
+records source/APK SHA-256 values, enters the same ADB queue, installs and launches the PoC as an
+ordinary application UID, correlates its nonce-tagged result, and uninstalls it. In host
+`personal_lab` mode raw ADB is available for exploration, but only platform Probe/PoC evidence can
+establish ordinary-app reachability. A PoC's own impact boolean remains a claim and cannot by itself
+satisfy the platform harm oracle.
 
 The default worker pool explores up to three entry points concurrently across all scans. Every
-install, reset, probe, optional instrumentation action, and cleanup still passes through one global
+install, reset, probe, and cleanup still passes through one global
 priority/FIFO device queue. The device is released before model planning, critic, review, and final
 evaluation turns; an accepted model-requested test reacquires the lease and prepares the device
 again. Device-queue wait is excluded from the 20-minute task budget but remains bounded by the
@@ -110,7 +110,7 @@ again. Device-queue wait is excluded from the 20-minute task budget but remains 
 
 An investigation task receives a 20-minute budget by default. A task that reaches `timed_out`
 exposes the **继续深度探索** action in the Web console. Each manual continuation receives a fresh
-20-minute budget and reloads the task's prior static, ADB, Frida, and AI Evidence instead of starting
+20-minute budget and reloads the task's prior static, ADB, and AI Evidence instead of starting
 from an empty investigation context. Continuations are explicit and unlimited by the automatic retry
 count; every continuation still creates a new attempt, model audit, device lease, and cleanup cycle.
 
@@ -143,30 +143,8 @@ credit. Confirmed findings that do not match the private ground truth count as f
 unproven AI output is reported separately as noise.
 
 Likewise, a model may emit `not_reproduced` only when a correlated executed test case carries an
-explicit platform `oracle_refuted=true` result. Reachability logs or one failed payload alone are
-insufficient and are downgraded to `inconclusive`.
-
-Configure the single-account login replay with a non-secret JSON flow and OS-keyring references:
-
-```bash
-cp config/auth-flow.example.json config/auth-flow.json
-export APKSCANNER_AUTH_FLOW="$PWD/config/auth-flow.json"
-scanctl auth-set-secret username
-scanctl auth-set-secret password
-scanctl auth-status
-```
-
-The final `assert_text` step is mandatory so accepted input events are not mistaken for a successful
-login. ADB text entry intentionally accepts only a shell-safe test-credential character set, and the
-input command is redacted before persistence. Target UI evidence can still contain test-account data
-and must be handled as sensitive.
-
-For Frida, set the Frida device ID (or a remote frida-server endpoint):
-
-```bash
-export APKSCANNER_FRIDA_DEVICE=cloud-device-id
-# or: export APKSCANNER_FRIDA_HOST=frida.example.test:27042
-```
+explicit platform `oracle_refuted=true` result. Without that Oracle the platform retains an explicit
+static verdict instead of manufacturing a generic “insufficient information” conclusion.
 
 ## Codex configuration
 
@@ -221,21 +199,19 @@ scanctl capabilities --deep
 ```
 
 The host worker creates a private temporary HOME/XDG tree and an authenticated loopback OpenCode
-server for each invocation. The stable path sends bounded target-code context and evidence directly
-to a tool-disabled StructuredOutput turn. Each invocation still receives an isolated
-per-task/attempt workspace, but native `read`, `glob`, `grep`, and `bash` are available only when
-the experimental thinking explorer is explicitly enabled. Native editing, web, MCP, subagents, and
-ADB remain denied. Android actions are requested as data, then validated and executed by the Python
-control plane.
+server for each invocation. The default `personal_lab` path runs a non-thinking analyzer with
+`read`, `glob`, `grep`, and `bash`, complete read-only decompiler roots, and a writable
+per-task/attempt workspace; an isolated tool-disabled StructuredOutput turn finalizes its memo.
+Host mode may use raw ADB and authorized network access for exploration. Android actions that must
+count as proof are still requested as typed data, validated, and executed by the Python control
+plane. Set `APKSCANNER_AGENT_PERMISSION_PROFILE=strict` for a single tool-disabled finalizer.
 Host mode does not isolate same-UID processes or their `/proc` metadata, so it is suitable only for
 controlled personal debugging and is not a credential-security boundary. Use the default Docker
 mode for production or untrusted APKs.
 
-All orchestration phases use one non-thinking `structured_finalizer` by default. This removes the
-text-memo dependency that could leave DeepSeek on `finish=tool-calls` indefinitely. Set
-`APKSCANNER_OPENCODE_THINKING_EXPLORER=true` only for explicit protocol experiments; it affects
-`test_planning`, `adversarial_review`, and `exploration_round`, while final/recovery evaluation
-remains tool-disabled.
+The `personal_lab` analyzer and finalizer both disable thinking, avoiding the unbounded thinking
+tool loop. Set `APKSCANNER_OPENCODE_THINKING_EXPLORER=true` only for explicit protocol experiments;
+the finalizer always remains non-thinking and tool-disabled.
 
 DeepSeek thinking requests reject `tool_choice`. OpenCode 1.18.4 injects `tool_choice: auto`, so the
 one-shot worker uses a loopback compatibility proxy that removes this field only when
@@ -279,13 +255,12 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_ADB_SERIAL` | unset | Remote cloud-device ADB serial |
 | `APKSCANNER_PROBE_APK` | unset | Built Probe APK path |
 | `APKSCANNER_ANDROID_SDK_ROOT` | Android SDK env/unset | SDK used for platform-managed Agent PoC builds |
-| `APKSCANNER_POC_ENABLED` | `true` | Permit validated source-only Agent PoC builds |
+| `APKSCANNER_POC_ENABLED` | `true` | Permit validated source or Agent-built prebuilt PoC APKs |
 | `APKSCANNER_POC_BUILD_TIMEOUT` | 180 s | Per-command PoC build timeout (30–600 s) |
-| `APKSCANNER_POC_MAX_SOURCE_BYTES` | 512 KiB | PoC source-project limit (64 KiB–2 MiB) |
-| `APKSCANNER_AUTH_FLOW` | unset | Non-secret login replay JSON |
-| `APKSCANNER_FRIDA_DEVICE` | ADB serial | Frida device identifier |
-| `APKSCANNER_FRIDA_HOST` | unset | Remote frida-server endpoint |
+| `APKSCANNER_POC_MAX_SOURCE_BYTES` | 512 KiB | Platform-managed PoC source-project limit (64 KiB–16 MiB) |
+| `APKSCANNER_POC_MAX_APK_BYTES` | 128 MiB | Agent-built prebuilt PoC APK limit |
 | `APKSCANNER_INVESTIGATOR_BACKEND` | `codex` | Default: `codex`, `opencode`, or `none` |
+| `APKSCANNER_AGENT_PERMISSION_PROFILE` | `personal_lab` | `personal_lab` enables full decompiler access and writable tool analysis; `strict` keeps schema-only analysis |
 | `APKSCANNER_CODEX_ENABLED` | `false` | Dispatch Codex investigations |
 | `APKSCANNER_CODEX_ISOLATION` | `docker` | `docker` or explicit `host` fallback |
 | `APKSCANNER_CODEX_DOCKER_IMAGE` | `apk-scanner-worker:0.1.0` | Worker image |
@@ -304,7 +279,10 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `DEEPSEEK_API_KEY` | unset | DeepSeek credential delivered to the selected worker over its one-shot stdin request |
 | `APKSCANNER_MOBSF_URL` / `APKSCANNER_MOBSF_API_KEY` | unset | Optional MobSF API |
 | `APKSCANNER_ANDROID_VERSION` | `16` | Reported dynamic baseline |
-| `APKSCANNER_ANDROID_API` | `36` | Required cloud-device API level |
+| `APKSCANNER_ANDROID_API` | `36` | Android SDK API used for platform-managed PoC builds |
+| `APKSCANNER_DEVICE_MIN_API` / `APKSCANNER_DEVICE_MAX_API` | `21` / `99` | Compatible cloud-device API range |
+| `APKSCANNER_DEVICE_INSTALL_POLICY` | `install_or_reuse` | `replace`, `install_or_reuse`, or `reuse_installed` target policy |
+| `APKSCANNER_DEVICE_RESET_POLICY` | `per_round` | `per_test`, `per_round`, or `never`; each requested test may override it |
 | `APKSCANNER_MAX_UPLOAD_BYTES` | 512 MiB | Intake limit |
 | `APKSCANNER_TASK_TIMEOUT` | 1200 s | Per-investigation budget |
 | `APKSCANNER_TASK_MAX_ATTEMPTS` | 2 | Retry budget |
@@ -333,11 +311,12 @@ The server binds to `127.0.0.1` and rejects untrusted Host headers.
 - APK code, resources, strings, logs, and web content are untrusted prompt data.
 - The Probe APK is intentionally dangerous and must never remain on employee/production devices.
 - No source code or server authorization context is available; AUTH and PRIVACY remain partial.
-- v1 covers one APK, one Android 16 baseline, one authenticated role, and `pm clear` rather than a
+- v1 covers one APK, one dedicated Android test device, and `pm clear` rather than a
   full device snapshot.
-- The Codex worker gets a read-only task-attempt mount. OpenCode gets a separate writable
-  task-attempt workspace with bounded target Java/Smali files and evidence; `read`, `glob`, `grep`,
-  and `bash` are enabled there, while ADB, web, MCP, native editing, and subagents remain denied.
+- The Codex worker gets a read-only task-attempt mount. OpenCode personal-lab mode gets a separate
+  writable task-attempt workspace plus complete read-only Apktool/JADX/archive roots; `read`,
+  `glob`, `grep`, `bash`, local helper/APK builds, network, and host-mode ADB exploration are
+  enabled. Final proof still uses correlated platform Probe/PoC evidence.
 - Agent containers still have outbound networking for their selected model provider. Restrict each
   worker's egress to the approved provider/gateway before a team deployment.
 - DeepSeek receives the bounded task context and evidence summaries. Confirm company data handling,

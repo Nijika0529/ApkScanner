@@ -309,13 +309,7 @@ class HypothesisLedger:
             and item.get("metadata", {}).get("poc_claimed_security_impact") is True
             for item in evidence
         )
-        instrumented = any(
-            item.get("kind") == "instrumented.frida"
-            and item.get("metadata", {}).get("capture_success")
-            and item.get("metadata", {}).get("observation_count", 0) > 0
-            for item in evidence
-        )
-        execution_demonstrated = probe_succeeded or poc_succeeded or instrumented
+        execution_demonstrated = probe_succeeded or poc_succeeded
         impact_observed = any(
             item.get("metadata", {}).get("security_impact_observed") is True
             for item in evidence
@@ -346,7 +340,6 @@ class HypothesisLedger:
                 "correlated_poc_result": poc_correlated,
                 "poc_succeeded": poc_succeeded,
                 "poc_claimed_security_impact": poc_claimed_impact,
-                "instrumented_observation": instrumented,
                 "execution_demonstrated": execution_demonstrated,
                 "security_impact_observed": impact_observed,
                 "oracle_refuted": oracle_refuted,
@@ -426,10 +419,12 @@ class HypothesisLedger:
         if result_value in {
             FindingStatus.SUPPORTED_STATIC.value,
             FindingStatus.REPRODUCED_BLACKBOX.value,
-            FindingStatus.OBSERVED_INSTRUMENTED.value,
         }:
             status = HypothesisStatus.ACCEPTED_FOR_PROOF.value
-        elif result_value == FindingStatus.NOT_REPRODUCED.value:
+        elif result_value in {
+            FindingStatus.REFUTED_STATIC.value,
+            FindingStatus.NOT_REPRODUCED.value,
+        }:
             status = HypothesisStatus.REFUTED.value
         else:
             status = HypothesisStatus.INCONCLUSIVE.value
@@ -528,10 +523,6 @@ class HypothesisLedger:
             )
             if not attempts:
                 return None
-            instrumented = any(
-                bool((attempt.oracle or {}).get("instrumented_observation"))
-                for attempt in attempts
-            )
             evidence_ids = list(
                 dict.fromkeys(
                     evidence_id
@@ -539,12 +530,7 @@ class HypothesisLedger:
                     for evidence_id in attempt.evidence_ids
                 )
             )
-            return (
-                FindingStatus.OBSERVED_INSTRUMENTED.value
-                if instrumented
-                else FindingStatus.REPRODUCED_BLACKBOX.value,
-                evidence_ids,
-            )
+            return FindingStatus.REPRODUCED_BLACKBOX.value, evidence_ids
 
     @staticmethod
     def _fingerprint(

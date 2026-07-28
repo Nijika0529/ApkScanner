@@ -971,6 +971,17 @@ function outputTransport({ profile, calls, explorerSessionID, explorerMemo }) {
 function buildConfig(payload) {
   const model = `${PROVIDER_ID}/${payload.model}`
   const workspaceTools = workspaceToolNames(payload)
+  const externalDirectoryPermission = {
+    "*": "deny",
+    "/tmp": "allow",
+    "/tmp/*": "allow",
+    ...Object.fromEntries(
+      (payload.external_read_roots ?? []).flatMap((root) => [
+        [root, "allow"],
+        [`${root}/*`, "allow"],
+      ]),
+    ),
+  }
   const workspacePermission = {
     "*": "deny",
     ...Object.fromEntries(
@@ -980,18 +991,16 @@ function buildConfig(payload) {
     ),
     ...(workspaceTools.includes("bash")
       ? {
-          bash: {
-            "*": "allow",
-            adb: "deny",
-            "adb *": "deny",
-            "*/adb": "deny",
-            "*/adb *": "deny",
-          },
-          external_directory: {
-            "*": "deny",
-            "/tmp": "allow",
-            "/tmp/*": "allow",
-          },
+          bash: payload.allow_adb
+            ? { "*": "allow" }
+            : {
+                "*": "allow",
+                adb: "deny",
+                "adb *": "deny",
+                "*/adb": "deny",
+                "*/adb *": "deny",
+              },
+          external_directory: externalDirectoryPermission,
         }
       : {}),
     StructuredOutput: "allow",
@@ -1182,6 +1191,28 @@ function validatePayload(value) {
     if (value.tool_profile !== WORKSPACE_TOOL_PROFILE) {
       throw new Error("unsupported OpenCode tool profile")
     }
+    value.permission_profile ??= "strict"
+    value.allow_adb ??= false
+    value.allow_network ??= false
+    value.external_read_roots ??= []
+    if (!["strict", "personal_lab"].includes(value.permission_profile)) {
+      throw new Error("unsupported Agent permission profile")
+    }
+    if (typeof value.allow_adb !== "boolean" || typeof value.allow_network !== "boolean") {
+      throw new Error("Agent runtime capabilities must be booleans")
+    }
+    if (
+      !Array.isArray(value.external_read_roots) ||
+      value.external_read_roots.some(
+        (item) =>
+          typeof item !== "string" ||
+          !item.startsWith("/") ||
+          item.includes("\u0000") ||
+          item.includes("\n"),
+      )
+    ) {
+      throw new Error("external_read_roots must contain absolute safe paths")
+    }
     value.allowed_hypothesis_ids = validateIdentifierList(
       value.allowed_hypothesis_ids,
       "allowed_hypothesis_ids",
@@ -1189,6 +1220,10 @@ function validatePayload(value) {
     value.allowed_entry_point_ids = validateIdentifierList(
       value.allowed_entry_point_ids,
       "allowed_entry_point_ids",
+    )
+    value.allowed_evidence_ids = validateIdentifierList(
+      value.allowed_evidence_ids,
+      "allowed_evidence_ids",
     )
   }
   return value
@@ -1424,21 +1459,33 @@ function semanticValidationErrors(value, payload) {
       message,
     })
   }
-  if (value.result === "inconclusive") {
-    if (value.severity_proposal !== "info") {
-      add(
-        "/severity_proposal",
-        "inconclusive results must use info because risk severity is undetermined",
+  if (Array.isArray(value.evidence_ids)) {
+    const allowedEvidence = payload.allowed_evidence_ids ?? []
+    value.evidence_ids = value.evidence_ids.map((evidenceID) => {
+      if (
+        typeof evidenceID !== "string" ||
+        allowedEvidence.includes(evidenceID) ||
+        evidenceID.length < 8
+      ) {
+        return evidenceID
+      }
+      const matches = allowedEvidence.filter((candidate) =>
+        candidate.startsWith(evidenceID),
       )
-    }
-    if (value.confidence !== "low") {
-      add("/confidence", "inconclusive results must use low confidence")
-    }
-  } else if (
+      return matches.length === 1 ? matches[0] : evidenceID
+    })
+  }
+  if (value.result === "refuted_static" && value.severity_proposal !== "info") {
+    add(
+      "/severity_proposal",
+      "refuted_static must use info because the risk hypothesis was rejected",
+    )
+  }
+  if (
     [
       "supported_static",
+      "refuted_static",
       "reproduced_blackbox",
-      "observed_instrumented",
       "not_reproduced",
     ].includes(value.result) &&
     (!Array.isArray(value.evidence_ids) || value.evidence_ids.length === 0)
@@ -1447,6 +1494,17 @@ function semanticValidationErrors(value, payload) {
       "/evidence_ids",
       `${value.result} requires at least one platform-issued evidence ID`,
     )
+  }
+  if (Array.isArray(value.evidence_ids)) {
+    const allowedEvidence = new Set(payload.allowed_evidence_ids ?? [])
+    value.evidence_ids.forEach((evidenceID, index) => {
+      if (typeof evidenceID === "string" && !allowedEvidence.has(evidenceID)) {
+        add(
+          `/evidence_ids/${index}`,
+          "evidence ID must exactly match a full platform-issued ID for this task",
+        )
+      }
+    })
   }
   if (
     ["final_evaluation", "recovery_evaluation"].includes(payload.phase) &&
