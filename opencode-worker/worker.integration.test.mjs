@@ -40,7 +40,6 @@ test("non-thinking finalizer uses StructuredOutput with required tool choice", a
       root,
       investigationPayload({
         baseURL: `http://127.0.0.1:${address.port}`,
-        profile: finalizerProfile(),
       }),
     )
     assert.equal(completed.code, 0, completed.stderr)

@@ -1245,17 +1245,9 @@ function validateBaseURL(value) {
 
 function validateExecutionProfile(value) {
   const fallback = {
-    name: PROFILE_STABLE_ANALYZER,
-    output_mode: OUTPUT_MODE_ANALYZE_THEN_FINALIZE,
+    name: PROFILE_STRUCTURED_FINALIZER,
+    output_mode: OUTPUT_MODE_STRUCTURED_TOOL,
     stages: [
-      {
-        name: "analyzer",
-        thinking_mode: "disabled",
-        reasoning_effort: null,
-        output_mode: "text",
-        workspace_tools: true,
-        wire_tool_choice: "auto",
-      },
       {
         name: "finalizer",
         thinking_mode: "disabled",

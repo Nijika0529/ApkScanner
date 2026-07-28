@@ -310,7 +310,7 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_TASK_MAX_ATTEMPTS` | 2 | Retry budget |
 | `APKSCANNER_AGENT_CONCURRENCY` | 3 | Global entry-investigation worker limit (1–8); ADB remains single-concurrency |
 | `APKSCANNER_AGENT_MAX_ROUNDS` | 3 | Maximum adaptive AI/device rounds per task (1–5) |
-| `APKSCANNER_AGENT_TESTS_PER_ROUND` | 800 | Maximum accepted AI-requested tests per round (1–1000) |
+| `APKSCANNER_AGENT_TESTS_PER_ROUND` | 8 | Maximum accepted AI-requested tests per round (1–1000) |
 
 ## Verification
 

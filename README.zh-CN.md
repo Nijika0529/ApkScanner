@@ -238,7 +238,7 @@ APK 上传
       → 认证探测：通过 ADB 输入事件回放登录流程，然后重新探测
       → 收集 Frida 观察结果
       → 清理并释放唯一 ADB，再由 AI 进行 test_planning
-      → AI 默认最多请求 800 个限定补充测试（可配置上限 1000）
+      → AI 默认最多请求 8 个限定补充测试（可配置上限 1000）
       → 平台验证申请；如需执行则重新进入单设备队列，prepare 后串行执行并再次释放
       → Codex 第二阶段（final_evaluation）：AI 做出最终判定
       → 证据校验：平台检查引用的 Evidence ID 是否存在，降级无效声明
@@ -313,7 +313,7 @@ AI 审计中，不能被当作平台确认风险等级。
 | `APKSCANNER_TASK_MAX_ATTEMPTS` | 2 | 重试次数预算 |
 | `APKSCANNER_AGENT_CONCURRENCY` | 3 | 全局入口探索 worker 上限（1–8）；ADB 仍固定单并发 |
 | `APKSCANNER_AGENT_MAX_ROUNDS` | 3 | 每任务最大自适应 AI/设备轮数（1–5） |
-| `APKSCANNER_AGENT_TESTS_PER_ROUND` | 800 | 每轮最多接受的 AI 测试数（1–1000） |
+| `APKSCANNER_AGENT_TESTS_PER_ROUND` | 8 | 每轮最多接受的 AI 测试数（1–1000） |
 
 ## 验证
 

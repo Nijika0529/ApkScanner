@@ -2497,7 +2497,7 @@ class ScanOrchestrator:
         entries: list[EntryPoint],
         *,
         auth_available: bool,
-        limit: int = 800,
+        limit: int = 8,
         hypothesis_ids: set[str] | None = None,
     ) -> tuple[list[AgentRequestedTest], list[str]]:
         entries_by_id = {entry.id: entry for entry in entries}

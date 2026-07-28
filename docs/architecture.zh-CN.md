@@ -32,7 +32,7 @@ flowchart LR
 平台而不是 Codex/OpenCode 负责 fan-out。默认有 3 个全局入口探索 worker，可通过
 `APKSCANNER_AGENT_CONCURRENCY` 调整为 1–8；多个扫描也共享这一上限。一个导出组件对应
 一个任务；同一 handler 的 Deep Links 合并成一个任务。Agent 不能创建子 Agent，也不能
-直接把自己的文字当作复现证据。默认最多进行 3 个自适应测试轮次、每轮接受 800 个受限
+直接把自己的文字当作复现证据。默认最多进行 3 个自适应测试轮次、每轮接受 8 个受限
 测试：只能使用当前任务的入口 ID；Deep Link 和 Provider URI 必须保持 Manifest 声明的
 scheme、host/authority 和 port；额外参数有数量、键名、类型和长度上限。每轮证据都会回灌
 下一次判断，最终再执行禁止申请新动作的证据总结。轮次和单轮测试数可在 1–5 / 1–1000 的
