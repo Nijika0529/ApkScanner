@@ -19,7 +19,7 @@ v1 产品是一个单用户、仅限本机（localhost）的 Web 应用。它接
 - 有限范围的 Frida 旁路追踪（URI/Query 脱敏），带独立的 instrumented 判定。
 - 可选的 MobSF 上传/报告归一化，缺失时显式标注降级覆盖。
 - 官方 `openai-codex==0.144.4` 集成：严格 JSON Schema、全新线程、无子 Agent fan-out、一轮平台介导的补充测试、证据支撑的结果降级。
-- 固定版本 `@opencode-ai/sdk`/OpenCode `1.18.4` 集成（适配 DeepSeek）：按阶段显式控制思考模式、完整 workspace 工具循环、独立的非思考 StructuredOutput 定稿器、Ajv/语义校验、ADB 阻断和完整调用审计。
+- 固定版本 `@opencode-ai/sdk`/OpenCode `1.18.4` 集成（适配 DeepSeek）：默认单阶段、关闭思考的 StructuredOutput，带 Ajv/语义/平台 ID 校验、阶段预算、ADB 阻断和完整调用审计。
 - 可选的每任务 Docker Worker，带隔离的 task-attempt 挂载和资源/能力限制。
 - 响应式明亮主题 React 审核控制台、人工 Finding 判定、实时事件、任务停止/删除、JSON/HTML/SARIF 导出。
 
@@ -174,35 +174,33 @@ scanctl capabilities --deep
 ```
 
 Host Worker 为每次调用创建私有的临时 HOME/XDG 目录树以及认证过的 loopback OpenCode
-服务器。两种模式都只给 OpenCode 一个按 `task_id + attempt` 隔离的 workspace，其中物化
-当前入口的代码上下文和不可变 Evidence；它可使用 `read`、`glob`、`grep` 和 `bash`，
-但不会与其他并发 Agent 共享可写扫描目录。原生编辑、Web、MCP、子 Agent 和 ADB 保持
-禁用，请求的 Android 测试仍由 Python 控制面验证并执行。
+服务器。稳定路径把限定长度的目标代码上下文和 Evidence 直接交给禁用工具的
+StructuredOutput 回合。每次调用仍有按 `task_id + attempt` 隔离的 workspace，但只有
+显式开启实验性 Thinking Explorer 时才开放 `read`、`glob`、`grep` 和 `bash`。原生
+编辑、Web、MCP、子 Agent 和 ADB 保持禁用，请求的 Android 测试仍由 Python 控制面
+验证并执行。
 Host 模式不提供 PID/同 UID 进程隔离；同机 Agent 可能读取控制面进程可见的信息，因此
 它只适合个人受控调试，不能作为凭据隔离边界。生产或处理不受信任 APK 时使用默认 Docker
 模式。
 
-执行方式不再根据模型名猜测，而是由编排阶段明确选择：
-
-- `static_only`：关闭思考的分析器使用 workspace 工具，再交给全新会话中的非思考定稿器；
-- `test_planning`、`adversarial_review`、`exploration_round`：思考型 Explorer 完成
-  OpenCode 工具循环，再交给独立定稿器；
-- `final_evaluation`、`recovery_evaluation`：只运行定稿器，不开放 workspace 工具，也
-  不允许继续申请测试。
+默认情况下所有编排阶段只运行一次关闭思考的 `structured_finalizer`。这移除了 DeepSeek
+停在 `finish=tool-calls` 时对文本 memo 的依赖。只有显式设置
+`APKSCANNER_OPENCODE_THINKING_EXPLORER=true`，`test_planning`、
+`adversarial_review` 和 `exploration_round` 才进入旧的实验性工具循环；
+`final_evaluation`、`recovery_evaluation` 始终禁用工具。
 
 DeepSeek 思考模式拒绝任何 `tool_choice`，而 OpenCode 1.18.4 会注入
 `tool_choice: auto`。一次性 Worker 内的 loopback 兼容代理只在
 `thinking.type=enabled` 时删除该字段，同时完整保留 OpenCode 工具循环以及
 `reasoning_content` 回放。定稿器始终关闭思考，使用 OpenCode `StructuredOutput`
-（`tool_choice: required`），随后再通过 Ajv 和平台语义规则校验；每次纠正都使用全新
-会话，避免 DSML/tool-call 上下文污染。
-Analyzer/Explorer 默认最多执行 1000 步。如果工具探索耗尽后停在
-`finish=tool-calls` 且没有文本交接，Worker 会在同一会话追加一个禁用工具、关闭
-thinking 的 memo-writer 收尾回合；空 memo 不再交给 Finalizer。
+（`tool_choice: required`），随后再通过 Ajv、平台语义规则以及当前任务
+Hypothesis/EntryPoint 白名单校验；每次纠正都使用全新会话，避免
+DSML/tool-call 上下文污染。memo-writer 只保留在显式开启的实验性 Explorer 中，不参与
+正常扫描。
 
-当前建议先用默认的 `deepseek-v4-flash` 跑通扫描、工具调用、动态申请和最终裁决全链路。
-仅在单独验证 Pro 适配时设置 `APKSCANNER_OPENCODE_MODEL=deepseek-v4-pro`；两者使用同一
-阶段协议，失败时不会静默换模型。`scanctl capabilities --deep` 会执行一次很小但真实、
+当前使用默认的 `deepseek-v4-flash` 跑扫描、动态申请和最终裁决全链路。文本输出型
+`deepseek-v4-pro` 无法满足强制 StructuredOutput 契约，会在能力检查时提前拒绝；失败时
+不会静默换模型。`scanctl capabilities --deep` 会执行一次很小但真实、
 会计费的非思考结构化请求。可通过 `APKSCANNER_DEEPSEEK_BASE_URL` 指定企业兼容网关；
 远程网关必须使用 HTTPS，纯 HTTP 仅允许 loopback。官方地址应填写
 `https://api.deepseek.com`，不要附加 `/v1`。URL 中的凭据、查询参数和片段会被拒绝，
@@ -297,9 +295,10 @@ AI 审计中，不能被当作平台确认风险等级。
 | `APKSCANNER_CODEX_AUTH_FILE` | 未设置 | 仅挂载到 Worker 中的认证文件 |
 | `APKSCANNER_CODEX_BIN` | 内置 SDK 运行时 | 显式测试过的 Codex 二进制覆盖 |
 | `APKSCANNER_OPENCODE_ENABLED` | `false` | 是否启用 OpenCode + DeepSeek 调查 |
-| `APKSCANNER_OPENCODE_MODEL` | `deepseek-v4-flash` | DeepSeek 模型 ID；Pro 适配验证时显式改为 `deepseek-v4-pro` |
-| `APKSCANNER_OPENCODE_REASONING_EFFORT` | `high` | 思考型 Explorer 强度：`high` 或 `max` |
-| `APKSCANNER_OPENCODE_AGENT_STEPS` | 1000 | OpenCode Analyzer/Explorer 步数预算（50–1000） |
+| `APKSCANNER_OPENCODE_MODEL` | `deepseek-v4-flash` | DeepSeek 模型 ID；文本型 V4 Pro 会被拒绝 |
+| `APKSCANNER_OPENCODE_THINKING_EXPLORER` | `false` | 实验性的旧 Thinking/工具循环 |
+| `APKSCANNER_OPENCODE_REASONING_EFFORT` | `high` | 实验性 Explorer 强度：`high` 或 `max` |
+| `APKSCANNER_OPENCODE_AGENT_STEPS` | 1000 | 实验性 Explorer 步数预算（50–1000） |
 | `APKSCANNER_OPENCODE_ISOLATION` | `docker` | `docker` 或显式 `host` 降级 |
 | `APKSCANNER_OPENCODE_DOCKER_IMAGE` | `apk-scanner-opencode-worker:0.1.0` | Worker 镜像名称 |
 | `APKSCANNER_OPENCODE_NODE_BIN` | PATH 中的 `node` | Host 模式下的 Node.js 覆盖 |

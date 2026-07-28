@@ -28,10 +28,9 @@ finding without platform evidence IDs.
 - Official `openai-codex==0.144.4` integration with strict JSON Schema, streamed turn/item events,
   read-only workspace inspection, no subagent fan-out, bounded adaptive platform-mediated test
   rounds, and evidence-backed result downgrades.
-- Pinned `@opencode-ai/sdk`/OpenCode `1.18.4` integration for DeepSeek, with explicit
-  phase-based thinking modes, complete workspace-tool loops, an isolated non-thinking
-  StructuredOutput finalizer, local Ajv/semantic validation, ADB/subagent denial, and full
-  provider-wire/runtime audit.
+- Pinned `@opencode-ai/sdk`/OpenCode `1.18.4` integration for DeepSeek, with a stable
+  single-stage non-thinking StructuredOutput path, local Ajv/semantic and platform-ID validation,
+  ADB/subagent denial, bounded phase budgets, and full provider-wire/runtime audit.
 - Optional per-task Docker workers with isolated task-attempt mounts and resource/capability limits.
 - Responsive React review console, human Finding decisions, live events, JSON/HTML/SARIF exports.
 - Light review console with confirmed deletion of completed scans and shared-artifact-safe cleanup.
@@ -222,37 +221,35 @@ scanctl capabilities --deep
 ```
 
 The host worker creates a private temporary HOME/XDG tree and an authenticated loopback OpenCode
-server for each invocation. In both modes, OpenCode receives an isolated per-task/attempt workspace
-containing the relevant code context and immutable evidence, exposed through native `read`, `glob`,
-`grep`, and `bash`. Bash analysis artifacts are limited by policy to that workspace or `/tmp`;
-native editing, web, MCP, subagents, and ADB remain denied. Android actions are requested as data,
-then validated and executed by the Python control plane.
+server for each invocation. The stable path sends bounded target-code context and evidence directly
+to a tool-disabled StructuredOutput turn. Each invocation still receives an isolated
+per-task/attempt workspace, but native `read`, `glob`, `grep`, and `bash` are available only when
+the experimental thinking explorer is explicitly enabled. Native editing, web, MCP, subagents, and
+ADB remain denied. Android actions are requested as data, then validated and executed by the Python
+control plane.
 Host mode does not isolate same-UID processes or their `/proc` metadata, so it is suitable only for
 controlled personal debugging and is not a credential-security boundary. Use the default Docker
 mode for production or untrusted APKs.
 
-Execution is selected by orchestration phase, not by matching a model name:
-
-- `static_only`: non-thinking analyzer with workspace tools, followed by a fresh non-thinking
-  StructuredOutput finalizer.
-- `test_planning`, `adversarial_review`, and `exploration_round`: thinking explorer with the
-  complete OpenCode tool loop, followed by the isolated finalizer.
-- `final_evaluation` and `recovery_evaluation`: finalizer only; no workspace tools or new tests.
+All orchestration phases use one non-thinking `structured_finalizer` by default. This removes the
+text-memo dependency that could leave DeepSeek on `finish=tool-calls` indefinitely. Set
+`APKSCANNER_OPENCODE_THINKING_EXPLORER=true` only for explicit protocol experiments; it affects
+`test_planning`, `adversarial_review`, and `exploration_round`, while final/recovery evaluation
+remains tool-disabled.
 
 DeepSeek thinking requests reject `tool_choice`. OpenCode 1.18.4 injects `tool_choice: auto`, so the
 one-shot worker uses a loopback compatibility proxy that removes this field only when
 `thinking.type=enabled`; it preserves OpenCode's message/tool loop and full `reasoning_content`
-replay. The finalizer always disables thinking and uses OpenCode `StructuredOutput`
-(`tool_choice: required`), then Ajv and platform semantic rules validate the result. Each retry uses
-a fresh session. A retryable local transport failure can rebuild the worker once within the original
-task budget without changing models.
-Explorer/analyzer turns receive up to 1,000 steps by default. If a turn exhausts its tool work and
-becomes idle on `finish=tool-calls` without a text handoff, the worker starts a tool-disabled,
-non-thinking memo-writer turn in the same session; an empty memo is never passed to the finalizer.
+replay. The stable finalizer disables thinking and uses OpenCode `StructuredOutput`
+(`tool_choice: required`), then Ajv, semantic rules, and current-task Hypothesis/EntryPoint
+allowlists validate the result. Each retry uses a fresh session. A retryable local transport failure
+can rebuild the worker once within the original task budget without changing models. The legacy
+memo-writer exists only inside the opt-in experimental explorer profile and is not part of normal
+scans.
 
-Use the default `deepseek-v4-flash` model to establish the end-to-end baseline. Set
-`APKSCANNER_OPENCODE_MODEL=deepseek-v4-pro` only for explicit Pro compatibility testing. Both models
-use the same phase profile; no failure silently switches models. `scanctl capabilities --deep`
+Use the default `deepseek-v4-flash` model. The text-only `deepseek-v4-pro` is rejected early because
+it cannot satisfy the scanner's mandatory StructuredOutput contract; no failure silently switches
+models. `scanctl capabilities --deep`
 performs a small real, billable non-thinking StructuredOutput call rather than only checking a
 catalog. An enterprise DeepSeek-compatible gateway can be selected with
 `APKSCANNER_DEEPSEEK_BASE_URL`; remote gateways must use HTTPS, while plain HTTP is accepted only on
@@ -295,9 +292,10 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_CODEX_AUTH_FILE` | unset | Auth file mounted only into the worker |
 | `APKSCANNER_CODEX_BIN` | bundled SDK runtime | Explicit tested Codex binary override |
 | `APKSCANNER_OPENCODE_ENABLED` | `false` | Allow OpenCode + DeepSeek investigations |
-| `APKSCANNER_OPENCODE_MODEL` | `deepseek-v4-flash` | DeepSeek model ID; opt into `deepseek-v4-pro` for compatibility testing |
-| `APKSCANNER_OPENCODE_REASONING_EFFORT` | `high` | Thinking explorer effort: `high` or `max` |
-| `APKSCANNER_OPENCODE_AGENT_STEPS` | 1000 | OpenCode analyzer/explorer step budget (50–1000) |
+| `APKSCANNER_OPENCODE_MODEL` | `deepseek-v4-flash` | DeepSeek model ID; text-only V4 Pro is rejected |
+| `APKSCANNER_OPENCODE_THINKING_EXPLORER` | `false` | Experimental legacy thinking/tool-loop profile |
+| `APKSCANNER_OPENCODE_REASONING_EFFORT` | `high` | Experimental explorer effort: `high` or `max` |
+| `APKSCANNER_OPENCODE_AGENT_STEPS` | 1000 | Experimental explorer step budget (50–1000) |
 | `APKSCANNER_OPENCODE_ISOLATION` | `docker` | `docker` or explicit `host` fallback |
 | `APKSCANNER_OPENCODE_DOCKER_IMAGE` | `apk-scanner-opencode-worker:0.1.0` | Worker image |
 | `APKSCANNER_OPENCODE_NODE_BIN` | `node` on PATH | Host-mode Node.js override |

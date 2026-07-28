@@ -2,18 +2,15 @@
 
 ## 结论
 
-项目不再把“是否思考、是否开放工具、怎样结构化输出”绑定到模型名称，而是由扫描阶段
-显式选择执行协议。这样 `deepseek-v4-flash` 和 `deepseek-v4-pro` 可以共用同一套编排，
-也不会因为供应商调整模型默认行为而悄悄切换调用语义。
+稳定路径不再依赖“Explorer 先产出文本 memo、Finalizer 再定稿”的双阶段协议。所有扫描
+阶段默认直接运行一次关闭思考、禁用 workspace 工具的 StructuredOutput 定稿器；完整的
+入口、代码片段、假设和 Evidence 都由 Python 控制面放进结构化上下文。这消除了模型停在
+`finish=tool-calls`、最终文本为空以及第三阶段挤占任务预算的问题。
 
-当前稳定基线是 `deepseek-v4-flash`。真实 API 已验证三条路径：
-
-1. 非思考分析器使用 workspace 工具，再由独立定稿器输出结构化结果；
-2. 思考型 Explorer 连续调用工具并完整回放 `reasoning_content`，再由独立定稿器收敛；
-3. 最终裁决只运行非思考定稿器。
-
-`deepseek-v4-pro` 保留为显式兼容测试项，不会在 Flash 失败后自动启用，也不会被平台
-静默替换为 Flash。
+当前稳定基线是 `deepseek-v4-flash`。思考型 Explorer 仅作为显式实验选项保留，通过
+`APKSCANNER_OPENCODE_THINKING_EXPLORER=true` 开启，而且不会影响最终或恢复裁决。
+文本输出型 `deepseek-v4-pro` 无法满足扫描器强制 StructuredOutput 契约，会在能力检查时
+直接拒绝；系统不会静默切换模型。
 
 参考资料：
 
@@ -50,16 +47,16 @@
 - `fetch failed` 或长响应链路断开；
 - Schema 合法，但“证据不足 + 高危/高置信度”在业务语义上自相矛盾。
 
-## 三种执行配置
+## 执行配置
 
 | 扫描阶段 | 执行配置 | 思考与工具 | 输出 |
 | --- | --- | --- | --- |
-| `static_only` 及未识别阶段 | `stable_analyzer` | Analyzer 关闭思考，允许 `read/glob/grep/bash`，普通 `auto` 工具循环 | 全新 Finalizer 关闭思考，以 `StructuredOutput` 定稿 |
-| `test_planning`、`adversarial_review`、`exploration_round` | `thinking_explorer_then_finalizer` | Explorer 开启思考，允许 workspace 工具；线上不发送 `tool_choice` | 全新 Finalizer 关闭思考，以 `StructuredOutput` 定稿 |
-| `final_evaluation`、`recovery_evaluation` | `structured_finalizer` | 不开放 workspace 工具 | 直接用非思考 `StructuredOutput` 定稿 |
+| 所有阶段（默认） | `structured_finalizer` | 关闭思考，不开放 workspace 工具 | 单次 `StructuredOutput` |
+| `test_planning`、`adversarial_review`、`exploration_round`（显式实验） | `thinking_explorer_then_finalizer` | Explorer 开启思考并允许受限 workspace 工具；定稿器关闭思考 | 文本 memo 后接隔离的 `StructuredOutput` |
+| `final_evaluation`、`recovery_evaluation` | `structured_finalizer` | 始终关闭思考且不开放 workspace 工具 | 单次 `StructuredOutput` |
 
-思考强度通过 `APKSCANNER_OPENCODE_REASONING_EFFORT=high|max` 配置，默认 `high`。模型 ID
-只选择供应商模型，不决定执行配置。
+实验性 Explorer 的思考强度通过
+`APKSCANNER_OPENCODE_REASONING_EFFORT=high|max` 配置，默认 `high`。
 
 ## 调用链
 
@@ -73,7 +70,7 @@ sequenceDiagram
 
     P->>W: task context + schema + explicit execution profile
     W->>O: start authenticated loopback server
-    opt Analyzer / Explorer
+    opt Explicit experimental Explorer only
         W->>O: promptAsync(text)
         O->>X: chat/completions + tools
         X->>X: thinking enabled 时仅删除 tool_choice
@@ -109,20 +106,23 @@ sequenceDiagram
 
 ## 工具循环与长任务
 
-Analyzer/Explorer 使用 `promptAsync` 下发，再以短连接轮询 `session.messages` 和
-`session.status`。Worker 只有同时看到会话 idle 和已完成 assistant 消息才会读取结果；
-`finish=tool-calls` 只表示中间步骤，不再被误当成最终输出。
+默认路径不调用 `promptAsync`，也不读取 Explorer 文本。显式实验性 Explorer 才会异步
+下发并轮询 `session.messages` 和 `session.status`；`finish=tool-calls` 只表示中间步骤，
+不会被误当成最终输出。实验性 memo 为空时可调用独立 memo-writer，但该兜底不参与正常
+扫描。
 
 本地读取遇到短暂 `fetch failed`、`ECONNRESET`、Undici socket/header timeout 时会有限
 退避重试；整个 Worker 仍失败时，Python 只会在原任务剩余预算内重建一次，不延长总预算、
-不切换模型。单任务的 OpenCode 最大步骤数保持为 100，平台的 AI 总超时和手动续跑机制
-仍是外层硬边界；每个一次性 Worker 最多向 provider 转发 120 个经过认证的
-`chat/completions` 请求，为默认 1000 个 Agent 步骤、定稿和少量传输重试留出空间。
+不切换模型。会话事件流和会话删除都有 1 秒清理上限；终态 NDJSON 写入后 Worker 显式
+退出，Python 无论成功、超时还是取消都会终止并回收整个 Worker 进程组，避免遗留
+`opencode serve` 子进程。平台按阶段预留最终裁决预算，Critic 和额外探索预算不足时会
+跳过而不是发起注定超时的调用。
 
 ## 结构化结果与危害约束
 
-Explorer 只生成证据备忘录，不负责最终 JSON。Finalizer 位于全新 session，关闭思考且只
-允许内部 `StructuredOutput`，避免工具标记、隐藏推理和旧会话状态污染定稿。
+稳定 Finalizer 位于全新 session，关闭思考且只允许内部 `StructuredOutput`，避免工具
+标记、隐藏推理和旧会话状态污染定稿。实验性 Explorer 只生成证据备忘录，不负责最终
+JSON。
 
 OpenCode 返回后还要经过本地 Ajv 8.20.0 和业务语义校验：
 
@@ -130,6 +130,7 @@ OpenCode 返回后还要经过本地 Ajv 8.20.0 和业务语义校验：
 - `supported_static`、`reproduced_blackbox`、`observed_instrumented`、
   `not_reproduced` 必须至少引用一个平台 Evidence ID；
 - `final_evaluation`、`recovery_evaluation` 不允许再产生 `requested_tests`；
+- `requested_tests[].hypothesis_id` 必填，且 Hypothesis/EntryPoint ID 必须属于当前任务；
 - 数组数量和文本长度均有上限；
 - 纠正最多两次，每次使用全新 session，并把精确校验错误交给定稿器。
 
@@ -141,8 +142,8 @@ OpenCode 返回后还要经过本地 Ajv 8.20.0 和业务语义校验：
 
 ## 权限和审计
 
-- OpenCode Agent 默认 `* = deny`，只给 Analyzer/Explorer 开放
-  `read/glob/grep/bash`；Finalizer 只允许 `StructuredOutput`。
+- OpenCode Agent 默认 `* = deny`；稳定 Finalizer 只允许 `StructuredOutput`。仅显式
+  实验性 Explorer 开放 `read/glob/grep/bash`。
 - 平台按 `task_id + attempt` 物化独立 workspace；提示词要求 Bash 只在该目录和 `/tmp`
   创建分析产物。
 - 原生 write/edit/patch、Web、MCP、task/subagent 禁用。
@@ -164,7 +165,7 @@ OpenCode 返回后还要经过本地 Ajv 8.20.0 和业务语义校验：
 - 精确 prompt、执行阶段、profile、思考模式和 reasoning effort；
 - OpenCode thread/turn ID、工具名称与受限参数摘要、步骤状态；
 - 兼容代理看到的实际 wire 语义和 HTTP 状态；
-- Explorer 备忘录、Finalizer 结构化值、Ajv/语义错误及各次是否接受；
+- 实验性 Explorer 备忘录、Finalizer 结构化值、Ajv/语义/平台 ID 错误及各次是否接受；
 - provider/model、token、cache、reasoning、cost 和调用次数；
 - 401、402、422、429、5xx、工具选择冲突、reasoning 回放错误等归一化类别。
 
@@ -180,7 +181,6 @@ export APKSCANNER_INVESTIGATOR_BACKEND=opencode
 export APKSCANNER_OPENCODE_ENABLED=true
 export APKSCANNER_OPENCODE_ISOLATION=host
 export APKSCANNER_OPENCODE_MODEL=deepseek-v4-flash
-export APKSCANNER_OPENCODE_REASONING_EFFORT=high
 
 scanctl capabilities --deep
 ```
@@ -208,11 +208,13 @@ Worker 协议测试覆盖：
 2. `read` 与 `bash` 均不能读取 workspace 和 `/tmp` 之外的哨兵文件；
 3. Bash 环境读取不到 API Key，但 provider 上游认证仍然成功；
 4. 非思考 Finalizer 使用 `required` StructuredOutput；
-5. 稳定 Analyzer 完成真实工具循环后进入隔离 Finalizer；
-6. Thinking Explorer 删除 wire `tool_choice`，并回放 reasoning/tool result；
-7. deep capability 发起真实 provider 请求；
-8. 401 等 provider 错误被分类且不泄露密钥；
-9. Schema 合法但语义矛盾的结果被拒绝，并用新 session 纠正。
+5. 稳定路径所有阶段只调用一次禁用思考/工具的 StructuredOutput；
+6. 显式 Thinking Explorer 删除 wire `tool_choice`，并回放 reasoning/tool result；
+7. 当前任务之外的 Hypothesis/EntryPoint ID 被本地拒绝并纠正；
+8. deep capability 发起真实 provider 请求；
+9. 401 等 provider 错误被分类且不泄露密钥；
+10. Schema 合法但语义矛盾的结果被拒绝，并用新 session 纠正；
+11. Worker 成功、超时和服务关闭均不遗留 OpenCode 子进程。
 
 升级 OpenCode 时必须同步更新 SDK、CLI、lockfile、Python 常量、Docker protocol label，
 再执行协议测试和非生产 DeepSeek smoke test。重点复核 provider 的 thinking 参数映射、

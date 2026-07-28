@@ -58,6 +58,7 @@ class ToolRunner:
     def __init__(self, timeout_seconds: int = 600, max_output_chars: int = 2_000_000):
         self.timeout_seconds = timeout_seconds
         self.max_output_chars = max_output_chars
+        self._shutdown = threading.Event()
 
     def available(self, tool: str) -> bool:
         return shutil.which(tool) is not None
@@ -73,12 +74,14 @@ class ToolRunner:
     ) -> CommandResult:
         if not argv or not shutil.which(argv[0]):
             return CommandResult(argv=argv, exit_code=127, stdout="", stderr="tool not found")
-        if cancel_event is not None and cancel_event.is_set():
+        if self._shutdown.is_set() or (
+            cancel_event is not None and cancel_event.is_set()
+        ):
             return CommandResult(
                 argv=argv,
                 exit_code=130,
                 stdout="",
-                stderr="command cancelled before dispatch",
+                stderr="command cancelled before dispatch or during scanner shutdown",
                 canceled=True,
             )
         command_env = os.environ.copy()
@@ -124,7 +127,7 @@ class ToolRunner:
         )
         deadline = time.monotonic() + timeout
         while True:
-            if cancel_event.is_set():
+            if self._shutdown.is_set() or cancel_event.is_set():
                 stdout, stderr = self._terminate(process)
                 return CommandResult(
                     argv=argv,
@@ -153,6 +156,10 @@ class ToolRunner:
                 )
             except subprocess.TimeoutExpired:
                 continue
+
+    def shutdown(self) -> None:
+        """Request cancellation of every current and future tool subprocess."""
+        self._shutdown.set()
 
     @staticmethod
     def _terminate(process: subprocess.Popen[str]) -> tuple[str, str]:

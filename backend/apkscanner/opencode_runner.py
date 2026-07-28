@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -95,9 +96,10 @@ def opencode_execution_profile(
     phase: str | None,
     *,
     reasoning_effort: str = "high",
+    enable_thinking_explorer: bool = False,
 ) -> OpenCodeExecutionProfile:
     normalized = (phase or "").strip().lower()
-    if normalized in OPENCODE_THINKING_PHASES:
+    if enable_thinking_explorer and normalized in OPENCODE_THINKING_PHASES:
         return OpenCodeExecutionProfile(
             name=OPENCODE_PROFILE_THINKING_EXPLORER,
             output_mode=OPENCODE_OUTPUT_MODE_EXPLORE_THEN_FINALIZE,
@@ -118,31 +120,15 @@ def opencode_execution_profile(
                 ),
             ),
         )
-    if normalized in OPENCODE_FINALIZER_PHASES:
-        return OpenCodeExecutionProfile(
-            name=OPENCODE_PROFILE_STRUCTURED_FINALIZER,
-            output_mode=OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
-            stages=(
-                OpenCodeExecutionStage(
-                    name="finalizer",
-                    thinking_mode="disabled",
-                    reasoning_effort=None,
-                    output_mode=OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
-                    workspace_tools=False,
-                ),
-            ),
-        )
+    # DeepSeek V4 Flash is most reliable when the complete, bounded task context
+    # is sent through one non-thinking StructuredOutput turn. Text analysis
+    # stages depend on OpenCode observing a terminal memo after a tool loop;
+    # DeepSeek may instead finish on ``tool-calls`` indefinitely. Keep the
+    # thinking explorer available only as an explicit experimental opt-in.
     return OpenCodeExecutionProfile(
-        name=OPENCODE_PROFILE_STABLE_ANALYZER,
-        output_mode=OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE,
+        name=OPENCODE_PROFILE_STRUCTURED_FINALIZER,
+        output_mode=OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
         stages=(
-            OpenCodeExecutionStage(
-                name="analyzer",
-                thinking_mode="disabled",
-                reasoning_effort=None,
-                output_mode="text",
-                workspace_tools=True,
-            ),
             OpenCodeExecutionStage(
                 name="finalizer",
                 thinking_mode="disabled",
@@ -159,6 +145,7 @@ def opencode_output_mode(
     *,
     phase: str | None = None,
     reasoning_effort: str = "high",
+    enable_thinking_explorer: bool = False,
 ) -> str:
     # ``model`` is retained for API compatibility, but execution semantics are
     # deliberately selected by phase rather than inferred from a model name.
@@ -166,6 +153,7 @@ def opencode_output_mode(
     return opencode_execution_profile(
         phase,
         reasoning_effort=reasoning_effort,
+        enable_thinking_explorer=enable_thinking_explorer,
     ).output_mode
 
 
@@ -206,11 +194,15 @@ class OpenCodeInvestigator:
         )
         self._deep_capability: dict[str, Any] | None = None
         self._capability_lock = threading.Lock()
+        self._process_lock = threading.Lock()
+        self._active_process_cleanups: dict[int, Callable[[], None]] = {}
+        self._shutting_down = threading.Event()
 
     def capability(self, *, deep: bool = False) -> dict[str, Any]:
         default_profile = opencode_execution_profile(
             "static_only",
             reasoning_effort=self.settings.opencode_reasoning_effort,
+            enable_thinking_explorer=self.settings.opencode_thinking_explorer,
         )
         capability: dict[str, Any] = {
             "available": True,
@@ -331,44 +323,33 @@ class OpenCodeInvestigator:
         execution_profile = opencode_execution_profile(
             phase,
             reasoning_effort=self.settings.opencode_reasoning_effort,
+            enable_thinking_explorer=self.settings.opencode_thinking_explorer,
+        )
+        workspace_tools_enabled = any(
+            stage.workspace_tools for stage in execution_profile.stages
+        )
+        prompt = investigation_prompt(
+            scan,
+            task,
+            entries,
+            evidence,
+            context,
+            direct_tool_access=workspace_tools_enabled,
+            shell_access=workspace_tools_enabled,
+            workspace_write=workspace_tools_enabled,
+            response_contract="structured_result",
+        )
+        instructions = developer_instructions(
+            direct_tool_access=workspace_tools_enabled,
+            shell_access=workspace_tools_enabled,
+            workspace_write=workspace_tools_enabled,
+            response_contract="structured_result",
         )
         payload = {
             "schema_version": "1.0",
             "action": "investigate",
-            "prompt": investigation_prompt(
-                scan,
-                task,
-                entries,
-                evidence,
-                context,
-                direct_tool_access=True,
-                shell_access=True,
-                workspace_write=True,
-                response_contract="structured_result",
-            ),
-            "explorer_prompt": investigation_prompt(
-                scan,
-                task,
-                entries,
-                evidence,
-                context,
-                direct_tool_access=True,
-                shell_access=True,
-                workspace_write=True,
-                response_contract="analysis_memo",
-            ),
-            "developer_instructions": developer_instructions(
-                direct_tool_access=True,
-                shell_access=True,
-                workspace_write=True,
-                response_contract="structured_result",
-            ),
-            "explorer_instructions": developer_instructions(
-                direct_tool_access=True,
-                shell_access=True,
-                workspace_write=True,
-                response_contract="analysis_memo",
-            ),
+            "prompt": prompt,
+            "developer_instructions": instructions,
             "model": self.settings.opencode_model,
             "base_url": self.settings.deepseek_base_url,
             "phase": phase,
@@ -377,7 +358,31 @@ class OpenCodeInvestigator:
             "execution_profile": execution_profile.as_payload(),
             "max_agent_steps": self.settings.opencode_agent_steps,
             "timeout_ms": max(1, timeout) * 1000,
+            "allowed_hypothesis_ids": sorted(
+                str(item["id"])
+                for item in context.get("security_hypotheses", [])
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            ),
+            "allowed_entry_point_ids": sorted(entry.id for entry in entries),
         }
+        if workspace_tools_enabled:
+            payload["explorer_prompt"] = investigation_prompt(
+                scan,
+                task,
+                entries,
+                evidence,
+                context,
+                direct_tool_access=True,
+                shell_access=True,
+                workspace_write=True,
+                response_contract="analysis_memo",
+            )
+            payload["explorer_instructions"] = developer_instructions(
+                direct_tool_access=True,
+                shell_access=True,
+                workspace_write=True,
+                response_contract="analysis_memo",
+            )
         response = self._invoke_investigation_with_retry(
             payload,
             timeout_seconds=timeout,
@@ -559,7 +564,12 @@ class OpenCodeInvestigator:
         }:
             return (
                 "deepseek-chat and deepseek-reasoner are retired; use "
-                "deepseek-v4-flash or deepseek-v4-pro"
+                "deepseek-v4-flash"
+            )
+        if self.settings.opencode_model.lower() == "deepseek-v4-pro":
+            return (
+                "deepseek-v4-pro exposes text-only output and cannot satisfy the scanner's "
+                "required StructuredOutput contract; use deepseek-v4-flash"
             )
         if self.settings.opencode_reasoning_effort not in {"high", "max"}:
             return "APKSCANNER_OPENCODE_REASONING_EFFORT must be high or max"
@@ -750,6 +760,8 @@ class OpenCodeInvestigator:
         event_callback: AgentEventCallback | None = None,
         cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
+        if self._shutting_down.is_set():
+            raise AgentCancelledError("OpenCode investigator is shutting down")
         worker_payload = self._worker_payload(payload)
         if self.settings.opencode_isolation == "docker":
             return self._invoke_docker(
@@ -810,26 +822,34 @@ class OpenCodeInvestigator:
                 text=True,
                 start_new_session=True,
             )
+            self._register_process(
+                process,
+                lambda: self._kill_process_group(process),
+            )
             try:
-                response, _stderr = consume_worker_process(
-                    process,
-                    payload=payload,
-                    timeout_seconds=timeout_seconds,
-                    event_callback=event_callback,
-                    on_timeout=lambda: self._kill_process_group(process),
-                    cancel_event=cancel_event,
-                    on_cancel=lambda: self._kill_process_group(process),
-                )
-            except WorkerCancelledError as exc:
-                raise AgentCancelledError(
-                    "OpenCode investigation was cancelled by the user"
-                ) from exc
-            except WorkerTimeoutError as exc:
-                raise TimeoutError(
-                    f"OpenCode investigation exceeded {timeout_seconds} seconds"
-                ) from exc
-            except RuntimeError as exc:
-                raise RuntimeError(f"OpenCode worker failed: {exc}") from exc
+                try:
+                    response, _stderr = consume_worker_process(
+                        process,
+                        payload=payload,
+                        timeout_seconds=timeout_seconds,
+                        event_callback=event_callback,
+                        on_timeout=lambda: self._kill_process_group(process),
+                        cancel_event=cancel_event,
+                        on_cancel=lambda: self._kill_process_group(process),
+                    )
+                except WorkerCancelledError as exc:
+                    raise AgentCancelledError(
+                        "OpenCode investigation was cancelled by the user"
+                    ) from exc
+                except WorkerTimeoutError as exc:
+                    raise TimeoutError(
+                        f"OpenCode investigation exceeded {timeout_seconds} seconds"
+                    ) from exc
+                except RuntimeError as exc:
+                    raise RuntimeError(f"OpenCode worker failed: {exc}") from exc
+            finally:
+                self._kill_process_group(process)
+                self._unregister_process(process)
         return response
 
     def _worker_environment(self, root: Path) -> dict[str, str]:
@@ -966,28 +986,56 @@ class OpenCodeInvestigator:
                 check=False,
             )
 
+        self._register_process(process, stop_container)
         try:
-            response, _stderr = consume_worker_process(
-                process,
-                payload=payload,
-                timeout_seconds=timeout_seconds,
-                event_callback=event_callback,
-                on_timeout=stop_container,
-                cancel_event=cancel_event,
-                on_cancel=stop_container,
-                on_error_cleanup=stop_container,
-            )
-        except WorkerCancelledError as exc:
-            raise AgentCancelledError(
-                "containerized OpenCode investigation was cancelled by the user"
-            ) from exc
-        except WorkerTimeoutError as exc:
-            raise TimeoutError(
-                f"containerized OpenCode investigation exceeded {timeout_seconds} seconds"
-            ) from exc
-        except RuntimeError as exc:
-            raise RuntimeError(f"containerized OpenCode worker failed: {exc}") from exc
+            try:
+                response, _stderr = consume_worker_process(
+                    process,
+                    payload=payload,
+                    timeout_seconds=timeout_seconds,
+                    event_callback=event_callback,
+                    on_timeout=stop_container,
+                    cancel_event=cancel_event,
+                    on_cancel=stop_container,
+                    on_error_cleanup=stop_container,
+                )
+            except WorkerCancelledError as exc:
+                raise AgentCancelledError(
+                    "containerized OpenCode investigation was cancelled by the user"
+                ) from exc
+            except WorkerTimeoutError as exc:
+                raise TimeoutError(
+                    f"containerized OpenCode investigation exceeded {timeout_seconds} seconds"
+                ) from exc
+            except RuntimeError as exc:
+                raise RuntimeError(f"containerized OpenCode worker failed: {exc}") from exc
+        finally:
+            self._unregister_process(process)
         return response
+
+    def _register_process(
+        self,
+        process: subprocess.Popen[str],
+        cleanup: Callable[[], None],
+    ) -> None:
+        with self._process_lock:
+            if self._shutting_down.is_set():
+                cleanup()
+                raise AgentCancelledError("OpenCode investigator is shutting down")
+            self._active_process_cleanups[process.pid] = cleanup
+
+    def _unregister_process(self, process: subprocess.Popen[str]) -> None:
+        with self._process_lock:
+            self._active_process_cleanups.pop(process.pid, None)
+
+    def shutdown(self) -> None:
+        """Terminate worker process groups, including capability probes."""
+        self._shutting_down.set()
+        with self._process_lock:
+            cleanups = list(self._active_process_cleanups.values())
+        for cleanup in cleanups:
+            with suppress(Exception):
+                cleanup()
 
     @staticmethod
     def _prepare_root_owned_docker_workspace(workspace: Path) -> None:
@@ -999,13 +1047,12 @@ class OpenCodeInvestigator:
 
     @staticmethod
     def _kill_process_group(process: subprocess.Popen[str]) -> None:
-        if process.poll() is not None:
-            return
         if os.name == "posix":
             with suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
             return
-        process.kill()
+        if process.poll() is None:
+            process.kill()
 
     @staticmethod
     def _parse_worker_response(stdout: str) -> dict[str, Any]:

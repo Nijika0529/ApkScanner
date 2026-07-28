@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from apkscanner.device import (
@@ -9,6 +10,7 @@ from apkscanner.device import (
     DeviceLeaseCancelledError,
     SingleDeviceScheduler,
 )
+from apkscanner.tools import CommandResult
 
 
 def test_single_device_scheduler_orders_waiters_by_priority_then_fifo() -> None:
@@ -208,3 +210,82 @@ def test_non_blocking_health_probe_does_not_wait_behind_an_adb_command(settings)
     release.set()
     worker.join(timeout=5)
     assert not worker.is_alive()
+
+
+def test_device_prepare_stops_after_failed_health_check(settings) -> None:  # noqa: ANN001
+    calls: list[list[str]] = []
+
+    class FailingRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @staticmethod
+        def run(argv, **_kwargs):  # noqa: ANN001, ANN205
+            calls.append(argv)
+            return CommandResult(argv, 1, "", "device unavailable")
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        FailingRunner(),  # type: ignore[arg-type]
+    )
+
+    commands = adapter.prepare(Path("/tmp/sample.apk"), "com.example.app")
+
+    assert [kind for kind, _result, _metadata in commands] == ["device.health"]
+    assert len(calls) == 1
+
+
+def test_non_blocking_device_health_reuses_recent_failure(settings) -> None:  # noqa: ANN001
+    calls: list[list[str]] = []
+
+    class FailingRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @staticmethod
+        def run(argv, **_kwargs):  # noqa: ANN001, ANN205
+            calls.append(argv)
+            return CommandResult(argv, 1, "", "device unavailable")
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        FailingRunner(),  # type: ignore[arg-type]
+    )
+
+    first = adapter.capability(non_blocking=True)
+    second = adapter.capability(non_blocking=True)
+
+    assert first["available"] is False
+    assert second["available"] is False
+    assert second["cached"] is True
+    assert len(calls) == 1
+
+
+def test_device_prepare_stops_after_failed_install(settings) -> None:  # noqa: ANN001
+    calls: list[list[str]] = []
+
+    class InstallFailingRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @staticmethod
+        def run(argv, **_kwargs):  # noqa: ANN001, ANN205
+            calls.append(argv)
+            exit_code = 0 if argv[-1] == "get-state" else 1
+            return CommandResult(argv, exit_code, "device" if exit_code == 0 else "", "")
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        InstallFailingRunner(),  # type: ignore[arg-type]
+    )
+
+    commands = adapter.prepare(Path("/tmp/sample.apk"), "com.example.app")
+
+    assert [kind for kind, _result, _metadata in commands] == [
+        "device.health",
+        "device.install",
+    ]
+    assert len(calls) == 2

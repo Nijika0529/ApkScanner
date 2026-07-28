@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,10 +13,8 @@ from apkscanner.models import EntryPoint, InvestigationTask, Scan
 from apkscanner.opencode_runner import (
     AJV_VERSION,
     OPENCODE_CLI_VERSION,
-    OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE,
     OPENCODE_OUTPUT_MODE_EXPLORE_THEN_FINALIZE,
     OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
-    OPENCODE_PROFILE_STABLE_ANALYZER,
     OPENCODE_PROFILE_STRUCTURED_FINALIZER,
     OPENCODE_PROFILE_THINKING_EXPLORER,
     OPENCODE_PROVIDER_KEY_FIELD,
@@ -82,7 +82,7 @@ def test_host_capability_requires_key_and_pinned_packages(
     assert available["available"] is True
     assert available["provider"] == "deepseek"
     assert available["model"] == "deepseek-v4-flash"
-    assert available["output_mode"] == OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE
+    assert available["output_mode"] == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
     assert available["max_steps"] == 1_000
     assert available["max_provider_requests"] == 1_100
 
@@ -165,6 +165,25 @@ def test_capability_rejects_retired_deepseek_aliases(
     assert "retired" in capability["detail"]
 
 
+def test_capability_rejects_text_only_v4_pro(
+    settings, tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "unit-test-only")
+    configured = replace(
+        settings,
+        opencode_model="deepseek-v4-pro",
+        opencode_isolation="host",
+        opencode_node_bin="/usr/bin/node",
+        opencode_worker_dir=_worker_tree(tmp_path),
+    )
+
+    capability = OpenCodeInvestigator(configured).capability()
+
+    assert capability["available"] is False
+    assert "text-only" in capability["detail"]
+    assert "deepseek-v4-flash" in capability["detail"]
+
+
 def test_capability_rejects_invalid_reasoning_effort(
     settings, tmp_path, monkeypatch
 ) -> None:  # noqa: ANN001
@@ -230,17 +249,41 @@ def test_worker_response_must_be_a_json_object() -> None:
     assert OpenCodeInvestigator._parse_worker_response('{"ok": true}') == {"ok": True}
 
 
-def test_output_mode_is_selected_by_phase_instead_of_model_name() -> None:
+def test_shutdown_terminates_registered_worker_process(settings) -> None:  # noqa: ANN001
+    investigator = OpenCodeInvestigator(settings)
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+    )
+    investigator._register_process(
+        process,
+        lambda: investigator._kill_process_group(process),
+    )
+
+    investigator.shutdown()
+    process.wait(timeout=3)
+
+    assert process.returncode is not None
+
+
+def test_structured_output_is_default_and_thinking_explorer_requires_opt_in() -> None:
     assert (
         opencode_output_mode("deepseek-v4-pro")
-        == OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE
+        == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
     )
-    assert opencode_output_mode("deepseek-v4-flash") == OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE
+    assert (
+        opencode_output_mode("deepseek-v4-flash")
+        == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
+    )
     static = opencode_execution_profile("static_only")
-    assert static.name == OPENCODE_PROFILE_STABLE_ANALYZER
-    assert static.output_mode == OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE
-    assert [stage.thinking_mode for stage in static.stages] == ["disabled", "disabled"]
-    thinking = opencode_execution_profile("exploration_round", reasoning_effort="max")
+    assert static.name == OPENCODE_PROFILE_STRUCTURED_FINALIZER
+    assert static.output_mode == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
+    assert [stage.thinking_mode for stage in static.stages] == ["disabled"]
+    thinking = opencode_execution_profile(
+        "exploration_round",
+        reasoning_effort="max",
+        enable_thinking_explorer=True,
+    )
     assert thinking.name == OPENCODE_PROFILE_THINKING_EXPLORER
     assert thinking.output_mode == OPENCODE_OUTPUT_MODE_EXPLORE_THEN_FINALIZE
     assert thinking.stages[0].thinking_mode == "enabled"
@@ -271,7 +314,7 @@ def test_output_mode_is_selected_by_phase_instead_of_model_name() -> None:
     )
 
 
-def test_investigate_builds_a_workspace_shell_prompt_and_validates_result(
+def test_investigate_builds_a_single_structured_prompt_and_validates_result(
     settings, tmp_path, monkeypatch
 ) -> None:  # noqa: ANN001
     configured = replace(settings, opencode_isolation="host")
@@ -308,21 +351,25 @@ def test_investigate_builds_a_workspace_shell_prompt_and_validates_result(
         assert payload["action"] == "investigate"
         assert payload["model"] == "deepseek-v4-flash"
         assert payload["phase"] == "static_only"
-        assert "run shell commands" in payload["prompt"]
-        assert "workspace or /tmp" in payload["prompt"]
-        assert "analysis memo" in payload["explorer_prompt"]
-        assert "separate finalizer" in payload["explorer_instructions"]
+        assert "cannot inspect files or execute commands directly" in payload["prompt"]
+        assert "explorer_prompt" not in payload
+        assert "explorer_instructions" not in payload
         assert payload["tool_profile"] == "workspace_shell"
-        assert payload["execution_profile"]["name"] == OPENCODE_PROFILE_STABLE_ANALYZER
-        assert payload["execution_profile"]["output_mode"] == (
-            OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE
-        )
+        assert payload["execution_profile"]["name"] == OPENCODE_PROFILE_STRUCTURED_FINALIZER
+        assert payload["execution_profile"]["output_mode"] == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
         assert payload["execution_profile"]["stages"][0]["thinking_mode"] == "disabled"
-        assert payload["execution_profile"]["stages"][0]["wire_tool_choice"] == "auto"
-        assert payload["execution_profile"]["stages"][1]["wire_tool_choice"] == "required"
+        assert payload["execution_profile"]["stages"][0]["wire_tool_choice"] == "required"
+        assert payload["allowed_entry_point_ids"] == [
+            "00000000-0000-0000-0000-000000000003"
+        ]
+        assert payload["allowed_hypothesis_ids"] == []
         assert payload["output_schema"]["title"] == "AgentInvestigationResult"
         assert payload["output_schema"]["additionalProperties"] is False
         assert payload["output_schema"]["properties"]["requested_tests"]["maxItems"] == 1_000
+        requested_test_schema = payload["output_schema"]["properties"][
+            "requested_tests"
+        ]["items"]
+        assert "hypothesis_id" in requested_test_schema["required"]
         serialized_schema = json.dumps(payload["output_schema"])
         assert '"$defs"' not in serialized_schema
         assert '"$ref"' not in serialized_schema

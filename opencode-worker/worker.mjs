@@ -535,7 +535,10 @@ async function withSession(client, title, operation) {
     return await operation(sessionID)
   } finally {
     await eventPump.stop()
-    await client.session.delete({ path: { id: sessionID } }).catch(() => undefined)
+    await settleWithin(
+      client.session.delete({ path: { id: sessionID } }),
+      1_000,
+    )
   }
 }
 
@@ -783,8 +786,23 @@ async function startEventPump(client) {
   return {
     async stop() {
       controller.abort()
-      await done.catch(() => undefined)
+      await settleWithin(done, 1_000)
     },
+  }
+}
+
+async function settleWithin(promise, timeoutMilliseconds) {
+  let timeoutID
+  try {
+    await Promise.race([
+      Promise.resolve(promise).catch(() => undefined),
+      new Promise((resolvePromise) => {
+        timeoutID = setTimeout(resolvePromise, timeoutMilliseconds)
+        timeoutID.unref?.()
+      }),
+    ])
+  } finally {
+    clearTimeout(timeoutID)
   }
 }
 
@@ -1164,8 +1182,31 @@ function validatePayload(value) {
     if (value.tool_profile !== WORKSPACE_TOOL_PROFILE) {
       throw new Error("unsupported OpenCode tool profile")
     }
+    value.allowed_hypothesis_ids = validateIdentifierList(
+      value.allowed_hypothesis_ids,
+      "allowed_hypothesis_ids",
+    )
+    value.allowed_entry_point_ids = validateIdentifierList(
+      value.allowed_entry_point_ids,
+      "allowed_entry_point_ids",
+    )
   }
   return value
+}
+
+function validateIdentifierList(value, label) {
+  if (value === undefined || value === null) return []
+  if (
+    !Array.isArray(value) ||
+    value.some(
+      (item) =>
+        typeof item !== "string" ||
+        !/^[a-f0-9-]{36}$/.test(item),
+    )
+  ) {
+    throw new Error(`${label} must contain only platform UUIDs`)
+  }
+  return [...new Set(value)]
 }
 
 function validateBaseURL(value) {
@@ -1424,6 +1465,31 @@ function semanticValidationErrors(value, payload) {
       "/requested_tests",
       `${payload.phase} must not request additional tests`,
     )
+  }
+  if (Array.isArray(value.requested_tests)) {
+    const allowedHypotheses = new Set(payload.allowed_hypothesis_ids ?? [])
+    const allowedEntries = new Set(payload.allowed_entry_point_ids ?? [])
+    value.requested_tests.forEach((request, index) => {
+      if (!request || typeof request !== "object" || Array.isArray(request)) return
+      if (
+        typeof request.hypothesis_id === "string" &&
+        !allowedHypotheses.has(request.hypothesis_id)
+      ) {
+        add(
+          `/requested_tests/${index}/hypothesis_id`,
+          "requested test must reference a hypothesis issued for this task",
+        )
+      }
+      if (
+        typeof request.entry_point_id === "string" &&
+        !allowedEntries.has(request.entry_point_id)
+      ) {
+        add(
+          `/requested_tests/${index}/entry_point_id`,
+          "requested test must reference an entry point issued for this task",
+        )
+      }
+    })
   }
   return errors
 }
@@ -1857,11 +1923,10 @@ for (const name of ["SIGINT", "SIGTERM"]) {
 }
 
 main()
-  .then((result) => emitRecord({ type: "result", result }))
+  .then((result) => emitFinalRecord({ type: "result", result }, 0))
   .catch((error) => {
     const message = formatThrownError(error)
-    stderr.write(redactSecret(message))
-    process.exitCode = 1
+    stderr.write(redactSecret(message), () => process.exit(1))
   })
 
 function formatThrownError(error) {
@@ -1897,4 +1962,9 @@ function emitRuntimeEvent(eventType, message, data = {}) {
 function emitRecord(value) {
   const serialized = JSON.stringify(value)
   stdout.write(`${redactSecret(serialized)}\n`)
+}
+
+function emitFinalRecord(value, exitCode) {
+  const serialized = JSON.stringify(value)
+  stdout.write(`${redactSecret(serialized)}\n`, () => process.exit(exitCode))
 }

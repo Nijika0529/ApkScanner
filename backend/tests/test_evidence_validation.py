@@ -175,6 +175,7 @@ def test_agent_requested_deep_link_must_preserve_declared_origin() -> None:
         metadata_json={},
     )
     allowed = AgentRequestedTest(
+        hypothesis_id="22222222-2222-2222-2222-222222222222",
         entry_point_id=entry.id,
         state="guest",
         uri="https://example.test/open?next=%2Fadmin",
@@ -182,6 +183,7 @@ def test_agent_requested_deep_link_must_preserve_declared_origin() -> None:
         rationale="Test redirect validation",
     )
     rejected = AgentRequestedTest(
+        hypothesis_id="22222222-2222-2222-2222-222222222222",
         entry_point_id=entry.id,
         state="guest",
         uri="https://unrelated.test/open",

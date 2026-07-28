@@ -51,7 +51,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             application.state.background_tasks.add(task)
             task.add_done_callback(application.state.background_tasks.discard)
         yield
+        orchestrator.shutdown()
         pending = list(application.state.background_tasks)
+        if pending:
+            _done, still_pending = await asyncio.wait(pending, timeout=10)
+            pending = list(still_pending)
         for task in pending:
             task.cancel()
         if pending:

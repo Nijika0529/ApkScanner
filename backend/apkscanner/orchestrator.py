@@ -55,6 +55,12 @@ from .security_pipeline import HypothesisLedger
 from .static_analysis import ApkInspector
 from .tools import CommandResult, TimeBudget, ToolRunner
 
+AGENT_PLANNING_TIMEOUT_CAP_SECONDS = 300
+AGENT_CRITIC_TIMEOUT_CAP_SECONDS = 120
+AGENT_FINAL_TIMEOUT_CAP_SECONDS = 180
+AGENT_FINAL_RESERVE_SECONDS = 60
+AGENT_MIN_OPTIONAL_PHASE_SECONDS = 30
+
 
 class ScanOrchestrator:
     def __init__(self, settings: Settings, database: Database, store: ArtifactStore):
@@ -81,6 +87,7 @@ class ScanOrchestrator:
         self._running_lock = asyncio.Lock()
         self._task_cancellations: dict[str, threading.Event] = {}
         self._task_cancellations_lock = threading.Lock()
+        self._shutting_down = threading.Event()
         # Bound task workers across all scans handled by this control-plane
         # process. Per-scan executors may queue work, but model/device orchestration
         # cannot exceed this shared limit.
@@ -137,6 +144,8 @@ class ScanOrchestrator:
             session.commit()
 
     async def submit(self, scan_id: str) -> None:
+        if self._shutting_down.is_set():
+            return
         async with self._running_lock:
             if scan_id in self._running:
                 self._resubmit_requested.add(scan_id)
@@ -156,6 +165,16 @@ class ScanOrchestrator:
             async with self._running_lock:
                 self._running.discard(scan_id)
                 self._resubmit_requested.discard(scan_id)
+
+    def shutdown(self) -> None:
+        """Cancel active orchestration and terminate owned subprocess groups."""
+        self._shutting_down.set()
+        with self._task_cancellations_lock:
+            cancellations = list(self._task_cancellations.values())
+        for cancellation in cancellations:
+            cancellation.set()
+        self.runner.shutdown()
+        self.opencode.shutdown()
 
     def recover_interrupted_device_tasks(self) -> None:
         """Normalize transient single-device states after a control-plane restart."""
@@ -1510,13 +1529,16 @@ class ScanOrchestrator:
                 )
                 return None, str(exc)
 
-        # A cached/non-blocking health snapshot may be stale while another task
-        # owns ADB. Queue every safely addressable task when the adapter itself is
-        # configured; the leased prepare stage is the authoritative health check.
+        # A busy non-blocking snapshot remains eligible for the device queue, but
+        # an explicit unavailable result should degrade directly to static AI.
         device_ready = bool(
             self.device.configured
             and package_name
             and self.device.package_safe(package_name)
+            and (
+                device_capability.get("available")
+                or device_capability.get("busy")
+            )
         )
         if not device_ready:
             package_gap = (
@@ -1531,7 +1553,10 @@ class ScanOrchestrator:
                     or "Remote Android 16 device is unavailable or package metadata is missing."
                 )
             )
-            agent_result, agent_error = invoke_agent(phase="static_only")
+            agent_result, agent_error = invoke_agent(
+                phase="static_only",
+                timeout_cap=AGENT_PLANNING_TIMEOUT_CAP_SECONDS,
+            )
         else:
             device_session = self._task_device_session(
                 scan_id,
@@ -1547,6 +1572,7 @@ class ScanOrchestrator:
             if device_session is not None:
                 frida_session = None
                 prepared = False
+                target_installed = False
                 try:
                     stages["device_attempted"] = True
                     prepare_commands = self.device.prepare(
@@ -1554,6 +1580,10 @@ class ScanOrchestrator:
                     )
                     self._record_commands(
                         scan_id, task_id, prepare_commands, evidence_summaries
+                    )
+                    target_installed = any(
+                        kind == "device.install" and result.exit_code == 0
+                        for kind, result, _metadata in prepare_commands
                     )
                     critical = {
                         kind: result
@@ -1660,27 +1690,42 @@ class ScanOrchestrator:
                                 coverage_gaps.append(
                                     "Frida was attempted but produced no validated entry-flow observations."
                                 )
-                    if prepared or stages["device_attempted"]:
+                    if target_installed:
                         cleanup = self.device.cleanup(package_name)
                         self._record_commands(scan_id, task_id, cleanup, None)
                     completed_device_session = device_session
                     device_session = None
                     completed_device_session.__exit__(None, None, None)
-                    phase_one_cap = max(1, budget.remaining() // 2)
+                    planning_reserve = min(
+                        AGENT_CRITIC_TIMEOUT_CAP_SECONDS
+                        + AGENT_FINAL_RESERVE_SECONDS,
+                        max(0, budget.remaining() // 3),
+                    )
+                    phase_one_cap = min(
+                        AGENT_PLANNING_TIMEOUT_CAP_SECONDS,
+                        max(1, budget.remaining() - planning_reserve),
+                    )
                     agent_result, agent_error = invoke_agent(
                         phase="test_planning",
                         timeout_cap=phase_one_cap,
                         round_index=0,
                     )
+                    critic_budget = min(
+                        AGENT_CRITIC_TIMEOUT_CAP_SECONDS,
+                        max(
+                            0,
+                            budget.remaining() - AGENT_FINAL_RESERVE_SECONDS,
+                        ),
+                    )
                     if (
                         agent_result is not None
                         and not budget.expired
-                        and budget.remaining() >= 10
+                        and critic_budget >= AGENT_MIN_OPTIONAL_PHASE_SECONDS
                     ):
                         candidate_payload = agent_result.result.model_dump(mode="json")
                         critic_result, critic_error = invoke_agent(
                             phase="adversarial_review",
-                            timeout_cap=min(180, max(1, budget.remaining() // 3)),
+                            timeout_cap=critic_budget,
                             candidate_under_review=candidate_payload,
                             round_index=0,
                         )
@@ -1740,6 +1785,11 @@ class ScanOrchestrator:
                             coverage_gaps.append(
                                 f"Adversarial review was unavailable: {critic_error}"
                             )
+                    elif agent_result is not None and not budget.expired:
+                        coverage_gaps.append(
+                            "Adversarial review was skipped to preserve the final-evaluation "
+                            "budget."
+                        )
                     completed_rounds = 0
                     while (
                         agent_result
@@ -1833,6 +1883,7 @@ class ScanOrchestrator:
                                     requested_lease["wait_seconds"],
                                     maximum_deadline=scan_deadline,
                                 )
+                                round_target_installed = False
                                 try:
                                     round_prepare = self.device.prepare(
                                         Path(scan.artifact_path),
@@ -1844,6 +1895,11 @@ class ScanOrchestrator:
                                         task_id,
                                         round_prepare,
                                         evidence_summaries,
+                                    )
+                                    round_target_installed = any(
+                                        kind == "device.install"
+                                        and result.exit_code == 0
+                                        for kind, result, _metadata in round_prepare
                                     )
                                     round_critical = {
                                         kind: result
@@ -1882,13 +1938,14 @@ class ScanOrchestrator:
                                             poc_artifacts=poc_artifacts,
                                         )
                                 finally:
-                                    cleanup = self.device.cleanup(package_name)
-                                    self._record_commands(
-                                        scan_id,
-                                        task_id,
-                                        cleanup,
-                                        None,
-                                    )
+                                    if round_target_installed:
+                                        cleanup = self.device.cleanup(package_name)
+                                        self._record_commands(
+                                            scan_id,
+                                            task_id,
+                                            cleanup,
+                                            None,
+                                        )
                             executed_agent_tests.extend(executed_this_round)
                             coverage_gaps.extend(execution_gaps)
                             stages["instrumented_attempted"] = (
@@ -1921,9 +1978,22 @@ class ScanOrchestrator:
                             or completed_rounds >= self.settings.agent_max_rounds
                         ):
                             break
+                        exploration_budget = min(
+                            AGENT_PLANNING_TIMEOUT_CAP_SECONDS,
+                            max(
+                                0,
+                                budget.remaining() - AGENT_FINAL_RESERVE_SECONDS,
+                            ),
+                        )
+                        if exploration_budget < AGENT_MIN_OPTIONAL_PHASE_SECONDS:
+                            coverage_gaps.append(
+                                "Adaptive AI exploration was skipped to preserve the "
+                                "final-evaluation budget."
+                            )
+                            break
                         next_result, next_error = invoke_agent(
                             phase="exploration_round",
-                            timeout_cap=max(1, budget.remaining() // 2),
+                            timeout_cap=exploration_budget,
                             executed_tests=executed_agent_tests,
                             round_index=completed_rounds,
                         )
@@ -1945,9 +2015,17 @@ class ScanOrchestrator:
                             "Further AI-requested tests were not executed because the configured "
                             "adaptive exploration round limit was reached."
                         )
-                    if (executed_agent_tests or debate_context) and not budget.expired:
+                    final_budget = min(
+                        AGENT_FINAL_TIMEOUT_CAP_SECONDS,
+                        budget.remaining(),
+                    )
+                    if (
+                        (executed_agent_tests or debate_context)
+                        and final_budget >= AGENT_MIN_OPTIONAL_PHASE_SECONDS
+                    ):
                         final_result, final_error = invoke_agent(
                             phase="final_evaluation",
+                            timeout_cap=final_budget,
                             executed_tests=executed_agent_tests,
                             round_index=completed_rounds,
                         )
@@ -1964,6 +2042,12 @@ class ScanOrchestrator:
                                 "Final AI evaluation failed; retained the latest exploration result: "
                                 f"{final_error}"
                             )
+                    elif (executed_agent_tests or debate_context) and not budget.expired:
+                        coverage_gaps.append(
+                            "Final AI evaluation was skipped because less than "
+                            f"{AGENT_MIN_OPTIONAL_PHASE_SECONDS} seconds remained; retained "
+                            "the latest validated planning result."
+                        )
                 except AgentCancelledError:
                     raise
                 except Exception as exc:
@@ -1983,7 +2067,7 @@ class ScanOrchestrator:
                             evidence_summaries,
                         )
                     if device_session is not None:
-                        if prepared or stages["device_attempted"]:
+                        if target_installed:
                             cleanup = self.device.cleanup(package_name)
                             self._record_commands(
                                 scan_id,
@@ -1996,7 +2080,10 @@ class ScanOrchestrator:
                         failed_device_session.__exit__(None, None, None)
                     coverage_gaps.append(f"Dynamic investigation failed safely: {exc}")
                     if agent_result is None:
-                        agent_result, agent_error = invoke_agent(phase="recovery_evaluation")
+                        agent_result, agent_error = invoke_agent(
+                            phase="recovery_evaluation",
+                            timeout_cap=AGENT_FINAL_TIMEOUT_CAP_SECONDS,
+                        )
                 finally:
                     if frida_session is not None:
                         frida_result = self.frida.collect(frida_session)
@@ -2012,9 +2099,7 @@ class ScanOrchestrator:
                             ],
                             evidence_summaries,
                         )
-                    if device_session is not None and (
-                        prepared or stages["device_attempted"]
-                    ):
+                    if device_session is not None and target_installed:
                         cleanup = self.device.cleanup(package_name)
                         self._record_commands(scan_id, task_id, cleanup, None)
                     if device_session is not None:
@@ -2833,9 +2918,6 @@ class ScanOrchestrator:
         phase: str,
         capability: dict[str, Any],
     ) -> str:
-        direct_tool_access = backend in {"codex", "opencode"}
-        shell_access = backend in {"codex", "opencode"}
-        workspace_write = backend == "opencode"
         provider = "openai" if backend == "codex" else "deepseek"
         model = (
             self.settings.codex_worker_model
@@ -2846,10 +2928,18 @@ class ScanOrchestrator:
             opencode_execution_profile(
                 phase,
                 reasoning_effort=self.settings.opencode_reasoning_effort,
+                enable_thinking_explorer=self.settings.opencode_thinking_explorer,
             )
             if backend == "opencode"
             else None
         )
+        opencode_workspace_tools = bool(
+            execution_profile
+            and any(stage.workspace_tools for stage in execution_profile.stages)
+        )
+        direct_tool_access = backend == "codex" or opencode_workspace_tools
+        shell_access = backend == "codex" or opencode_workspace_tools
+        workspace_write = backend == "opencode" and opencode_workspace_tools
         output_mode = (
             execution_profile.output_mode
             if execution_profile is not None
@@ -2933,14 +3023,16 @@ class ScanOrchestrator:
             "output_schema": AGENT_RESULT_JSON_SCHEMA,
             "tool_boundary": {
                 "direct_tool_access": direct_tool_access,
-                "model_tools_enabled": backend in {"codex", "opencode"},
+                "model_tools_enabled": direct_tool_access,
                 "workspace_tool_profile": (
                     OPENCODE_TOOL_PROFILE if backend == "opencode" else "codex_readonly"
                 ),
                 "workspace_tools": (
                     list(OPENCODE_WORKSPACE_TOOLS)
-                    if backend == "opencode"
+                    if backend == "opencode" and opencode_workspace_tools
                     else ["file", "shell"]
+                    if backend == "codex"
+                    else []
                 ),
                 "shell_enabled": shell_access,
                 "write_enabled": workspace_write,
@@ -2952,7 +3044,7 @@ class ScanOrchestrator:
                 "network_enabled": backend == "opencode",
                 "network_policy": (
                     "container_bridge; target requests prohibited by developer instructions"
-                    if backend == "opencode"
+                    if backend == "opencode" and opencode_workspace_tools
                     else "sandbox_disabled"
                 ),
                 "adb_enabled": False,

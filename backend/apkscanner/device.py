@@ -135,6 +135,8 @@ class SingleDeviceScheduler:
 class AdbDeviceAdapter:
     """Serialized remote-ADB adapter for the single-device MVP."""
 
+    NON_BLOCKING_CAPABILITY_TTL_SECONDS = 30.0
+
     def __init__(self, settings: Settings, runner: ToolRunner):
         self.settings = settings
         self.runner = runner
@@ -142,6 +144,7 @@ class AdbDeviceAdapter:
         self._lease = threading.RLock()
         self.scheduler = SingleDeviceScheduler()
         self._last_capability: dict[str, Any] | None = None
+        self._last_capability_at: float | None = None
         self._active_cancel_event: threading.Event | None = None
         self.credentials = CredentialStore()
         self.auth_flow_error: str | None = None
@@ -213,6 +216,18 @@ class AdbDeviceAdapter:
                 active_task_id=active_task_id,
                 waiting_count=len(scheduler_state["waiting"]),
             )
+        if (
+            non_blocking
+            and self._last_capability is not None
+            and self._last_capability_at is not None
+        ):
+            age = max(0.0, time.monotonic() - self._last_capability_at)
+            if age < self.NON_BLOCKING_CAPABILITY_TTL_SECONDS:
+                return {
+                    **self._last_capability,
+                    "cached": True,
+                    "cache_age_seconds": round(age, 3),
+                }
         if non_blocking:
             acquired = self._lease.acquire(blocking=False)
             if not acquired:
@@ -261,6 +276,7 @@ class AdbDeviceAdapter:
                 "detail": state.stderr.strip() or "ADB device is unavailable",
             }
             self._last_capability = dict(result)
+            self._last_capability_at = time.monotonic()
             return result
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="adb-capability") as executor:
             version_future = executor.submit(
@@ -292,6 +308,7 @@ class AdbDeviceAdapter:
             "detail": detail,
         }
         self._last_capability = dict(result)
+        self._last_capability_at = time.monotonic()
         return result
 
     def auth_capability(self, package_name: str | None = None) -> dict[str, Any]:
@@ -331,14 +348,20 @@ class AdbDeviceAdapter:
     ) -> list[tuple[str, CommandResult, dict]]:
         self._validate_package(package_name)
         commands: list[tuple[str, CommandResult, dict]] = []
-        commands.append(("device.health", self._adb_budget(["get-state"], budget, 30), {}))
+        health = self._adb_budget(["get-state"], budget, 30)
+        commands.append(("device.health", health, {}))
+        if health.exit_code != 0:
+            return commands
+        install = self._adb_budget(["install", "-r", "-t", str(apk_path)], budget, 300)
         commands.append(
             (
                 "device.install",
-                self._adb_budget(["install", "-r", "-t", str(apk_path)], budget, 300),
+                install,
                 {"package": package_name},
             )
         )
+        if install.exit_code != 0:
+            return commands
         if self.settings.probe_apk_path and self.settings.probe_apk_path.is_file():
             commands.append(
                 (

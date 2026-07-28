@@ -747,6 +747,108 @@ test("semantic validation rejects inconclusive risk ratings and retries independ
   }
 })
 
+test("semantic validation rejects requested tests outside platform-issued IDs", async () => {
+  const requests = []
+  const allowedHypothesis = "11111111-1111-1111-1111-111111111111"
+  const allowedEntry = "22222222-2222-2222-2222-222222222222"
+  const requestSchema = {
+    type: "object",
+    properties: {
+      result: { type: "string", const: "inconclusive" },
+      severity_proposal: { type: "string", const: "info" },
+      confidence: { type: "string", const: "low" },
+      evidence_ids: { type: "array", items: { type: "string" } },
+      requested_tests: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            hypothesis_id: { type: "string" },
+            entry_point_id: { type: "string" },
+          },
+          required: ["hypothesis_id", "entry_point_id"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: [
+      "result",
+      "severity_proposal",
+      "confidence",
+      "evidence_ids",
+      "requested_tests",
+    ],
+    additionalProperties: false,
+  }
+  const base = {
+    result: "inconclusive",
+    severity_proposal: "info",
+    confidence: "low",
+    evidence_ids: [],
+  }
+  const invalid = {
+    ...base,
+    requested_tests: [
+      {
+        hypothesis_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        entry_point_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      },
+    ],
+  }
+  const corrected = {
+    ...base,
+    requested_tests: [
+      {
+        hypothesis_id: allowedHypothesis,
+        entry_point_id: allowedEntry,
+      },
+    ],
+  }
+  const api = createServer(async (request, response) => {
+    const body = await readJSON(request)
+    requests.push({ url: request.url, body })
+    sendCompletion(response, body, {
+      id: `bounded-id-${requests.length}`,
+      toolCalls: [
+        structuredOutputCall(requests.length === 1 ? invalid : corrected),
+      ],
+      finish: "tool_calls",
+    })
+  })
+  await listen(api)
+  const address = api.address()
+  assert(address && typeof address !== "string")
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-bounded-id-test-"))
+  try {
+    const completed = await runWorker(
+      root,
+      investigationPayload({
+        baseURL: `http://127.0.0.1:${address.port}`,
+        profile: finalizerProfile(),
+        outputSchema: requestSchema,
+        allowedHypothesisIDs: [allowedHypothesis],
+        allowedEntryPointIDs: [allowedEntry],
+      }),
+    )
+    assert.equal(completed.code, 0, completed.stderr)
+    const { result } = parseWorkerOutput(completed.stdout)
+    assert.deepEqual(result.result, corrected)
+    assert.equal(requests.length, 2)
+    assert.deepEqual(
+      result.output_transport.model_calls[0].validation_errors.map(
+        (item) => item.instance_path,
+      ),
+      [
+        "/requested_tests/0/hypothesis_id",
+        "/requested_tests/0/entry_point_id",
+      ],
+    )
+  } finally {
+    api.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 function investigationPayload({
   baseURL,
   profile,
@@ -754,6 +856,8 @@ function investigationPayload({
   phase = "test_planning",
   outputSchema = resultSchema,
   timeoutMs = 30_000,
+  allowedHypothesisIDs = [],
+  allowedEntryPointIDs = [],
 }) {
   return {
     schema_version: "1.0",
@@ -769,6 +873,8 @@ function investigationPayload({
     output_schema: outputSchema,
     execution_profile: profile,
     timeout_ms: timeoutMs,
+    allowed_hypothesis_ids: allowedHypothesisIDs,
+    allowed_entry_point_ids: allowedEntryPointIDs,
   }
 }
 

@@ -18,3 +18,4 @@ opencode-worker/node_modules/
 .vscode
 start.sh
 opencode-worker/bin/
+testapk/

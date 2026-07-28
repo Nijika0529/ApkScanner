@@ -59,6 +59,28 @@ def test_tool_runner_cancels_an_active_process_group() -> None:
     assert result_holder[0].canceled is True
 
 
+def test_tool_runner_shutdown_cancels_active_and_future_commands() -> None:
+    runner = ToolRunner(timeout_seconds=10)
+    result_holder = []
+
+    def run_command() -> None:
+        result_holder.append(
+            runner.run([sys.executable, "-c", "import time; time.sleep(10)"])
+        )
+
+    worker = threading.Thread(target=run_command)
+    worker.start()
+    time.sleep(0.15)
+    runner.shutdown()
+    worker.join(timeout=3)
+
+    assert not worker.is_alive()
+    assert result_holder[0].canceled is True
+    refused = runner.run([sys.executable, "-c", "raise SystemExit(0)"])
+    assert refused.canceled is True
+    assert refused.exit_code == 130
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux /proc process-state checks")
 def test_tool_runner_timeout_kills_the_spawned_process_group() -> None:
     runner = ToolRunner(timeout_seconds=10)

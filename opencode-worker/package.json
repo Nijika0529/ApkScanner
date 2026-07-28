@@ -8,7 +8,7 @@
   },
   "scripts": {
     "check": "node --check worker.mjs",
-    "test": "node --test worker.integration.test.mjs"
+    "test": "node --test --test-concurrency=1 worker.integration.test.mjs"
   },
   "dependencies": {
     "@opencode-ai/sdk": "1.18.4",

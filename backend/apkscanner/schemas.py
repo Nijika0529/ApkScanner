@@ -229,10 +229,7 @@ class AgentPocSpec(BaseModel):
 class AgentRequestedTest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    hypothesis_id: str | None = Field(
-        default=None,
-        pattern=r"^[a-f0-9-]{36}$",
-    )
+    hypothesis_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
     entry_point_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
     state: Literal["guest", "authenticated"]
     uri: str | None = Field(max_length=4096)

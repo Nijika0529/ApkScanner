@@ -851,16 +851,11 @@ def test_opencode_audit_records_explicit_phase_execution_profile(settings) -> No
         capability={"version": "1.18.4"},
     )
     transport = {
-        "mode": "analyze_then_finalize",
-        "profile": "stable_analyzer",
+        "mode": "structured_output_tool",
+        "profile": "structured_finalizer",
         "format": "json_schema",
-        "request_mode": "async_analysis_then_sync_finalize",
+        "request_mode": "prompt_sync",
         "stages": [
-            {
-                "name": "analyzer",
-                "thinking_mode": "disabled",
-                "wire_tool_choice": "auto",
-            },
             {
                 "name": "finalizer",
                 "thinking_mode": "disabled",
@@ -871,10 +866,10 @@ def test_opencode_audit_records_explicit_phase_execution_profile(settings) -> No
         "structured_retry_count": 2,
         "model_calls": [
             {
-                "stage": "analyzer",
+                "stage": "finalizer",
                 "attempt": 1,
                 "prompt": "exact model prompt",
-                "response_text": "evidence memo",
+                "response_text": "",
                 "accepted": True,
             }
         ],
@@ -912,10 +907,10 @@ def test_opencode_audit_records_explicit_phase_execution_profile(settings) -> No
         assert response.status_code == 200
         audit = response.json()[0]
         request = audit["artifacts"]["request"]["content"]
-        assert request["runtime_options"]["output_mode"] == "analyze_then_finalize"
+        assert request["runtime_options"]["output_mode"] == "structured_output_tool"
         assert (
             request["runtime_options"]["execution_profile"]["name"]
-            == "stable_analyzer"
+            == "structured_finalizer"
         )
         assert (
             request["runtime_options"]["execution_profile"]["stages"][0][
@@ -927,26 +922,18 @@ def test_opencode_audit_records_explicit_phase_execution_profile(settings) -> No
         assert request["runtime_options"]["semantic_validator"] == "apkscanner@1.0"
         assert request["runtime_options"]["max_agent_steps"] == 1_000
         assert request["runtime_options"]["max_provider_requests"] == 1_100
-        assert request["tool_boundary"]["model_tools_enabled"] is True
+        assert request["tool_boundary"]["model_tools_enabled"] is False
         assert request["tool_boundary"]["workspace_tool_profile"] == "workspace_shell"
-        assert request["tool_boundary"]["workspace_tools"] == [
-            "read",
-            "glob",
-            "grep",
-            "bash",
-        ]
-        assert request["tool_boundary"]["shell_enabled"] is True
-        assert request["tool_boundary"]["write_enabled"] is True
+        assert request["tool_boundary"]["workspace_tools"] == []
+        assert request["tool_boundary"]["shell_enabled"] is False
+        assert request["tool_boundary"]["write_enabled"] is False
         assert request["tool_boundary"]["native_write_tools_enabled"] is False
-        assert request["tool_boundary"]["allowed_write_roots"] == [
-            "task_attempt_workspace",
-            "/tmp",
-        ]
+        assert request["tool_boundary"]["allowed_write_roots"] == []
         assert request["tool_boundary"]["shared_scan_workspace_exposed"] is False
         assert request["tool_boundary"]["adb_enabled"] is False
         assert request["tool_boundary"]["structured_output_tool_enabled"] is True
         assert "DEEPSEEK_THINKING_OUTPUT_ADAPTER" not in request["prompt"]
-        assert "analysis memo" in request["explorer_prompt"]
+        assert request["explorer_prompt"] is None
         recorded_transport = audit["artifacts"]["response"]["content"][
             "output_transport"
         ]
