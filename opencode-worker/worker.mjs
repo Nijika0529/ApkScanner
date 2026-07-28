@@ -27,6 +27,12 @@ const MAX_EXPLORER_MEMO_BYTES = 128 * 1024
 const LOCAL_POLL_INTERVAL_MS = 250
 const LOCAL_READ_RETRY_COUNT = 3
 const SANITIZED_BASH = fileURLToPath(new URL("./bin/bash", import.meta.url))
+const PROVIDER_API_KEY_FIELD = "_provider_api_key"
+const PROVIDER_API_KEY_IN_ENVIRONMENT = Object.prototype.hasOwnProperty.call(
+  process.env,
+  "DEEPSEEK_API_KEY",
+)
+delete process.env.DEEPSEEK_API_KEY
 
 let server
 let sessionID
@@ -42,13 +48,15 @@ let providerRequestCount = 0
 let providerRequestLimit = DEFAULT_MAX_AGENT_STEPS + PROVIDER_REQUEST_HEADROOM
 
 async function main() {
-  const payload = validatePayload(await readPayload())
-  providerRequestLimit = payload.max_agent_steps + PROVIDER_REQUEST_HEADROOM
-  providerAPIKey = process.env.DEEPSEEK_API_KEY?.trim()
-  if (!providerAPIKey) {
-    throw new Error("DEEPSEEK_API_KEY is not configured")
+  if (PROVIDER_API_KEY_IN_ENVIRONMENT) {
+    throw new Error(
+      `DEEPSEEK_API_KEY environment delivery is not supported; use ${PROVIDER_API_KEY_FIELD}`,
+    )
   }
-  delete process.env.DEEPSEEK_API_KEY
+  const rawPayload = await readPayload()
+  providerAPIKey = takeProviderAPIKey(rawPayload)
+  const payload = validatePayload(rawPayload)
+  providerRequestLimit = payload.max_agent_steps + PROVIDER_REQUEST_HEADROOM
   loopbackProxyAPIKey = randomBytes(32).toString("hex")
   workerDeadline = Date.now() + payload.timeout_ms
   const controller = new AbortController()
@@ -1070,6 +1078,18 @@ async function readPayload() {
   } catch {
     throw new Error("OpenCode worker input is not valid JSON")
   }
+}
+
+function takeProviderAPIKey(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("OpenCode worker payload must be an object")
+  }
+  const candidate = value[PROVIDER_API_KEY_FIELD]
+  delete value[PROVIDER_API_KEY_FIELD]
+  if (typeof candidate !== "string" || !candidate.trim()) {
+    throw new Error(`OpenCode worker ${PROVIDER_API_KEY_FIELD} is missing or empty`)
+  }
+  return candidate.trim()
 }
 
 function validatePayload(value) {

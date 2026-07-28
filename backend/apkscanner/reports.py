@@ -105,6 +105,7 @@ class ReportBuilder:
                 "signing": scan.signing,
                 "tool_versions": scan.tool_versions,
                 "stats": scan.stats,
+                "error": scan.error,
                 "preliminary_at": scan.preliminary_at.isoformat() if scan.preliminary_at else None,
                 "completed_at": scan.completed_at.isoformat() if scan.completed_at else None,
                 "limitations": [
@@ -141,6 +142,7 @@ class ReportBuilder:
             "permission_protection": item.permission_protection,
             "intent_filters": item.intent_filters,
             "deep_links": item.deep_links,
+            "code_anchors": item.code_anchors,
             "metadata": item.metadata_json,
         }
 

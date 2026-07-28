@@ -15,8 +15,11 @@ class InvestigationPlanner:
         tasks: list[InvestigationTask] = []
         deep_links_by_owner: dict[str, list[EntryPoint]] = defaultdict(list)
         for entry in entries:
+            if (entry.metadata_json or {}).get("effective_enabled") is False:
+                continue
             if entry.kind == EntryPointKind.DEEP_LINK.value:
-                deep_links_by_owner[entry.owner_component or entry.name].append(entry)
+                if entry.exported:
+                    deep_links_by_owner[entry.owner_component or entry.name].append(entry)
                 continue
             if not entry.exported:
                 continue

@@ -26,7 +26,11 @@ class AuthStep(BaseModel):
             "tap": self.x is not None and self.y is not None,
             "text": (self.secret is None) != (self.value is None),
             "keyevent": self.keycode is not None,
-            "assert_text": self.value is not None and self.secret is None,
+            "assert_text": (
+                self.value is not None
+                and bool(self.value.strip())
+                and self.secret is None
+            ),
         }
         if self.action in required and not required[self.action]:
             raise ValueError(f"auth step {self.action!r} is missing required fields")

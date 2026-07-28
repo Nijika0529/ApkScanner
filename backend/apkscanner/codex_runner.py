@@ -375,6 +375,7 @@ class CodexInvestigator:
                 on_timeout=stop_container,
                 cancel_event=cancel_event,
                 on_cancel=stop_container,
+                on_error_cleanup=stop_container,
             )
         except WorkerCancelledError as exc:
             raise AgentCancelledError(

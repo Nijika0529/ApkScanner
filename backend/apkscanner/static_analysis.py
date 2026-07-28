@@ -10,6 +10,7 @@ from typing import Any
 
 from .config import Settings
 from .manifest import ManifestDocument, parse_manifest
+from .permissions import ensure_private_directory
 from .tools import CommandResult, TimeBudget, ToolRunner, discover_tools
 
 
@@ -40,7 +41,7 @@ class ApkInspector:
     ) -> StaticAnalysisResult:
         file_inventory = self._validate_zip(apk_path)
         workspace = self.settings.data_dir / "workspaces" / scan_id
-        workspace.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(workspace)
         tool_versions = discover_tools(self.runner)
         tool_results: dict[str, dict[str, Any]] = {}
         decoded_dir = workspace / "apktool"

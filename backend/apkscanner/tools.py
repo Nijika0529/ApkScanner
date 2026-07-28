@@ -6,6 +6,7 @@ import signal
 import subprocess
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -84,40 +85,13 @@ class ToolRunner:
         if env:
             command_env.update(env)
         effective_timeout = self.timeout_seconds if timeout is None else timeout
-        if cancel_event is not None:
-            return self._run_cancelable(
-                argv,
-                cwd=cwd,
-                env=command_env,
-                timeout=effective_timeout,
-                cancel_event=cancel_event,
-            )
-        try:
-            completed = subprocess.run(
-                argv,
-                cwd=cwd,
-                env=command_env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=effective_timeout,
-                check=False,
-            )
-            return CommandResult(
-                argv=argv,
-                exit_code=completed.returncode,
-                stdout=completed.stdout[-self.max_output_chars :],
-                stderr=completed.stderr[-self.max_output_chars :],
-            )
-        except subprocess.TimeoutExpired as exc:
-            return CommandResult(
-                argv=argv,
-                exit_code=124,
-                stdout=self._decode_timeout(exc.stdout),
-                stderr=self._decode_timeout(exc.stderr) or "command timed out",
-                timed_out=True,
-            )
+        return self._run_cancelable(
+            argv,
+            cwd=cwd,
+            env=command_env,
+            timeout=effective_timeout,
+            cancel_event=cancel_event or threading.Event(),
+        )
 
     def _run_cancelable(
         self,
@@ -128,6 +102,15 @@ class ToolRunner:
         timeout: int,
         cancel_event: threading.Event,
     ) -> CommandResult:
+        process_options: dict[str, object] = {}
+        if os.name == "posix":
+            process_options["start_new_session"] = True
+        elif os.name == "nt":
+            process_options["creationflags"] = getattr(
+                subprocess,
+                "CREATE_NEW_PROCESS_GROUP",
+                0,
+            )
         process = subprocess.Popen(
             argv,
             cwd=cwd,
@@ -137,7 +120,7 @@ class ToolRunner:
             text=True,
             encoding="utf-8",
             errors="replace",
-            start_new_session=True,
+            **process_options,
         )
         deadline = time.monotonic() + timeout
         while True:
@@ -173,24 +156,45 @@ class ToolRunner:
 
     @staticmethod
     def _terminate(process: subprocess.Popen[str]) -> tuple[str, str]:
-        try:
+        def signal_process_group(*, force: bool) -> None:
             if os.name == "posix":
-                os.killpg(process.pid, signal.SIGTERM)
-            else:
-                process.terminate()
-        except ProcessLookupError:
-            pass
+                requested_signal = signal.SIGKILL if force else signal.SIGTERM
+                try:
+                    os.killpg(process.pid, requested_signal)
+                    return
+                except OSError:
+                    pass
+            if process.poll() is None:
+                try:
+                    if force:
+                        process.kill()
+                    else:
+                        process.terminate()
+                except OSError:
+                    pass
+
+        signal_process_group(force=False)
         try:
             return process.communicate(timeout=2)
         except subprocess.TimeoutExpired:
+            signal_process_group(force=True)
             try:
-                if os.name == "posix":
-                    os.killpg(process.pid, signal.SIGKILL)
-                else:
-                    process.kill()
-            except ProcessLookupError:
-                pass
-            return process.communicate()
+                return process.communicate(timeout=2)
+            except subprocess.TimeoutExpired as exc:
+                stdout = ToolRunner._decode_timeout(exc.stdout)
+                stderr = ToolRunner._decode_timeout(exc.stderr)
+                if process.poll() is None:
+                    with suppress(OSError):
+                        process.kill()
+                if process.stdout is not None:
+                    with suppress(OSError):
+                        process.stdout.close()
+                if process.stderr is not None:
+                    with suppress(OSError):
+                        process.stderr.close()
+                with suppress(Exception):
+                    process.wait(timeout=1)
+                return stdout, stderr
 
     @staticmethod
     def _decode_timeout(value: str | bytes | None) -> str:

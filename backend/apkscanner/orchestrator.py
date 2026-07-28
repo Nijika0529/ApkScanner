@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from .agent_events import AgentCancelledError, AgentRuntimeEvent
 from .agent_prompt import developer_instructions, investigation_prompt
@@ -1005,6 +1005,7 @@ class ScanOrchestrator:
             while not self._agent_slots.acquire(timeout=0.25):
                 self._raise_if_cancelled(cancel_event)
             slot_acquired = True
+            self._raise_if_cancelled(cancel_event)
             self._run_task_impl(
                 scan_id,
                 task_id,
@@ -1032,14 +1033,59 @@ class ScanOrchestrator:
             scan = session.get(Scan, scan_id)
             task = session.get(InvestigationTask, task_id)
             assert scan is not None and task is not None
+            if task.scan_id != scan.id:
+                raise ValueError("investigation task does not belong to the selected scan")
             if task.status not in {
                 TaskStatus.QUEUED.value,
                 TaskStatus.RUNNING.value,
             }:
                 return
             entries = list(
-                session.scalars(select(EntryPoint).where(EntryPoint.id.in_(task.target_entry_ids)))
+                session.scalars(
+                    select(EntryPoint).where(
+                        EntryPoint.scan_id == scan.id,
+                        EntryPoint.id.in_(task.target_entry_ids),
+                    )
+                )
             )
+            loaded_entry_ids = {entry.id for entry in entries}
+            expected_entry_ids = set(task.target_entry_ids)
+            if not expected_entry_ids or loaded_entry_ids != expected_entry_ids:
+                transition = session.execute(
+                    update(InvestigationTask)
+                    .where(
+                        InvestigationTask.id == task_id,
+                        InvestigationTask.scan_id == scan_id,
+                        InvestigationTask.status.in_(
+                            [TaskStatus.QUEUED.value, TaskStatus.RUNNING.value]
+                        ),
+                    )
+                    .values(
+                        status=TaskStatus.FAILED.value,
+                        error=(
+                            "Investigation task references missing entry points or "
+                            "entry points outside its scan"
+                        ),
+                        completed_at=now(),
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                if transition.rowcount == 1:
+                    add_event(
+                        session,
+                        scan_id,
+                        "task.failed",
+                        "Investigation stopped because its entry-point references are invalid",
+                        {
+                            "task_id": task.id,
+                            "expected_entry_point_ids": sorted(expected_entry_ids),
+                            "loaded_entry_point_ids": sorted(loaded_entry_ids),
+                        },
+                    )
+                    session.commit()
+                else:
+                    session.rollback()
+                return
             persisted_task_result = dict(task.result or {})
             continuation_context = dict(
                 persisted_task_result.get("manual_continuation") or {}
@@ -2021,43 +2067,132 @@ class ScanOrchestrator:
                 raw_payload=raw_payload,
                 validated_payload=validated_payload,
             )
-            self.hypothesis_ledger.finalize(
-                task_id=task_id,
-                payload=validated_payload,
-                result_value=validated_result_value,
-                backend=agent_backend,
-                model=(
-                    self.settings.codex_worker_model
-                    if agent_backend == "codex"
-                    else self.settings.opencode_model
-                ),
-            )
 
         with self.database.session_factory() as session:
             task = session.get(InvestigationTask, task_id)
             scan = session.get(Scan, scan_id)
             assert task is not None and scan is not None
             existing_result = dict(task.result or {})
+            terminal_values: dict[str, Any] = {
+                "completed_at": now(),
+            }
             if agent_result:
                 assert validated_payload is not None
                 assert validated_result_value is not None
                 payload = validated_payload
                 result_value = validated_result_value
-                task.thread_id = agent_result.thread_id
-                task.turn_id = agent_result.turn_id
-                task.result = {
-                    **existing_result,
-                    **payload,
-                    "result": result_value,
-                    "agent_backend": agent_backend,
-                    "usage": agent_result.usage,
-                    "platform_context": {
-                        "device": device_capability,
-                        "authentication": auth_capability,
-                        "frida": frida_capability,
-                        "executed_agent_tests": executed_agent_tests,
+                terminal_values.update(
+                    {
+                        "thread_id": agent_result.thread_id,
+                        "turn_id": agent_result.turn_id,
+                        "result": {
+                            **existing_result,
+                            **payload,
+                            "result": result_value,
+                            "agent_backend": agent_backend,
+                            "usage": agent_result.usage,
+                            "platform_context": {
+                                "device": device_capability,
+                                "authentication": auth_capability,
+                                "frida": frida_capability,
+                                "executed_agent_tests": executed_agent_tests,
+                            },
+                        },
+                        "status": (
+                            TaskStatus.NOT_REPRODUCED.value
+                            if result_value == FindingStatus.NOT_REPRODUCED.value
+                            else TaskStatus.COMPLETED.value
+                        ),
                     },
-                }
+                )
+            elif budget.expired:
+                terminal_values.update(
+                    {
+                        "status": TaskStatus.TIMED_OUT.value,
+                        "error": agent_error or "task time budget exhausted",
+                        "result": {
+                            **existing_result,
+                            "deterministic_evidence": evidence_summaries,
+                            "coverage_gaps": coverage_gaps,
+                            "agent_backend": agent_backend,
+                        },
+                    },
+                )
+            elif stages["device_attempted"]:
+                terminal_values.update(
+                    {
+                        "status": TaskStatus.INCONCLUSIVE.value,
+                        "error": agent_error,
+                        "result": {
+                            **existing_result,
+                            "deterministic_evidence": evidence_summaries,
+                            "coverage_gaps": [
+                                *coverage_gaps,
+                                (
+                                    f"{agent_backend} semantic investigation was "
+                                    "disabled or unavailable."
+                                ),
+                            ],
+                            "agent_backend": agent_backend,
+                        },
+                    },
+                )
+            else:
+                terminal_values.update(
+                    {
+                        "status": TaskStatus.BLOCKED_DEVICE.value,
+                        "error": agent_error or str(device_capability.get("detail")),
+                        "result": {
+                            **existing_result,
+                            "coverage_gaps": coverage_gaps,
+                            "static_agent_attempted": agent_enabled,
+                            "agent_backend": agent_backend,
+                        },
+                    },
+                )
+
+            transition = session.execute(
+                update(InvestigationTask)
+                .where(
+                    InvestigationTask.id == task_id,
+                    InvestigationTask.status == TaskStatus.RUNNING.value,
+                )
+                .values(**terminal_values)
+                .execution_options(synchronize_session=False)
+            )
+            if transition.rowcount != 1:
+                session.rollback()
+                current_status = session.scalar(
+                    select(InvestigationTask.status).where(
+                        InvestigationTask.id == task_id
+                    )
+                )
+                if current_status in {
+                    TaskStatus.CANCEL_REQUESTED.value,
+                    TaskStatus.DELETED.value,
+                }:
+                    raise AgentCancelledError(
+                        "task cancellation won the terminal-state transition"
+                    )
+                return
+
+            # The conditional update is the task's terminal-state linearization
+            # point. All terminal findings, coverage, and events are written in
+            # the same transaction only after that transition succeeds.
+            session.refresh(task)
+            if agent_result:
+                self.hypothesis_ledger.finalize(
+                    task_id=task_id,
+                    payload=payload,
+                    result_value=result_value,
+                    backend=agent_backend,
+                    model=(
+                        self.settings.codex_worker_model
+                        if agent_backend == "codex"
+                        else self.settings.opencode_model
+                    ),
+                    session=session,
+                )
                 add_event(
                     session,
                     scan_id,
@@ -2074,11 +2209,6 @@ class ScanOrchestrator:
                         "evidence_ids": payload.get("evidence_ids", []),
                     },
                 )
-                task.status = (
-                    TaskStatus.NOT_REPRODUCED.value
-                    if result_value == FindingStatus.NOT_REPRODUCED.value
-                    else TaskStatus.COMPLETED.value
-                )
                 self._supersede_prior_agent_findings(
                     session, task, result_value, agent_backend
                 )
@@ -2090,37 +2220,6 @@ class ScanOrchestrator:
                     result_value,
                     agent_backend,
                 )
-            elif budget.expired:
-                task.status = TaskStatus.TIMED_OUT.value
-                task.error = agent_error or "task time budget exhausted"
-                task.result = {
-                    **existing_result,
-                    "deterministic_evidence": evidence_summaries,
-                    "coverage_gaps": coverage_gaps,
-                    "agent_backend": agent_backend,
-                }
-            elif stages["device_attempted"]:
-                task.status = TaskStatus.INCONCLUSIVE.value
-                task.error = agent_error
-                task.result = {
-                    **existing_result,
-                    "deterministic_evidence": evidence_summaries,
-                    "coverage_gaps": [
-                        *coverage_gaps,
-                        f"{agent_backend} semantic investigation was disabled or unavailable.",
-                    ],
-                    "agent_backend": agent_backend,
-                }
-            else:
-                task.status = TaskStatus.BLOCKED_DEVICE.value
-                task.error = agent_error or str(device_capability.get("detail"))
-                task.result = {
-                    **existing_result,
-                    "coverage_gaps": coverage_gaps,
-                    "static_agent_attempted": agent_enabled,
-                    "agent_backend": agent_backend,
-                }
-            task.completed_at = now()
             self._update_entry_coverage(
                 session,
                 scan_id,
@@ -2162,19 +2261,83 @@ class ScanOrchestrator:
 
     def _mark_task_canceled(self, scan_id: str, task_id: str) -> None:
         with self.database.session_factory() as session:
-            task = session.get(InvestigationTask, task_id)
-            if task is None:
+            for _attempt in range(3):
+                task = session.get(InvestigationTask, task_id)
+                if task is None:
+                    return
+                observed_status = task.status
+                completed_at = now()
+                existing_cancellation = dict(
+                    (task.result or {}).get("cancellation") or {}
+                )
+                if observed_status == TaskStatus.DELETED.value:
+                    cancellation_result = {
+                        **dict(task.result or {}),
+                        "cancellation": {
+                            **existing_cancellation,
+                            "requested": True,
+                            "acknowledged": True,
+                            "completed_at": completed_at.isoformat(),
+                        },
+                    }
+                    transition_values = {"result": cancellation_result}
+                elif observed_status in {
+                    TaskStatus.QUEUED.value,
+                    TaskStatus.RUNNING.value,
+                    TaskStatus.AWAITING_DEVICE.value,
+                    TaskStatus.CANCEL_REQUESTED.value,
+                }:
+                    cancellation_result = {
+                        **dict(task.result or {}),
+                        "cancellation": {
+                            **existing_cancellation,
+                            "requested": True,
+                            "acknowledged": True,
+                            "completed_at": completed_at.isoformat(),
+                        },
+                    }
+                    transition_values = {
+                        "status": TaskStatus.CANCELED.value,
+                        "error": "用户已停止本次分析",
+                        "completed_at": completed_at,
+                        "result": cancellation_result,
+                    }
+                elif (
+                    observed_status == TaskStatus.CANCELED.value
+                    and existing_cancellation.get("requested") is True
+                    and "completed_at" not in existing_cancellation
+                ):
+                    cancellation_result = {
+                        **dict(task.result or {}),
+                        "cancellation": {
+                            **existing_cancellation,
+                            "acknowledged": True,
+                            "completed_at": completed_at.isoformat(),
+                        },
+                    }
+                    transition_values = {"result": cancellation_result}
+                else:
+                    # A completion/failure transition that won before cancellation
+                    # is already authoritative and must never be overwritten.
+                    return
+
+                transition = session.execute(
+                    update(InvestigationTask)
+                    .where(
+                        InvestigationTask.id == task_id,
+                        InvestigationTask.status == observed_status,
+                    )
+                    .values(**transition_values)
+                    .execution_options(synchronize_session=False)
+                )
+                if transition.rowcount == 1:
+                    session.refresh(task)
+                    break
+                session.rollback()
+            else:
                 return
-            if task.status == TaskStatus.DELETED.value:
-                task.result = {
-                    **dict(task.result or {}),
-                    "cancellation": {
-                        **dict((task.result or {}).get("cancellation") or {}),
-                        "requested": True,
-                        "acknowledged": True,
-                        "completed_at": now().isoformat(),
-                    },
-                }
+
+            if observed_status == TaskStatus.DELETED.value:
                 coverage = list(
                     session.scalars(
                         select(CoverageItem).where(
@@ -2203,17 +2366,6 @@ class ScanOrchestrator:
                 )
                 session.commit()
                 return
-            task.status = TaskStatus.CANCELED.value
-            task.error = "用户已停止本次分析"
-            task.completed_at = now()
-            task.result = {
-                **dict(task.result or {}),
-                "cancellation": {
-                    "requested": True,
-                    "acknowledged": True,
-                    "completed_at": task.completed_at.isoformat(),
-                },
-            }
             coverage = list(
                 session.scalars(
                     select(CoverageItem).where(

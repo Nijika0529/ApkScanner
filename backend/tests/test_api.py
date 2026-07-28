@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import apkscanner.api as api_module
 import pytest
+from apkscanner.enums import TaskStatus
 from apkscanner.main import create_app
 from apkscanner.models import EntryPoint, Evidence, Finding, InvestigationTask, Scan
 from apkscanner.schemas import AgentInvestigationResult
@@ -37,10 +41,21 @@ def test_local_api_requires_console_marker_for_mutations(settings) -> None:  # n
 
         health = client.get("/api/v1/health").json()
         assert health["default_investigator"] == "codex"
+        assert health["max_upload_bytes"] == settings.max_upload_bytes
         assert {item["name"] for item in health["capabilities"]} >= {
             "codex",
             "opencode_deepseek",
         }
+
+
+def test_in_memory_sqlite_is_shared_with_app_worker_threads(settings) -> None:  # noqa: ANN001
+    app = create_app(replace(settings, database_url="sqlite:///:memory:"))
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/scans")
+
+    assert response.status_code == 200
+    assert response.json() == []
 
 
 @pytest.mark.parametrize(
@@ -57,6 +72,84 @@ def test_scan_child_collections_return_not_found_for_unknown_scan(
             f"/api/v1/scans/00000000-0000-0000-0000-000000000099/{suffix}"
         )
     assert response.status_code == 404
+
+
+def test_report_exports_scan_error_and_entry_code_anchors(settings) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    with TestClient(app) as client:
+        with app.state.database.session_factory() as session:
+            scan = Scan(
+                status="failed",
+                filename="failed.apk",
+                artifact_sha256="e" * 64,
+                artifact_path=str(settings.data_dir / "missing-failed.apk"),
+                error="static analysis failed",
+            )
+            entry = EntryPoint(
+                scan=scan,
+                kind="activity",
+                name="com.example.FailedActivity",
+                exported=True,
+                code_anchors=[
+                    {
+                        "path": "sources/com/example/FailedActivity.java",
+                        "line": 42,
+                    }
+                ],
+            )
+            session.add_all([scan, entry])
+            session.commit()
+            scan_id = scan.id
+
+        response = client.get(f"/api/v1/scans/{scan_id}/report/json")
+
+    assert response.status_code == 200
+    report = response.json()
+    assert report["scan"]["error"] == "static analysis failed"
+    assert report["entry_points"][0]["code_anchors"] == [
+        {
+            "path": "sources/com/example/FailedActivity.java",
+            "line": 42,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_event_stream_ends_if_scan_is_deleted(settings) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    with app.state.database.session_factory() as session:
+        scan = Scan(
+            status="queued",
+            filename="stream-delete.apk",
+            artifact_sha256="d" * 64,
+            artifact_path=str(settings.data_dir / "missing-stream-delete.apk"),
+        )
+        session.add(scan)
+        session.commit()
+        scan_id = scan.id
+
+    class ConnectedRequest:
+        headers: dict[str, str] = {}
+
+        @staticmethod
+        async def is_disconnected() -> bool:
+            return False
+
+    response = await api_module.stream_events(
+        scan_id,
+        ConnectedRequest(),
+        app.state.database,
+    )
+    with app.state.database.session_factory() as session:
+        persisted = session.get(Scan, scan_id)
+        assert persisted is not None
+        session.delete(persisted)
+        session.commit()
+
+    end_event = await asyncio.wait_for(anext(response.body_iterator), timeout=1)
+    assert end_event == "event: end\ndata: {}\n\n"
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(anext(response.body_iterator), timeout=1)
 
 
 def test_completed_scan_can_be_deleted_with_its_unshared_files(settings) -> None:  # noqa: ANN001
@@ -207,6 +300,71 @@ def test_terminal_task_can_be_deleted_while_ai_audit_is_preserved(settings) -> N
         evidence = session.scalar(select(Evidence).where(Evidence.scan_id == scan.id))
         assert evidence is not None
         assert evidence.task_id == task.id
+
+
+@pytest.mark.parametrize(
+    ("method", "suffix", "payload"),
+    [
+        ("PATCH", "agent-control", {"enabled": False}),
+        ("POST", "retry", None),
+        ("POST", "rerun", None),
+        ("POST", "continue", None),
+        ("POST", "cancel", None),
+        ("DELETE", "", None),
+    ],
+)
+def test_deleted_task_cannot_be_mutated_or_restored(
+    settings,
+    monkeypatch,
+    method: str,
+    suffix: str,
+    payload: dict[str, bool] | None,
+) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    submitted: list[str] = []
+
+    async def submit(scan_id: str) -> None:
+        submitted.append(scan_id)
+
+    monkeypatch.setattr(app.state.orchestrator, "submit", submit)
+    with TestClient(app) as client:
+        with app.state.database.session_factory() as session:
+            scan = Scan(
+                status="final",
+                filename="deleted-task.apk",
+                artifact_sha256="f" * 64,
+                artifact_path=str(settings.data_dir / "missing-deleted-task.apk"),
+            )
+            task = InvestigationTask(
+                scan=scan,
+                task_type="component",
+                status="deleted",
+                result={"deletion": {"soft_deleted": True}},
+            )
+            session.add_all([scan, task])
+            session.commit()
+            scan_id = scan.id
+            task_id = task.id
+
+        path = f"/api/v1/tasks/{task_id}"
+        if suffix:
+            path = f"{path}/{suffix}"
+        request_options = {
+            "headers": {"X-APKScanner-Request": "console"},
+        }
+        if payload is not None:
+            request_options["json"] = payload
+        response = client.request(method, path, **request_options)
+
+        assert response.status_code == 404
+        assert client.get(f"/api/v1/scans/{scan_id}/tasks").json() == []
+
+    with app.state.database.session_factory() as session:
+        persisted = session.get(InvestigationTask, task_id)
+        assert persisted is not None
+        assert persisted.status == "deleted"
+        assert persisted.result == {"deletion": {"soft_deleted": True}}
+    assert submitted == []
 
 
 def test_running_task_cannot_be_deleted(settings) -> None:  # noqa: ANN001
@@ -419,6 +577,81 @@ def test_running_task_cancellation_is_acknowledged_when_runtime_already_exited(
         assert response.status_code == 202
         assert response.json()["status"] == "canceled"
         assert response.json()["result"]["cancellation"]["acknowledged"] is True
+
+
+def test_worker_completion_wins_a_race_with_task_cancellation(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    transition_started = threading.Event()
+    allow_transition = threading.Event()
+    original_transition = api_module._transition_task
+
+    def delayed_transition(
+        session,
+        task_id: str,
+        *,
+        expected_status: str,
+        values,
+    ) -> bool:  # noqa: ANN001
+        if expected_status == TaskStatus.RUNNING.value:
+            transition_started.set()
+            assert allow_transition.wait(timeout=5)
+        return original_transition(
+            session,
+            task_id,
+            expected_status=expected_status,
+            values=values,
+        )
+
+    monkeypatch.setattr(api_module, "_transition_task", delayed_transition)
+    with TestClient(app) as client:
+        with app.state.database.session_factory() as session:
+            scan = Scan(
+                status="investigating",
+                filename="cancel-race.apk",
+                artifact_sha256="4" * 64,
+                artifact_path=str(settings.data_dir / "missing.apk"),
+            )
+            task = InvestigationTask(
+                scan=scan,
+                task_type="component",
+                status="running",
+                result={"initial": True},
+            )
+            session.add_all([scan, task])
+            session.commit()
+            task_id = task.id
+
+        response_box = {}
+
+        def cancel() -> None:
+            response_box["response"] = client.post(
+                f"/api/v1/tasks/{task_id}/cancel",
+                headers={"X-APKScanner-Request": "console"},
+            )
+
+        request_thread = threading.Thread(target=cancel)
+        request_thread.start()
+        assert transition_started.wait(timeout=5)
+        with app.state.database.session_factory() as worker_session:
+            worker_task = worker_session.get(InvestigationTask, task_id)
+            assert worker_task is not None
+            worker_task.status = TaskStatus.COMPLETED.value
+            worker_task.result = {"worker_success": True}
+            worker_session.commit()
+        allow_transition.set()
+        request_thread.join(timeout=5)
+        assert not request_thread.is_alive()
+
+        response = response_box["response"]
+        assert response.status_code == 409
+        with app.state.database.session_factory() as session:
+            persisted = session.get(InvestigationTask, task_id)
+            assert persisted is not None
+            assert persisted.status == TaskStatus.COMPLETED.value
+            assert persisted.result == {"worker_success": True}
 
 
 def test_deleting_one_scan_preserves_a_shared_apk(settings) -> None:  # noqa: ANN001

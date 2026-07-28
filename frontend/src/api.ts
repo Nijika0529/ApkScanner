@@ -35,23 +35,30 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<Health>("/api/v1/health"),
   scans: () => request<Scan[]>("/api/v1/scans"),
-  scan: (id: string) => request<Scan>(`/api/v1/scans/${id}`),
-  entries: (id: string) => request<EntryPoint[]>(`/api/v1/scans/${id}/entries`),
-  findings: (id: string) => request<Finding[]>(`/api/v1/scans/${id}/findings`),
-  coverage: (id: string) => request<CoverageItem[]>(`/api/v1/scans/${id}/coverage`),
-  tasks: (id: string) => request<InvestigationTask[]>(`/api/v1/scans/${id}/tasks`),
-  hypotheses: (id: string) =>
-    request<SecurityHypothesis[]>(`/api/v1/scans/${id}/hypotheses`),
-  evaluations: (id: string) =>
-    request<BenchmarkEvaluation[]>(`/api/v1/scans/${id}/evaluations`),
+  scan: (id: string, signal?: AbortSignal) =>
+    request<Scan>(`/api/v1/scans/${id}`, { signal }),
+  entries: (id: string, signal?: AbortSignal) =>
+    request<EntryPoint[]>(`/api/v1/scans/${id}/entries`, { signal }),
+  findings: (id: string, signal?: AbortSignal) =>
+    request<Finding[]>(`/api/v1/scans/${id}/findings`, { signal }),
+  coverage: (id: string, signal?: AbortSignal) =>
+    request<CoverageItem[]>(`/api/v1/scans/${id}/coverage`, { signal }),
+  tasks: (id: string, signal?: AbortSignal) =>
+    request<InvestigationTask[]>(`/api/v1/scans/${id}/tasks`, { signal }),
+  hypotheses: (id: string, signal?: AbortSignal) =>
+    request<SecurityHypothesis[]>(`/api/v1/scans/${id}/hypotheses`, { signal }),
+  evaluations: (id: string, signal?: AbortSignal) =>
+    request<BenchmarkEvaluation[]>(`/api/v1/scans/${id}/evaluations`, { signal }),
   evaluateGroundTruth: (id: string, spec: unknown) =>
     request<BenchmarkEvaluation>(`/api/v1/scans/${id}/evaluations`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(spec),
     }),
-  agentAudits: (id: string) => request<AgentAudit[]>(`/api/v1/scans/${id}/agent-audits`),
-  events: (id: string) => request<ScanEvent[]>(`/api/v1/scans/${id}/events`),
+  agentAudits: (id: string, signal?: AbortSignal) =>
+    request<AgentAudit[]>(`/api/v1/scans/${id}/agent-audits`, { signal }),
+  events: (id: string, signal?: AbortSignal) =>
+    request<ScanEvent[]>(`/api/v1/scans/${id}/events`, { signal }),
   upload: async (file: File, investigator: InvestigatorChoice = "configured") => {
     const form = new FormData()
     form.append("apk", file)

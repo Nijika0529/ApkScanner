@@ -30,6 +30,7 @@ from .worker_protocol import (
 OPENCODE_SDK_VERSION = "1.18.4"
 OPENCODE_CLI_VERSION = "1.18.4"
 AJV_VERSION = "8.20.0"
+OPENCODE_WORKER_PROTOCOL_VERSION = "6"
 OPENCODE_PROVIDER = "deepseek"
 OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL = "structured_output_tool"
 OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE = "analyze_then_finalize"
@@ -42,6 +43,7 @@ OPENCODE_MAX_PROVIDER_REQUESTS = OPENCODE_MAX_STEPS + 100
 OPENCODE_PROFILE_STABLE_ANALYZER = "stable_analyzer"
 OPENCODE_PROFILE_THINKING_EXPLORER = "thinking_explorer_then_finalizer"
 OPENCODE_PROFILE_STRUCTURED_FINALIZER = "structured_finalizer"
+OPENCODE_PROVIDER_KEY_FIELD = "_provider_api_key"
 OPENCODE_THINKING_PHASES = frozenset(
     {"test_planning", "adversarial_review", "exploration_round"}
 )
@@ -715,7 +717,10 @@ class OpenCodeInvestigator:
                 "available": False,
                 "detail": f"build the OpenCode worker image first: {image}",
             }
-        expected = f"{OPENCODE_SDK_VERSION}|{OPENCODE_CLI_VERSION}|{AJV_VERSION}|5"
+        expected = (
+            f"{OPENCODE_SDK_VERSION}|{OPENCODE_CLI_VERSION}|{AJV_VERSION}|"
+            f"{OPENCODE_WORKER_PROTOCOL_VERSION}"
+        )
         if inspected.stdout.strip() != expected:
             return {
                 **capability,
@@ -745,21 +750,36 @@ class OpenCodeInvestigator:
         event_callback: AgentEventCallback | None = None,
         cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
+        worker_payload = self._worker_payload(payload)
         if self.settings.opencode_isolation == "docker":
             return self._invoke_docker(
-                payload,
+                worker_payload,
                 timeout_seconds=timeout_seconds,
                 workspace=workspace,
                 event_callback=event_callback,
                 cancel_event=cancel_event,
             )
         return self._invoke_host(
-            payload,
+            worker_payload,
             timeout_seconds=timeout_seconds,
             workspace=workspace,
             event_callback=event_callback,
             cancel_event=cancel_event,
         )
+
+    @staticmethod
+    def _worker_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        api_key = os.getenv("DEEPSEEK_API_KEY")
+        if not api_key or not api_key.strip():
+            raise RuntimeError("DEEPSEEK_API_KEY is not configured")
+        # The worker must not inherit the provider credential in its initial
+        # environment: deleting an environment variable after process startup
+        # does not remove it from /proc/<pid>/environ. The one-shot stdin pipe
+        # is consumed and closed before any workspace tool is made available.
+        return {
+            **payload,
+            OPENCODE_PROVIDER_KEY_FIELD: api_key,
+        }
 
     def _invoke_host(
         self,
@@ -814,7 +834,6 @@ class OpenCodeInvestigator:
 
     def _worker_environment(self, root: Path) -> dict[str, str]:
         allowed = {
-            "DEEPSEEK_API_KEY",
             "HTTP_PROXY",
             "HTTPS_PROXY",
             "NO_PROXY",
@@ -878,8 +897,6 @@ class OpenCodeInvestigator:
             "--read-only",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
-            "--user",
-            f"{worker_uid}:{worker_gid}",
             "--pids-limit=256",
             "--memory=3g",
             "--cpus=2",
@@ -896,15 +913,17 @@ class OpenCodeInvestigator:
             "XDG_CACHE_HOME=/tmp/opencode-home/cache",
             "--env",
             "XDG_STATE_HOME=/tmp/opencode-home/state",
-            "--env",
-            "DEEPSEEK_API_KEY",
         ]
+        if worker_uid != 0:
+            command.extend(["--user", f"{worker_uid}:{worker_gid}"])
         if workspace is not None:
             resolved_workspace = workspace.resolve()
             if not resolved_workspace.is_dir() or "," in str(resolved_workspace):
                 raise ValueError(
                     "scan workspace is unavailable or unsafe for a Docker bind mount"
                 )
+            if worker_uid == 0:
+                self._prepare_root_owned_docker_workspace(resolved_workspace)
             command.extend(
                 [
                     "--mount",
@@ -956,6 +975,7 @@ class OpenCodeInvestigator:
                 on_timeout=stop_container,
                 cancel_event=cancel_event,
                 on_cancel=stop_container,
+                on_error_cleanup=stop_container,
             )
         except WorkerCancelledError as exc:
             raise AgentCancelledError(
@@ -968,6 +988,14 @@ class OpenCodeInvestigator:
         except RuntimeError as exc:
             raise RuntimeError(f"containerized OpenCode worker failed: {exc}") from exc
         return response
+
+    @staticmethod
+    def _prepare_root_owned_docker_workspace(workspace: Path) -> None:
+        """Give the image's non-root node user access to its isolated workspace copy."""
+        for candidate in (workspace, *workspace.rglob("*")):
+            if candidate.is_symlink():
+                raise ValueError("scan workspace must not contain symbolic links")
+            os.chown(candidate, 1000, 1000, follow_symlinks=False)
 
     @staticmethod
     def _kill_process_group(process: subprocess.Popen[str]) -> None:

@@ -178,7 +178,11 @@ class BuiltinRuleEngine:
                 )
             )
         for entry in manifest.entries:
+            if entry.metadata.get("effective_enabled") is False:
+                continue
             if entry.kind == EntryPointKind.DEEP_LINK.value:
+                if not entry.exported:
+                    continue
                 findings.extend(self._deep_link_rules(entry))
                 continue
             if not entry.exported:
@@ -378,17 +382,65 @@ class BuiltinRuleEngine:
             "MASVS-RESILIENCE": "Reverse engineering and tamper resilience",
             "MASVS-PRIVACY": "Privacy-related permissions and SDKs",
         }
-        code_available = bool(result.searchable_roots)
+        component_statuses = [
+            str(item.get("status")) for item in result.code_index.values()
+        ]
+        component_code_available = any(
+            status
+            in {
+                "source_available",
+                "partial_source_available",
+                "smali_fallback",
+            }
+            for status in component_statuses
+        )
+        global_decompilation_status = str(result.decompilation.get("status") or "")
+        global_code_available = bool(
+            result.decompilation.get("output_usable")
+            or result.decompilation.get("generated_java_files", 0)
+            or global_decompilation_status in {"complete", "partial_success"}
+        )
+        code_available = component_code_available or global_code_available or any(
+            item.rule_id.startswith("CODE-") for item in findings
+        )
+        full_code_coverage = (
+            global_decompilation_status == "complete"
+            and global_code_available
+            and all(status == "source_available" for status in component_statuses)
+        )
+        incomplete_components = sum(
+            status != "source_available" for status in component_statuses
+        )
         coverage: list[CoverageDraft] = []
         for domain, title in domains.items():
-            partial = domain in {"MASVS-AUTH", "MASVS-PRIVACY"} or not code_available
+            partial = (
+                domain in {"MASVS-AUTH", "MASVS-PRIVACY"}
+                or not full_code_coverage
+            )
             gap = None
             if domain == "MASVS-AUTH":
                 gap = "APK-only analysis and one test account cannot prove server-side authorization."
             elif domain == "MASVS-PRIVACY":
                 gap = "Runtime data collection and declared privacy policy are not available from the APK alone."
             elif not code_available:
-                gap = "No decompiled code root was available; manifest and archive checks only."
+                gap = (
+                    "No searchable application code was available; manifest and archive checks only."
+                )
+            elif global_decompilation_status == "partial_success":
+                gap = (
+                    "Decompiler output was only partially successful; code coverage cannot "
+                    "be considered complete."
+                )
+            elif incomplete_components:
+                gap = (
+                    f"{incomplete_components} of {len(component_statuses)} target component(s) "
+                    "lack complete decompiled source."
+                )
+            elif not full_code_coverage:
+                gap = (
+                    "Searchable code was available only through a degraded or fallback path; "
+                    "code coverage is partial."
+                )
             coverage.append(
                 CoverageDraft(
                     control_id=f"{domain}-BASELINE",

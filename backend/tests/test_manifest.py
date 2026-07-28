@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from apkscanner.manifest import parse_manifest
+from apkscanner.models import EntryPoint
+from apkscanner.planner import InvestigationPlanner
+from apkscanner.rules import BuiltinRuleEngine
 
 from .conftest import MANIFEST
 
@@ -29,3 +32,183 @@ def test_signature_permission_is_inherited_by_component() -> None:
     service = next(entry for entry in document.entries if entry.kind == "service")
     assert service.permission == "com.example.vulnerable.TRUSTED"
     assert service.permission_protection == "signature"
+
+
+def test_manifest_defaults_use_effective_target_sdk() -> None:
+    modern = parse_manifest(
+        """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+        package="com.example.modern">
+          <uses-sdk android:minSdkVersion="28" />
+          <application>
+            <provider android:name=".Data" android:authorities="com.example.modern.data" />
+          </application>
+        </manifest>"""
+    )
+    modern_provider = next(entry for entry in modern.entries if entry.kind == "provider")
+    assert modern.target_sdk is None
+    assert modern.application["effective_target_sdk"] == 28
+    assert modern.application["uses_cleartext_traffic"] is False
+    assert modern_provider.exported is False
+
+    legacy = parse_manifest(
+        """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+        package="com.example.legacy">
+          <application>
+            <provider android:name=".Data" android:authorities="com.example.legacy.data" />
+          </application>
+        </manifest>"""
+    )
+    legacy_provider = next(entry for entry in legacy.entries if entry.kind == "provider")
+    assert legacy.application["effective_target_sdk"] == 1
+    assert legacy.application["uses_cleartext_traffic"] is True
+    assert legacy_provider.exported is True
+    assert legacy_provider.exported_reason == "legacy_provider_default"
+
+
+def test_alias_and_provider_permission_precedence_is_preserved() -> None:
+    document = parse_manifest(
+        """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+        package="com.example.permissions">
+          <uses-sdk android:targetSdkVersion="35" />
+          <permission android:name="com.example.SIGNATURE"
+              android:protectionLevel="signature" />
+          <permission android:name="com.example.NORMAL"
+              android:protectionLevel="normal" />
+          <application android:permission="com.example.SIGNATURE">
+            <activity android:name=".Target" android:exported="false" />
+            <activity-alias android:name=".PublicAlias" android:targetActivity=".Target"
+                android:exported="true" />
+            <provider android:name=".Data" android:authorities="com.example.permissions.data"
+                android:exported="true"
+                android:readPermission="com.example.NORMAL"
+                android:writePermission="com.example.SIGNATURE" />
+          </application>
+        </manifest>"""
+    )
+    entries = {entry.name: entry for entry in document.entries}
+    alias = entries["com.example.permissions.PublicAlias"]
+    provider = entries["com.example.permissions.Data"]
+
+    # An alias without its own permission is public even when the application
+    # or target activity has a default permission.
+    assert alias.permission is None
+    assert alias.permission_protection is None
+
+    # Provider read/write permissions override the common provider/application
+    # permission. The exposed boundary reports the weakest effective access.
+    assert provider.permission == "com.example.NORMAL"
+    assert provider.permission_protection == "normal"
+    assert provider.metadata["effective_read_permission"] == "com.example.NORMAL"
+    assert provider.metadata["effective_write_permission"] == "com.example.SIGNATURE"
+
+
+def test_provider_path_permission_contributes_weakest_access_boundary() -> None:
+    document = parse_manifest(
+        """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+        package="com.example.pathpermissions">
+          <uses-sdk android:targetSdkVersion="35" />
+          <permission android:name="com.example.SIGNATURE"
+              android:protectionLevel="signature" />
+          <permission android:name="com.example.NORMAL"
+              android:protectionLevel="normal" />
+          <application>
+            <provider android:name=".Data"
+                android:authorities="com.example.pathpermissions.data"
+                android:exported="true"
+                android:readPermission="com.example.SIGNATURE"
+                android:writePermission="com.example.SIGNATURE">
+              <path-permission android:pathPrefix="/public"
+                  android:readPermission="com.example.NORMAL" />
+            </provider>
+          </application>
+        </manifest>"""
+    )
+    provider = next(entry for entry in document.entries if entry.kind == "provider")
+
+    assert provider.permission == "com.example.NORMAL"
+    assert provider.permission_protection == "normal"
+    assert provider.metadata["path_permissions"] == [
+        {
+            "path_kind": "pathPrefix",
+            "path": "/public",
+            "permission": None,
+            "effective_read_permission": "com.example.NORMAL",
+            "effective_read_permission_protection": "normal",
+            "effective_write_permission": "com.example.SIGNATURE",
+            "effective_write_permission_protection": "signature",
+        }
+    ]
+    findings = BuiltinRuleEngine()._manifest_rules(document)
+    assert any(item.rule_id == "EXPORTED-PROVIDER" for item in findings)
+
+
+def test_private_or_disabled_deep_links_are_not_reported_or_scheduled() -> None:
+    document = parse_manifest(
+        """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+        package="com.example.links">
+          <uses-sdk android:targetSdkVersion="35" />
+          <application>
+            <activity android:name=".Private" android:exported="false">
+              <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="private-demo" android:host="example.test" />
+              </intent-filter>
+            </activity>
+            <activity android:name=".Disabled" android:enabled="false"
+                android:exported="true">
+              <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="disabled-demo" android:host="example.test" />
+              </intent-filter>
+            </activity>
+          </application>
+        </manifest>"""
+    )
+    deep_links = [entry for entry in document.entries if entry.kind == "deep_link"]
+    assert len(deep_links) == 2
+    assert {entry.exported for entry in deep_links} == {False, True}
+    assert any(entry.metadata["effective_enabled"] is False for entry in deep_links)
+
+    findings = BuiltinRuleEngine()._manifest_rules(document)
+    assert not any(item.rule_id.startswith("DEEPLINK-") for item in findings)
+
+    persisted = [
+        EntryPoint(
+            id=f"00000000-0000-0000-0000-00000000000{index}",
+            scan_id="scan",
+            kind=entry.kind,
+            name=entry.name,
+            owner_component=entry.owner_component,
+            exported=entry.exported,
+            exported_reason=entry.exported_reason,
+            metadata_json=entry.metadata,
+        )
+        for index, entry in enumerate(deep_links, start=1)
+    ]
+    tasks = InvestigationPlanner(
+        android_version="16",
+        adb_configured=False,
+    ).plan("scan", persisted)
+    assert tasks == []
+
+
+def test_non_activity_intent_filters_do_not_create_deep_link_entries() -> None:
+    document = parse_manifest(
+        """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+        package="com.example.service">
+          <uses-sdk android:targetSdkVersion="35" />
+          <application>
+            <service android:name=".ViewService" android:exported="true">
+              <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="service-demo" android:host="example.test" />
+              </intent-filter>
+            </service>
+          </application>
+        </manifest>"""
+    )
+
+    assert [entry.kind for entry in document.entries] == ["service"]

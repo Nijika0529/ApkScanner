@@ -12,7 +12,7 @@ LABEL io.apkscanner.version="0.1.0" \
       io.apkscanner.opencode-sdk-version="1.18.4" \
       io.apkscanner.opencode-version="1.18.4" \
       io.apkscanner.ajv-version="8.20.0" \
-      io.apkscanner.worker-protocol="5"
+      io.apkscanner.worker-protocol="6"
 
 WORKDIR /opt/apkscanner-opencode
 COPY opencode-worker/package.json opencode-worker/package-lock.json ./

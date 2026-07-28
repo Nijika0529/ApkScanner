@@ -26,10 +26,12 @@ v1 产品是一个单用户、仅限本机（localhost）的 Web 应用。它接
 详细的控制流程、信任边界、Security IR 和判定规则参见 [`docs/architecture.zh-CN.md`](docs/architecture.zh-CN.md)。
 用于内部汇报的一页式说明与数据口径参见
 [`docs/project-brief.zh-CN.md`](docs/project-brief.zh-CN.md)。
+后续版本差分、人工漏洞库和安全复验方案参见
+[`docs/release-regression.zh-CN.md`](docs/release-regression.zh-CN.md)。
 
 ## 本地搭建
 
-推荐 Python 3.12+ 和 Node 22+。最小的有用静态工具集为 `aapt2`、`apksigner` 和 `apktool`；`jadx` 可选但能改善代码检索。
+推荐 Python 3.12+ 和 Node 22.13+。最小的有用静态工具集为 `aapt2`、`apksigner` 和 `apktool`；`jadx` 可选但能改善代码检索。
 
 ```bash
 python -m venv .venv
@@ -176,6 +178,9 @@ Host Worker 为每次调用创建私有的临时 HOME/XDG 目录树以及认证�
 当前入口的代码上下文和不可变 Evidence；它可使用 `read`、`glob`、`grep` 和 `bash`，
 但不会与其他并发 Agent 共享可写扫描目录。原生编辑、Web、MCP、子 Agent 和 ADB 保持
 禁用，请求的 Android 测试仍由 Python 控制面验证并执行。
+Host 模式不提供 PID/同 UID 进程隔离；同机 Agent 可能读取控制面进程可见的信息，因此
+它只适合个人受控调试，不能作为凭据隔离边界。生产或处理不受信任 APK 时使用默认 Docker
+模式。
 
 执行方式不再根据模型名猜测，而是由编排阶段明确选择：
 
@@ -201,8 +206,10 @@ thinking 的 memo-writer 收尾回合；空 memo 不再交给 Finalizer。
 会计费的非思考结构化请求。可通过 `APKSCANNER_DEEPSEEK_BASE_URL` 指定企业兼容网关；
 远程网关必须使用 HTTPS，纯 HTTP 仅允许 loopback。官方地址应填写
 `https://api.deepseek.com`，不要附加 `/v1`。URL 中的凭据、查询参数和片段会被拒绝，
-Worker 只在兼容代理内存中保留真实 Key，OpenCode 仅获得一次性 loopback 凭据；
-真实 Key、配置内容和本地 Server 凭据会从 Bash 子进程环境删除；已退役的
+控制面通过一次性 stdin 请求把真实 Key 交给 Worker；Worker 在校验业务 payload 前提取
+并删除该内部字段，且启动环境从一开始就不含真实 Key，避免 `/proc/*/environ` 泄漏。
+兼容代理只在内存中保留真实 Key，OpenCode 仅获得一次性 loopback 凭据；配置内容和本地
+Server 凭据也会从 Bash 子进程环境删除。已退役的
 `deepseek-chat` / `deepseek-reasoner` 也会被拒绝。
 
 实现原理、协议、安全控制及升级清单参见 [`docs/opencode-deepseek.zh-CN.md`](docs/opencode-deepseek.zh-CN.md)。
@@ -298,7 +305,7 @@ AI 审计中，不能被当作平台确认风险等级。
 | `APKSCANNER_OPENCODE_NODE_BIN` | PATH 中的 `node` | Host 模式下的 Node.js 覆盖 |
 | `APKSCANNER_OPENCODE_WORKER_DIR` | 仓库 `opencode-worker/` | Host Worker 目录 |
 | `APKSCANNER_DEEPSEEK_BASE_URL` | DeepSeek 默认地址 | 可选的可信 HTTP(S) 网关 |
-| `DEEPSEEK_API_KEY` | 未设置 | DeepSeek 凭据，仅传递给选定的 Worker |
+| `DEEPSEEK_API_KEY` | 未设置 | DeepSeek 凭据，通过一次性 stdin 请求传递给选定的 Worker |
 | `APKSCANNER_MOBSF_URL` / `APKSCANNER_MOBSF_API_KEY` | 未设置 | 可选 MobSF API |
 | `APKSCANNER_ANDROID_VERSION` | `16` | 报告的动态基线 Android 版本 |
 | `APKSCANNER_ANDROID_API` | `36` | 要求的云真机 API Level |
@@ -329,7 +336,7 @@ cd ../opencode-worker && npm run check && npm test
 - Probe APK 是故意危险的工具，必须永远不保留在员工/生产设备上。
 - 无源码或服务端权限上下文可用；AUTH 和 PRIVACY 覆盖为部分覆盖。
 - v1 覆盖范围：单 APK、Android 16 基线、单一认证角色、`pm clear`（而非完整设备快照）。
-- Codex Docker Worker 具有只读扫描挂载。OpenCode Worker 仅接收任务 JSON，无扫描工作区挂载；所有可执行的 OpenCode 工具均被拒绝。
+- Codex Docker Worker 具有只读扫描挂载。OpenCode Worker 只挂载按任务与尝试隔离的可写上下文副本，其中仅包含有界的目标 Java/Smali 与 Evidence；不暴露共享扫描工作区。
 - Agent 容器对其所选模型 provider 仍保留出站网络连接。团队部署前需将每个 Worker 的出站流量限制到批准的 provider/网关。
 - DeepSeek 接收有边界的任务上下文和证据摘要。在用于生产 APK 之前，请确认公司的数据处理、留存、区域和网关策略。
 
@@ -344,6 +351,7 @@ ApkScanner/
   docs/
     architecture.zh-CN.md            # 架构与判定模型文档
     opencode-deepseek.zh-CN.md       # OpenCode + DeepSeek 实现文档
+    release-regression.zh-CN.md      # 版本差分与漏洞回归复验设计
   config/
     auth-flow.example.json           # 登录回放配置示例
   backend/

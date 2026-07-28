@@ -38,10 +38,12 @@ finding without platform evidence IDs.
 
 The detailed control flow, trust boundaries, IR, and verdict rules are in
 [`docs/architecture.zh-CN.md`](docs/architecture.zh-CN.md).
+The planned release-diff and vulnerability-retest model is documented in
+[`docs/release-regression.zh-CN.md`](docs/release-regression.zh-CN.md).
 
 ## Local setup
 
-Python 3.12+ and Node 22+ are recommended. The minimum useful static toolset is `aapt2`,
+Python 3.12+ and Node 22.13+ are recommended. The minimum useful static toolset is `aapt2`,
 `apksigner`, and `apktool`; `jadx` is optional but improves code retrieval.
 
 ```bash
@@ -225,6 +227,9 @@ containing the relevant code context and immutable evidence, exposed through nat
 `grep`, and `bash`. Bash analysis artifacts are limited by policy to that workspace or `/tmp`;
 native editing, web, MCP, subagents, and ADB remain denied. Android actions are requested as data,
 then validated and executed by the Python control plane.
+Host mode does not isolate same-UID processes or their `/proc` metadata, so it is suitable only for
+controlled personal debugging and is not a credential-security boundary. Use the default Docker
+mode for production or untrusted APKs.
 
 Execution is selected by orchestration phase, not by matching a model name:
 
@@ -298,7 +303,7 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_OPENCODE_NODE_BIN` | `node` on PATH | Host-mode Node.js override |
 | `APKSCANNER_OPENCODE_WORKER_DIR` | repository `opencode-worker/` | Host worker directory |
 | `APKSCANNER_DEEPSEEK_BASE_URL` | DeepSeek default | Optional trusted HTTP(S) gateway |
-| `DEEPSEEK_API_KEY` | unset | DeepSeek credential passed only to the selected worker |
+| `DEEPSEEK_API_KEY` | unset | DeepSeek credential delivered to the selected worker over its one-shot stdin request |
 | `APKSCANNER_MOBSF_URL` / `APKSCANNER_MOBSF_API_KEY` | unset | Optional MobSF API |
 | `APKSCANNER_ANDROID_VERSION` | `16` | Reported dynamic baseline |
 | `APKSCANNER_ANDROID_API` | `36` | Required cloud-device API level |

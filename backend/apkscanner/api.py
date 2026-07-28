@@ -7,7 +7,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
-from sqlalchemy import case, desc, select
+from sqlalchemy import case, desc, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from . import __version__
@@ -79,6 +79,32 @@ def require_scan(session: Session, scan_id: str) -> Scan:
     if scan is None:
         raise HTTPException(404, "Scan not found")
     return scan
+
+
+def require_active_task(session: Session, task_id: str) -> InvestigationTask:
+    task = session.get(InvestigationTask, task_id)
+    if task is None or task.status == TaskStatus.DELETED.value:
+        raise HTTPException(404, "Task not found")
+    return task
+
+
+def _transition_task(
+    session: Session,
+    task_id: str,
+    *,
+    expected_status: str,
+    values: dict[str, Any],
+) -> bool:
+    result = session.execute(
+        update(InvestigationTask)
+        .where(
+            InvestigationTask.id == task_id,
+            InvestigationTask.status == expected_status,
+        )
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    return result.rowcount == 1
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -153,6 +179,7 @@ def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> Health
     )
     return HealthResponse(
         version=__version__,
+        max_upload_bytes=orchestrator.settings.max_upload_bytes,
         default_investigator=orchestrator.resolve_investigator(),
         enabled_investigators=[
             name
@@ -478,7 +505,10 @@ async def stream_events(
                     else event.event_type
                 )
                 yield f"id: {event.id}\nevent: {stream_event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-            if scan and scan.status in {ScanStatus.FINAL.value, ScanStatus.FAILED.value} and not events:
+            if scan is None or (
+                scan.status in {ScanStatus.FINAL.value, ScanStatus.FAILED.value}
+                and not events
+            ):
                 yield "event: end\ndata: {}\n\n"
                 break
             await asyncio.sleep(1)
@@ -559,9 +589,7 @@ def update_task_agent_control(
     control: TaskAgentControl,
     session: Session = Depends(get_session),
 ) -> InvestigationTask:
-    task = session.get(InvestigationTask, task_id)
-    if task is None:
-        raise HTTPException(404, "Task not found")
+    task = require_active_task(session, task_id)
     if task.status in {
         TaskStatus.RUNNING.value,
         TaskStatus.CANCEL_REQUESTED.value,
@@ -706,9 +734,7 @@ async def retry_task(
     session: Session = Depends(get_session),
     orchestrator: ScanOrchestrator = Depends(get_orchestrator),
 ) -> InvestigationTask:
-    task = session.get(InvestigationTask, task_id)
-    if task is None:
-        raise HTTPException(404, "Task not found")
+    task = require_active_task(session, task_id)
     if task.status in {
         TaskStatus.QUEUED.value,
         TaskStatus.AWAITING_DEVICE.value,
@@ -744,9 +770,7 @@ async def rerun_task(
     session: Session = Depends(get_session),
     orchestrator: ScanOrchestrator = Depends(get_orchestrator),
 ) -> InvestigationTask:
-    task = session.get(InvestigationTask, task_id)
-    if task is None:
-        raise HTTPException(404, "Task not found")
+    task = require_active_task(session, task_id)
     if task.status in {
         TaskStatus.QUEUED.value,
         TaskStatus.AWAITING_DEVICE.value,
@@ -777,9 +801,7 @@ async def continue_timed_out_task(
     session: Session = Depends(get_session),
     orchestrator: ScanOrchestrator = Depends(get_orchestrator),
 ) -> InvestigationTask:
-    task = session.get(InvestigationTask, task_id)
-    if task is None:
-        raise HTTPException(404, "Task not found")
+    task = require_active_task(session, task_id)
     if task.status != TaskStatus.TIMED_OUT.value:
         raise HTTPException(409, "Only a timed-out task can continue from prior evidence")
     scan = session.get(Scan, task.scan_id)
@@ -863,9 +885,7 @@ def cancel_task(
     session: Session = Depends(get_session),
     orchestrator: ScanOrchestrator = Depends(get_orchestrator),
 ) -> InvestigationTask:
-    task = session.get(InvestigationTask, task_id)
-    if task is None:
-        raise HTTPException(404, "Task not found")
+    task = require_active_task(session, task_id)
     if task.status == TaskStatus.CANCEL_REQUESTED.value:
         raise HTTPException(409, "Task cancellation is already pending")
     if task.status not in {
@@ -881,7 +901,7 @@ def cancel_task(
         TaskStatus.AWAITING_DEVICE.value,
         TaskStatus.RUNNING.value,
     }
-    task.result = {
+    cancellation_result = {
         **dict(task.result or {}),
         "cancellation": {
             "requested": True,
@@ -890,13 +910,17 @@ def cancel_task(
         },
     }
     if runtime_active:
-        task.status = TaskStatus.CANCEL_REQUESTED.value
-        task.error = (
+        next_status = TaskStatus.CANCEL_REQUESTED.value
+        next_error = (
             "正在从云真机队列取消任务"
             if previous_status == TaskStatus.AWAITING_DEVICE.value
             else "正在停止当前分析"
         )
-        should_signal = True
+        transition_values = {
+            "status": next_status,
+            "error": next_error,
+            "result": cancellation_result,
+        }
         message = (
             "用户已请求取消等待云真机的入口探索任务"
             if previous_status == TaskStatus.AWAITING_DEVICE.value
@@ -905,11 +929,26 @@ def cancel_task(
     else:
         # A queued task may already have a registered runtime immediately before
         # it enters the device scheduler. Signalling is harmless when no runtime exists.
-        should_signal = True
-        task.status = TaskStatus.CANCELED.value
-        task.error = "用户在任务执行前取消了分析"
-        task.completed_at = requested_at
+        next_status = TaskStatus.CANCELED.value
+        transition_values = {
+            "status": next_status,
+            "error": "用户在任务执行前取消了分析",
+            "completed_at": requested_at,
+            "result": cancellation_result,
+        }
         message = "用户已取消等待中的入口探索任务"
+    if not _transition_task(
+        session,
+        task_id,
+        expected_status=previous_status,
+        values=transition_values,
+    ):
+        session.rollback()
+        current = require_active_task(session, task_id)
+        raise HTTPException(
+            409,
+            f"Task state changed to {current.status!r} before cancellation could be applied",
+        )
     add_event(
         session,
         task.scan_id,
@@ -917,7 +956,7 @@ def cancel_task(
         message,
         {
             "task_id": task.id,
-            "status": task.status,
+            "status": next_status,
             "requested_at": requested_at.isoformat(),
         },
     )
@@ -929,34 +968,46 @@ def cancel_task(
         {
             "task_id": task.id,
             "source": "platform",
-            "status": task.status,
+            "status": next_status,
         },
     )
     session.commit()
-    if should_signal and not orchestrator.request_task_cancellation(task_id):
-        session.refresh(task)
-        if task.status == TaskStatus.CANCEL_REQUESTED.value:
-            task.status = TaskStatus.CANCELED.value
-            task.error = "分析运行时已经退出，停止请求已确认"
-            task.completed_at = now()
-            task.result = {
-                **dict(task.result or {}),
+    if not orchestrator.request_task_cancellation(task_id):
+        session.expire_all()
+        current = require_active_task(session, task_id)
+        if current.status == TaskStatus.CANCEL_REQUESTED.value:
+            completed_at = now()
+            acknowledged_result = {
+                **dict(current.result or {}),
                 "cancellation": {
-                    **dict((task.result or {}).get("cancellation") or {}),
+                    **dict((current.result or {}).get("cancellation") or {}),
                     "acknowledged": True,
-                    "completed_at": task.completed_at.isoformat(),
+                    "completed_at": completed_at.isoformat(),
                 },
             }
-            add_event(
+            if _transition_task(
                 session,
-                task.scan_id,
-                "task.cancelled",
-                "分析运行时已经退出，停止请求已确认",
-                {"task_id": task.id, "status": TaskStatus.CANCELED.value},
-            )
-            session.commit()
-    session.refresh(task)
-    return task
+                task_id,
+                expected_status=TaskStatus.CANCEL_REQUESTED.value,
+                values={
+                    "status": TaskStatus.CANCELED.value,
+                    "error": "分析运行时已经退出，停止请求已确认",
+                    "completed_at": completed_at,
+                    "result": acknowledged_result,
+                },
+            ):
+                add_event(
+                    session,
+                    current.scan_id,
+                    "task.cancelled",
+                    "分析运行时已经退出，停止请求已确认",
+                    {"task_id": current.id, "status": TaskStatus.CANCELED.value},
+                )
+                session.commit()
+            else:
+                session.rollback()
+    session.expire_all()
+    return require_active_task(session, task_id)
 
 
 @router.delete("/tasks/{task_id}", response_model=TaskDeleteResult)
@@ -965,11 +1016,7 @@ def delete_task(
     session: Session = Depends(get_session),
     orchestrator: ScanOrchestrator = Depends(get_orchestrator),
 ) -> TaskDeleteResult:
-    task = session.get(InvestigationTask, task_id)
-    if task is None:
-        raise HTTPException(404, "Task not found")
-    if task.status == TaskStatus.DELETED.value:
-        raise HTTPException(404, "Task not found")
+    task = require_active_task(session, task_id)
     if task.status not in {
         TaskStatus.BLOCKED_DEVICE.value,
         TaskStatus.COMPLETED.value,

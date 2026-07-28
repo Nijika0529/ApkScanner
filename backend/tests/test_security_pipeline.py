@@ -175,6 +175,76 @@ def test_identical_claims_in_separate_tasks_do_not_collide(settings) -> None:  #
     assert ledger.ensure_task_hypotheses(first)[0].id == first_hypothesis.id
 
 
+def test_plan_proof_rejects_cross_task_hypothesis_without_fallback(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    first_entry_id = "00000000-0000-0000-0000-000000000011"
+    second_entry_id = "00000000-0000-0000-0000-000000000012"
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="proof-isolation.apk",
+            artifact_sha256="e" * 64,
+            artifact_path=str(settings.data_dir / "proof-isolation.apk"),
+        )
+        first = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            target_entry_ids=[first_entry_id],
+            hypotheses=["First task hypothesis."],
+        )
+        second = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            target_entry_ids=[second_entry_id],
+            hypotheses=["Second task hypothesis."],
+        )
+        session.add_all([scan, first, second])
+        session.commit()
+
+    ledger = HypothesisLedger(database)
+    first_hypothesis = ledger.ensure_task_hypotheses(first)[0]
+    second_hypothesis = ledger.ensure_task_hypotheses(second)[0]
+    cross_task_request = AgentRequestedTest(
+        hypothesis_id=second_hypothesis.id,
+        entry_point_id=first_entry_id,
+        state="guest",
+        uri=None,
+        extras={},
+        rationale="This must not fall back to the first task's hypothesis.",
+    )
+    assert (
+        ledger.plan_proof(
+            task_id=first.id,
+            test_case_id="cross-task",
+            request=cross_task_request,
+        )
+        is None
+    )
+
+    outside_entry_request = AgentRequestedTest(
+        hypothesis_id=first_hypothesis.id,
+        entry_point_id=second_entry_id,
+        state="guest",
+        uri=None,
+        extras={},
+        rationale="This entry point belongs to another task.",
+    )
+    assert (
+        ledger.plan_proof(
+            task_id=first.id,
+            test_case_id="outside-entry",
+            request=outside_entry_request,
+        )
+        is None
+    )
+    with database.session_factory() as session:
+        attempts = list(
+            session.scalars(select(ProofAttempt).where(ProofAttempt.task_id == first.id))
+        )
+        assert attempts == []
+
+
 def test_platform_proof_result_is_independent_from_model_verdict(settings) -> None:  # noqa: ANN001
     settings.ensure_directories()
     database = Database(settings)

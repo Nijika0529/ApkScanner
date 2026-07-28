@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from .db import Database
 from .enums import FindingStatus, HypothesisStatus, ProofAttemptStatus
@@ -200,12 +201,19 @@ class HypothesisLedger:
         request: AgentRequestedTest,
     ) -> str | None:
         with self.database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            if task is None or request.entry_point_id not in set(task.target_entry_ids):
+                return None
             hypothesis = None
             if request.hypothesis_id:
                 hypothesis = session.get(SecurityHypothesis, request.hypothesis_id)
-                if hypothesis is not None and hypothesis.task_id != task_id:
-                    hypothesis = None
-            if hypothesis is None:
+                if (
+                    hypothesis is None
+                    or hypothesis.task_id != task_id
+                    or hypothesis.scan_id != task.scan_id
+                ):
+                    return None
+            else:
                 hypothesis = session.scalar(
                     select(SecurityHypothesis)
                     .where(SecurityHypothesis.task_id == task_id)
@@ -382,6 +390,38 @@ class HypothesisLedger:
         result_value: str,
         backend: str,
         model: str | None,
+        session: Session | None = None,
+    ) -> None:
+        if session is None:
+            with self.database.session_factory() as owned_session:
+                self._finalize(
+                    owned_session,
+                    task_id=task_id,
+                    payload=payload,
+                    result_value=result_value,
+                    backend=backend,
+                    model=model,
+                )
+                owned_session.commit()
+            return
+        self._finalize(
+            session,
+            task_id=task_id,
+            payload=payload,
+            result_value=result_value,
+            backend=backend,
+            model=model,
+        )
+
+    @staticmethod
+    def _finalize(
+        session: Session,
+        *,
+        task_id: str,
+        payload: dict[str, Any],
+        result_value: str,
+        backend: str,
+        model: str | None,
     ) -> None:
         if result_value in {
             FindingStatus.SUPPORTED_STATIC.value,
@@ -400,59 +440,64 @@ class HypothesisLedger:
         evidence_ids = [
             value for value in payload.get("evidence_ids", []) if isinstance(value, str)
         ]
-        self.record_argument(
-            task_id=task_id,
-            role="arbiter",
-            phase="platform_validation",
-            backend=backend,
-            model=model,
-            payload={**payload, "platform_result": result_value},
+        hypotheses = list(
+            session.scalars(
+                select(SecurityHypothesis).where(SecurityHypothesis.task_id == task_id)
+            )
         )
-        with self.database.session_factory() as session:
-            hypotheses = list(
-                session.scalars(
-                    select(SecurityHypothesis).where(SecurityHypothesis.task_id == task_id)
+        argument_payload = {**payload, "platform_result": result_value}
+        for hypothesis in hypotheses:
+            session.add(
+                HypothesisArgument(
+                    scan_id=hypothesis.scan_id,
+                    task_id=task_id,
+                    hypothesis_id=hypothesis.id,
+                    role="arbiter",
+                    position="decision",
+                    phase="platform_validation",
+                    backend=backend,
+                    model=model,
+                    payload=argument_payload,
+                    evidence_ids=evidence_ids,
                 )
             )
-            for hypothesis in hypotheses:
-                harm_demonstrated = session.scalar(
-                    select(ProofAttempt.id)
-                    .where(
-                        ProofAttempt.hypothesis_id == hypothesis.id,
-                        ProofAttempt.harm_demonstrated.is_(True),
-                    )
-                    .limit(1)
+            harm_demonstrated = session.scalar(
+                select(ProofAttempt.id)
+                .where(
+                    ProofAttempt.hypothesis_id == hypothesis.id,
+                    ProofAttempt.harm_demonstrated.is_(True),
                 )
-                hypothesis.status = (
-                    HypothesisStatus.PROVEN.value
-                    if harm_demonstrated is not None
-                    else status
+                .limit(1)
+            )
+            hypothesis.status = (
+                HypothesisStatus.PROVEN.value
+                if harm_demonstrated is not None
+                else status
+            )
+            hypothesis.confidence_score = confidence
+            hypothesis.impact = str(
+                payload.get("summary")
+                or "No concrete security impact was established."
+            )
+            if status in {
+                HypothesisStatus.PROVEN.value,
+                HypothesisStatus.ACCEPTED_FOR_PROOF.value,
+            }:
+                hypothesis.support_evidence_ids = HypothesisLedger._merge_ids(
+                    hypothesis.support_evidence_ids,
+                    evidence_ids,
                 )
-                hypothesis.confidence_score = confidence
-                hypothesis.impact = str(
-                    payload.get("summary")
-                    or "No concrete security impact was established."
+            elif status == HypothesisStatus.REFUTED.value:
+                hypothesis.refute_evidence_ids = HypothesisLedger._merge_ids(
+                    hypothesis.refute_evidence_ids,
+                    evidence_ids,
                 )
-                if status in {
-                    HypothesisStatus.PROVEN.value,
-                    HypothesisStatus.ACCEPTED_FOR_PROOF.value,
-                }:
-                    hypothesis.support_evidence_ids = self._merge_ids(
-                        hypothesis.support_evidence_ids,
-                        evidence_ids,
-                    )
-                elif status == HypothesisStatus.REFUTED.value:
-                    hypothesis.refute_evidence_ids = self._merge_ids(
-                        hypothesis.refute_evidence_ids,
-                        evidence_ids,
-                    )
-                hypothesis.metadata_json = {
-                    **dict(hypothesis.metadata_json or {}),
-                    "platform_result": result_value,
-                    "severity_proposal": payload.get("severity_proposal"),
-                    "platform_severity": payload.get("platform_severity"),
-                }
-            session.commit()
+            hypothesis.metadata_json = {
+                **dict(hypothesis.metadata_json or {}),
+                "platform_result": result_value,
+                "severity_proposal": payload.get("severity_proposal"),
+                "platform_severity": payload.get("platform_severity"),
+            }
 
     def task_harm_demonstrated(self, task_id: str) -> bool:
         with self.database.session_factory() as session:

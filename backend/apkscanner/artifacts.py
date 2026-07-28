@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -13,6 +14,11 @@ from typing import Any, BinaryIO
 from fastapi import UploadFile
 
 from .config import Settings
+from .permissions import (
+    PRIVATE_FILE_MODE,
+    ensure_private_directory,
+    ensure_private_file,
+)
 
 
 class ArtifactTooLargeError(ValueError):
@@ -20,8 +26,17 @@ class ArtifactTooLargeError(ValueError):
 
 
 class ArtifactStore:
+    _CONTENT_CATEGORIES = {
+        "artifacts",
+        "evidence",
+        "poc_artifacts",
+        "poc_sources",
+        "reports",
+    }
+
     def __init__(self, settings: Settings):
         self.settings = settings
+        self._harden_existing_paths()
 
     async def save_upload(self, upload: UploadFile) -> tuple[str, Path, int]:
         artifact_root = self._category_root("artifacts")
@@ -29,6 +44,7 @@ class ArtifactStore:
             mode="wb", prefix="upload-", suffix=".part", dir=artifact_root, delete=False
         )
         temp_path = Path(temporary.name)
+        ensure_private_file(temp_path)
         digest = hashlib.sha256()
         total = 0
         try:
@@ -44,7 +60,7 @@ class ArtifactStore:
                 destination.flush()
             sha256 = digest.hexdigest()
             final_dir = artifact_root / sha256[:2]
-            final_dir.mkdir(parents=True, exist_ok=True)
+            ensure_private_directory(final_dir)
             self._verify_directory(final_dir, artifact_root)
             final_path = final_dir / f"{sha256}.apk"
             if final_path.exists() or final_path.is_symlink():
@@ -52,6 +68,7 @@ class ArtifactStore:
                 temp_path.unlink(missing_ok=True)
             else:
                 temp_path.replace(final_path)
+            ensure_private_file(final_path)
             return sha256, final_path, total
         except Exception:
             temporary.close()
@@ -77,17 +94,28 @@ class ArtifactStore:
         digest = hashlib.sha256(content).hexdigest()
         root = self._category_root(category)
         directory = root / digest[:2]
-        directory.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(directory)
         self._verify_directory(directory, root)
         path = directory / f"{digest}{suffix}"
         if path.exists() or path.is_symlink():
             self._verify_existing(path, digest)
         else:
             try:
-                with path.open("xb") as stream:
-                    stream.write(content)
+                descriptor = os.open(
+                    path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    PRIVATE_FILE_MODE,
+                )
             except FileExistsError:
                 self._verify_existing(path, digest)
+            else:
+                try:
+                    with os.fdopen(descriptor, "wb") as stream:
+                        stream.write(content)
+                except Exception:
+                    path.unlink(missing_ok=True)
+                    raise
+        ensure_private_file(path)
         return digest, path
 
     def put_json(self, category: str, value: Any) -> tuple[str, Path]:
@@ -121,6 +149,7 @@ class ArtifactStore:
         if not candidate.resolve().is_relative_to(root.resolve()):
             raise ValueError("content-addressed artifact escapes its configured root")
         self._verify_existing(candidate, expected_sha256)
+        ensure_private_file(candidate)
         return candidate
 
     def delete_content_addressed(
@@ -175,9 +204,34 @@ class ArtifactStore:
         root = data_root / category
         if root.is_symlink():
             raise ValueError(f"artifact category must not be a symbolic link: {root}")
-        root.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(root)
         self._verify_directory(root, data_root)
         return root
+
+    def _harden_existing_paths(self) -> None:
+        data_root = self.settings.data_dir.resolve()
+        for category in self._CONTENT_CATEGORIES:
+            root = data_root / category
+            if root.is_symlink() or not root.is_dir():
+                continue
+            ensure_private_directory(root)
+            for entry in root.iterdir():
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir():
+                    ensure_private_directory(entry)
+                    for candidate in entry.iterdir():
+                        ensure_private_file(candidate)
+                else:
+                    ensure_private_file(entry)
+
+        workspace_root = data_root / "workspaces"
+        if workspace_root.is_symlink() or not workspace_root.is_dir():
+            return
+        ensure_private_directory(workspace_root)
+        for workspace in workspace_root.iterdir():
+            if not workspace.is_symlink() and workspace.is_dir():
+                ensure_private_directory(workspace)
 
     @staticmethod
     def _verify_directory(path: Path, allowed_root: Path) -> None:

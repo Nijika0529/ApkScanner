@@ -299,10 +299,12 @@ class AdbDeviceAdapter:
             return {"available": False, "detail": self.auth_flow_error}
         if self.auth_flow is None:
             return {"available": False, "detail": "APKSCANNER_AUTH_FLOW is not configured"}
-        if not any(step.action == "assert_text" for step in self.auth_flow.steps):
+        if self.auth_flow.steps[-1].action != "assert_text":
             return {
                 "available": False,
-                "detail": "auth flow requires an assert_text step to prove login succeeded",
+                "detail": (
+                    "auth flow must end with an assert_text step to prove login succeeded"
+                ),
             }
         if package_name and self.auth_flow.package and self.auth_flow.package != package_name:
             return {
@@ -829,6 +831,10 @@ class AdbDeviceAdapter:
     def _safe_input_text(value: str) -> str:
         if not value or len(value) > 500:
             raise ValueError("auth text must contain between 1 and 500 characters")
+        if "%s" in value:
+            raise ValueError(
+                "auth text cannot contain the adb input-text space escape sequence %s"
+            )
         encoded = value.replace(" ", "%s")
         if not re.fullmatch(r"[A-Za-z0-9@._+%=-]+", encoded):
             raise ValueError(

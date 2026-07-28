@@ -18,7 +18,12 @@ def android_attr(element: ElementTree.Element, name: str) -> str | None:
 def parse_bool(value: str | None, default: bool = False) -> bool:
     if value is None:
         return default
-    return value.strip().lower() == "true"
+    normalized = value.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    return default
 
 
 def normalize_class_name(package_name: str, name: str) -> str:
@@ -174,6 +179,16 @@ def parse_manifest(xml_text: str) -> ManifestDocument:
     uses_sdk = root.find("uses-sdk")
     min_sdk = _int_attr(uses_sdk, "minSdkVersion")
     target_sdk = _int_attr(uses_sdk, "targetSdkVersion")
+    target_sdk_attribute = (
+        android_attr(uses_sdk, "targetSdkVersion") if uses_sdk is not None else None
+    )
+    effective_target_sdk = (
+        target_sdk
+        if target_sdk is not None
+        else (min_sdk if min_sdk is not None else 1)
+        if target_sdk_attribute is None
+        else None
+    )
     version_name = android_attr(root, "versionName")
     version_code = android_attr(root, "versionCode")
     permission_declarations: dict[str, str] = {}
@@ -190,10 +205,15 @@ def parse_manifest(xml_text: str) -> ManifestDocument:
     if application_element is None:
         raise ValueError("AndroidManifest.xml is missing the application element")
     application_permission = android_attr(application_element, "permission")
+    application_enabled = parse_bool(
+        android_attr(application_element, "enabled"),
+        True,
+    )
     cleartext_attribute = android_attr(application_element, "usesCleartextTraffic")
-    cleartext_default = target_sdk is None or target_sdk <= 27
+    cleartext_default = effective_target_sdk is None or effective_target_sdk <= 27
     application = {
         "name": android_attr(application_element, "name"),
+        "enabled": application_enabled,
         "debuggable": parse_bool(android_attr(application_element, "debuggable")),
         "allow_backup": parse_bool(android_attr(application_element, "allowBackup"), True),
         "uses_cleartext_traffic": parse_bool(cleartext_attribute, cleartext_default),
@@ -202,6 +222,7 @@ def parse_manifest(xml_text: str) -> ManifestDocument:
         "test_only": parse_bool(android_attr(application_element, "testOnly")),
         "extract_native_libs": android_attr(application_element, "extractNativeLibs"),
         "permission": application_permission,
+        "effective_target_sdk": effective_target_sdk,
     }
     entries: list[ParsedEntryPoint] = []
     tag_kinds = {
@@ -223,16 +244,122 @@ def parse_manifest(xml_text: str) -> ManifestDocument:
                 owner = normalize_class_name(package_name, target) if target else name
             filters = [_intent_filter(item) for item in component.findall("intent-filter")]
             exported, reason = _effective_exported(
-                tag, android_attr(component, "exported"), bool(filters), target_sdk
+                tag,
+                android_attr(component, "exported"),
+                bool(filters),
+                effective_target_sdk,
             )
-            permission = android_attr(component, "permission") or application_permission
+            declared_permission = android_attr(component, "permission")
+            permission = (
+                declared_permission
+                if tag == "activity-alias"
+                else declared_permission or application_permission
+            )
+            provider_permissions: dict[str, Any] = {}
             if tag == "provider":
-                permission = permission or android_attr(component, "readPermission")
-            protection = permission_declarations.get(permission) if permission else None
-            deep_links = [link for item in filters for link in _expand_deep_links(item)]
+                read_permission = android_attr(component, "readPermission") or permission
+                write_permission = android_attr(component, "writePermission") or permission
+                read_protection = (
+                    permission_declarations.get(read_permission)
+                    if read_permission
+                    else None
+                )
+                write_protection = (
+                    permission_declarations.get(write_permission)
+                    if write_permission
+                    else None
+                )
+                provider_permissions = {
+                    "effective_read_permission": read_permission,
+                    "effective_read_permission_protection": read_protection,
+                    "effective_write_permission": write_permission,
+                    "effective_write_permission_protection": write_protection,
+                }
+                path_permissions: list[dict[str, str | None]] = []
+                path_access_boundaries: list[tuple[str | None, str | None]] = []
+                for path_permission in component.findall("path-permission"):
+                    common_path_permission = android_attr(path_permission, "permission")
+                    path_read_permission = (
+                        android_attr(path_permission, "readPermission")
+                        or common_path_permission
+                        or read_permission
+                    )
+                    path_write_permission = (
+                        android_attr(path_permission, "writePermission")
+                        or common_path_permission
+                        or write_permission
+                    )
+                    path_read_protection = (
+                        permission_declarations.get(path_read_permission)
+                        if path_read_permission
+                        else None
+                    )
+                    path_write_protection = (
+                        permission_declarations.get(path_write_permission)
+                        if path_write_permission
+                        else None
+                    )
+                    path_match = next(
+                        (
+                            (key, value)
+                            for key in (
+                                "path",
+                                "pathPrefix",
+                                "pathPattern",
+                                "pathAdvancedPattern",
+                            )
+                            if (value := android_attr(path_permission, key)) is not None
+                        ),
+                        (None, None),
+                    )
+                    path_permissions.append(
+                        {
+                            "path_kind": path_match[0],
+                            "path": path_match[1],
+                            "permission": common_path_permission,
+                            "effective_read_permission": path_read_permission,
+                            "effective_read_permission_protection": path_read_protection,
+                            "effective_write_permission": path_write_permission,
+                            "effective_write_permission_protection": path_write_protection,
+                        }
+                    )
+                    path_access_boundaries.extend(
+                        (
+                            (path_read_permission, path_read_protection),
+                            (path_write_permission, path_write_protection),
+                        )
+                    )
+                provider_permissions["path_permissions"] = path_permissions
+                access_boundaries = (
+                    (read_permission, read_protection),
+                    (write_permission, write_protection),
+                    *path_access_boundaries,
+                )
+                permission, protection = next(
+                    (
+                        (candidate_permission, candidate_protection)
+                        for candidate_permission, candidate_protection in access_boundaries
+                        if candidate_permission is None
+                        or "signature" not in (candidate_protection or "").lower()
+                    ),
+                    access_boundaries[0],
+                )
+            else:
+                protection = (
+                    permission_declarations.get(permission) if permission else None
+                )
+            deep_links = (
+                [link for item in filters for link in _expand_deep_links(item)]
+                if tag in {"activity", "activity-alias"}
+                else []
+            )
+            component_enabled = parse_bool(android_attr(component, "enabled"), True)
             metadata: dict[str, Any] = {
                 "enabled": android_attr(component, "enabled"),
+                "application_enabled": application_enabled,
+                "effective_enabled": application_enabled and component_enabled,
                 "process": android_attr(component, "process"),
+                **provider_permissions,
             }
             if tag == "provider":
                 metadata.update(
@@ -271,7 +398,10 @@ def parse_manifest(xml_text: str) -> ManifestDocument:
                         permission_protection=protection,
                         intent_filters=filters,
                         deep_links=[link],
-                        metadata={"filter_link_index": filter_index},
+                        metadata={
+                            **metadata,
+                            "filter_link_index": filter_index,
+                        },
                     )
                 )
     return ManifestDocument(

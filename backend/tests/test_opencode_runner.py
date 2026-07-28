@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -16,6 +17,7 @@ from apkscanner.opencode_runner import (
     OPENCODE_PROFILE_STABLE_ANALYZER,
     OPENCODE_PROFILE_STRUCTURED_FINALIZER,
     OPENCODE_PROFILE_THINKING_EXPLORER,
+    OPENCODE_PROVIDER_KEY_FIELD,
     OPENCODE_SDK_VERSION,
     OpenCodeInvestigationError,
     OpenCodeInvestigator,
@@ -177,6 +179,51 @@ def test_capability_rejects_invalid_reasoning_effort(
     capability = OpenCodeInvestigator(configured).capability()
     assert capability["available"] is False
     assert "must be high or max" in capability["detail"]
+
+
+def test_provider_key_is_sent_in_one_shot_payload_not_worker_environment(
+    settings, tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "unit-test-provider-secret")
+    configured = replace(
+        settings,
+        opencode_isolation="host",
+        opencode_worker_dir=_worker_tree(tmp_path),
+    )
+    investigator = OpenCodeInvestigator(configured)
+    original = {"schema_version": "1.0", "action": "capability"}
+
+    worker_payload = investigator._worker_payload(original)
+    worker_environment = investigator._worker_environment(tmp_path / "runtime")
+
+    assert original == {"schema_version": "1.0", "action": "capability"}
+    assert worker_payload[OPENCODE_PROVIDER_KEY_FIELD] == "unit-test-provider-secret"
+    assert "DEEPSEEK_API_KEY" not in worker_environment
+
+
+@pytest.mark.skipif(not hasattr(os, "chown"), reason="requires POSIX ownership")
+def test_root_docker_workspace_is_prepared_for_image_node_user(
+    settings,
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    nested = workspace / "nested"
+    nested.mkdir(parents=True)
+    evidence = nested / "evidence.json"
+    evidence.write_text("{}", encoding="utf-8")
+    ownership: list[tuple[Path, int, int, bool]] = []
+
+    monkeypatch.setattr(
+        "apkscanner.opencode_runner.os.chown",
+        lambda path, uid, gid, *, follow_symlinks: ownership.append(
+            (Path(path), uid, gid, follow_symlinks)
+        ),
+    )
+    OpenCodeInvestigator(settings)._prepare_root_owned_docker_workspace(workspace)
+
+    assert {item[0] for item in ownership} == {workspace, nested, evidence}
+    assert all(item[1:] == (1000, 1000, False) for item in ownership)
 
 
 def test_worker_response_must_be_a_json_object() -> None:

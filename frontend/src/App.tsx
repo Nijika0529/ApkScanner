@@ -44,6 +44,32 @@ const severityTone = {
   info: "neutral",
 } as const
 
+const DETAIL_REFRESH_EVENTS = [
+  "static.started",
+  "static.mobsf_failed",
+  "static.completed",
+  "scan.preliminary_ready",
+  "scan.preliminary_sla_missed",
+  "scan.deadline_exhausted",
+  "scan.final",
+  "scan.failed",
+  "investigation.pool.started",
+  "task.worker_requeued",
+  "task.device_requeued",
+  "task.device_interrupted",
+  "task.failed",
+  "task.awaiting_device",
+  "task.device_acquired",
+  "task.device_released",
+  "task.started",
+  "task.completed",
+  "task.cancel_requested",
+  "task.cancelled",
+  "task.cancelled_after_deletion",
+  "task.deleted",
+  "exploration.update",
+] as const
+
 function statusTone(status: string): "neutral" | "good" | "warning" | "danger" | "info" {
   if (["final", "completed", "covered", "accepted", "reproduced_blackbox", "proven"].includes(status)) return "good"
   if (["failed", "critical", "high", "tool_failed"].includes(status)) return "danger"
@@ -54,6 +80,10 @@ function statusTone(status: string): "neutral" | "good" | "warning" | "danger" |
 
 function scanProgress(status: string) {
   return { queued: 5, intake: 12, static_running: 35, static_complete: 55, preliminary_ready: 68, investigating: 82, final: 100, failed: 100 }[status] ?? 0
+}
+
+function isAbortError(reason: unknown) {
+  return reason instanceof DOMException && reason.name === "AbortError"
 }
 
 interface DetailData {
@@ -78,68 +108,139 @@ function App() {
   const [uploadOpen, setUploadOpen] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<Scan | null>(null)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
+  const detailRequestRef = useRef(0)
+  const selectedIdRef = useRef<string | null>(selectedId)
 
   const loadScans = useCallback(async () => {
     const data = await api.scans()
-    setScans(data)
-    setSelectedId((current) => current ?? data[0]?.id ?? null)
+    setScans((current) => {
+      const returnedIds = new Set(data.map((scan) => scan.id))
+      const optimistic = current.filter((scan) => !returnedIds.has(scan.id))
+      return [...optimistic, ...data]
+    })
+    const next = selectedIdRef.current ?? data[0]?.id ?? null
+    selectedIdRef.current = next
+    setSelectedId(next)
+    return data
   }, [])
 
-  const loadDetail = useCallback(async (id: string) => {
-    const [scan, entries, findings, coverage, tasks, audits, hypotheses, evaluations, events] = await Promise.all([
-      api.scan(id), api.entries(id), api.findings(id), api.coverage(id), api.tasks(id), api.agentAudits(id), api.hypotheses(id), api.evaluations(id), api.events(id),
-    ])
-    setDetail({ scan, entries, findings, coverage, tasks, audits, hypotheses, evaluations, events })
-    setScans((items) => items.map((item) => item.id === scan.id ? scan : item))
+  const loadDetail = useCallback(async (id: string, signal?: AbortSignal) => {
+    const requestId = ++detailRequestRef.current
+    try {
+      const [scan, entries, findings, coverage, tasks, audits, hypotheses, evaluations, events] = await Promise.all([
+        api.scan(id, signal),
+        api.entries(id, signal),
+        api.findings(id, signal),
+        api.coverage(id, signal),
+        api.tasks(id, signal),
+        api.agentAudits(id, signal),
+        api.hypotheses(id, signal),
+        api.evaluations(id, signal),
+        api.events(id, signal),
+      ])
+      if (signal?.aborted || requestId !== detailRequestRef.current) return false
+      setDetail({ scan, entries, findings, coverage, tasks, audits, hypotheses, evaluations, events })
+      setScans((items) => items.map((item) => item.id === scan.id ? scan : item))
+      return true
+    } catch (reason) {
+      if (signal?.aborted || requestId !== detailRequestRef.current || isAbortError(reason)) {
+        return false
+      }
+      throw reason
+    } finally {
+      if (!signal?.aborted && requestId === detailRequestRef.current) setLoading(false)
+    }
   }, [])
+
+  const refreshDetail = useCallback(async (
+    id: string,
+    { signal, reportError = true }: { signal?: AbortSignal; reportError?: boolean } = {},
+  ) => {
+    if (selectedIdRef.current !== id) return
+    try {
+      await loadDetail(id, signal)
+    } catch (reason) {
+      if (reportError && !signal?.aborted) {
+        setError(reason instanceof Error ? reason.message : "刷新扫描详情失败")
+      }
+    }
+  }, [loadDetail])
 
   useEffect(() => {
-    Promise.all([loadScans(), api.health().then(setHealth)])
+    void loadScans()
+      .then((items) => {
+        if (!items.length) setLoading(false)
+      })
+      .catch((reason: Error) => {
+        setError(reason.message)
+        setLoading(false)
+      })
+    void api.health()
+      .then(setHealth)
       .catch((reason: Error) => setError(reason.message))
-      .finally(() => setLoading(false))
   }, [loadScans])
 
   useEffect(() => {
-    if (!selectedId) { setDetail(null); return }
+    if (!selectedId) {
+      detailRequestRef.current += 1
+      setDetail(null)
+      setLoading(false)
+      return
+    }
+    const controller = new AbortController()
+    setDetail(null)
     setLoading(true)
-    loadDetail(selectedId).catch((reason: Error) => setError(reason.message)).finally(() => setLoading(false))
     const source = new EventSource(`/api/v1/scans/${selectedId}/events/stream`)
     let refreshTimer: ReturnType<typeof setTimeout> | undefined
+    let initialRefreshPending = true
+    let refreshQueuedDuringInitial = false
     const refresh = () => {
+      if (initialRefreshPending) {
+        refreshQueuedDuringInitial = true
+        return
+      }
       if (refreshTimer) clearTimeout(refreshTimer)
-      refreshTimer = setTimeout(() => void loadDetail(selectedId).catch(() => undefined), 200)
+      refreshTimer = setTimeout(
+        () => void refreshDetail(selectedId, {
+          signal: controller.signal,
+          reportError: false,
+        }),
+        200,
+      )
     }
     source.onmessage = refresh
-    source.addEventListener("static.completed", refresh)
-    source.addEventListener("task.completed", refresh)
-    source.addEventListener("task.awaiting_device", refresh)
-    source.addEventListener("task.device_acquired", refresh)
-    source.addEventListener("task.device_released", refresh)
-    source.addEventListener("task.cancel_requested", refresh)
-    source.addEventListener("task.cancelled", refresh)
-    source.addEventListener("exploration.update", refresh)
-    source.addEventListener("scan.final", refresh)
-    source.addEventListener("scan.failed", refresh)
+    DETAIL_REFRESH_EVENTS.forEach((eventType) => source.addEventListener(eventType, refresh))
     source.addEventListener("end", () => source.close())
+    void refreshDetail(selectedId, { signal: controller.signal }).finally(() => {
+      initialRefreshPending = false
+      if (refreshQueuedDuringInitial && !controller.signal.aborted) refresh()
+    })
     return () => {
       if (refreshTimer) clearTimeout(refreshTimer)
+      controller.abort()
       source.close()
     }
-  }, [selectedId, loadDetail])
+  }, [selectedId, refreshDetail])
 
   async function onUploaded(scan: Scan) {
     setUploadOpen(false)
     setScans((items) => [scan, ...items])
+    detailRequestRef.current += 1
+    setDetail(null)
+    setLoading(true)
+    selectedIdRef.current = scan.id
     setSelectedId(scan.id)
-    await loadDetail(scan.id)
   }
 
   async function onDeleted(scanId: string, warnings: string[]) {
     const remaining = scans.filter((scan) => scan.id !== scanId)
+    detailRequestRef.current += 1
     setDeleteTarget(null)
     setScans(remaining)
     setDetail(null)
-    setSelectedId(remaining[0]?.id ?? null)
+    setLoading(Boolean(remaining[0]))
+    selectedIdRef.current = remaining[0]?.id ?? null
+    setSelectedId(selectedIdRef.current)
     if (warnings.length) setError(`扫描已删除，但有文件未能清理：${warnings.join("；")}`)
   }
 
@@ -148,7 +249,16 @@ function App() {
       scans={scans}
       selectedId={selectedId}
       health={health}
-      onSelect={(id) => { setSelectedId(id); setMobileNavOpen(false) }}
+      onSelect={(id) => {
+        if (id !== selectedId) {
+          detailRequestRef.current += 1
+          setDetail(null)
+          setLoading(true)
+          selectedIdRef.current = id
+          setSelectedId(id)
+        }
+        setMobileNavOpen(false)
+      }}
       onUpload={() => { setUploadOpen(true); setMobileNavOpen(false) }}
     />
   )
@@ -175,12 +285,12 @@ function App() {
           </div>
           <div className="flex items-center gap-2">
             {detail && <Badge tone={statusTone(detail.scan.status)}><span className={cn("mr-1.5 h-1.5 w-1.5 rounded-full", detail.scan.status === "final" ? "bg-emerald-400" : "animate-pulse bg-current motion-reduce:animate-none")} />{statusLabel(detail.scan.status)}</Badge>}
-            <Button variant="secondary" size="sm" onClick={() => selectedId && loadDetail(selectedId)} disabled={!selectedId} aria-label="刷新数据"><RefreshCw className="h-3.5 w-3.5" /><span className="hidden sm:inline">刷新</span></Button>
+            <Button variant="secondary" size="sm" onClick={() => selectedId && void refreshDetail(selectedId)} disabled={!selectedId} aria-label="刷新数据"><RefreshCw className="h-3.5 w-3.5" /><span className="hidden sm:inline">刷新</span></Button>
           </div>
         </header>
         <div className="mx-auto max-w-[1500px] p-4 sm:p-6 lg:p-8">
           {error && <div role="alert" className="mb-6 flex items-start gap-3 rounded-xl border border-rose-500/35 bg-rose-500/10 p-4 text-sm text-rose-800"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /><span>{error}</span><button className="ml-auto" onClick={() => setError(null)} aria-label="关闭错误"><X className="h-4 w-4" /></button></div>}
-          {loading && !detail ? <LoadingState /> : detail ? <ScanDetailView data={detail} health={health} onRefresh={() => loadDetail(detail.scan.id)} onDelete={() => setDeleteTarget(detail.scan)} /> : <EmptyState onUpload={() => setUploadOpen(true)} />}
+          {loading && !detail ? <LoadingState /> : detail ? <ScanDetailView data={detail} health={health} onRefresh={() => refreshDetail(detail.scan.id)} onDelete={() => setDeleteTarget(detail.scan)} /> : <EmptyState onUpload={() => setUploadOpen(true)} />}
         </div>
       </main>
       <UploadDialog open={uploadOpen} onOpenChange={setUploadOpen} onUploaded={onUploaded} health={health} />
@@ -301,8 +411,26 @@ function ReviewDialog({ finding, open, onOpenChange, onReviewed }: { finding: Fi
   const [status, setStatus] = useState<"accepted" | "false_positive" | "candidate">("accepted")
   const [note, setNote] = useState("")
   const [saving, setSaving] = useState(false)
-  async function submit(event: FormEvent) { event.preventDefault(); setSaving(true); try { await api.review(finding.id, status, note); onOpenChange(false); setNote(""); await onReviewed() } finally { setSaving(false) } }
-  return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent><DialogTitle className="text-xl font-bold text-slate-950">审核 Finding</DialogTitle><DialogDescription className="mt-2 text-sm text-slate-600">Agent 和规则结论不会自动成为发布门禁，请记录人工判断依据。</DialogDescription><form className="mt-6 space-y-5" onSubmit={submit}><fieldset><legend className="mb-3 text-sm font-semibold text-slate-800">审核结论</legend><div className="grid grid-cols-3 gap-2">{([['accepted','接受'],['false_positive','误报'],['candidate','待确认']] as const).map(([value,label]) => <label key={value} className={cn("cursor-pointer rounded-lg border p-3 text-center text-sm", status === value ? "border-cyan-400 bg-cyan-400/10 text-cyan-800" : "border-slate-300 text-slate-600")}><input type="radio" name="status" value={value} checked={status === value} onChange={() => setStatus(value)} className="sr-only" />{label}</label>)}</div></fieldset><label className="block"><span className="mb-2 block text-sm font-semibold text-slate-800">审核备注 <span className="text-rose-700">*</span></span><textarea required minLength={1} maxLength={4000} value={note} onChange={(event) => setNote(event.target.value)} rows={5} className="field resize-y" placeholder="说明接受、误报或待确认的依据" /></label><div className="flex justify-end gap-2"><Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>取消</Button><Button type="submit" disabled={saving || !note.trim()}>{saving && <LoaderCircle className="h-4 w-4 animate-spin" />}保存审核</Button></div></form></DialogContent></Dialog>
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => {
+    if (open) setError(null)
+  }, [open, finding.id])
+  async function submit(event: FormEvent) {
+    event.preventDefault()
+    setSaving(true)
+    setError(null)
+    try {
+      await api.review(finding.id, status, note)
+      onOpenChange(false)
+      setNote("")
+      await onReviewed()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "保存审核失败")
+    } finally {
+      setSaving(false)
+    }
+  }
+  return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent><DialogTitle className="text-xl font-bold text-slate-950">审核 Finding</DialogTitle><DialogDescription className="mt-2 text-sm text-slate-600">Agent 和规则结论不会自动成为发布门禁，请记录人工判断依据。</DialogDescription><form className="mt-6 space-y-5" onSubmit={submit}><fieldset><legend className="mb-3 text-sm font-semibold text-slate-800">审核结论</legend><div className="grid grid-cols-3 gap-2">{([['accepted','接受'],['false_positive','误报'],['candidate','待确认']] as const).map(([value,label]) => <label key={value} className={cn("cursor-pointer rounded-lg border p-3 text-center text-sm", status === value ? "border-cyan-400 bg-cyan-400/10 text-cyan-800" : "border-slate-300 text-slate-600")}><input type="radio" name="status" value={value} checked={status === value} onChange={() => setStatus(value)} className="sr-only" />{label}</label>)}</div></fieldset><label className="block"><span className="mb-2 block text-sm font-semibold text-slate-800">审核备注 <span className="text-rose-700">*</span></span><textarea required minLength={1} maxLength={4000} value={note} onChange={(event) => setNote(event.target.value)} rows={5} className="field resize-y" placeholder="说明接受、误报或待确认的依据" /></label>{error && <p role="alert" className="text-sm text-rose-700">{error}</p>}<div className="flex justify-end gap-2"><Button type="button" variant="ghost" onClick={() => onOpenChange(false)} disabled={saving}>取消</Button><Button type="submit" disabled={saving || !note.trim()}>{saving && <LoaderCircle className="h-4 w-4 animate-spin" />}保存审核</Button></div></form></DialogContent></Dialog>
 }
 
 function CoverageMatrix({ coverage }: { coverage: CoverageItem[] }) {
@@ -368,7 +496,19 @@ function Tasks({ scan, tasks, entries, audits, events, health, onRefresh }: { sc
   const [controlError, setControlError] = useState<string | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<InvestigationTask | null>(null)
   const [cancelTarget, setCancelTarget] = useState<InvestigationTask | null>(null)
-  async function retry(task: InvestigationTask) { setRetrying(task.id); try { if (task.status === "timed_out") await api.continueTask(task.id); else await api.retryTask(task.id); await onRefresh() } finally { setRetrying(null) } }
+  async function retry(task: InvestigationTask) {
+    setRetrying(task.id)
+    setControlError(null)
+    try {
+      if (task.status === "timed_out") await api.continueTask(task.id)
+      else await api.retryTask(task.id)
+      await onRefresh()
+    } catch (reason) {
+      setControlError(reason instanceof Error ? reason.message : "重新分析失败")
+    } finally {
+      setRetrying(null)
+    }
+  }
   const agentControl = recordValue(scan.stats.agent_control)
   const configuredBackend = textValue(agentControl?.backend) ?? textValue(scan.stats.investigator) ?? "none"
   const backend: "codex" | "opencode" | "none" = configuredBackend === "opencode" ? "opencode" : configuredBackend === "codex" ? "codex" : "none"
@@ -910,12 +1050,30 @@ function UploadDialog({ open, onOpenChange, onUploaded, health }: { open: boolea
   const [uploading, setUploading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const maxUploadBytes = health?.max_upload_bytes
+  const maxUploadLabel = maxUploadBytes
+    ? `${(maxUploadBytes / 1024 / 1024).toLocaleString(undefined, { maximumFractionDigits: 2 })} MB`
+    : "由服务端配置"
   async function submit(event: FormEvent) { event.preventDefault(); if (!file) return; setUploading(true); setError(null); try { const scan = await api.upload(file, investigator); setFile(null); setInvestigator("configured"); await onUploaded(scan) } catch (reason) { setError(reason instanceof Error ? reason.message : "上传失败") } finally { setUploading(false) } }
-  function choose(candidate?: File) { if (!candidate) return; if (!candidate.name.toLowerCase().endsWith(".apk")) { setError("首期仅支持单个可安装 .apk 文件"); return } setError(null); setFile(candidate) }
+  function choose(candidate?: File) {
+    if (inputRef.current) inputRef.current.value = ""
+    if (!candidate) return
+    setFile(null)
+    if (!candidate.name.toLowerCase().endsWith(".apk")) {
+      setError("首期仅支持单个可安装 .apk 文件")
+      return
+    }
+    if (maxUploadBytes && candidate.size > maxUploadBytes) {
+      setError(`APK 不能超过 ${maxUploadLabel}`)
+      return
+    }
+    setError(null)
+    setFile(candidate)
+  }
   const defaultLabel = health?.default_investigator === "opencode" ? "OpenCode + DeepSeek" : health?.default_investigator === "codex" ? "Codex" : "仅静态与确定性动态"
   const codexReady = Boolean(health?.enabled_investigators.includes("codex") && health.capabilities.find((item) => item.name === "codex")?.available)
   const opencodeReady = Boolean(health?.enabled_investigators.includes("opencode") && health.capabilities.find((item) => item.name === "opencode_deepseek")?.available)
-  return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent><DialogTitle className="text-xl font-bold text-slate-950">新建 APK 安全扫描</DialogTitle><DialogDescription className="mt-2 text-sm leading-relaxed text-slate-600">APK 将保存在本机内容寻址存储中。AI 受单次任务范围约束，所有进入报告的结论仍须通过平台证据校验。</DialogDescription><form className="mt-6" onSubmit={submit}><button type="button" className={cn("grid min-h-52 w-full place-items-center rounded-2xl border border-dashed p-6 text-center transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-700", dragging ? "border-cyan-300 bg-cyan-400/10" : "border-slate-300 bg-slate-50 hover:border-slate-500")} onClick={() => inputRef.current?.click()} onDragOver={(event) => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); choose(event.dataTransfer.files[0]) }}><input ref={inputRef} type="file" accept=".apk,application/vnd.android.package-archive" className="sr-only" onChange={(event) => choose(event.target.files?.[0])} /><div>{file ? <><FileArchive className="mx-auto h-10 w-10 text-cyan-700" /><p className="mt-4 break-all font-semibold text-slate-900">{file.name}</p><p className="mt-2 text-xs text-slate-500">{(file.size / 1024 / 1024).toFixed(2)} MB · 点击更换</p></> : <><UploadCloud className="mx-auto h-10 w-10 text-slate-500" /><p className="mt-4 font-semibold text-slate-800">拖入 APK 或点击选择</p><p className="mt-2 text-xs text-slate-600">最大 512 MB · 不支持 AAB/XAPK/split APK</p></>}</div></button><label className="mt-5 block"><span className="mb-2 block text-sm font-semibold text-slate-800">语义探索后端</span><select className="field w-full" value={investigator} onChange={(event) => setInvestigator(event.target.value as InvestigatorChoice)}><option value="configured">服务默认 · {defaultLabel}</option><option value="codex" disabled={!codexReady}>Codex · {codexReady ? "已就绪" : "未启用或依赖未就绪"}</option><option value="opencode" disabled={!opencodeReady}>OpenCode + DeepSeek · {opencodeReady ? "已就绪" : "未启用或依赖未就绪"}</option><option value="none">关闭 AI · 仅规则和确定性动态测试</option></select><span className="mt-2 block text-xs leading-relaxed text-slate-600">这是本次扫描的初始选择；扫描详情中仍可显式调整总开关、后端和逐任务开关。</span></label>{error && <p role="alert" className="mt-3 text-sm text-rose-700">{error}</p>}<div className="mt-6 flex justify-end gap-2"><Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>取消</Button><Button type="submit" disabled={!file || uploading}>{uploading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <ScanSearch className="h-4 w-4" />}{uploading ? "正在接收" : "开始扫描"}</Button></div></form></DialogContent></Dialog>
+  return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent><DialogTitle className="text-xl font-bold text-slate-950">新建 APK 安全扫描</DialogTitle><DialogDescription className="mt-2 text-sm leading-relaxed text-slate-600">APK 将保存在本机内容寻址存储中。AI 受单次任务范围约束，所有进入报告的结论仍须通过平台证据校验。</DialogDescription><form className="mt-6" onSubmit={submit}><button type="button" className={cn("grid min-h-52 w-full place-items-center rounded-2xl border border-dashed p-6 text-center transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-700", dragging ? "border-cyan-300 bg-cyan-400/10" : "border-slate-300 bg-slate-50 hover:border-slate-500")} onClick={() => { if (inputRef.current) inputRef.current.value = ""; inputRef.current?.click() }} onDragOver={(event) => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); choose(event.dataTransfer.files[0]) }}><input ref={inputRef} type="file" accept=".apk,application/vnd.android.package-archive" className="sr-only" onChange={(event) => choose(event.target.files?.[0])} /><div>{file ? <><FileArchive className="mx-auto h-10 w-10 text-cyan-700" /><p className="mt-4 break-all font-semibold text-slate-900">{file.name}</p><p className="mt-2 text-xs text-slate-500">{(file.size / 1024 / 1024).toFixed(2)} MB · 点击更换</p></> : <><UploadCloud className="mx-auto h-10 w-10 text-slate-500" /><p className="mt-4 font-semibold text-slate-800">拖入 APK 或点击选择</p><p className="mt-2 text-xs text-slate-600">最大 {maxUploadLabel} · 不支持 AAB/XAPK/split APK</p></>}</div></button><label className="mt-5 block"><span className="mb-2 block text-sm font-semibold text-slate-800">语义探索后端</span><select className="field w-full" value={investigator} onChange={(event) => setInvestigator(event.target.value as InvestigatorChoice)}><option value="configured">服务默认 · {defaultLabel}</option><option value="codex" disabled={!codexReady}>Codex · {codexReady ? "已就绪" : "未启用或依赖未就绪"}</option><option value="opencode" disabled={!opencodeReady}>OpenCode + DeepSeek · {opencodeReady ? "已就绪" : "未启用或依赖未就绪"}</option><option value="none">关闭 AI · 仅规则和确定性动态测试</option></select><span className="mt-2 block text-xs leading-relaxed text-slate-600">这是本次扫描的初始选择；扫描详情中仍可显式调整总开关、后端和逐任务开关。</span></label>{error && <p role="alert" className="mt-3 text-sm text-rose-700">{error}</p>}<div className="mt-6 flex justify-end gap-2"><Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>取消</Button><Button type="submit" disabled={!file || uploading}>{uploading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <ScanSearch className="h-4 w-4" />}{uploading ? "正在接收" : "开始扫描"}</Button></div></form></DialogContent></Dialog>
 }
 
 function Metric({ label, value, icon: Icon, tone }: { label: string; value: number | string; icon: typeof AlertTriangle; tone: "rose" | "cyan" | "violet" | "emerald" }) {

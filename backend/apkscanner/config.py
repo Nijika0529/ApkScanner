@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .permissions import ensure_private_directory
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -187,4 +189,4 @@ class Settings:
             self.data_dir / "evidence",
             self.data_dir / "reports",
         ):
-            path.mkdir(parents=True, exist_ok=True)
+            ensure_private_directory(path)

@@ -224,6 +224,7 @@ export interface Capability {
 export interface Health {
   status: "ok"
   version: string
+  max_upload_bytes: number
   default_investigator: "codex" | "opencode" | "none"
   enabled_investigators: Array<"codex" | "opencode">
   capabilities: Capability[]

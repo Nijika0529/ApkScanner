@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import os
+import stat
 import zipfile
 
 import pytest
 from apkscanner.manifest import parse_manifest
 from apkscanner.rules import BuiltinRuleEngine
-from apkscanner.static_analysis import ApkInspector, InvalidApkError
+from apkscanner.static_analysis import (
+    ApkInspector,
+    InvalidApkError,
+    StaticAnalysisResult,
+)
 from apkscanner.tools import CommandResult
 
 from .conftest import MANIFEST
@@ -17,6 +23,8 @@ def test_inspector_falls_back_to_plaintext_manifest(settings, fixture_apk) -> No
     assert result.manifest.package_name == "com.example.vulnerable"
     assert result.file_inventory["dex_files"] == ["classes.dex"]
     assert result.file_inventory["native_libraries"] == ["lib/arm64-v8a/libdemo.so"]
+    if os.name == "posix":
+        assert stat.S_IMODE(result.workspace.stat().st_mode) == 0o700
 
 
 def test_builtin_rules_emit_candidates_and_coverage(settings, fixture_apk) -> None:  # noqa: ANN001
@@ -93,3 +101,120 @@ def test_partial_jadx_is_scoped_to_the_target_component(tmp_path) -> None:
     assert provider["target_in_jadx_failure_list"] is False
     assert provider["anchors"][0]["path"].endswith("DataProvider.java")
     assert "public class DataProvider" in provider["anchors"][0]["content"]
+
+
+def test_manifest_only_roots_do_not_claim_code_coverage(tmp_path) -> None:
+    manifest = parse_manifest(MANIFEST)
+    result = StaticAnalysisResult(
+        manifest=manifest,
+        workspace=tmp_path,
+        tool_versions={},
+        tool_results={},
+        signing={},
+        file_inventory={},
+        searchable_roots=[tmp_path],
+        code_index={
+            str(entry.owner_component or entry.name): {"status": "source_not_found"}
+            for entry in manifest.entries
+        },
+    )
+
+    _findings, coverage = BuiltinRuleEngine().evaluate(result)
+    by_domain = {item.domain: item for item in coverage}
+
+    assert by_domain["MASVS-CRYPTO"].status == "partial"
+    assert "No searchable application code" in by_domain["MASVS-CRYPTO"].gap_reason
+
+
+@pytest.mark.parametrize(
+    ("decompilation", "code_index", "expected_gap"),
+    [
+        (
+            {
+                "status": "complete",
+                "output_usable": True,
+                "generated_java_files": 2,
+            },
+            {
+                "com.example.First": {"status": "source_available"},
+                "com.example.Second": {"status": "source_not_found"},
+            },
+            "1 of 2 target component",
+        ),
+        (
+            {
+                "status": "partial_success",
+                "output_usable": True,
+                "generated_java_files": 2,
+            },
+            {
+                "com.example.First": {"status": "source_available"},
+                "com.example.Second": {"status": "source_available"},
+            },
+            "partially successful",
+        ),
+        (
+            {
+                "status": "failed",
+                "output_usable": False,
+                "generated_java_files": 0,
+            },
+            {
+                "com.example.First": {"status": "smali_fallback"},
+            },
+            "lack complete decompiled source",
+        ),
+    ],
+)
+def test_incomplete_code_sources_never_claim_full_coverage(
+    tmp_path,
+    decompilation: dict,
+    code_index: dict,
+    expected_gap: str,
+) -> None:
+    result = StaticAnalysisResult(
+        manifest=parse_manifest(MANIFEST),
+        workspace=tmp_path,
+        tool_versions={},
+        tool_results={},
+        signing={},
+        file_inventory={},
+        searchable_roots=[tmp_path],
+        decompilation=decompilation,
+        code_index=code_index,
+    )
+
+    _findings, coverage = BuiltinRuleEngine().evaluate(result)
+    by_domain = {item.domain: item for item in coverage}
+
+    assert by_domain["MASVS-CODE"].status == "partial"
+    assert expected_gap in str(by_domain["MASVS-CODE"].gap_reason)
+
+
+def test_complete_global_decompilation_without_components_counts_as_code_coverage(
+    tmp_path,
+) -> None:
+    manifest = parse_manifest(
+        """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+        package="com.example.library"><application /></manifest>"""
+    )
+    result = StaticAnalysisResult(
+        manifest=manifest,
+        workspace=tmp_path,
+        tool_versions={},
+        tool_results={},
+        signing={},
+        file_inventory={},
+        searchable_roots=[tmp_path],
+        decompilation={
+            "status": "complete",
+            "output_usable": True,
+            "generated_java_files": 10,
+        },
+        code_index={},
+    )
+
+    _findings, coverage = BuiltinRuleEngine().evaluate(result)
+    by_domain = {item.domain: item for item in coverage}
+
+    assert by_domain["MASVS-CODE"].status == "covered"

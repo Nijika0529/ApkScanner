@@ -20,16 +20,76 @@ from apkscanner.models import (
     EntryPoint,
     Evidence,
     Finding,
+    HypothesisArgument,
     InvestigationTask,
     ProofAttempt,
     Scan,
     ScanEvent,
+    SecurityHypothesis,
 )
 from apkscanner.orchestrator import ScanOrchestrator
 from apkscanner.reports import ReportBuilder
 from apkscanner.schemas import AgentInvestigationResult, AgentRequestedTest
 from apkscanner.tools import CommandResult, TimeBudget
 from sqlalchemy import select
+
+
+def test_task_fails_closed_when_entry_belongs_to_another_scan(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    store = ArtifactStore(settings)
+    with database.session_factory() as session:
+        selected_scan = Scan(
+            status="final",
+            filename="selected.apk",
+            artifact_sha256="1" * 64,
+            artifact_path=str(settings.data_dir / "selected.apk"),
+        )
+        foreign_scan = Scan(
+            status="final",
+            filename="foreign.apk",
+            artifact_sha256="2" * 64,
+            artifact_path=str(settings.data_dir / "foreign.apk"),
+        )
+        foreign_entry = EntryPoint(
+            scan=foreign_scan,
+            kind="provider",
+            name="com.example.ForeignProvider",
+            owner_component="com.example.ForeignProvider",
+            exported=True,
+        )
+        session.add_all([selected_scan, foreign_scan, foreign_entry])
+        session.flush()
+        task = InvestigationTask(
+            scan=selected_scan,
+            task_type="component",
+            status="queued",
+            target_entry_ids=[foreign_entry.id],
+        )
+        session.add(task)
+        session.commit()
+        selected_scan_id = selected_scan.id
+        task_id = task.id
+
+    orchestrator = ScanOrchestrator(settings, database, store)
+    orchestrator._run_task(selected_scan_id, task_id, 1)
+
+    with database.session_factory() as session:
+        task = session.get(InvestigationTask, task_id)
+        assert task is not None
+        assert task.status == "failed"
+        assert "outside its scan" in str(task.error)
+        events = list(
+            session.scalars(
+                select(ScanEvent).where(
+                    ScanEvent.scan_id == selected_scan_id,
+                    ScanEvent.event_type == "task.failed",
+                )
+            )
+        )
+        assert len(events) == 1
+        assert events[0].data["loaded_entry_point_ids"] == []
 
 
 def test_task_dispatch_uses_configured_agent_concurrency(settings) -> None:  # noqa: ANN001
@@ -735,6 +795,377 @@ def test_running_agent_is_interrupted_and_audited_as_cancelled(settings) -> None
         audits = build_agent_audits(session, store, scan_id)
         assert audits[0]["status"] == "cancelled"
         assert "cancellation" in audits[0]["artifacts"]
+
+
+@pytest.mark.parametrize(
+    ("winning_status", "expected_status"),
+    [
+        ("cancel_requested", "canceled"),
+        ("deleted", "deleted"),
+    ],
+)
+def test_cancellation_after_runtime_registration_is_acknowledged_before_task_load(
+    settings,
+    winning_status: str,
+    expected_status: str,
+) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    store = ArtifactStore(settings)
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="startup-cancel.apk",
+            artifact_sha256="6" * 64,
+            artifact_path=str(settings.data_dir / "missing.apk"),
+        )
+        entry = EntryPoint(
+            scan=scan,
+            kind="receiver",
+            name="com.example.StartupReceiver",
+            owner_component="com.example.StartupReceiver",
+            exported=True,
+        )
+        session.add_all([scan, entry])
+        session.flush()
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="running",
+            target_entry_ids=[entry.id],
+        )
+        session.add(task)
+        session.commit()
+        scan_id = scan.id
+        task_id = task.id
+
+    orchestrator = ScanOrchestrator(settings, database, store)
+
+    class CancelOnAcquire:
+        @staticmethod
+        def acquire(*, timeout: float) -> bool:
+            del timeout
+            with database.session_factory() as session:
+                task = session.get(InvestigationTask, task_id)
+                assert task is not None
+                task.status = winning_status
+                task.result = {
+                    "cancellation": {
+                        "requested": True,
+                        "acknowledged": False,
+                    },
+                    **(
+                        {"deletion": {"soft_deleted": True}}
+                        if winning_status == "deleted"
+                        else {}
+                    ),
+                }
+                session.commit()
+            assert orchestrator.request_task_cancellation(task_id) is True
+            return True
+
+        @staticmethod
+        def release() -> None:
+            return None
+
+    orchestrator._agent_slots = CancelOnAcquire()  # type: ignore[assignment]
+    orchestrator._run_task(scan_id, task_id, 10)
+
+    with database.session_factory() as session:
+        task = session.get(InvestigationTask, task_id)
+        assert task is not None
+        assert task.status == expected_status
+        assert task.result["cancellation"]["acknowledged"] is True
+
+
+@pytest.mark.parametrize(
+    ("winning_status", "expected_status"),
+    [
+        ("cancel_requested", "canceled"),
+        ("deleted", "deleted"),
+    ],
+)
+def test_terminal_write_yields_to_cancel_or_delete_without_completion_side_effects(
+    settings,
+    monkeypatch,
+    winning_status: str,
+    expected_status: str,
+) -> None:  # noqa: ANN001
+    configured = replace(settings, codex_enabled=True)
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    store = ArtifactStore(configured)
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="terminal-race.apk",
+            artifact_sha256="8" * 64,
+            artifact_path=str(configured.data_dir / "missing.apk"),
+            stats={"investigator": "codex"},
+        )
+        entry = EntryPoint(
+            scan=scan,
+            kind="provider",
+            name="com.example.RaceProvider",
+            owner_component="com.example.RaceProvider",
+            exported=True,
+        )
+        session.add_all([scan, entry])
+        session.flush()
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="queued",
+            target_entry_ids=[entry.id],
+        )
+        coverage = CoverageItem(
+            scan=scan,
+            control_id="entry:terminal-race",
+            domain="entry_point",
+            title="Terminal transition race",
+            status="not_tested",
+            stages={"agent": "not_tested"},
+            entry_point_id=entry.id,
+        )
+        session.add_all([task, coverage])
+        session.commit()
+        scan_id = scan.id
+        task_id = task.id
+        coverage_id = coverage.id
+
+    class FakeInvestigator:
+        @staticmethod
+        def capability(*, deep=False):  # noqa: ANN001, ANN205
+            return {"available": True, "version": "fake-sdk", "deep": deep}
+
+        @staticmethod
+        def investigate(**_kwargs):  # noqa: ANN003, ANN205
+            return SimpleNamespace(
+                thread_id="thread-terminal-race",
+                turn_id="turn-terminal-race",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                result=AgentInvestigationResult(
+                    summary="No conclusive dynamic evidence.",
+                    result="inconclusive",
+                    hypotheses_tested=[],
+                    test_cases=[],
+                    evidence_ids=[],
+                    severity_proposal="low",
+                    confidence="low",
+                    coverage_gaps=["No device evidence"],
+                    followups=[],
+                    requested_tests=[],
+                ),
+            )
+
+    def win_terminal_race(**_kwargs) -> None:  # noqa: ANN003
+        with database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            assert task is not None and task.status == "running"
+            task.status = winning_status
+            task.result = {
+                "race_winner": winning_status,
+                "cancellation": {
+                    "requested": True,
+                    "acknowledged": False,
+                },
+                **(
+                    {"deletion": {"soft_deleted": True}}
+                    if winning_status == "deleted"
+                    else {}
+                ),
+            }
+            session.commit()
+
+    orchestrator = ScanOrchestrator(configured, database, store)
+    orchestrator.investigators["codex"] = FakeInvestigator()
+    monkeypatch.setattr(
+        orchestrator,
+        "_record_agent_validation",
+        win_terminal_race,
+    )
+
+    orchestrator._run_task(scan_id, task_id, 10)
+
+    with database.session_factory() as session:
+        task = session.get(InvestigationTask, task_id)
+        coverage = session.get(CoverageItem, coverage_id)
+        assert task is not None and task.status == expected_status
+        assert task.result["race_winner"] == winning_status
+        assert task.result["cancellation"]["acknowledged"] is True
+        assert coverage is not None and coverage.status == "partial"
+        assert coverage.stages["agent"] == "cancelled"
+        assert (
+            session.scalar(
+                select(Finding).where(
+                    Finding.scan_id == scan_id,
+                    Finding.metadata_json["task_id"].as_string() == task_id,
+                )
+            )
+            is None
+        )
+        event_types = set(
+            session.scalars(
+                select(ScanEvent.event_type).where(ScanEvent.scan_id == scan_id)
+            )
+        )
+        assert "exploration.conclusion.recorded" not in event_types
+        assert "task.completed" not in event_types
+        assert "exploration.completed" not in event_types
+        assert (
+            session.scalar(
+                select(HypothesisArgument.id)
+                .where(
+                    HypothesisArgument.task_id == task_id,
+                    HypothesisArgument.role == "arbiter",
+                )
+                .limit(1)
+            )
+            is None
+        )
+        hypotheses = list(
+            session.scalars(
+                select(SecurityHypothesis).where(SecurityHypothesis.task_id == task_id)
+            )
+        )
+        assert hypotheses
+        assert all(
+            "platform_result" not in hypothesis.metadata_json
+            for hypothesis in hypotheses
+        )
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        "blocked_device",
+        "completed",
+        "not_reproduced",
+        "inconclusive",
+        "timed_out",
+        "failed",
+        "canceled",
+    ],
+)
+def test_cancel_acknowledgement_does_not_overwrite_terminal_task(
+    settings,
+    terminal_status: str,
+) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="already-terminal.apk",
+            artifact_sha256="7" * 64,
+            artifact_path=str(settings.data_dir / "missing.apk"),
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status=terminal_status,
+            result={"terminal_winner": terminal_status},
+            error="terminal result",
+            completed_at=datetime(2025, 1, 1, tzinfo=UTC),
+        )
+        session.add_all([scan, task])
+        session.commit()
+        scan_id = scan.id
+        task_id = task.id
+
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    orchestrator._mark_task_canceled(scan_id, task_id)
+
+    with database.session_factory() as session:
+        task = session.get(InvestigationTask, task_id)
+        assert task is not None
+        assert task.status == terminal_status
+        assert task.result == {"terminal_winner": terminal_status}
+        assert task.error == "terminal result"
+        assert task.completed_at == datetime(2025, 1, 1)
+        assert (
+            session.scalar(
+                select(ScanEvent).where(
+                    ScanEvent.scan_id == scan_id,
+                    ScanEvent.event_type.in_(
+                        {
+                            "task.cancelled",
+                            "exploration.cancelled",
+                        }
+                    ),
+                )
+            )
+            is None
+        )
+
+
+def test_predispatch_cancellation_finishes_coverage_and_audit(settings) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="predispatch-cancel.apk",
+            artifact_sha256="5" * 64,
+            artifact_path=str(settings.data_dir / "missing.apk"),
+        )
+        entry = EntryPoint(
+            scan=scan,
+            kind="activity",
+            name="com.example.CancelledActivity",
+            owner_component="com.example.CancelledActivity",
+            exported=True,
+        )
+        session.add_all([scan, entry])
+        session.flush()
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="canceled",
+            target_entry_ids=[entry.id],
+            result={
+                "cancellation": {
+                    "requested": True,
+                    "acknowledged": True,
+                    "requested_at": "2026-07-28T00:00:00+00:00",
+                }
+            },
+        )
+        coverage = CoverageItem(
+            scan=scan,
+            control_id="entry:predispatch-cancel",
+            domain="entry_point",
+            title="Predispatch cancellation",
+            status="not_tested",
+            stages={"agent": "pending"},
+            entry_point_id=entry.id,
+        )
+        session.add_all([task, coverage])
+        session.commit()
+        scan_id = scan.id
+        task_id = task.id
+        coverage_id = coverage.id
+
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    orchestrator._mark_task_canceled(scan_id, task_id)
+
+    with database.session_factory() as session:
+        task = session.get(InvestigationTask, task_id)
+        coverage = session.get(CoverageItem, coverage_id)
+        assert task is not None
+        assert task.status == "canceled"
+        assert task.result["cancellation"]["acknowledged"] is True
+        assert "completed_at" in task.result["cancellation"]
+        assert coverage is not None
+        assert coverage.status == "partial"
+        assert coverage.stages["agent"] == "cancelled"
+        event_types = set(
+            session.scalars(
+                select(ScanEvent.event_type).where(ScanEvent.scan_id == scan_id)
+            )
+        )
+        assert {"task.cancelled", "exploration.cancelled"} <= event_types
 
 
 def test_canceled_task_selected_before_dispatch_is_not_restarted(settings) -> None:  # noqa: ANN001

@@ -342,7 +342,7 @@ test("workspace tools cannot read or shell-cat files outside workspace and /tmp"
   }
 })
 
-test("bash cannot read the provider API key while upstream authentication still works", async () => {
+test("bash cannot read the provider API key from process environments", async () => {
   const requests = []
   const authorizationHeaders = []
   const api = createServer(async (request, response) => {
@@ -360,8 +360,15 @@ test("bash cannot read the provider API key while upstream authentication still 
             function: {
               name: "bash",
               arguments: JSON.stringify({
-                command: "env",
-                description: "Verify provider credentials are absent from the complete tool environment",
+                command:
+                  "node -e 'const f=require(\"fs\");let p=process.pid,found=false,checked=0;" +
+                  "for(let i=0;i<32&&p>0;i++){try{const e=f.readFileSync(`/proc/${p}/environ`);" +
+                  "checked++;if(e.includes(Buffer.from(\"DEEPSEEK_API_KEY=\")))found=true;" +
+                  "const s=f.readFileSync(`/proc/${p}/status`,\"utf8\");" +
+                  "p=Number(s.match(/^PPid:\\s+(\\d+)/m)?.[1]??0)}catch{break}}" +
+                  "console.log(found?\"provider credential found\":`provider credential absent across ${checked} process environments`)'",
+                description:
+                  "Verify provider credentials are absent from this tool and all ancestor process environments",
               }),
             },
           },
@@ -373,7 +380,7 @@ test("bash cannot read the provider API key while upstream authentication still 
     if (requests.length === 2) {
       sendCompletion(response, body, {
         id: "secret-environment-memo",
-        content: "The provider key is absent from the Bash environment.",
+        content: "The provider key is absent from the Bash and worker process environments.",
       })
       return
     }
@@ -395,15 +402,33 @@ test("bash cannot read the provider API key while upstream authentication still 
         profile: stableProfile(),
       }),
     )
-    assert.equal(completed.code, 0, completed.stderr)
+    assert.equal(
+      completed.code,
+      0,
+      [completed.stderr, completed.stdout].filter(Boolean).join("\n"),
+    )
     assert.doesNotMatch(completed.stdout, /integration-test-only/)
     assert.doesNotMatch(completed.stderr, /integration-test-only/)
     const { result } = parseWorkerOutput(completed.stdout)
     assert.deepEqual(result.result, expected)
     assert.equal(requests.length, 3)
     const toolReplay = JSON.stringify(requests[1].body.messages)
+    const toolOutput = requests[1].body.messages
+      .filter((message) => message.role === "tool")
+      .map((message) => message.content)
+      .join("\n")
+    const checkedProcesses = Number(
+      toolOutput.match(/provider credential absent across (\d+) process environments/)?.[1],
+    )
+    assert.ok(checkedProcesses >= 3, toolOutput)
+    assert.doesNotMatch(toolOutput, /provider credential found/)
     assert.doesNotMatch(toolReplay, /integration-test-only/)
-    assert.doesNotMatch(toolReplay, /DEEPSEEK_API_KEY=/)
+    assert.doesNotMatch(toolOutput, /DEEPSEEK_API_KEY=/)
+    assert.ok(
+      requests.every(
+        (item) => !JSON.stringify(item.body).includes("integration-test-only"),
+      ),
+    )
     assert.doesNotMatch(toolReplay, /OPENCODE_CONFIG_CONTENT=/)
     assert.doesNotMatch(toolReplay, /OPENCODE_SERVER_PASSWORD=/)
     assert.ok(
@@ -413,6 +438,27 @@ test("bash cannot read the provider API key while upstream authentication still 
     )
   } finally {
     api.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("worker rejects a missing or empty internal provider key", async () => {
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-missing-key-test-"))
+  const payload = investigationPayload({
+    baseURL: "http://127.0.0.1:9",
+    profile: finalizerProfile(),
+  })
+  try {
+    for (const options of [
+      { includeProviderAPIKey: false },
+      { providerAPIKey: "   " },
+    ]) {
+      const completed = await runWorker(root, payload, options)
+      assert.equal(completed.code, 1)
+      assert.match(completed.stderr, /_provider_api_key is missing or empty/)
+      assert.equal(completed.stdout, "")
+    }
+  } finally {
     await rm(root, { recursive: true, force: true })
   }
 })
@@ -707,6 +753,7 @@ function investigationPayload({
   explorerPrompt,
   phase = "test_planning",
   outputSchema = resultSchema,
+  timeoutMs = 30_000,
 }) {
   return {
     schema_version: "1.0",
@@ -721,7 +768,7 @@ function investigationPayload({
     tool_profile: "workspace_shell",
     output_schema: outputSchema,
     execution_profile: profile,
-    timeout_ms: 15_000,
+    timeout_ms: timeoutMs,
   }
 }
 
@@ -863,7 +910,14 @@ function toolNames(body) {
   return (body.tools ?? []).map((item) => item.function.name).sort()
 }
 
-function runWorker(root, payload) {
+function runWorker(
+  root,
+  payload,
+  {
+    providerAPIKey = "integration-test-only",
+    includeProviderAPIKey = true,
+  } = {},
+) {
   return new Promise((resolvePromise, reject) => {
     const worker = spawn(process.execPath, [resolve("worker.mjs")], {
       cwd: root,
@@ -874,7 +928,6 @@ function runWorker(root, payload) {
         XDG_CONFIG_HOME: join(root, "config"),
         XDG_CACHE_HOME: join(root, "cache"),
         XDG_STATE_HOME: join(root, "state"),
-        DEEPSEEK_API_KEY: "integration-test-only",
         OPENCODE_DISABLE_PROJECT_CONFIG: "1",
         OPENCODE_DISABLE_CLAUDE_CODE: "1",
         OPENCODE_DISABLE_MODELS_FETCH: "1",
@@ -888,7 +941,7 @@ function runWorker(root, payload) {
     const timeout = setTimeout(() => {
       worker.kill("SIGKILL")
       reject(new Error("OpenCode integration worker timed out"))
-    }, 30_000)
+    }, 45_000)
     worker.stdout.setEncoding("utf8")
     worker.stderr.setEncoding("utf8")
     worker.stdout.on("data", (chunk) => {
@@ -902,7 +955,14 @@ function runWorker(root, payload) {
       clearTimeout(timeout)
       resolvePromise({ code, stdout, stderr })
     })
-    worker.stdin.end(JSON.stringify(payload))
+    worker.stdin.end(
+      JSON.stringify({
+        ...payload,
+        ...(includeProviderAPIKey
+          ? { _provider_api_key: providerAPIKey }
+          : {}),
+      }),
+    )
   })
 }
 

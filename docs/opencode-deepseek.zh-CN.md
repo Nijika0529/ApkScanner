@@ -150,11 +150,14 @@ OpenCode 返回后还要经过本地 Ajv 8.20.0 和业务语义校验：
   向 Python 申请设备动作。
 - 每次调用使用临时 HOME/XDG、全新 OpenCode server 和随机 Basic Auth。
 - `OPENCODE_PURE=1`，并关闭项目配置、Claude 配置、模型目录刷新和自动升级。
-- API Key 只通过 Worker 启动环境传递；Worker 立即把它转移到兼容代理的内存中并从
-  子进程环境删除，OpenCode provider 配置只拿到无权限的 loopback 占位 Key。因此即使
-  Bash 输出完整 `env` 也看不到真实凭据。专用 Bash wrapper 同时删除
+- API Key 通过 Worker 的一次性 stdin 请求传递，不进入 Worker 初始环境。Worker 在
+  校验业务 payload 前提取并删除内部凭据字段，再把 Key 留在兼容代理内存中；OpenCode
+  provider 配置只拿到无权限的 loopback 占位 Key。因此 Bash 读取自身或 Docker 内祖先
+  进程的 `/proc/*/environ` 也看不到真实凭据。专用 Bash wrapper 同时删除
   `OPENCODE_CONFIG_CONTENT`、loopback Server 认证信息和代理环境变量。密钥不进入
-  payload、数据库、事件或错误消息。
+  业务 payload、数据库、事件或错误消息。
+- Host 降级模式没有 PID/同 UID 进程隔离，Agent 可能观察同机控制面进程；它不是凭据
+  隔离边界，只用于个人受控调试。生产和不受信任 APK 必须使用默认 Docker 模式。
 
 每次 AI 调用审计以下内容：
 
