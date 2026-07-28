@@ -1743,10 +1743,7 @@ class ScanOrchestrator:
                                 *agent_result.result.requested_tests,
                                 *critic_result.result.requested_tests,
                             ]:
-                                signature = json.dumps(
-                                    request.model_dump(mode="json"),
-                                    sort_keys=True,
-                                )
+                                signature = self._requested_test_signature(request)
                                 if signature in seen_requests:
                                     continue
                                 seen_requests.add(signature)
@@ -2006,15 +2003,6 @@ class ScanOrchestrator:
                         agent_result = next_result
                         agent_error = None
 
-                    if (
-                        agent_result
-                        and agent_result.result.requested_tests
-                        and completed_rounds >= self.settings.agent_max_rounds
-                    ):
-                        coverage_gaps.append(
-                            "Further AI-requested tests were not executed because the configured "
-                            "adaptive exploration round limit was reached."
-                        )
                     final_budget = min(
                         AGENT_FINAL_TIMEOUT_CAP_SECONDS,
                         budget.remaining(),
@@ -2114,6 +2102,14 @@ class ScanOrchestrator:
             raw_payload = agent_result.result.model_dump(mode="json")
             validated_payload, validated_result_value = self._validated_agent_payload(
                 deepcopy(raw_payload), evidence_summaries
+            )
+            validated_payload["coverage_gaps"] = list(
+                dict.fromkeys(
+                    [
+                        *validated_payload.get("coverage_gaps", []),
+                        *coverage_gaps,
+                    ]
+                )
             )
             platform_proof = self.hypothesis_ledger.task_proof_result(task_id)
             if platform_proof is not None:
@@ -2487,6 +2483,15 @@ class ScanOrchestrator:
             session.commit()
 
     @staticmethod
+    def _requested_test_signature(request: AgentRequestedTest) -> str:
+        payload = request.model_dump(mode="json")
+        # Rationale is audit prose, not part of the device action identity.
+        # Keep the hypothesis in the signature so one physical input is not
+        # silently attributed to a different proof obligation.
+        payload.pop("rationale", None)
+        return json.dumps(payload, sort_keys=True)
+
+    @staticmethod
     def _validate_requested_tests(
         requests: list[AgentRequestedTest],
         entries: list[EntryPoint],
@@ -2534,7 +2539,7 @@ class ScanOrchestrator:
             if reason:
                 gaps.append(f"Rejected agent-requested test for {request.entry_point_id}: {reason}.")
                 continue
-            signature = json.dumps(request.model_dump(mode="json"), sort_keys=True)
+            signature = ScanOrchestrator._requested_test_signature(request)
             if signature in seen:
                 continue
             seen.add(signature)

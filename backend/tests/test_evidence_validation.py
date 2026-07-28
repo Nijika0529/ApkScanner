@@ -239,3 +239,37 @@ def test_activity_request_accepts_its_declared_deep_link_and_android_extra_key()
 
     assert accepted == [allowed]
     assert any("preserve" in gap for gap in gaps)
+
+
+def test_requested_test_deduplication_ignores_rationale_only_changes() -> None:
+    entry = EntryPoint(
+        id="11111111-1111-1111-1111-111111111111",
+        scan_id="scan",
+        kind="activity",
+        name="com.example.ExportedActivity",
+        owner_component="com.example.ExportedActivity",
+        exported=True,
+        exported_reason="explicit_true",
+        intent_filters=[],
+        deep_links=[],
+        metadata_json={},
+    )
+    first = AgentRequestedTest(
+        hypothesis_id="22222222-2222-2222-2222-222222222222",
+        entry_point_id=entry.id,
+        state="guest",
+        uri=None,
+        extras={"source": "external"},
+        rationale="Candidate rationale",
+    )
+    duplicate = first.model_copy(update={"rationale": "Critic rationale"})
+
+    accepted, gaps = ScanOrchestrator._validate_requested_tests(
+        [first, duplicate],
+        [entry],
+        auth_available=False,
+        hypothesis_ids={first.hypothesis_id},
+    )
+
+    assert accepted == [first]
+    assert gaps == []
