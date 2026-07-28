@@ -60,7 +60,7 @@ def test_in_memory_sqlite_is_shared_with_app_worker_threads(settings) -> None:  
 
 @pytest.mark.parametrize(
     "suffix",
-    ["entries", "findings", "tasks", "hypotheses", "coverage", "events"],
+    ["entries", "findings", "signals", "tasks", "hypotheses", "coverage", "events"],
 )
 def test_scan_child_collections_return_not_found_for_unknown_scan(
     settings,
@@ -112,6 +112,103 @@ def test_report_exports_scan_error_and_entry_code_anchors(settings) -> None:  # 
             "line": 42,
         }
     ]
+
+
+def test_findings_require_platform_harm_and_valid_evidence(settings) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    with TestClient(app) as client:
+        with app.state.database.session_factory() as session:
+            scan = Scan(
+                status="final",
+                filename="proof-policy.apk",
+                artifact_sha256="f" * 64,
+                artifact_path=str(settings.data_dir / "proof-policy.apk"),
+            )
+            session.add(scan)
+            session.flush()
+            evidence = Evidence(
+                scan_id=scan.id,
+                kind="dynamic.oracle",
+                sha256="a" * 64,
+                path=str(settings.data_dir / "evidence.json"),
+                summary="Platform Oracle observed unauthorized impact",
+            )
+            session.add(evidence)
+            session.flush()
+            records = [
+                Finding(
+                    scan_id=scan.id,
+                    dedupe_key="builtin-static",
+                    rule_id="BUILTIN",
+                    source="builtin",
+                    title="Static candidate",
+                    description="Rule-only signal",
+                    masvs="MASVS-PLATFORM",
+                    severity="high",
+                    status="candidate",
+                ),
+                Finding(
+                    scan_id=scan.id,
+                    dedupe_key="agent-static",
+                    rule_id="AGENT",
+                    source="opencode",
+                    title="Static support",
+                    description="Static evidence only",
+                    masvs="MASVS-PLATFORM",
+                    severity="high",
+                    status="supported_static",
+                    evidence_ids=[evidence.id],
+                    metadata_json={"harm_demonstrated": False},
+                ),
+                Finding(
+                    scan_id=scan.id,
+                    dedupe_key="proven",
+                    rule_id="AGENT",
+                    source="opencode",
+                    title="Proven impact",
+                    description="Platform-correlated harm",
+                    masvs="MASVS-PLATFORM",
+                    severity="high",
+                    status="reproduced_blackbox",
+                    evidence_ids=[evidence.id],
+                    metadata_json={"harm_demonstrated": True},
+                ),
+                Finding(
+                    scan_id=scan.id,
+                    dedupe_key="invalid-proof",
+                    rule_id="AGENT",
+                    source="opencode",
+                    title="Invalid proof reference",
+                    description="Missing evidence",
+                    masvs="MASVS-PLATFORM",
+                    severity="high",
+                    status="reproduced_blackbox",
+                    evidence_ids=["00000000-0000-0000-0000-000000000099"],
+                    metadata_json={"harm_demonstrated": True},
+                ),
+            ]
+            session.add_all(records)
+            session.commit()
+            scan_id = scan.id
+
+        findings = client.get(f"/api/v1/scans/{scan_id}/findings")
+        signals = client.get(f"/api/v1/scans/{scan_id}/signals")
+        report = client.get(f"/api/v1/scans/{scan_id}/report/json")
+
+    assert findings.status_code == 200
+    assert [item["title"] for item in findings.json()] == ["Proven impact"]
+    assert signals.status_code == 200
+    assert {item["title"] for item in signals.json()} == {
+        "Static candidate",
+        "Static support",
+        "Invalid proof reference",
+    }
+    assert [item["title"] for item in report.json()["findings"]] == ["Proven impact"]
+    assert {item["title"] for item in report.json()["signals"]} == {
+        "Static candidate",
+        "Static support",
+        "Invalid proof reference",
+    }
 
 
 @pytest.mark.asyncio
@@ -1179,6 +1276,22 @@ def test_hypothesis_and_private_evaluation_endpoints(settings) -> None:  # noqa:
             session.add_all([scan, entry, task])
             session.flush()
             task.target_entry_ids = [entry.id]
+            probe_evidence = Evidence(
+                scan_id=scan.id,
+                task_id=task.id,
+                kind="dynamic.probe",
+                sha256="6" * 64,
+                path=str(settings.data_dir / "probe.json"),
+            )
+            log_evidence = Evidence(
+                scan_id=scan.id,
+                task_id=task.id,
+                kind="dynamic.log",
+                sha256="7" * 64,
+                path=str(settings.data_dir / "log.json"),
+            )
+            session.add_all([probe_evidence, log_evidence])
+            session.flush()
             session.add(
                 Finding(
                     scan=scan,
@@ -1191,7 +1304,7 @@ def test_hypothesis_and_private_evaluation_endpoints(settings) -> None:  # noqa:
                     severity="high",
                     status="reproduced_blackbox",
                     entry_point_ids=[entry.id],
-                    evidence_ids=["probe", "log"],
+                    evidence_ids=[probe_evidence.id, log_evidence.id],
                     metadata_json={"harm_demonstrated": True},
                 )
             )

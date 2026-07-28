@@ -26,6 +26,7 @@ from .db import Database
 from .device import AdbDeviceAdapter, DeviceLeaseCancelledError
 from .enums import FindingStatus, ScanStatus, TaskStatus
 from .evidence import EvidenceRecorder
+from .finding_policy import partition_findings
 from .mobsf import MobSFAdapter
 from .models import (
     CoverageItem,
@@ -4167,21 +4168,29 @@ class ScanOrchestrator:
                 select(InvestigationTask.status).where(InvestigationTask.scan_id == scan_id)
             ):
                 counts[status] += 1
-            finding_count = len(
-                list(session.scalars(select(Finding.id).where(Finding.scan_id == scan_id)))
+            finding_records = list(
+                session.scalars(select(Finding).where(Finding.scan_id == scan_id))
             )
+            confirmed_findings, signals = partition_findings(session, finding_records)
+            finding_count = len(confirmed_findings)
+            signal_count = len(signals)
             scan.status = ScanStatus.FINAL.value
             scan.completed_at = datetime.now(UTC)
             scan.stats = {
                 **scan.stats,
                 "task_status_counts": dict(counts),
                 "finding_count": finding_count,
+                "signal_count": signal_count,
             }
             add_event(
                 session,
                 scan_id,
                 "scan.final",
                 "Final report is ready",
-                {"task_status_counts": dict(counts), "findings": finding_count},
+                {
+                    "task_status_counts": dict(counts),
+                    "findings": finding_count,
+                    "signals": signal_count,
+                },
             )
             session.commit()

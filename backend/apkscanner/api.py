@@ -16,6 +16,7 @@ from .artifacts import ArtifactStore, ArtifactTooLargeError
 from .benchmark import BenchmarkEvaluator
 from .db import Database
 from .enums import FindingStatus, ScanStatus, TaskStatus
+from .finding_policy import partition_findings
 from .models import (
     BenchmarkEvaluation,
     CoverageItem,
@@ -321,7 +322,7 @@ def list_entries(scan_id: str, session: Session = Depends(get_session)) -> list[
 @router.get("/scans/{scan_id}/findings", response_model=list[FindingOut])
 def list_findings(scan_id: str, session: Session = Depends(get_session)) -> list[Finding]:
     require_scan(session, scan_id)
-    return list(
+    findings = list(
         session.scalars(
             select(Finding)
             .where(Finding.scan_id == scan_id)
@@ -337,6 +338,34 @@ def list_findings(scan_id: str, session: Session = Depends(get_session)) -> list
             )
         )
     )
+    confirmed, _signals = partition_findings(session, findings)
+    return confirmed
+
+
+@router.get("/scans/{scan_id}/signals", response_model=list[FindingOut])
+def list_finding_signals(
+    scan_id: str,
+    session: Session = Depends(get_session),
+) -> list[Finding]:
+    require_scan(session, scan_id)
+    findings = list(
+        session.scalars(
+            select(Finding)
+            .where(Finding.scan_id == scan_id)
+            .order_by(
+                case(
+                    (Finding.severity == "critical", 0),
+                    (Finding.severity == "high", 1),
+                    (Finding.severity == "medium", 2),
+                    (Finding.severity == "low", 3),
+                    else_=4,
+                ),
+                Finding.created_at,
+            )
+        )
+    )
+    _confirmed, signals = partition_findings(session, findings)
+    return signals
 
 
 @router.get("/scans/{scan_id}/tasks", response_model=list[InvestigationTaskOut])

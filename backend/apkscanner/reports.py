@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import case, select
 from sqlalchemy.orm import Session, selectinload
 
+from .finding_policy import partition_findings
 from .models import (
     BenchmarkEvaluation,
     CoverageItem,
@@ -32,7 +33,7 @@ class ReportBuilder:
                 select(EntryPoint).where(EntryPoint.scan_id == scan.id).order_by(EntryPoint.kind, EntryPoint.name)
             )
         )
-        findings = list(
+        finding_records = list(
             session.scalars(
                 select(Finding)
                 .where(Finding.scan_id == scan.id)
@@ -48,6 +49,7 @@ class ReportBuilder:
                 )
             )
         )
+        findings, signals = partition_findings(session, finding_records)
         tasks = list(
             session.scalars(
                 select(InvestigationTask)
@@ -116,6 +118,7 @@ class ReportBuilder:
             },
             "entry_points": [self._entry(item) for item in entries],
             "findings": [self._finding(item) for item in findings],
+            "signals": [self._finding(item) for item in signals],
             "tasks": [self._task(item) for item in tasks],
             "security_hypotheses": [
                 self._security_hypothesis(item) for item in hypotheses
@@ -355,6 +358,15 @@ class ReportBuilder:
             "</tr>"
             for item in report["findings"]
         )
+        signal_rows = "".join(
+            "<tr>"
+            f"<td>{html.escape(item['severity'])}</td>"
+            f"<td>{html.escape(item['status'])}</td>"
+            f"<td>{html.escape(item['title'])}</td>"
+            f"<td>{html.escape(item['source'])}</td>"
+            "</tr>"
+            for item in report["signals"]
+        )
         audit_rows = "".join(
             "<tr>"
             f"<td>{html.escape(item['phase'])}</td>"
@@ -392,6 +404,8 @@ th{{background:#eef4f7}}code{{background:#eef4f7;padding:2px 5px}}</style></head
  · {html.escape(scan['status'])} · <code>{scan['artifact_sha256']}</code></p>
 <h2>Finding</h2><table><thead><tr><th>Severity</th><th>Status</th><th>Title</th><th>MASVS</th></tr></thead>
 <tbody>{finding_rows}</tbody></table>
+<h2>静态与待验证线索</h2><table><thead><tr><th>Severity</th><th>Status</th><th>Title</th><th>Source</th></tr></thead>
+<tbody>{signal_rows}</tbody></table>
 <h2>验证链</h2><table><thead><tr><th>Hypothesis ID</th><th>Status</th><th>Claim</th>
 <th>Proof Attempts</th><th>Harm Proven</th></tr></thead><tbody>{hypothesis_rows}</tbody></table>
 <h2>AI 审计</h2><table><thead><tr><th>Phase</th><th>Backend</th><th>Model</th><th>Status</th>

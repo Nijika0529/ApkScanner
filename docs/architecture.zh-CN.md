@@ -161,8 +161,9 @@ Oracle 将“入口执行成功”和“实际危害”分开：普通应用 UID
 评分。SPEC 支持按 rule ID、CWE、入口名称和 Finding 文本关键词匹配已知漏洞，并为每项真值
 指定 `static` 或 `dynamic` 最低证明等级。
 
-评分只统计平台确认的 `supported_static` 和 `reproduced_blackbox`。默认真值要求
-`dynamic`，因此只有静态猜测的高危描述既不能命中，
+评分和最终 Finding 只统计带有效 Evidence 引用、且平台 Oracle 已确认具体危害的
+`reproduced_blackbox`。`supported_static` 与 builtin 规则输出保留为静态线索，不进入
+Finding 数量或 SARIF。默认真值要求 `dynamic`，因此只有静态猜测的高危描述既不能命中，
 如果已被平台确认为 Finding 但不匹配任何真值，还会计为 false positive。主指标使用 F0.5，
 精确率权重是召回率的两倍；`candidate`、`inconclusive`、人工 review 的 accepted 状态和
 没有平台证明的模型输出均不算发现，只作为 `unproven_ai_noise` 单独报告。这样可以直接比较

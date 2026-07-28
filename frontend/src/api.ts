@@ -41,6 +41,8 @@ export const api = {
     request<EntryPoint[]>(`/api/v1/scans/${id}/entries`, { signal }),
   findings: (id: string, signal?: AbortSignal) =>
     request<Finding[]>(`/api/v1/scans/${id}/findings`, { signal }),
+  signals: (id: string, signal?: AbortSignal) =>
+    request<Finding[]>(`/api/v1/scans/${id}/signals`, { signal }),
   coverage: (id: string, signal?: AbortSignal) =>
     request<CoverageItem[]>(`/api/v1/scans/${id}/coverage`, { signal }),
   tasks: (id: string, signal?: AbortSignal) =>

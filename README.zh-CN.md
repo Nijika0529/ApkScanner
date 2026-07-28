@@ -21,6 +21,7 @@ v1 产品是一个单用户、仅限本机（localhost）的 Web 应用。它接
 - 固定版本 `@opencode-ai/sdk`/OpenCode `1.18.4` 集成（适配 DeepSeek）：稳定的非思考工具分析器与独立 StructuredOutput 定稿器，带 Ajv/语义/平台 ID 校验、personal-lab 工作区/ADB 能力和完整调用审计。
 - 可选的每任务 Docker Worker，带隔离的 task-attempt 挂载和资源/能力限制。
 - 响应式明亮主题 React 审核控制台、人工 Finding 判定、实时事件、任务停止/删除、JSON/HTML/SARIF 导出。
+- 最终 Finding 与静态线索分层：只有平台 Oracle 证明具体危害且 Evidence 引用完整的动态复现才计为 Finding。
 
 详细的控制流程、信任边界、Security IR 和判定规则参见 [`docs/architecture.zh-CN.md`](docs/architecture.zh-CN.md)。
 用于内部汇报的一页式说明与数据口径参见

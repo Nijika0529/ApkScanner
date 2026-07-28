@@ -7,6 +7,7 @@ from sqlalchemy import select
 from .config import Settings
 from .db import Database
 from .enums import FindingStatus, ScanStatus
+from .finding_policy import partition_findings
 from .models import BenchmarkEvaluation, EntryPoint, Finding, Scan
 from .schemas import BenchmarkSpec, GroundTruthVulnerability
 
@@ -43,15 +44,15 @@ class BenchmarkEvaluator:
                     .order_by(Finding.created_at)
                 )
             )
-            result = self._score(spec, findings, entries)
+            confirmed, signals = partition_findings(session, findings)
+            result = self._score(spec, confirmed, entries, signals)
             control = scan.stats.get("agent_control")
             if not isinstance(control, dict):
                 control = {}
             attributed_findings = [
                 finding
-                for finding in findings
+                for finding in confirmed
                 if finding.source in {"codex", "opencode"}
-                and self._confirmed(finding)
             ]
             observed_backends = sorted(
                 {finding.source for finding in attributed_findings}
@@ -115,14 +116,14 @@ class BenchmarkEvaluator:
         spec: BenchmarkSpec,
         findings: list[Finding],
         entries: list[EntryPoint],
+        signals: list[Finding],
     ) -> dict[str, Any]:
         entry_names = {entry.id: entry.name for entry in entries}
-        confirmed = [finding for finding in findings if cls._confirmed(finding)]
+        confirmed = findings
         ai_noise = [
             finding
-            for finding in findings
+            for finding in signals
             if finding.source in {"codex", "opencode"}
-            and not cls._confirmed(finding)
         ]
         findings_by_id = {finding.id: finding for finding in confirmed}
         candidate_ids_by_truth: list[list[str]] = []
@@ -263,14 +264,6 @@ class BenchmarkEvaluator:
                 for finding in ai_noise
             ],
         }
-
-    @staticmethod
-    def _confirmed(finding: Finding) -> bool:
-        if finding.status == FindingStatus.SUPPORTED_STATIC.value:
-            return True
-        if finding.status == FindingStatus.REPRODUCED_BLACKBOX.value:
-            return finding.metadata_json.get("harm_demonstrated") is True
-        return False
 
     @staticmethod
     def _matches(

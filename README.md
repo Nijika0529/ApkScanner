@@ -33,6 +33,7 @@ finding without platform evidence IDs.
   provider-wire/runtime audit.
 - Optional per-task Docker workers with isolated task-attempt mounts and resource/capability limits.
 - Responsive React review console, human Finding decisions, live events, JSON/HTML/SARIF exports.
+- Proven findings are separated from static signals: only platform-verified harm with complete Evidence references counts as a Finding.
 - Light review console with confirmed deletion of completed scans and shared-artifact-safe cleanup.
 
 The detailed control flow, trust boundaries, IR, and verdict rules are in

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from apkscanner.benchmark import BenchmarkEvaluator
 from apkscanner.db import Database
-from apkscanner.models import EntryPoint, Finding, Scan
+from apkscanner.models import EntryPoint, Evidence, Finding, Scan
 from apkscanner.schemas import BenchmarkSpec
 from pydantic import ValidationError
 
@@ -36,6 +36,20 @@ def test_private_benchmark_rewards_proven_harm_and_penalizes_confirmed_noise(
         )
         session.add_all([scan, vulnerable_entry, static_only_entry])
         session.flush()
+        proof_one = Evidence(
+            scan_id=scan.id,
+            kind="dynamic.oracle",
+            sha256="1" * 64,
+            path="proof-one.json",
+        )
+        proof_two = Evidence(
+            scan_id=scan.id,
+            kind="dynamic.log",
+            sha256="2" * 64,
+            path="proof-two.json",
+        )
+        session.add_all([proof_one, proof_two])
+        session.flush()
         session.add_all(
             [
                 Finding(
@@ -49,7 +63,7 @@ def test_private_benchmark_rewards_proven_harm_and_penalizes_confirmed_noise(
                     severity="high",
                     status="reproduced_blackbox",
                     entry_point_ids=[vulnerable_entry.id],
-                    evidence_ids=["proof-1", "proof-2"],
+                        evidence_ids=[proof_one.id, proof_two.id],
                     metadata_json={
                         "harm_demonstrated": True,
                         "model": "deepseek-v4-pro",
@@ -131,12 +145,12 @@ def test_private_benchmark_rewards_proven_harm_and_penalizes_confirmed_noise(
     evaluation = BenchmarkEvaluator(settings, database).evaluate(scan_id, spec)
     metrics = evaluation.result["metrics"]
     assert metrics["true_positives"] == 1
-    assert metrics["false_positives"] == 1
+    assert metrics["false_positives"] == 0
     assert metrics["false_negatives"] == 1
-    assert metrics["precision"] == 0.5
+    assert metrics["precision"] == 1.0
     assert metrics["recall"] == 0.5
-    assert metrics["score_100"] == 50.0
-    assert metrics["unproven_ai_noise"] == 2
+    assert metrics["score_100"] == 83.33
+    assert metrics["unproven_ai_noise"] == 3
     assert evaluation.result["matches"][0]["ground_truth_id"] == "GT-1"
     assert evaluation.result["missed"][0]["ground_truth_id"] == "GT-2"
     assert evaluation.investigator_backend == "opencode"
@@ -157,6 +171,20 @@ def test_benchmark_uses_maximum_matching_instead_of_truth_file_order(settings) -
         )
         session.add(scan)
         session.flush()
+        specific_evidence = Evidence(
+            scan_id=scan.id,
+            kind="dynamic.oracle",
+            sha256="3" * 64,
+            path="specific.json",
+        )
+        generic_evidence = Evidence(
+            scan_id=scan.id,
+            kind="dynamic.oracle",
+            sha256="4" * 64,
+            path="generic.json",
+        )
+        session.add_all([specific_evidence, generic_evidence])
+        session.flush()
         specific = Finding(
             scan=scan,
             dedupe_key="specific",
@@ -166,8 +194,9 @@ def test_benchmark_uses_maximum_matching_instead_of_truth_file_order(settings) -
             description="generic specific",
             masvs="MASVS-PLATFORM",
             severity="high",
-            status="supported_static",
-            evidence_ids=["one", "two"],
+            status="reproduced_blackbox",
+            evidence_ids=[specific_evidence.id],
+            metadata_json={"harm_demonstrated": True},
         )
         generic = Finding(
             scan=scan,
@@ -178,8 +207,9 @@ def test_benchmark_uses_maximum_matching_instead_of_truth_file_order(settings) -
             description="generic",
             masvs="MASVS-PLATFORM",
             severity="medium",
-            status="supported_static",
-            evidence_ids=["one"],
+            status="reproduced_blackbox",
+            evidence_ids=[generic_evidence.id],
+            metadata_json={"harm_demonstrated": True},
         )
         session.add_all([specific, generic])
         session.commit()
@@ -194,7 +224,7 @@ def test_benchmark_uses_maximum_matching_instead_of_truth_file_order(settings) -
                     "title": "Generic issue",
                     "harm": "Generic impact",
                     "severity": "medium",
-                    "minimum_proof": "static",
+                    "minimum_proof": "dynamic",
                     "match": {"title_contains": ["generic"]},
                 },
                 {
@@ -202,7 +232,7 @@ def test_benchmark_uses_maximum_matching_instead_of_truth_file_order(settings) -
                     "title": "Specific bypass",
                     "harm": "Authorization bypass",
                     "severity": "high",
-                    "minimum_proof": "static",
+                    "minimum_proof": "dynamic",
                     "match": {"title_contains": ["specific"]},
                 },
             ],

@@ -90,6 +90,7 @@ interface DetailData {
   scan: Scan
   entries: EntryPoint[]
   findings: Finding[]
+  signals: Finding[]
   coverage: CoverageItem[]
   tasks: InvestigationTask[]
   audits: AgentAudit[]
@@ -127,10 +128,11 @@ function App() {
   const loadDetail = useCallback(async (id: string, signal?: AbortSignal) => {
     const requestId = ++detailRequestRef.current
     try {
-      const [scan, entries, findings, coverage, tasks, audits, hypotheses, evaluations, events] = await Promise.all([
+      const [scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events] = await Promise.all([
         api.scan(id, signal),
         api.entries(id, signal),
         api.findings(id, signal),
+        api.signals(id, signal),
         api.coverage(id, signal),
         api.tasks(id, signal),
         api.agentAudits(id, signal),
@@ -139,7 +141,7 @@ function App() {
         api.events(id, signal),
       ])
       if (signal?.aborted || requestId !== detailRequestRef.current) return false
-      setDetail({ scan, entries, findings, coverage, tasks, audits, hypotheses, evaluations, events })
+      setDetail({ scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events })
       setScans((items) => items.map((item) => item.id === scan.id ? scan : item))
       return true
     } catch (reason) {
@@ -334,7 +336,7 @@ function Sidebar({ scans, selectedId, health, onSelect, onUpload }: { scans: Sca
 }
 
 function ScanDetailView({ data, health, onRefresh, onDelete }: { data: DetailData; health: Health | null; onRefresh: () => Promise<void>; onDelete: () => void }) {
-  const { scan, entries, findings, coverage, tasks, audits, hypotheses, evaluations, events } = data
+  const { scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events } = data
   const high = findings.filter((item) => ["critical", "high"].includes(item.severity)).length
   const reproduced = findings.filter((item) => item.status === "reproduced_blackbox").length
   const exported = entries.filter((item) => item.exported && item.kind !== "deep_link").length
@@ -355,7 +357,7 @@ function ScanDetailView({ data, health, onRefresh, onDelete }: { data: DetailDat
         </div>
       </section>
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
-        <Metric label="高危候选" value={high} icon={AlertTriangle} tone="rose" />
+        <Metric label="已证实高危" value={high} icon={AlertTriangle} tone="rose" />
         <Metric label="黑盒复现" value={reproduced} icon={ShieldX} tone="rose" />
         <Metric label="导出组件" value={exported} icon={Box} tone="cyan" />
         <Metric label="Deep Link" value={links} icon={Link2} tone="cyan" />
@@ -365,11 +367,12 @@ function ScanDetailView({ data, health, onRefresh, onDelete }: { data: DetailDat
       <Card className="p-4 sm:p-6">
         <Tabs defaultValue="overview">
           <TabsList aria-label="扫描详情">
-            <TabsTrigger value="overview">总览</TabsTrigger><TabsTrigger value="entries">攻击面 <span className="ml-1 text-xs text-slate-500">{entries.length}</span></TabsTrigger><TabsTrigger value="findings">Finding <span className="ml-1 text-xs text-slate-500">{findings.length}</span></TabsTrigger><TabsTrigger value="coverage">覆盖矩阵</TabsTrigger><TabsTrigger value="tasks">探索任务</TabsTrigger><TabsTrigger value="proofs">验证链 <span className="ml-1 text-xs text-slate-500">{hypotheses.length}</span></TabsTrigger><TabsTrigger value="audits">AI 审计 <span className="ml-1 text-xs text-slate-500">{audits.length}</span></TabsTrigger>
+            <TabsTrigger value="overview">总览</TabsTrigger><TabsTrigger value="entries">攻击面 <span className="ml-1 text-xs text-slate-500">{entries.length}</span></TabsTrigger><TabsTrigger value="findings">已证实 Finding <span className="ml-1 text-xs text-slate-500">{findings.length}</span></TabsTrigger><TabsTrigger value="signals">静态线索 <span className="ml-1 text-xs text-slate-500">{signals.length}</span></TabsTrigger><TabsTrigger value="coverage">覆盖矩阵</TabsTrigger><TabsTrigger value="tasks">探索任务</TabsTrigger><TabsTrigger value="proofs">验证链 <span className="ml-1 text-xs text-slate-500">{hypotheses.length}</span></TabsTrigger><TabsTrigger value="audits">AI 审计 <span className="ml-1 text-xs text-slate-500">{audits.length}</span></TabsTrigger>
           </TabsList>
           <TabsContent value="overview"><Overview scan={scan} events={events} health={health} coverage={coverage} /></TabsContent>
           <TabsContent value="entries"><EntryPoints entries={entries} /></TabsContent>
           <TabsContent value="findings"><Findings findings={findings} scanStatus={scan.status} onRefresh={onRefresh} /></TabsContent>
+          <TabsContent value="signals"><Signals signals={signals} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="coverage"><CoverageMatrix coverage={coverage} /></TabsContent>
           <TabsContent value="tasks"><Tasks scan={scan} tasks={tasks} entries={entries} audits={audits} events={events} health={health} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="proofs"><HypothesisPipeline scanId={scan.id} scanStatus={scan.status} hypotheses={hypotheses} evaluations={evaluations} entries={entries} onRefresh={onRefresh} /></TabsContent>
@@ -399,13 +402,18 @@ function EntryPoints({ entries }: { entries: EntryPoint[] }) {
 function Findings({ findings, scanStatus, onRefresh }: { findings: Finding[]; scanStatus: string; onRefresh: () => Promise<void> }) {
   const sorted = [...findings].sort((a, b) => ["critical", "high", "medium", "low", "info"].indexOf(a.severity) - ["critical", "high", "medium", "low", "info"].indexOf(b.severity))
   const isFinal = ["final", "failed"].includes(scanStatus)
-  return <div className="space-y-3">{!isFinal && <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-900">以下是扫描过程中逐任务落库的阶段性结论，便于实时观察；在扫描完成前仍可能被补充、降级或判为信息不全，最终报告以扫描状态变为“完成”后为准。</div>}{sorted.map((finding) => <FindingCard key={finding.id} finding={finding} onRefresh={onRefresh} />)}{!findings.length && <EmptyRow text="尚未产生 Finding" />}</div>
+  return <div className="space-y-3"><div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm leading-relaxed text-emerald-950">这里只展示平台 Oracle 已证明具体安全影响、且所有 Evidence ID 均可核验的漏洞。静态规则与 AI 静态判断不会计入 Finding。</div>{!isFinal && <div className="rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-sm leading-relaxed text-cyan-950">扫描尚未完成，后续动态证明可能继续增加 Finding。</div>}{sorted.map((finding) => <FindingCard key={finding.id} finding={finding} onRefresh={onRefresh} />)}{!findings.length && <EmptyRow text="尚无经过动态证据证明的 Finding" />}</div>
+}
+
+function Signals({ signals, onRefresh }: { signals: Finding[]; onRefresh: () => Promise<void> }) {
+  const sorted = [...signals].sort((a, b) => ["critical", "high", "medium", "low", "info"].indexOf(a.severity) - ["critical", "high", "medium", "low", "info"].indexOf(b.severity))
+  return <div className="space-y-3"><div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">这些是静态规则、AI 静态支持或尚未完成影响证明的调查线索，用于指导后续验证；它们不计入最终 Finding，也不代表漏洞已经成立。</div>{sorted.map((finding) => <FindingCard key={finding.id} finding={finding} onRefresh={onRefresh} />)}{!signals.length && <EmptyRow text="没有待验证线索" />}</div>
 }
 
 function FindingCard({ finding, onRefresh }: { finding: Finding; onRefresh: () => Promise<void> }) {
   const [open, setOpen] = useState(false)
   const [reviewOpen, setReviewOpen] = useState(false)
-  return <article className="rounded-xl border border-slate-200 bg-slate-50/70"><button onClick={() => setOpen(!open)} className="flex w-full items-start gap-4 p-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-700 sm:p-5" aria-expanded={open}><Badge tone={severityTone[finding.severity]} className="mt-0.5 min-w-16 justify-center uppercase">{finding.severity}</Badge><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h3 className="font-semibold text-slate-900">{finding.title}</h3><Badge tone={statusTone(finding.status)}>{statusLabel(finding.status)}</Badge></div><p className="mt-1.5 line-clamp-2 text-sm leading-relaxed text-slate-500">{finding.description}</p><div className="mt-3 flex flex-wrap gap-3 text-[11px] text-slate-600"><span>{finding.masvs}</span>{finding.cwe && <span>{finding.cwe}</span>}<span>置信度 {finding.confidence}</span><span>{finding.source}</span></div></div><ChevronRight className={cn("mt-1 h-4 w-4 shrink-0 text-slate-600 transition-transform", open && "rotate-90")} /></button>{open && <div className="border-t border-slate-200 px-4 py-5 sm:px-5"><div className="grid gap-5 lg:grid-cols-2"><div><p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">风险说明</p><p className="text-sm leading-7 text-slate-700">{finding.description}</p></div><div><p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">修复建议</p><p className="text-sm leading-7 text-slate-700">{finding.remediation}</p></div></div><div className="mt-5 flex flex-wrap items-center justify-between gap-3"><p className="font-mono text-xs text-slate-600">rule · {finding.rule_id} · evidence {finding.evidence_ids.length}</p><Button variant="secondary" size="sm" onClick={() => setReviewOpen(true)}>人工审核</Button></div></div>}<ReviewDialog finding={finding} open={reviewOpen} onOpenChange={setReviewOpen} onReviewed={onRefresh} /></article>
+  return <article className="rounded-xl border border-slate-200 bg-slate-50/70"><button onClick={() => setOpen(!open)} className="flex w-full items-start gap-4 p-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-700 sm:p-5" aria-expanded={open}><Badge tone={severityTone[finding.severity]} className="mt-0.5 min-w-16 justify-center uppercase">{finding.severity}</Badge><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h3 className="font-semibold text-slate-900">{finding.title}</h3><Badge tone={statusTone(finding.status)}>{statusLabel(finding.status)}</Badge></div><p className="mt-1.5 line-clamp-2 text-sm leading-relaxed text-slate-500">{finding.description}</p><div className="mt-3 flex flex-wrap gap-3 text-[11px] text-slate-600"><span>{finding.masvs}</span>{finding.cwe && <span>{finding.cwe}</span>}<span>置信度 {finding.confidence}</span><span>{finding.source}</span></div></div><ChevronRight className={cn("mt-1 h-4 w-4 shrink-0 text-slate-600 transition-transform", open && "rotate-90")} /></button>{open && <div className="border-t border-slate-200 px-4 py-5 sm:px-5"><div className="grid gap-5 lg:grid-cols-2"><div><p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">风险说明</p><p className="text-sm leading-7 text-slate-700">{finding.description}</p></div><div><p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">修复建议</p><p className="text-sm leading-7 text-slate-700">{finding.remediation}</p></div></div>{finding.evidence_ids.length > 0 && <div className="mt-5"><p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">可核验证据</p><div className="flex flex-wrap gap-2">{finding.evidence_ids.map((evidenceId) => <a key={evidenceId} href={`/api/v1/evidence/${evidenceId}/download`} className="rounded-lg border border-cyan-200 bg-cyan-50 px-2.5 py-1.5 font-mono text-[11px] text-cyan-900 hover:border-cyan-400 hover:underline">{evidenceId}</a>)}</div></div>}<div className="mt-5 flex flex-wrap items-center justify-between gap-3"><p className="font-mono text-xs text-slate-600">rule · {finding.rule_id} · evidence {finding.evidence_ids.length}</p><Button variant="secondary" size="sm" onClick={() => setReviewOpen(true)}>人工审核</Button></div></div>}<ReviewDialog finding={finding} open={reviewOpen} onOpenChange={setReviewOpen} onReviewed={onRefresh} /></article>
 }
 
 function ReviewDialog({ finding, open, onOpenChange, onReviewed }: { finding: Finding; open: boolean; onOpenChange: (open: boolean) => void; onReviewed: () => Promise<void> }) {
@@ -822,6 +830,7 @@ function AgentAudits({ audits, tasks, entries }: { audits: AgentAudit[]; tasks: 
       {audits.map((audit) => {
         const task = audit.task_id ? tasksById.get(audit.task_id) : undefined
         const target = task?.target_entry_ids.map((id) => names.get(id) ?? id).join(" · ")
+        const current = Boolean(task?.turn_id && audit.turn_id === task.turn_id)
         return (
           <article key={audit.id} className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
             <div className="flex flex-col gap-4 border-b border-slate-200 p-4 sm:flex-row sm:items-start sm:justify-between">
@@ -832,6 +841,7 @@ function AgentAudits({ audits, tasks, entries }: { audits: AgentAudit[]; tasks: 
                     <h3 className="font-semibold text-slate-950">{auditPhaseLabel(audit.phase)}</h3>
                     <Badge tone={statusTone(audit.status)}>{statusLabel(audit.status)}</Badge>
                     <Badge tone={audit.integrity === "verified" ? "good" : "danger"}>{audit.integrity === "verified" ? "SHA-256 已验证" : "完整性异常"}</Badge>
+                    <Badge tone={current ? "good" : "neutral"}>{current ? "当前最终调用" : "历史/过程调用"}</Badge>
                   </div>
                   <p className="mt-1 truncate text-sm text-slate-600">{target ?? audit.task_id ?? "未知任务"}</p>
                   <p className="mt-2 font-mono text-xs text-slate-500">{audit.backend} · {audit.provider}/{audit.model} · {audit.isolation} · attempt {audit.attempt}</p>
@@ -842,7 +852,7 @@ function AgentAudits({ audits, tasks, entries }: { audits: AgentAudit[]; tasks: 
                 <p className="mt-1 font-mono">audit {shortHash(audit.id)}</p>
               </div>
             </div>
-            <AuditConclusion audit={audit} />
+            <AuditConclusion audit={audit} current={current} taskResult={textValue(task?.result.result)} />
             <div className="grid gap-3 p-4 md:grid-cols-2">
               <AuditValue label="Thread ID" value={audit.thread_id ?? "—"} />
               <AuditValue label="Turn ID" value={audit.turn_id ?? "—"} />
@@ -864,14 +874,14 @@ function AgentAudits({ audits, tasks, entries }: { audits: AgentAudit[]; tasks: 
   )
 }
 
-function AuditConclusion({ audit }: { audit: AgentAudit }) {
+function AuditConclusion({ audit, current, taskResult }: { audit: AgentAudit; current: boolean; taskResult?: string }) {
   const response = asRecord(audit.artifacts.response?.content)
   const validation = asRecord(audit.artifacts.validation?.content)
   const rawOutput = asRecord(response?.structured_output)
   const validatedOutput = asRecord(validation?.validated_output) ?? rawOutput
   if (!validatedOutput) return null
 
-  const result = textValue(validation?.final_result) ?? textValue(validatedOutput.result) ?? "inconclusive"
+  const result = (current ? taskResult : undefined) ?? textValue(validation?.final_result) ?? textValue(validatedOutput.result) ?? "unknown"
   const claimedResult = textValue(validation?.claimed_result)
   const summary = textValue(validatedOutput.summary) ?? "模型未提供结论摘要。"
   const proposedSeverity = textValue(validatedOutput.severity_proposal) ?? "—"
@@ -885,7 +895,7 @@ function AuditConclusion({ audit }: { audit: AgentAudit }) {
   const rejectedEvidenceIds = stringValues(validation?.rejected_evidence_ids)
   const gaps = stringValues(validatedOutput.coverage_gaps)
   const downgraded = validation?.downgraded === true
-  const presentation = auditResultPresentation(result)
+  const presentation = auditResultPresentation(result, current)
   const headingId = `audit-conclusion-${audit.id}`
 
   return (
@@ -893,10 +903,10 @@ function AuditConclusion({ audit }: { audit: AgentAudit }) {
       <div className="flex flex-col gap-4 p-4 sm:flex-row sm:items-start sm:justify-between">
         <div className="flex min-w-0 gap-3">
           <div className={cn("grid h-11 w-11 shrink-0 place-items-center rounded-xl ring-1 ring-inset", presentation.iconContainer)}>
-            {result === "not_reproduced" ? <ShieldCheck className="h-5 w-5" /> : result === "inconclusive" ? <AlertTriangle className="h-5 w-5" /> : <ShieldX className="h-5 w-5" />}
+            {["not_reproduced", "refuted_static"].includes(result) ? <ShieldCheck className="h-5 w-5" /> : ["inconclusive", "unknown"].includes(result) ? <AlertTriangle className="h-5 w-5" /> : <ShieldX className="h-5 w-5" />}
           </div>
           <div className="min-w-0">
-            <p className={cn("text-[11px] font-bold uppercase tracking-[0.16em]", presentation.eyebrow)}>{validation ? "平台校验后的最终结论" : "模型本轮结论"}</p>
+            <p className={cn("text-[11px] font-bold uppercase tracking-[0.16em]", presentation.eyebrow)}>{current ? "任务当前最终结论" : validation ? "历史平台校验记录" : "中间模型输出"}</p>
             <h4 id={headingId} className="mt-1 text-lg font-bold text-slate-950">{presentation.label}</h4>
             <p className="mt-2 text-sm leading-6 text-slate-700">{summary}</p>
           </div>
@@ -909,14 +919,14 @@ function AuditConclusion({ audit }: { audit: AgentAudit }) {
       </div>
       {(downgraded || gaps.length > 0 || rejectedEvidenceIds.length > 0) && (
         <div className="border-t border-current/10 bg-white/55 px-4 py-3">
-          {downgraded && <div role="status" className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /><span>平台因证据条件不足，将模型声明从“{auditResultPresentation(claimedResult ?? "inconclusive").label}”降级为“{presentation.label}”。</span></div>}
+          {downgraded && <div role="status" className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /><span>平台将模型声明从“{auditResultPresentation(claimedResult ?? "unknown", false).label}”调整为“{presentation.label}”。</span></div>}
           <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-xs text-slate-600">
             {gaps.slice(0, 3).map((gap, index) => <span key={`${index}-${gap}`} className="flex items-start gap-1.5"><CircleDot className="mt-0.5 h-3 w-3 shrink-0" />{gap}</span>)}
             {rejectedEvidenceIds.length > 0 && <span>拒绝了 {rejectedEvidenceIds.length} 个无效 Evidence ID</span>}
           </div>
         </div>
       )}
-      {result === "inconclusive" && proposedSeverity !== "—" && (
+      {current && result === "inconclusive" && proposedSeverity !== "—" && (
         <div className="border-t border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-950">
           模型曾建议风险等级 {proposedSeverity.toUpperCase()}，但平台因证据不足未采纳；该值仅保留在原始审计中供后续补扫参考。
         </div>
@@ -929,12 +939,14 @@ function ConclusionMetric({ label, value }: { label: string; value: string }) {
   return <div className="rounded-lg border border-white/70 bg-white/75 px-2 py-2 text-center shadow-sm"><p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">{label}</p><p className="mt-1 text-xs font-bold text-slate-900">{value}</p></div>
 }
 
-function auditResultPresentation(result: string) {
-  if (result === "reproduced_blackbox") return { label: "已完成黑盒复现", container: "border-rose-200 bg-rose-50/80", iconContainer: "bg-rose-100 text-rose-700 ring-rose-200", eyebrow: "text-rose-700" }
-  if (result === "supported_static") return { label: "静态证据支持风险", container: "border-orange-200 bg-orange-50/80", iconContainer: "bg-orange-100 text-orange-700 ring-orange-200", eyebrow: "text-orange-700" }
-  if (result === "refuted_static") return { label: "静态证据已反驳风险", container: "border-emerald-200 bg-emerald-50/80", iconContainer: "bg-emerald-100 text-emerald-700 ring-emerald-200", eyebrow: "text-emerald-700" }
-  if (result === "not_reproduced") return { label: "当前测试未能复现", container: "border-emerald-200 bg-emerald-50/80", iconContainer: "bg-emerald-100 text-emerald-700 ring-emerald-200", eyebrow: "text-emerald-700" }
-  return { label: "证据不足，暂无法定论", container: "border-amber-200 bg-amber-50/80", iconContainer: "bg-amber-100 text-amber-800 ring-amber-200", eyebrow: "text-amber-800" }
+function auditResultPresentation(result: string, current: boolean) {
+  const prefix = current ? "" : "过程输出："
+  if (result === "reproduced_blackbox") return { label: `${prefix}已完成黑盒复现`, container: "border-rose-200 bg-rose-50/80", iconContainer: "bg-rose-100 text-rose-700 ring-rose-200", eyebrow: "text-rose-700" }
+  if (result === "supported_static") return { label: `${prefix}静态证据支持风险`, container: "border-orange-200 bg-orange-50/80", iconContainer: "bg-orange-100 text-orange-700 ring-orange-200", eyebrow: "text-orange-700" }
+  if (result === "refuted_static") return { label: `${prefix}静态证据已反驳风险`, container: "border-emerald-200 bg-emerald-50/80", iconContainer: "bg-emerald-100 text-emerald-700 ring-emerald-200", eyebrow: "text-emerald-700" }
+  if (result === "not_reproduced") return { label: `${prefix}当前测试未能复现`, container: "border-emerald-200 bg-emerald-50/80", iconContainer: "bg-emerald-100 text-emerald-700 ring-emerald-200", eyebrow: "text-emerald-700" }
+  if (result === "inconclusive") return { label: current ? "本次任务未形成有效结论" : "历史调用当时未形成结论", container: "border-amber-200 bg-amber-50/80", iconContainer: "bg-amber-100 text-amber-800 ring-amber-200", eyebrow: "text-amber-800" }
+  return { label: current ? `未识别的任务结果：${result}` : `未识别的过程输出：${result}`, container: "border-slate-200 bg-slate-50/80", iconContainer: "bg-slate-100 text-slate-700 ring-slate-200", eyebrow: "text-slate-700" }
 }
 
 function confidenceLabel(value: string) {
