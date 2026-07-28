@@ -62,6 +62,28 @@ public final class ProbeReceiver extends BroadcastReceiver {
                     );
                     Intent target = new Intent(Intent.ACTION_VIEW, uri);
                     target.setPackage(packageName);
+                    ComponentName packageResolved =
+                        target.resolveActivity(context.getPackageManager());
+                    result.put(
+                        "packageResolvedComponent",
+                        packageResolved == null
+                            ? JSONObject.NULL
+                            : packageResolved.flattenToShortString()
+                    );
+                    if (!component.isEmpty()) {
+                        String expectedClass = component.startsWith(".")
+                            ? packageName + component
+                            : component;
+                        ComponentName expected = new ComponentName(packageName, expectedClass);
+                        result.put("expectedComponent", expected.flattenToShortString());
+                        boolean targetMatched = expected.equals(packageResolved);
+                        result.put("targetMatched", targetMatched);
+                        if (!targetMatched) {
+                            throw new SecurityException(
+                                "deep link did not resolve to the expected component"
+                            );
+                        }
+                    }
                     applyExtras(target, request.optJSONObject("extras"));
                     target.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                     context.startActivity(target);

@@ -803,9 +803,21 @@ class AdbDeviceAdapter:
         request: dict[str, Any] = {
             "kind": entry.kind,
             "package": package_name,
-            "component": entry.name,
+            "component": (
+                entry.owner_component
+                or ("" if entry.kind == "deep_link" else entry.name)
+            ),
         }
-        if entry.kind == "deep_link":
+        if (
+            entry.kind in {"activity", "activity_alias"}
+            and uri_override is not None
+        ):
+            # Preserve implicit URI dispatch semantics even when the planner
+            # attached a manifest deep link to its owning Activity entry.
+            # Older Probe APKs already understand the deep_link request kind.
+            request["kind"] = "deep_link"
+            request["uri"] = uri_override
+        elif entry.kind == "deep_link":
             request["uri"] = uri_override or entry.name
         elif entry.kind == "provider":
             authority = entry.metadata_json.get("authorities")

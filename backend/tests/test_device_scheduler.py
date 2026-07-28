@@ -10,6 +10,7 @@ from apkscanner.device import (
     DeviceLeaseCancelledError,
     SingleDeviceScheduler,
 )
+from apkscanner.models import EntryPoint
 from apkscanner.tools import CommandResult
 
 
@@ -289,3 +290,36 @@ def test_device_prepare_stops_after_failed_install(settings) -> None:  # noqa: A
         "device.install",
     ]
     assert len(calls) == 2
+
+
+def test_activity_deep_link_probe_preserves_uri_and_expected_component() -> None:
+    entry = EntryPoint(
+        id="11111111-1111-1111-1111-111111111111",
+        scan_id="scan",
+        kind="activity",
+        name="com.example.LinkActivity",
+        owner_component="com.example.LinkActivity",
+        exported=True,
+        deep_links=[
+            {
+                "scheme": "example",
+                "host": "open",
+                "uri_template": "example://open/path",
+            }
+        ],
+    )
+
+    request = AdbDeviceAdapter._probe_request(
+        entry,
+        "com.example",
+        uri_override="example://open/path?source=test",
+        extras={":settings:fragment_args_key": "privacy"},
+    )
+
+    assert request == {
+        "kind": "deep_link",
+        "package": "com.example",
+        "component": "com.example.LinkActivity",
+        "uri": "example://open/path?source=test",
+        "extras": {":settings:fragment_args_key": "privacy"},
+    }

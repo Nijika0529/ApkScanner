@@ -2672,7 +2672,7 @@ class ScanOrchestrator:
             return "URI cannot be parsed"
         if candidate.username or candidate.password:
             return "URI user-info is not allowed"
-        if entry.kind in {"deep_link", "activity"}:
+        if entry.kind in {"deep_link", "activity", "activity_alias"}:
             declared_uris = (
                 [entry.name]
                 if entry.kind == "deep_link"
