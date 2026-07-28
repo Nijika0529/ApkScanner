@@ -2515,7 +2515,7 @@ class ScanOrchestrator:
             elif request.state == "authenticated" and not auth_available:
                 reason = "authenticated replay is unavailable"
             elif any(
-                not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", key)
+                not re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", key)
                 for key in request.extras
             ):
                 reason = "an extra key is unsafe"
@@ -2667,22 +2667,37 @@ class ScanOrchestrator:
             return "URI cannot be parsed"
         if candidate.username or candidate.password:
             return "URI user-info is not allowed"
-        if entry.kind == "deep_link":
+        if entry.kind in {"deep_link", "activity"}:
+            declared_uris = (
+                [entry.name]
+                if entry.kind == "deep_link"
+                else [
+                    str(item.get("uri_template"))
+                    for item in entry.deep_links
+                    if isinstance(item, dict) and item.get("uri_template")
+                ]
+            )
+            expected_origins: set[tuple[str, str, int | None]] = set()
             try:
-                baseline = urlsplit(entry.name)
-                expected = (
-                    baseline.scheme.lower(),
-                    (baseline.hostname or "").lower(),
-                    baseline.port,
-                )
                 actual = (
                     candidate.scheme.lower(),
                     (candidate.hostname or "").lower(),
                     candidate.port,
                 )
+                for declared_uri in declared_uris:
+                    baseline = urlsplit(declared_uri)
+                    expected_origins.add(
+                        (
+                            baseline.scheme.lower(),
+                            (baseline.hostname or "").lower(),
+                            baseline.port,
+                        )
+                    )
             except ValueError:
                 return "URI authority or port is invalid"
-            if actual != expected:
+            if not expected_origins:
+                return "activity has no manifest-declared deep-link origin"
+            if actual not in expected_origins:
                 return "URI must preserve the manifest-declared scheme, host, and port"
             return None
         if entry.kind == "provider":

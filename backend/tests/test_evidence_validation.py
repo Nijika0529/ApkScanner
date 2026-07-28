@@ -195,3 +195,47 @@ def test_agent_requested_deep_link_must_preserve_declared_origin() -> None:
     )
     assert accepted == [allowed]
     assert any("preserve" in gap for gap in gaps)
+
+
+def test_activity_request_accepts_its_declared_deep_link_and_android_extra_key() -> None:
+    entry = EntryPoint(
+        id="11111111-1111-1111-1111-111111111111",
+        scan_id="scan",
+        kind="activity",
+        name="com.example.LinkActivity",
+        owner_component="com.example.LinkActivity",
+        exported=True,
+        exported_reason="explicit_true",
+        intent_filters=[],
+        deep_links=[
+            {
+                "scheme": "iqoo",
+                "host": "com.iqoo.secure",
+                "port": None,
+                "path": "/smart_privacy",
+                "uri_template": "iqoo://com.iqoo.secure/smart_privacy",
+            }
+        ],
+        metadata_json={},
+    )
+    allowed = AgentRequestedTest(
+        hypothesis_id="22222222-2222-2222-2222-222222222222",
+        entry_point_id=entry.id,
+        state="guest",
+        uri="iqoo://com.iqoo.secure/smart_privacy?source=test",
+        extras={":settings:fragment_args_key": "clipboard_privacy_protect"},
+        rationale="Exercise the activity's declared deep link and framework-style extra",
+    )
+    rejected = allowed.model_copy(
+        update={"uri": "iqoo://unrelated.example/smart_privacy"}
+    )
+
+    accepted, gaps = ScanOrchestrator._validate_requested_tests(
+        [allowed, rejected],
+        [entry],
+        auth_available=False,
+        hypothesis_ids={allowed.hypothesis_id},
+    )
+
+    assert accepted == [allowed]
+    assert any("preserve" in gap for gap in gaps)
