@@ -1361,6 +1361,7 @@ class ScanOrchestrator:
         agent_result = None
         agent_error = None
         executed_agent_tests: list[dict[str, Any]] = []
+        agent_round_history: list[dict[str, Any]] = []
         debate_context: dict[str, Any] = {}
         package_name = scan.package_name
         investigator = self.investigators.get(agent_backend)
@@ -1411,6 +1412,7 @@ class ScanOrchestrator:
                     "target_code_context": target_code_context,
                     "entry_scope": entry_scope,
                     "executed_agent_tests": executed_tests or [],
+                    "agent_round_history": deepcopy(agent_round_history),
                     "further_test_rounds_available": (
                         phase != "final_evaluation"
                         and round_index < self.settings.agent_max_rounds
@@ -1603,6 +1605,16 @@ class ScanOrchestrator:
                             ),
                         },
                     )
+                agent_round_history.append(
+                    {
+                        "phase": phase,
+                        "round_index": round_index,
+                        "thread_id": result.thread_id,
+                        "turn_id": result.turn_id,
+                        "model_result": result.result.model_dump(mode="json"),
+                        "test_validation": None,
+                    }
+                )
                 return result, None
             except AgentCancelledError as exc:
                 if audit_id is not None and runtime_events:
@@ -1946,10 +1958,21 @@ class ScanOrchestrator:
                             executed=executed_this_round,
                             gaps=[*request_gaps, *execution_gaps],
                         )
+                        for round_handoff in reversed(agent_round_history):
+                            if round_handoff.get("turn_id") == planning_turn_id:
+                                round_handoff["test_validation"] = {
+                                    "submitted": submitted_tests,
+                                    "accepted": [
+                                        item.model_dump(mode="json")
+                                        for item in requested
+                                    ],
+                                    "executed": executed_this_round,
+                                    "gaps": [*request_gaps, *execution_gaps],
+                                }
+                                break
                         completed_rounds += 1
                         if (
-                            not executed_this_round
-                            or budget.expired
+                            budget.expired
                             or completed_rounds >= self.settings.agent_max_rounds
                         ):
                             break
@@ -2117,6 +2140,7 @@ class ScanOrchestrator:
                             "platform_context": {
                                 "device": current_device_capability(),
                                 "executed_agent_tests": executed_agent_tests,
+                                "agent_round_history": agent_round_history,
                             },
                         },
                         "status": (
@@ -2881,7 +2905,11 @@ class ScanOrchestrator:
                     error=str(execution_error) if execution_error else None,
                 )
                 if execution_error is not None:
-                    raise execution_error
+                    gaps.append(
+                        f"Agent-requested test {test_case_id} failed during execution: "
+                        f"{execution_error}"
+                    )
+                    continue
                 evidence_ids = [item["id"] for item in proof_evidence]
                 executed.append(
                     {

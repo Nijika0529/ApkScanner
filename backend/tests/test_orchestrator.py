@@ -450,6 +450,155 @@ def test_device_task_keeps_one_lease_through_agent_investigation(
     ]
 
 
+def test_rejected_agent_test_is_handed_to_next_exploration_round(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    configured = replace(
+        settings,
+        adb_serial="iterative-device:5555",
+        codex_enabled=True,
+        agent_max_rounds=3,
+    )
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="iterative.apk",
+            package_name="com.example.iterative",
+            artifact_sha256="6" * 64,
+            artifact_path=str(configured.data_dir / "iterative.apk"),
+            stats={"investigator": "codex"},
+        )
+        entry = EntryPoint(
+            scan=scan,
+            kind="activity",
+            name="com.example.iterative.MainActivity",
+            owner_component="com.example.iterative.MainActivity",
+            exported=True,
+        )
+        session.add_all([scan, entry])
+        session.flush()
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="queued",
+            target_entry_ids=[entry.id],
+        )
+        session.add(task)
+        session.commit()
+        scan_id = scan.id
+        task_id = task.id
+
+    orchestrator = ScanOrchestrator(
+        configured,
+        database,
+        ArtifactStore(configured),
+    )
+    monkeypatch.setattr(
+        orchestrator.device.runner,
+        "available",
+        lambda executable: executable == "adb",
+    )
+    monkeypatch.setattr(
+        orchestrator.device,
+        "capability",
+        lambda *, non_blocking=False: {"available": True},
+    )
+    monkeypatch.setattr(
+        orchestrator.device,
+        "prepare",
+        lambda *_args, **_kwargs: [
+            (
+                "device.install",
+                CommandResult(["adb", "install"], 0, "", ""),
+                {},
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        orchestrator.device,
+        "probe",
+        lambda *_args, **_kwargs: SimpleNamespace(commands=[]),
+    )
+    monkeypatch.setattr(orchestrator.device, "cleanup", lambda _package: [])
+    monkeypatch.setattr(
+        orchestrator,
+        "_validated_agent_payload",
+        lambda payload, _evidence: (payload, "refuted_static"),
+    )
+    phases: list[str] = []
+
+    class FakeInvestigator:
+        @staticmethod
+        def capability(*, deep=False):  # noqa: ANN001, ANN205
+            return {"available": True, "version": "fake-sdk", "deep": deep}
+
+        @staticmethod
+        def investigate(**kwargs):  # noqa: ANN003, ANN205
+            context = kwargs["platform_context"]
+            phase = context["phase"]
+            phases.append(phase)
+            hypothesis_id = context["security_hypotheses"][0]["id"]
+            requested_tests = []
+            if phase == "test_planning":
+                requested_tests = [
+                    {
+                        "hypothesis_id": hypothesis_id,
+                        "entry_point_id": "00000000-0000-0000-0000-000000000099",
+                        "state": "guest",
+                        "uri": None,
+                        "extras": {},
+                        "rationale": "先尝试一个需要平台修正作用域的入口。",
+                    }
+                ]
+            elif phase == "exploration_round":
+                history = context["agent_round_history"]
+                planning = next(
+                    item for item in history if item["phase"] == "test_planning"
+                )
+                validation = planning["test_validation"]
+                assert len(validation["submitted"]) == 1
+                assert validation["accepted"] == []
+                assert validation["executed"] == []
+                assert any(
+                    "outside this task" in gap for gap in validation["gaps"]
+                )
+            return SimpleNamespace(
+                thread_id=f"thread-{phase}",
+                turn_id=f"turn-{phase}",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                result=AgentInvestigationResult(
+                    summary="本轮已根据平台反馈调整验证策略。",
+                    result="refuted_static",
+                    hypotheses_tested=[hypothesis_id],
+                    test_cases=[],
+                    evidence_ids=[],
+                    severity_proposal="info",
+                    confidence="medium",
+                    coverage_gaps=[],
+                    followups=[],
+                    requested_tests=requested_tests,
+                ),
+            )
+
+    orchestrator.investigators["codex"] = FakeInvestigator()
+    orchestrator._run_task(scan_id, task_id, 120)
+
+    assert phases == ["test_planning", "exploration_round"]
+    with database.session_factory() as session:
+        completed_task = session.get(InvestigationTask, task_id)
+        assert completed_task is not None
+        history = completed_task.result["platform_context"]["agent_round_history"]
+        assert [item["phase"] for item in history] == [
+            "test_planning",
+            "exploration_round",
+        ]
+        assert history[0]["test_validation"]["accepted"] == []
+
+
 def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # noqa: ANN001
     settings.ensure_directories()
     database = Database(settings)
