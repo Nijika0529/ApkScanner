@@ -341,7 +341,14 @@ class AgentInvestigationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: Literal["1.0"] = "1.0"
-    summary: str = Field(min_length=1, max_length=8000)
+    summary: str = Field(
+        min_length=1,
+        max_length=8000,
+        pattern=r"[\u3400-\u9fff]",
+        description=(
+            "Simplified-Chinese conclusion summary. Technical identifiers remain verbatim."
+        ),
+    )
     result: Literal[
         "supported_static",
         "refuted_static",

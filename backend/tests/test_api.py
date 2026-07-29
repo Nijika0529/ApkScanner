@@ -833,7 +833,7 @@ def test_ai_calls_are_exposed_as_integrity_checked_audit_records(settings) -> No
         turn_id="turn-audit",
         usage={"input_tokens": 12, "output_tokens": 4},
         result=AgentInvestigationResult(
-            summary="Static evidence is insufficient.",
+            summary="静态证据不足，当前攻击路径已按证据强度处理。",
             result="refuted_static",
             hypotheses_tested=["Check exported reachability"],
             test_cases=[],
@@ -977,7 +977,7 @@ def test_opencode_audit_records_explicit_phase_execution_profile(settings) -> No
         usage={"calls": 1},
         output_transport=transport,
         result=AgentInvestigationResult(
-            summary="Static evidence is insufficient.",
+            summary="静态证据不足，当前攻击路径已按证据强度处理。",
             result="refuted_static",
             hypotheses_tested=["Check exported reachability"],
             test_cases=[],

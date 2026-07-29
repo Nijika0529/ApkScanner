@@ -54,10 +54,11 @@ def developer_instructions(
         else "Direct network access is unavailable. "
     )
     response_instruction = (
-        "Return only the requested JSON."
+        "Return only the requested JSON. Write all explanatory prose in Simplified Chinese."
         if response_contract == "structured_result"
         else (
-            "Return a concise evidence-backed analysis memo for a separate finalizer. "
+            "Return a concise evidence-backed analysis memo in Simplified Chinese for a separate "
+            "finalizer. "
             "Do not emit JSON, a final platform verdict, or additional tool-call markup."
         )
     )
@@ -72,6 +73,8 @@ Distinguish adb-shell reachability from an ordinary third-party app UID. A dynam
 reproduction requires evidence IDs supplied by the platform. Missing optional tools
 is never itself a verdict: reach a positive or negative static conclusion from the
 available manifest, Apktool/Smali, archive, and code evidence.
+All human-readable conclusions must use Simplified Chinese. Keep schema enum values,
+Evidence IDs, package/class names, code symbols, paths, commands, and URIs verbatim.
 {response_instruction}
 """.strip()
 
@@ -186,10 +189,15 @@ def investigation_prompt(
         else ""
     )
     response_instruction = (
-        "Return the exact structured result schema."
+        "Return the exact structured result schema. Write summary, hypothesis assessment "
+        "explanations, test-case explanations, coverage_gaps, followups, and requested-test "
+        "rationales in Simplified Chinese. The summary must contain Chinese text. Keep enum "
+        "values, Evidence IDs, package/class names, code symbols, paths, commands, and URIs "
+        "verbatim."
         if response_contract == "structured_result"
         else (
-            "Finish with a concise analysis memo that records inspected paths, evidence IDs, "
+            "Finish with a concise Simplified-Chinese analysis memo that records inspected paths, "
+            "evidence IDs, "
             "supported and refuted hypotheses, concrete impact reasoning, unresolved gaps, and "
             "the smallest useful requested tests. Do not return the final JSON result; a separate "
             "non-thinking finalizer will convert this memo and the task context into the schema."

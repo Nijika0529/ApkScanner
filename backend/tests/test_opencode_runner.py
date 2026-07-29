@@ -334,7 +334,7 @@ def test_personal_lab_investigate_uses_workspace_analysis_then_validates_result(
             "turn_id": "message-test",
             "result": {
                 "schema_version": "1.0",
-                "summary": "Static review refuted the attacker path.",
+                "summary": "静态审查结果反驳了该攻击路径。",
                 "result": "refuted_static",
                 "hypotheses_tested": [],
                 "test_cases": [],

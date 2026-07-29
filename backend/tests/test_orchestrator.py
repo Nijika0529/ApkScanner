@@ -609,6 +609,7 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
         def investigate(**kwargs):  # noqa: ANN003, ANN205
             task = kwargs["task"]
             evidence = kwargs["evidence"]
+            assert kwargs["platform_context"]["output_language"] == "zh-CN"
             code_context = kwargs["platform_context"]["target_code_context"]
             assert code_context["schema_version"] == "1.0"
             assert code_context["components"]
@@ -624,7 +625,7 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
                 turn_id=f"turn-{task.id}",
                 usage={"input_tokens": 10, "output_tokens": 5},
                 result=AgentInvestigationResult(
-                    summary="The manifest supports this candidate.",
+                    summary="Manifest 静态证据支持该风险线索。",
                     result="supported_static",
                     hypotheses_tested=task.hypotheses,
                     test_cases=[],
@@ -974,7 +975,7 @@ def test_terminal_write_yields_to_cancel_or_delete_without_completion_side_effec
                 turn_id="turn-terminal-race",
                 usage={"input_tokens": 1, "output_tokens": 1},
                 result=AgentInvestigationResult(
-                    summary="No conclusive dynamic evidence.",
+                    summary="当前没有形成可验证的动态危害证据。",
                     result="refuted_static",
                     hypotheses_tested=[],
                     test_cases=[],
@@ -1396,7 +1397,7 @@ def test_restart_recovery_normalizes_transient_device_states(settings) -> None: 
 
 def test_refuted_static_agent_result_has_no_platform_risk_severity() -> None:
     payload = AgentInvestigationResult(
-        summary="Static evidence refutes the attacker path.",
+        summary="静态证据表明攻击路径受到有效控制。",
         result="refuted_static",
         hypotheses_tested=["Exported provider may expose data"],
         test_cases=[],

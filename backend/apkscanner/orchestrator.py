@@ -1275,6 +1275,7 @@ class ScanOrchestrator:
                 platform_context = {
                     "phase": phase,
                     "round_index": round_index,
+                    "output_language": "zh-CN",
                     "device": device_capability,
                     "poc_builder": self.poc_builder.capability(),
                     "coverage_gaps": coverage_gaps,

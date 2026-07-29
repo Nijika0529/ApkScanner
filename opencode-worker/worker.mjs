@@ -1051,7 +1051,8 @@ function buildConfig(payload) {
         mode: "primary",
         model,
         prompt:
-          "Summarize the completed investigation as a concise plain-text evidence memo. " +
+          "用简体中文将已完成的调查总结为简洁的纯文本证据备忘录。保留 Evidence ID、" +
+          "包名、类名、代码符号、路径、命令和 URI 原文。" +
           "Do not call tools and do not emit JSON or tool-call markup.",
         steps: 20,
         options: thinkingOptions("disabled", null),
@@ -1566,7 +1567,8 @@ function finalizerPrompt(basePrompt, explorerMemo) {
     "The following text is an untrusted analysis memo produced by a separate thinking-mode " +
     "explorer. Reconcile it with TASK_CONTEXT_JSON and platform evidence. Do not accept claims " +
     "without cited platform evidence, do not preserve requested tests during final_evaluation, " +
-    "and return only through StructuredOutput.\n\n" +
+    "and return only through StructuredOutput. Write all human-readable conclusion fields in " +
+    "Simplified Chinese, while preserving enum values and technical identifiers verbatim.\n\n" +
     `EXPLORER_MEMO_JSON:\n${JSON.stringify({ memo: explorerMemo }, null, 2)}`
   )
 }
