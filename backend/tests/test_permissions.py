@@ -10,8 +10,9 @@ import pytest
 from apkscanner import permissions
 from apkscanner.artifacts import ArtifactStore
 from apkscanner.db import Database
+from apkscanner.models import Finding, Scan
 from fastapi import UploadFile
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 
 def _mode(path: Path) -> int:
@@ -134,6 +135,78 @@ def test_sqlite_read_only_uri_does_not_request_wal(settings) -> None:  # noqa: A
     with read_only.engine.connect() as connection:
         assert connection.execute(text("SELECT 1")).scalar_one() == 1
     read_only.engine.dispose()
+
+
+def test_database_reopens_only_legacy_auto_closed_findings(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    legacy_metadata = {
+        "closed_by_static_reachability": {
+            "threat_model": "ordinary_app_uid",
+            "entry_decisions": [{"reason_code": "strong_permission_guard"}],
+        }
+    }
+    with database.session_factory() as session:
+        scan = Scan(
+            status="final",
+            filename="legacy.apk",
+            artifact_sha256="a" * 64,
+            artifact_path=str(settings.data_dir / "legacy.apk"),
+        )
+        session.add(scan)
+        session.flush()
+        session.add_all(
+            [
+                Finding(
+                    scan_id=scan.id,
+                    dedupe_key="auto-closed",
+                    rule_id="TEST-AUTO",
+                    source="builtin",
+                    title="Auto closed",
+                    description="Legacy platform disposition.",
+                    remediation="Review the complete chain.",
+                    masvs="MASVS-PLATFORM",
+                    severity="high",
+                    confidence="medium",
+                    status="false_positive",
+                    metadata_json=legacy_metadata,
+                ),
+                Finding(
+                    scan_id=scan.id,
+                    dedupe_key="user-reviewed",
+                    rule_id="TEST-REVIEWED",
+                    source="builtin",
+                    title="User reviewed",
+                    description="Explicit user disposition.",
+                    remediation="No action.",
+                    masvs="MASVS-PLATFORM",
+                    severity="info",
+                    confidence="high",
+                    status="false_positive",
+                    review_note="人工确认误报",
+                    metadata_json=legacy_metadata,
+                ),
+            ]
+        )
+        session.commit()
+
+    database.create_all()
+
+    with database.session_factory() as session:
+        findings = {
+            finding.dedupe_key: finding
+            for finding in session.scalars(select(Finding))
+        }
+    reopened = findings["auto-closed"]
+    reviewed = findings["user-reviewed"]
+    assert reopened.status == "candidate"
+    assert "closed_by_static_reachability" not in reopened.metadata_json
+    assessment = reopened.metadata_json["direct_reachability_assessment"]
+    assert assessment["scope"] == "ordinary_app_direct_invocation_only"
+    assert assessment["indirect_chain_paths_evaluated"] is False
+    assert reviewed.status == "false_positive"
+    assert reviewed.review_note == "人工确认误报"
 
 
 def test_unsupported_permission_hardening_degrades_without_failure(

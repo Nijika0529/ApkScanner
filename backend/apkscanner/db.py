@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Generator
 from pathlib import Path
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -73,7 +73,53 @@ class Database:
         from . import models  # noqa: F401
 
         Base.metadata.create_all(self.engine)
+        if not self._sqlite_read_only:
+            self._reconcile_legacy_direct_reachability_findings()
         self._harden_sqlite_files()
+
+    def _reconcile_legacy_direct_reachability_findings(self) -> None:
+        """Reopen only findings auto-closed by the former direct-edge policy."""
+
+        from .enums import FindingStatus
+        from .models import Finding
+
+        with self.session_factory() as session:
+            findings = list(
+                session.scalars(
+                    select(Finding).where(
+                        Finding.status == FindingStatus.FALSE_POSITIVE.value,
+                        Finding.review_note.is_(None),
+                    )
+                )
+            )
+            changed = False
+            for finding in findings:
+                metadata = dict(finding.metadata_json or {})
+                legacy = metadata.pop("closed_by_static_reachability", None)
+                if not isinstance(legacy, dict):
+                    continue
+                finding.status = FindingStatus.CANDIDATE.value
+                metadata["direct_reachability_assessment"] = {
+                    "status": "blocked",
+                    "scope": "ordinary_app_direct_invocation_only",
+                    "indirect_chain_paths_evaluated": False,
+                    "threat_model": legacy.get(
+                        "threat_model",
+                        "ordinary_app_uid",
+                    ),
+                    "entry_decisions": legacy.get("entry_decisions", []),
+                }
+                metadata["legacy_status_reconciliation"] = {
+                    "previous_status": FindingStatus.FALSE_POSITIVE.value,
+                    "reason": (
+                        "blocked direct invocation does not refute indirect "
+                        "cross-component chains"
+                    ),
+                }
+                finding.metadata_json = metadata
+                changed = True
+            if changed:
+                session.commit()
 
     def session(self) -> Generator[Session, None, None]:
         with self.session_factory() as session:
