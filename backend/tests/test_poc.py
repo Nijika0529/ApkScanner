@@ -156,6 +156,43 @@ package="io.apkscanner.poc.providerprobe">
     )
 
 
+def test_poc_builder_allows_launcher_in_a_sibling_controlled_poc_package(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = write_poc_project(workspace)
+    manifest = project / "AndroidManifest.xml"
+    manifest.write_text(
+        """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+package="io.apkscanner.poc.commandservice">
+<application>
+<activity android:name="io.apkscanner.poc.providerprobe.MainActivity"
+android:exported="true">
+<intent-filter>
+<action android:name="android.intent.action.MAIN" />
+<category android:name="android.intent.category.LAUNCHER" />
+</intent-filter>
+</activity>
+</application>
+</manifest>""",
+        encoding="utf-8",
+    )
+    builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
+
+    _project, _sources, _manifest, effective = builder._validate_project(
+        workspace,
+        poc_spec(),
+    )
+
+    assert effective.package_name == "io.apkscanner.poc.commandservice"
+    assert (
+        effective.launch_component
+        == "io.apkscanner.poc.providerprobe.MainActivity"
+    )
+
+
 def test_poc_build_failure_includes_tool_diagnostic() -> None:
     result = CommandResult(
         ["aapt2", "link"],

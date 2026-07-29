@@ -222,7 +222,7 @@ class AgentPocSpec(BaseModel):
         max_length=196,
     )
     package_name: str = Field(
-        pattern=r"^io\.apkscanner\.poc\.[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$",
+        pattern=r"^io\.apkscanner\.poc(?:\.[a-z][a-z0-9_]*)*$",
         max_length=200,
     )
     launch_component: str = Field(

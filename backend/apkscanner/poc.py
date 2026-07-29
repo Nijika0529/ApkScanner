@@ -590,7 +590,7 @@ class PocBuilder:
                 else []
             )
             if len(candidates) != 1 or not candidates[0].startswith(
-                f"{effective_spec.package_name}."
+                "io.apkscanner.poc."
             ):
                 raise ValueError("launch_component is not declared as an activity")
             effective_spec = AgentPocSpec.model_validate(

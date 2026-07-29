@@ -3,7 +3,11 @@ from __future__ import annotations
 import pytest
 from apkscanner.agent_prompt import developer_instructions, investigation_prompt
 from apkscanner.models import EntryPoint, InvestigationTask, Scan
-from apkscanner.schemas import AgentInvestigationResult, AgentRequestedTest
+from apkscanner.schemas import (
+    AgentInvestigationResult,
+    AgentPocSpec,
+    AgentRequestedTest,
+)
 from pydantic import ValidationError
 
 
@@ -142,6 +146,16 @@ def test_requested_tests_can_be_omitted_when_no_platform_replay_is_needed() -> N
     )
 
     assert result.requested_tests == []
+
+
+def test_poc_base_package_remains_inside_the_controlled_namespace() -> None:
+    spec = AgentPocSpec(
+        project_path="poc/base",
+        package_name="io.apkscanner.poc",
+        launch_component="io.apkscanner.poc.MainActivity",
+    )
+
+    assert spec.package_name == "io.apkscanner.poc"
 
 
 def test_invalid_optional_requested_test_does_not_discard_static_verdict() -> None:
