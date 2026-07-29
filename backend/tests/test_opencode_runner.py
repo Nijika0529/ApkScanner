@@ -376,6 +376,8 @@ def test_personal_lab_investigate_uses_workspace_analysis_then_validates_result(
         assert "Inspect context.json first" in payload["prompt"]
         assert "mandatory coverage seed" in payload["prompt"]
         assert "scan-wide entry directory" in payload["prompt"]
+        assert str(expected_workspace.resolve()) in payload["prompt"]
+        assert f"{expected_workspace.resolve()}/poc" in payload["prompt"]
         assert "explorer_prompt" in payload
         assert "explorer_instructions" in payload
         assert payload["tool_profile"] == "workspace_shell"

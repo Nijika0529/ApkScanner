@@ -1038,10 +1038,17 @@ def test_opencode_audit_records_explicit_phase_execution_profile(settings) -> No
         assert request["runtime_options"]["max_provider_requests"] is None
         assert request["tool_boundary"]["model_tools_enabled"] is True
         assert request["tool_boundary"]["workspace_tool_profile"] == "workspace_shell"
-        assert request["tool_boundary"]["workspace_tools"] == ["read", "glob", "grep", "bash"]
+        assert request["tool_boundary"]["workspace_tools"] == [
+            "read",
+            "glob",
+            "grep",
+            "bash",
+            "write",
+            "edit",
+        ]
         assert request["tool_boundary"]["shell_enabled"] is True
         assert request["tool_boundary"]["write_enabled"] is True
-        assert request["tool_boundary"]["native_write_tools_enabled"] is False
+        assert request["tool_boundary"]["native_write_tools_enabled"] is True
         assert request["tool_boundary"]["allowed_write_roots"] == [
             "task_attempt_workspace",
             "/tmp",

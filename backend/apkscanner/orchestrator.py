@@ -3186,7 +3186,9 @@ class ScanOrchestrator:
                 ),
                 "shell_enabled": shell_access,
                 "write_enabled": workspace_write,
-                "native_write_tools_enabled": False,
+                "native_write_tools_enabled": (
+                    backend == "opencode" and opencode_workspace_tools
+                ),
                 "allowed_write_roots": (
                     ["task_attempt_workspace", "/tmp"] if workspace_write else []
                 ),

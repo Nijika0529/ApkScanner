@@ -144,7 +144,14 @@ test("stable analyzer uses non-thinking tools, then an isolated finalizer", asyn
     assert.equal(requests.length, 3)
     assert.equal(requests[0].body.thinking.type, "disabled")
     assert.equal(requests[0].body.tool_choice, "auto")
-    assert.deepEqual(toolNames(requests[0].body), ["bash", "glob", "grep", "read"])
+    assert.deepEqual(toolNames(requests[0].body), [
+      "bash",
+      "edit",
+      "glob",
+      "grep",
+      "read",
+      "write",
+    ])
     assert.match(JSON.stringify(requests[0].body.messages), /analysis memo/)
     assert.doesNotMatch(JSON.stringify(requests[0].body.messages), /requested structured contract/)
     assert.match(JSON.stringify(requests[1].body.messages), /exported provider evidence/)
@@ -561,7 +568,14 @@ test("thinking explorer omits tool_choice and replays reasoning_content", async 
     assert.equal(requests[0].body.thinking.type, "enabled")
     assert.equal(requests[0].body.reasoning_effort, "high")
     assert.equal(requests[0].body.tool_choice, undefined)
-    assert.deepEqual(toolNames(requests[0].body), ["bash", "glob", "grep", "read"])
+    assert.deepEqual(toolNames(requests[0].body), [
+      "bash",
+      "edit",
+      "glob",
+      "grep",
+      "read",
+      "write",
+    ])
     const replay = JSON.stringify(requests[1].body.messages)
     assert.match(replay, /I need to inspect the assigned evidence file/)
     assert.match(replay, /exported provider evidence/)

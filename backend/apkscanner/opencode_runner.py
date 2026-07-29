@@ -35,7 +35,7 @@ OPENCODE_PROVIDER = "deepseek"
 OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL = "structured_output_tool"
 OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE = "analyze_then_finalize"
 OPENCODE_TOOL_PROFILE = "workspace_shell"
-OPENCODE_WORKSPACE_TOOLS = ("read", "glob", "grep", "bash")
+OPENCODE_WORKSPACE_TOOLS = ("read", "glob", "grep", "bash", "write", "edit")
 OPENCODE_PROFILE_STABLE_ANALYZER = "stable_analyzer"
 OPENCODE_PROFILE_STRUCTURED_FINALIZER = "structured_finalizer"
 OPENCODE_PROVIDER_KEY_FIELD = "_provider_api_key"
@@ -327,7 +327,18 @@ class OpenCodeInvestigator:
         # OpenCode analysis is deliberately not assigned a wall-clock deadline.
         # The caller can still stop it through cancel_event or scanner shutdown.
         timeout = None
-        context = platform_context or {}
+        workspace_root = (
+            "/workspace"
+            if self.settings.opencode_isolation == "docker"
+            else str(workspace.resolve())
+        )
+        context = {
+            **(platform_context or {}),
+            "agent_workspace": {
+                "writable_root": workspace_root,
+                "poc_root": f"{workspace_root}/poc",
+            },
+        }
         phase = str(context.get("phase") or "static_only")
         execution_profile = opencode_execution_profile(
             phase,

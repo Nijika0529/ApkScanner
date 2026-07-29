@@ -95,7 +95,10 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     final = _phase_prompt("final_evaluation")
     memo = _phase_prompt("test_planning", response_contract="analysis_memo")
 
-    assert "single broad analysis pass" in planning
+    assert "seed-focused analysis pass" in planning
+    assert "Do not enumerate or open unrelated exported components" in planning
+    assert "platform_context.agent_workspace.poc_root" in planning
+    assert "manifest package, Activity class name, Java package" in planning
     assert "open the actual target source or Smali" in planning
     assert "not a fresh audit" in continuation
     assert "changed PoC, input, or Oracle" in continuation
