@@ -53,6 +53,9 @@ def test_agent_adb_policy_keeps_full_access_with_hard_safety_boundary() -> None:
     assert "assigned coverage seed is a hard workflow scope" in instructions
     assert "Do not use a broad glob" in instructions
     assert "A zero-result search ends that proposed branch" in instructions
+    assert "Treat raw ADB as a hypothesis probe, not an exploration loop" in instructions
+    assert "move directly to one platform-managed PoC" in instructions
+    assert "return the requested test rather than continuing raw ADB" in instructions
     assert "without discovering or invoking an Android SDK toolchain" in instructions
     assert "poc_builder.source_build_available=true" in instructions
 
@@ -109,6 +112,7 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     assert "do not search for aapt, aapt2, d8, dx, sdkmanager" in planning
     assert "platform_context.poc_builder.source_build_available" in planning
     assert "open the actual target source or Smali" in planning
+    assert "Do not read sibling application components" in planning
     assert "not a fresh audit" in continuation
     assert "changed PoC, input, or Oracle" in continuation
     assert "return requested_tests=[], and do not reopen" in critic
