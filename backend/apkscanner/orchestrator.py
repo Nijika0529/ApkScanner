@@ -1293,7 +1293,12 @@ class ScanOrchestrator:
             for entry in scan_entries
             if entry.id not in statically_closed_entry_ids
         ]
-        direct_test_entry_ids = {entry.id for entry in testable_entries}
+        seed_entry_ids = set(task.target_entry_ids)
+        direct_test_entry_ids = {
+            entry.id
+            for entry in testable_entries
+            if entry.id in seed_entry_ids
+        }
         entry_scope = {
             "policy": "seed_entry_with_scan_wide_chain_exploration",
             "seed_entry_point_ids": list(task.target_entry_ids),
@@ -1322,6 +1327,7 @@ class ScanOrchestrator:
                     "assigned_seed": entry.id in set(task.target_entry_ids),
                 }
                 for entry in scan_entries
+                if entry.id in seed_entry_ids
             ],
         }
         coverage_gaps: list[str] = []

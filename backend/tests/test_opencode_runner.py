@@ -375,7 +375,8 @@ def test_personal_lab_investigate_uses_workspace_analysis_then_validates_result(
         assert payload["phase"] == "static_only"
         assert "Inspect context.json first" in payload["prompt"]
         assert "mandatory root and scope boundary" in payload["prompt"]
-        assert "only to resolve the ID of a target already named" in payload["prompt"]
+        assert "catalog contains only the assigned seed" in payload["prompt"]
+        assert "may still be examined freely" in payload["prompt"]
         assert str(expected_workspace.resolve()) in payload["prompt"]
         assert f"{expected_workspace.resolve()}/poc" in payload["prompt"]
         assert "explorer_prompt" in payload

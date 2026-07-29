@@ -107,6 +107,8 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     assert "Do not enumerate or open unrelated exported components" in planning
     assert "scope boundary of this task" in planning
     assert "A zero-result reference search is proof" in planning
+    assert "catalog contains only the assigned seed" in planning
+    assert "may still be examined freely" in planning
     assert "platform_context.agent_workspace.poc_root" in planning
     assert "manifest package, Activity class name, Java package" in planning
     assert "do not search for aapt, aapt2, d8, dx, sdkmanager" in planning

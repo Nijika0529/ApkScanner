@@ -995,17 +995,15 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
                 "seed_entry_with_scan_wide_chain_exploration"
             )
             assert entry_scope["seed_entry_point_ids"] == task.target_entry_ids
-            trusted_catalog_item = next(
-                item
-                for item in entry_scope["catalog"]
-                if item["name"] == "com.example.vulnerable.TrustedService"
+            assert {
+                item["id"] for item in entry_scope["catalog"]
+            } == set(task.target_entry_ids)
+            assert all(
+                item["assigned_seed"] for item in entry_scope["catalog"]
             )
-            assert trusted_catalog_item["direct_test_allowed"] is False
-            assert trusted_catalog_item["direct_reachability"] == "blocked"
-            assert trusted_catalog_item["indirect_chain_target_allowed"] is True
-            assert (
-                trusted_catalog_item["direct_reachability_decision"]["reason_code"]
-                == "strong_permission_guard"
+            assert all(
+                item["name"] != "com.example.vulnerable.TrustedService"
+                for item in entry_scope["catalog"]
             )
             code_context = kwargs["platform_context"]["target_code_context"]
             assert code_context["schema_version"] == "1.0"
