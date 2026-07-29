@@ -50,6 +50,10 @@ def test_agent_adb_policy_keeps_full_access_with_hard_safety_boundary() -> None:
     assert "adb root" in instructions
     assert "uninstall temporary PoC APKs" in instructions
     assert "platform requested_test" in instructions
+    assert "assigned coverage seed is a hard workflow scope" in instructions
+    assert "Do not use a broad glob" in instructions
+    assert "A zero-result search ends that proposed branch" in instructions
+    assert "without discovering or invoking an Android SDK toolchain" in instructions
 
 
 def _phase_prompt(phase: str, *, response_contract: str = "structured_result") -> str:
