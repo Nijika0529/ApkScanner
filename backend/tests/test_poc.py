@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 from apkscanner.artifacts import ArtifactStore
 from apkscanner.db import Database
 from apkscanner.models import EntryPoint, InvestigationTask, ProofAttempt, Scan
@@ -58,9 +58,13 @@ def test_poc_builder_accepts_only_source_projects_under_workspace(
     assert manifest.name == "AndroidManifest.xml"
     assert [item.name for item in sources] == ["MainActivity.java"]
 
-    (project / "build.gradle").write_text("malicious build hook", encoding="utf-8")
-    with pytest.raises(ValueError, match="unsupported PoC source file"):
-        builder._validate_project(workspace, poc_spec())
+    (project / "build.gradle").write_text("ignored build hook", encoding="utf-8")
+    (project / "build").mkdir()
+    (project / "build" / "MainActivity.class").write_bytes(b"ignored")
+    validated, sources, manifest = builder._validate_project(workspace, poc_spec())
+    assert validated == project
+    assert manifest.name == "AndroidManifest.xml"
+    assert [item.name for item in sources] == ["MainActivity.java"]
 
 
 def test_poc_builder_recovers_a_unique_project_path_by_package(
@@ -94,6 +98,29 @@ def test_poc_build_failure_includes_tool_diagnostic() -> None:
         "poc.build.aapt2 failed with exit 1: "
         "AndroidManifest.xml:7: error: resource style/Missing not found."
     )
+
+
+def test_poc_builder_uses_legacy_dx_when_d8_is_unavailable(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    sdk = tmp_path / "android-sdk"
+    build_tools = sdk / "build-tools" / "debian"
+    platform = sdk / "platforms" / "android-23"
+    build_tools.mkdir(parents=True)
+    platform.mkdir(parents=True)
+    dx = build_tools / "dx"
+    dx.write_text("#!/bin/sh\n", encoding="utf-8")
+    (platform / "android.jar").write_bytes(b"android")
+    configured = replace(
+        settings,
+        android_sdk_root=sdk,
+        device_android_api=23,
+    )
+
+    builder = PocBuilder(configured, ToolRunner(), ArtifactStore(configured))
+
+    assert builder._dex_tool() == ("dx", dx)
 
 
 def test_personal_lab_ingests_an_agent_built_prebuilt_apk(

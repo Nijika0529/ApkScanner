@@ -23,7 +23,8 @@ def developer_instructions(
             "File and shell tools may inspect the supplied scan workspace. Shell commands may "
             "create or modify files only inside that workspace or /tmp. "
             "Do not make unrelated target/network requests. When the "
-            "platform advertises poc_builder.available=true, you may create a source-only Android "
+            "platform advertises poc_builder.source_build_available=true, you may create a "
+            "source-only Android "
             "PoC under poc/<name>/ and reference it from requested_tests.poc."
         )
     elif direct_tool_access and shell_access:
@@ -183,7 +184,8 @@ def investigation_prompt(
             "analysis helpers and complete Android PoC projects inside the task workspace. For a "
             "phone-verified ordinary-app test, prefer a dedicated PoC attached to requested_tests "
             "so the platform installs, records, and cleans it. If "
-            "platform_context.poc_builder.available is true, create a source-only project at "
+            "platform_context.poc_builder.source_build_available is true, create a source-only "
+            "project at "
             "poc/<name>/ containing AndroidManifest.xml and src/**/*.java, then attach a poc "
             "object to that requested test. Do not add Gradle files, binaries, native libraries, "
             "or downloaded dependencies when using the platform-managed source build. For this "

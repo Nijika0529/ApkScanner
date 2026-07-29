@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -52,12 +53,12 @@ class PocBuilder:
         if not self.settings.poc_enabled:
             return {"available": False, "detail": "Agent PoC building is disabled"}
         android_jar = self._android_jar()
-        d8 = self._build_tool("d8")
+        dex_tool = self._dex_tool()
         source_missing = [
             name
             for name, value in {
                 "Android SDK platform android.jar": android_jar,
-                "d8": d8,
+                "d8 or dx": dex_tool,
                 "java compiler": shutil.which("javac"),
                 "zipalign": shutil.which("zipalign") or self._build_tool("zipalign"),
                 "keytool": shutil.which("keytool"),
@@ -141,8 +142,9 @@ class PocBuilder:
             aligned_apk = output / "aligned.apk"
             signed_apk = output / "poc.apk"
             android_jar = self._android_jar()
-            d8 = self._build_tool("d8")
-            assert android_jar is not None and d8 is not None
+            dex_tool = self._dex_tool()
+            assert android_jar is not None and dex_tool is not None
+            dex_tool_name, dex_tool_path = dex_tool
 
             steps = [
                 (
@@ -216,9 +218,10 @@ class PocBuilder:
                     source_sha256=source_sha256,
                     source_path=source_path,
                 )
-            d8_result = self.runner.run(
+            classes_dex = dex / "classes.dex"
+            dex_argv = (
                 [
-                    str(d8),
+                    str(dex_tool_path),
                     "--lib",
                     str(android_jar),
                     "--min-api",
@@ -226,28 +229,40 @@ class PocBuilder:
                     "--output",
                     str(dex),
                     *[str(item) for item in class_files],
-                ],
-                cwd=project,
+                ]
+                if dex_tool_name == "d8"
+                else [
+                    str(dex_tool_path),
+                    "--dex",
+                    f"--output={classes_dex}",
+                    *[str(item.relative_to(classes)) for item in class_files],
+                ]
+            )
+            dex_result = self.runner.run(
+                dex_argv,
+                cwd=project if dex_tool_name == "d8" else classes,
                 timeout=self.settings.poc_build_timeout_seconds,
+                env=self._modern_java_environment(),
                 cancel_event=cancel_event,
             )
             commands.append(
                 (
-                    "poc.build.d8",
-                    d8_result,
+                    f"poc.build.{dex_tool_name}",
+                    dex_result,
                     self._command_metadata(effective_spec, source_sha256),
                 )
             )
-            if d8_result.exit_code != 0:
+            if dex_result.exit_code != 0:
                 return PocBuildResult(
                     ok=False,
                     commands=commands,
-                    error=self._command_failure("poc.build.d8", d8_result),
+                    error=self._command_failure(
+                        f"poc.build.{dex_tool_name}", dex_result
+                    ),
                     source_sha256=source_sha256,
                     source_path=source_path,
                 )
 
-            classes_dex = dex / "classes.dex"
             if not unsigned_apk.is_file() or not classes_dex.is_file():
                 return PocBuildResult(
                     ok=False,
@@ -483,11 +498,15 @@ class PocBuilder:
             or project.is_symlink()
         ):
             raise ValueError("project_path must resolve to a regular directory under poc/")
-        files = sorted(item for item in project.rglob("*") if item.is_file())
-        if not files or len(files) > 64:
-            raise ValueError("PoC project must contain between 1 and 64 files")
+        manifest = project / "AndroidManifest.xml"
+        sources = sorted((project / "src").rglob("*.java"))
+        if not manifest.is_file() or not sources:
+            raise ValueError("PoC project requires AndroidManifest.xml and src/**/*.java")
+        build_inputs = [manifest, *sources]
+        if len(build_inputs) > 64:
+            raise ValueError("PoC project must contain at most 64 build input files")
         total = 0
-        for item in files:
+        for item in build_inputs:
             if item.is_symlink() or not item.resolve().is_relative_to(project):
                 raise ValueError("PoC project contains a symbolic link or escaped path")
             if item.suffix.lower() not in ALLOWED_SOURCE_SUFFIXES:
@@ -497,10 +516,6 @@ class PocBuilder:
             raise ValueError(
                 f"PoC source exceeds {self.settings.poc_max_source_bytes} bytes"
             )
-        manifest = project / "AndroidManifest.xml"
-        sources = sorted((project / "src").rglob("*.java"))
-        if not manifest.is_file() or not sources:
-            raise ValueError("PoC project requires AndroidManifest.xml and src/**/*.java")
         tree = ElementTree.parse(manifest)
         root_element = tree.getroot()
         if root_element.tag != "manifest" or root_element.get("package") != spec.package_name:
@@ -607,6 +622,28 @@ class PocBuilder:
         ]
         return sorted(candidates)[-1] if candidates else None
 
+    def _dex_tool(self) -> tuple[str, Path] | None:
+        for name in ("d8", "dx"):
+            candidate = self._build_tool(name)
+            if candidate is not None:
+                return name, candidate
+        return None
+
+    @staticmethod
+    def _modern_java_environment() -> dict[str, str] | None:
+        for java_home in (
+            Path("/usr/lib/jvm/java-17-openjdk-amd64"),
+            Path("/usr/lib/jvm/java-21-openjdk-amd64"),
+        ):
+            if (java_home / "bin" / "java").is_file():
+                return {
+                    "JAVA_HOME": str(java_home),
+                    "PATH": os.pathsep.join(
+                        [str(java_home / "bin"), os.environ.get("PATH", "")]
+                    ),
+                }
+        return None
+
     def _required_tool(self, name: str) -> str:
         value = shutil.which(name) or self._build_tool(name)
         if value is None:
@@ -634,6 +671,8 @@ class PocBuilder:
                 [
                     self._required_tool("keytool"),
                     "-genkeypair",
+                    "-storetype",
+                    "JKS",
                     "-keystore",
                     str(keystore),
                     "-storepass",
