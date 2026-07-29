@@ -118,6 +118,44 @@ def test_poc_builder_uses_safe_manifest_package_as_source_of_truth(
     assert effective.package_name == "io.apkscanner.poc.providerprobe"
 
 
+def test_poc_builder_uses_unique_manifest_launcher_as_source_of_truth(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = write_poc_project(workspace)
+    manifest = project / "AndroidManifest.xml"
+    manifest.write_text(
+        """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+package="io.apkscanner.poc.providerprobe">
+<application>
+<activity android:name=".MainActivity" android:exported="true">
+<intent-filter>
+<action android:name="android.intent.action.MAIN" />
+<category android:name="android.intent.category.LAUNCHER" />
+</intent-filter>
+</activity>
+</application>
+</manifest>""",
+        encoding="utf-8",
+    )
+    builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
+    mismatched = poc_spec().model_copy(
+        update={"launch_component": ".ModelGuessActivity"}
+    )
+
+    _project, _sources, _manifest, effective = builder._validate_project(
+        workspace,
+        mismatched,
+    )
+
+    assert (
+        effective.launch_component
+        == "io.apkscanner.poc.providerprobe.MainActivity"
+    )
+
+
 def test_poc_build_failure_includes_tool_diagnostic() -> None:
     result = CommandResult(
         ["aapt2", "link"],

@@ -537,14 +537,15 @@ class PocBuilder:
         application = root_element.find("application")
         if application is None:
             raise ValueError("PoC manifest requires an application")
+        activity_elements = application.findall("activity")
         declared = {
             item.get(f"{{{ANDROID_NAMESPACE}}}name")
-            for item in application.findall("activity")
+            for item in activity_elements
         }
         component = (
             f"{effective_spec.package_name}{effective_spec.launch_component}"
-            if spec.launch_component.startswith(".")
-            else spec.launch_component
+            if effective_spec.launch_component.startswith(".")
+            else effective_spec.launch_component
         )
         normalized_declared = {
             (
@@ -553,9 +554,51 @@ class PocBuilder:
                 else name
             )
             for name in declared
+            if name
         }
         if component not in normalized_declared:
-            raise ValueError("launch_component is not declared as an activity")
+            launcher_candidates: list[str] = []
+            for activity in activity_elements:
+                name = activity.get(f"{{{ANDROID_NAMESPACE}}}name")
+                normalized = (
+                    f"{effective_spec.package_name}{name}"
+                    if name and name.startswith(".")
+                    else name
+                )
+                if not normalized:
+                    continue
+                for intent_filter in activity.findall("intent-filter"):
+                    actions = {
+                        item.get(f"{{{ANDROID_NAMESPACE}}}name")
+                        for item in intent_filter.findall("action")
+                    }
+                    categories = {
+                        item.get(f"{{{ANDROID_NAMESPACE}}}name")
+                        for item in intent_filter.findall("category")
+                    }
+                    if (
+                        "android.intent.action.MAIN" in actions
+                        and "android.intent.category.LAUNCHER" in categories
+                    ):
+                        launcher_candidates.append(normalized)
+                        break
+            candidates = (
+                launcher_candidates
+                if len(launcher_candidates) == 1
+                else list(normalized_declared)
+                if len(normalized_declared) == 1
+                else []
+            )
+            if len(candidates) != 1 or not candidates[0].startswith(
+                f"{effective_spec.package_name}."
+            ):
+                raise ValueError("launch_component is not declared as an activity")
+            effective_spec = AgentPocSpec.model_validate(
+                {
+                    **effective_spec.model_dump(mode="python"),
+                    "launch_component": candidates[0],
+                }
+            )
         return project, sources, manifest, effective_spec
 
     @staticmethod
