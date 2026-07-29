@@ -276,6 +276,33 @@ def test_source_build_drops_override_annotations_for_legacy_android_jar(
     assert "onNullBinding" in text
 
 
+def test_source_build_makes_fallback_request_id_effectively_final(
+    tmp_path,
+) -> None:
+    source = tmp_path / "MainActivity.java"
+    source.write_text(
+        """class MainActivity {
+    void run() {
+        String requestId = getIntentValue();
+        if (requestId == null) {
+            requestId = "unknown";
+        }
+        new Thread(() -> use(requestId)).start();
+    }
+}""",
+        encoding="utf-8",
+    )
+    output = tmp_path / "build"
+    output.mkdir()
+
+    normalized = PocBuilder._build_sources([source], output)
+
+    text = normalized[0].read_text(encoding="utf-8")
+    assert "String requestIdCandidate = getIntentValue();" in text
+    assert "requestIdCandidate = \"unknown\";" in text
+    assert "final String requestId = requestIdCandidate;" in text
+
+
 def test_poc_builder_uses_legacy_dx_when_d8_is_unavailable(
     settings,
     tmp_path,

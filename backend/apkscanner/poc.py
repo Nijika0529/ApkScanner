@@ -393,6 +393,26 @@ class PocBuilder:
             target = target_dir / source.name
             text = source.read_text(encoding="utf-8", errors="replace")
             text = re.sub(r"(?m)^[ \t]*@Override[ \t]*\r?\n", "", text)
+            text = re.sub(
+                r"""
+                (?P<indent>^[ \t]*)
+                String[ \t]+(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)[ \t]*=
+                (?P<initial>[^;]+);[ \t]*\r?\n
+                (?P=indent)if[ \t]*\([ \t]*(?P=name)[ \t]*==[ \t]*null[ \t]*\)
+                [ \t]*\{[ \t]*\r?\n
+                (?P=indent)[ \t]+(?P=name)[ \t]*=[ \t]*(?P<fallback>[^;]+);[ \t]*\r?\n
+                (?P=indent)\}
+                """,
+                (
+                    r"\g<indent>String \g<name>Candidate =\g<initial>;\n"
+                    r"\g<indent>if (\g<name>Candidate == null) {\n"
+                    r"\g<indent>    \g<name>Candidate = \g<fallback>;\n"
+                    r"\g<indent>}\n"
+                    r"\g<indent>final String \g<name> = \g<name>Candidate;"
+                ),
+                text,
+                flags=re.MULTILINE | re.VERBOSE,
+            )
             target.write_text(text, encoding="utf-8")
             normalized.append(target)
         return normalized
