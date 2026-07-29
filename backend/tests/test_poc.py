@@ -193,6 +193,32 @@ android:exported="true">
     )
 
 
+def test_poc_builder_uses_unique_java_log_tag_as_source_of_truth(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = write_poc_project(workspace)
+    source = next((project / "src").rglob("MainActivity.java"))
+    source.write_text(
+        """package io.apkscanner.poc.providerprobe;
+public final class MainActivity extends android.app.Activity {
+private static final String TAG = "PROVIDER_RESULT";
+}""",
+        encoding="utf-8",
+    )
+    builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
+    requested = poc_spec().model_copy(update={"log_tag": "MODEL_GUESS"})
+
+    _project, _sources, _manifest, effective = builder._validate_project(
+        workspace,
+        requested,
+    )
+
+    assert effective.log_tag == "PROVIDER_RESULT"
+
+
 def test_poc_build_failure_includes_tool_diagnostic() -> None:
     result = CommandResult(
         ["aapt2", "link"],

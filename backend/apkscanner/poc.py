@@ -611,6 +611,22 @@ class PocBuilder:
                     "launch_component": candidates[0],
                 }
             )
+        log_tags: set[str] = set()
+        for source in sources:
+            text = source.read_text(encoding="utf-8", errors="replace")
+            log_tags.update(
+                re.findall(
+                    r'\b(?:TAG|LOG_TAG)\s*=\s*"([A-Z][A-Z0-9_]{2,31})"',
+                    text,
+                )
+            )
+        if len(log_tags) == 1:
+            effective_spec = AgentPocSpec.model_validate(
+                {
+                    **effective_spec.model_dump(mode="python"),
+                    "log_tag": next(iter(log_tags)),
+                }
+            )
         return project, sources, manifest, effective_spec
 
     @staticmethod
