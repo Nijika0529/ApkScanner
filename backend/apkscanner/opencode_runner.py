@@ -452,7 +452,7 @@ class OpenCodeInvestigator:
                 for item in context.get("security_hypotheses", [])
                 if isinstance(item, dict) and isinstance(item.get("id"), str)
             ),
-            "require_hypothesis_receipts": True,
+            "require_hypothesis_receipts": phase != "adversarial_review",
             "allowed_entry_point_ids": sorted(
                 {
                     entry.id for entry in entries

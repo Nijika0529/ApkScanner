@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import pytest
-from apkscanner.agent_prompt import developer_instructions
+from apkscanner.agent_prompt import developer_instructions, investigation_prompt
+from apkscanner.models import EntryPoint, InvestigationTask, Scan
 from apkscanner.schemas import AgentInvestigationResult, AgentRequestedTest
 from pydantic import ValidationError
 
@@ -33,6 +34,76 @@ def test_agent_instructions_require_chinese_but_preserve_identifiers() -> None:
     assert "Simplified Chinese" in instructions
     assert "Evidence IDs" in instructions
     assert "class names" in instructions
+
+
+def test_agent_adb_policy_keeps_full_access_with_hard_safety_boundary() -> None:
+    instructions = developer_instructions(
+        direct_tool_access=True,
+        workspace_write=True,
+        adb_access=True,
+    )
+
+    assert "ADB is fully available" in instructions
+    assert "platform_context.device.serial" in instructions
+    assert "adb tcpip" in instructions
+    assert "adb forward/reverse" in instructions
+    assert "adb root" in instructions
+    assert "uninstall temporary PoC APKs" in instructions
+    assert "platform requested_test" in instructions
+
+
+def _phase_prompt(phase: str, *, response_contract: str = "structured_result") -> str:
+    scan = Scan(
+        id="00000000-0000-0000-0000-000000000001",
+        status="investigating",
+        filename="sample.apk",
+        package_name="com.example.sample",
+        artifact_sha256="a" * 64,
+        artifact_path="/tmp/sample.apk",
+    )
+    entry = EntryPoint(
+        id="00000000-0000-0000-0000-000000000002",
+        scan_id=scan.id,
+        kind="activity",
+        name="com.example.sample.MainActivity",
+        owner_component="com.example.sample.MainActivity",
+        exported=True,
+    )
+    task = InvestigationTask(
+        id="00000000-0000-0000-0000-000000000003",
+        scan_id=scan.id,
+        task_type="component",
+        target_entry_ids=[entry.id],
+    )
+    return investigation_prompt(
+        scan,
+        task,
+        [entry],
+        [],
+        {"phase": phase},
+        direct_tool_access=True,
+        workspace_write=True,
+        adb_access=True,
+        response_contract=response_contract,
+    )
+
+
+def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
+    planning = _phase_prompt("test_planning")
+    continuation = _phase_prompt("exploration_round")
+    critic = _phase_prompt("adversarial_review")
+    final = _phase_prompt("final_evaluation")
+    memo = _phase_prompt("test_planning", response_contract="analysis_memo")
+
+    assert "single broad analysis pass" in planning
+    assert "not a fresh audit" in continuation
+    assert "changed PoC, input, or Oracle" in continuation
+    assert "return requested_tests=[], and do not reopen" in critic
+    assert "does not need to regenerate hypothesis assessment receipts" in critic
+    assert "terminal decision turn" in final
+    assert "Do not assign the final platform verdict" in memo
+    assert "Make an explicit evidence-weighted decision" not in memo
+    assert "Unless the result is reproduced_blackbox" not in memo
 
 
 def test_invalid_optional_requested_test_does_not_discard_static_verdict() -> None:

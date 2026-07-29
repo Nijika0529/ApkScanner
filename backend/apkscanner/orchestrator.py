@@ -1796,6 +1796,7 @@ class ScanOrchestrator:
                     if (
                         agent_result is not None
                         and self._needs_adversarial_review(agent_result.result)
+                        and not self._has_requested_test_work(agent_result.result)
                         and not budget.expired
                         and critic_budget >= AGENT_MIN_OPTIONAL_PHASE_SECONDS
                     ):
@@ -1814,22 +1815,20 @@ class ScanOrchestrator:
                                 "critic_thread_id": critic_result.thread_id,
                                 "critic_turn_id": critic_result.turn_id,
                             }
-                            merged_requests: list[AgentRequestedTest] = []
-                            seen_requests: set[str] = set()
-                            for request in [
-                                *agent_result.result.requested_tests,
-                                *critic_result.result.requested_tests,
-                            ]:
-                                signature = self._requested_test_signature(request)
-                                if signature in seen_requests:
-                                    continue
-                                seen_requests.add(signature)
-                                merged_requests.append(request)
+                            critic_requested_test_count = len(
+                                critic_result.result.requested_tests
+                            ) + len(
+                                self._rejected_requested_tests(
+                                    critic_result.result
+                                )
+                            )
+                            if critic_requested_test_count:
+                                coverage_gaps.append(
+                                    "Critic proposed device tests, but Critic is evidence-only; "
+                                    "the proposals were not scheduled."
+                                )
                             merged_result = agent_result.result.model_copy(
                                 update={
-                                    "requested_tests": merged_requests[
-                                        : self.settings.agent_tests_per_round
-                                    ],
                                     "coverage_gaps": list(
                                         dict.fromkeys(
                                             [
@@ -1840,14 +1839,6 @@ class ScanOrchestrator:
                                     ),
                                 }
                             )
-                            merged_result._rejected_requested_tests = [  # noqa: SLF001
-                                *self._rejected_requested_tests(
-                                    agent_result.result
-                                ),
-                                *self._rejected_requested_tests(
-                                    critic_result.result
-                                ),
-                            ]
                             agent_result.result = merged_result
                             self._record_exploration_event(
                                 scan_id,
@@ -1861,14 +1852,24 @@ class ScanOrchestrator:
                                     "critic_objection_count": len(
                                         critic_payload.get("coverage_gaps", [])
                                     ),
-                                    "merged_test_count": len(merged_requests),
+                                    "critic_test_proposals_ignored": (
+                                        critic_requested_test_count
+                                    ),
                                 },
                             )
                         elif critic_error:
                             coverage_gaps.append(
                                 f"Adversarial review was unavailable: {critic_error}"
                             )
-                    elif agent_result is not None and not budget.expired:
+                    elif (
+                        agent_result is not None
+                        and self._needs_adversarial_review(agent_result.result)
+                        and not self._has_requested_test_work(agent_result.result)
+                        and (
+                            budget.expired
+                            or critic_budget < AGENT_MIN_OPTIONAL_PHASE_SECONDS
+                        )
+                    ):
                         coverage_gaps.append(
                             "Adversarial review was skipped to preserve the final-evaluation "
                             "budget."
@@ -2014,6 +2015,18 @@ class ScanOrchestrator:
                                 }
                                 break
                         completed_rounds += 1
+                        if self.hypothesis_ledger.task_proof_result(task_id) is not None:
+                            self._record_exploration_event(
+                                scan_id,
+                                task_id,
+                                "exploration.proof_terminal",
+                                "平台危害 Oracle 已形成终态，停止追加探索并进入最终结论",
+                                {
+                                    "source": "platform",
+                                    "round_index": completed_rounds,
+                                },
+                            )
+                            break
                         if (
                             budget.expired
                             or completed_rounds >= self.settings.agent_max_rounds
