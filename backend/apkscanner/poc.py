@@ -145,6 +145,7 @@ class PocBuilder:
             unsigned_apk = output / "unsigned.apk"
             aligned_apk = output / "aligned.apk"
             signed_apk = output / "poc.apk"
+            build_manifest = self._build_manifest(manifest, output)
             android_jar = self._android_jar()
             dex_tool = self._dex_tool()
             assert android_jar is not None and dex_tool is not None
@@ -161,7 +162,7 @@ class PocBuilder:
                         "-I",
                         str(android_jar),
                         "--manifest",
-                        str(manifest),
+                        str(build_manifest),
                         "--min-sdk-version",
                         str(self.settings.device_android_api),
                         "--target-sdk-version",
@@ -368,6 +369,17 @@ class PocBuilder:
             },
             effective_spec=effective_spec,
         )
+
+    @staticmethod
+    def _build_manifest(source: Path, output: Path) -> Path:
+        tree = ElementTree.parse(source)
+        root = tree.getroot()
+        for child in list(root):
+            if child.tag == "queries":
+                root.remove(child)
+        target = output / "AndroidManifest.xml"
+        tree.write(target, encoding="utf-8", xml_declaration=True)
+        return target
 
     def _ingest_prebuilt(
         self,

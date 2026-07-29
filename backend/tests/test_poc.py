@@ -207,6 +207,28 @@ def test_poc_build_failure_includes_tool_diagnostic() -> None:
     )
 
 
+def test_source_build_drops_package_visibility_queries_from_legacy_manifest(
+    tmp_path,
+) -> None:
+    source = tmp_path / "source.xml"
+    source.write_text(
+        """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+package="io.apkscanner.poc.providerprobe">
+<queries><package android:name="io.apkscanner.vulntest" /></queries>
+<application><activity android:name=".MainActivity" /></application>
+</manifest>""",
+        encoding="utf-8",
+    )
+    output = tmp_path / "build"
+    output.mkdir()
+
+    normalized = PocBuilder._build_manifest(source, output)
+
+    text = normalized.read_text(encoding="utf-8")
+    assert "<queries>" not in text
+    assert "MainActivity" in text
+
+
 def test_poc_builder_uses_legacy_dx_when_d8_is_unavailable(
     settings,
     tmp_path,
