@@ -337,6 +337,8 @@ function Sidebar({ scans, selectedId, health, onSelect, onUpload }: { scans: Sca
 
 function ScanDetailView({ data, health, onRefresh, onDelete }: { data: DetailData; health: Health | null; onRefresh: () => Promise<void>; onDelete: () => void }) {
   const { scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events } = data
+  const proofBacklog = signals.filter(isProofBacklogSignal)
+  const staticSignals = signals.filter((signal) => !isProofBacklogSignal(signal))
   const high = findings.filter((item) => ["critical", "high"].includes(item.severity)).length
   const reproduced = findings.filter((item) => item.status === "reproduced_blackbox").length
   const exported = entries.filter((item) => item.exported && item.kind !== "deep_link").length
@@ -361,18 +363,19 @@ function ScanDetailView({ data, health, onRefresh, onDelete }: { data: DetailDat
         <Metric label="黑盒复现" value={reproduced} icon={ShieldX} tone="rose" />
         <Metric label="导出组件" value={exported} icon={Box} tone="cyan" />
         <Metric label="Deep Link" value={links} icon={Link2} tone="cyan" />
-        <Metric label="探索任务" value={tasks.length} icon={Bot} tone="violet" />
+        <Metric label="待验证风险" value={proofBacklog.length} icon={Bot} tone="violet" />
         <Metric label="覆盖项目" value={`${Math.round(coveragePercent)}%`} icon={Gauge} tone="emerald" />
       </div>
       <Card className="p-4 sm:p-6">
         <Tabs defaultValue="overview">
           <TabsList aria-label="扫描详情">
-            <TabsTrigger value="overview">总览</TabsTrigger><TabsTrigger value="entries">攻击面 <span className="ml-1 text-xs text-slate-500">{entries.length}</span></TabsTrigger><TabsTrigger value="findings">已证实 Finding <span className="ml-1 text-xs text-slate-500">{findings.length}</span></TabsTrigger><TabsTrigger value="signals">静态线索 <span className="ml-1 text-xs text-slate-500">{signals.length}</span></TabsTrigger><TabsTrigger value="coverage">覆盖矩阵</TabsTrigger><TabsTrigger value="tasks">探索任务</TabsTrigger><TabsTrigger value="proofs">验证链 <span className="ml-1 text-xs text-slate-500">{hypotheses.length}</span></TabsTrigger><TabsTrigger value="audits">AI 审计 <span className="ml-1 text-xs text-slate-500">{audits.length}</span></TabsTrigger>
+            <TabsTrigger value="overview">总览</TabsTrigger><TabsTrigger value="entries">攻击面 <span className="ml-1 text-xs text-slate-500">{entries.length}</span></TabsTrigger><TabsTrigger value="findings">已证实 Finding <span className="ml-1 text-xs text-slate-500">{findings.length}</span></TabsTrigger><TabsTrigger value="proof-backlog">待验证风险 <span className="ml-1 text-xs text-slate-500">{proofBacklog.length}</span></TabsTrigger><TabsTrigger value="signals">静态线索 <span className="ml-1 text-xs text-slate-500">{staticSignals.length}</span></TabsTrigger><TabsTrigger value="coverage">覆盖矩阵</TabsTrigger><TabsTrigger value="tasks">探索任务</TabsTrigger><TabsTrigger value="proofs">验证链 <span className="ml-1 text-xs text-slate-500">{hypotheses.length}</span></TabsTrigger><TabsTrigger value="audits">AI 审计 <span className="ml-1 text-xs text-slate-500">{audits.length}</span></TabsTrigger>
           </TabsList>
           <TabsContent value="overview"><Overview scan={scan} events={events} health={health} coverage={coverage} /></TabsContent>
           <TabsContent value="entries"><EntryPoints entries={entries} /></TabsContent>
           <TabsContent value="findings"><Findings findings={findings} scanStatus={scan.status} onRefresh={onRefresh} /></TabsContent>
-          <TabsContent value="signals"><Signals signals={signals} onRefresh={onRefresh} /></TabsContent>
+          <TabsContent value="proof-backlog"><ProofBacklog signals={proofBacklog} tasks={tasks} onRefresh={onRefresh} /></TabsContent>
+          <TabsContent value="signals"><Signals signals={staticSignals} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="coverage"><CoverageMatrix coverage={coverage} /></TabsContent>
           <TabsContent value="tasks"><Tasks scan={scan} tasks={tasks} entries={entries} audits={audits} events={events} health={health} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="proofs"><HypothesisPipeline scanId={scan.id} scanStatus={scan.status} hypotheses={hypotheses} evaluations={evaluations} entries={entries} onRefresh={onRefresh} /></TabsContent>
@@ -408,6 +411,57 @@ function Findings({ findings, scanStatus, onRefresh }: { findings: Finding[]; sc
 function Signals({ signals, onRefresh }: { signals: Finding[]; onRefresh: () => Promise<void> }) {
   const sorted = [...signals].sort((a, b) => ["critical", "high", "medium", "low", "info"].indexOf(a.severity) - ["critical", "high", "medium", "low", "info"].indexOf(b.severity))
   return <div className="space-y-3"><div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">这些是静态规则、AI 静态支持或尚未完成影响证明的调查线索，用于指导后续验证；它们不计入最终 Finding，也不代表漏洞已经成立。</div>{sorted.map((finding) => <FindingCard key={finding.id} finding={finding} onRefresh={onRefresh} />)}{!signals.length && <EmptyRow text="没有待验证线索" />}</div>
+}
+
+function ProofBacklog({ signals, tasks, onRefresh }: { signals: Finding[]; tasks: InvestigationTask[]; onRefresh: () => Promise<void> }) {
+  const [retrying, setRetrying] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const tasksById = new Map(tasks.map((task) => [task.id, task]))
+  const sorted = [...signals].sort((a, b) => ["critical", "high", "medium", "low", "info"].indexOf(a.severity) - ["critical", "high", "medium", "low", "info"].indexOf(b.severity))
+
+  async function retry(task: InvestigationTask) {
+    setRetrying(task.id)
+    setError(null)
+    try {
+      await api.retryTask(task.id)
+      await onRefresh()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "重新验证失败")
+    } finally {
+      setRetrying(null)
+    }
+  }
+
+  return <div className="space-y-4">
+    <div className="rounded-xl border border-orange-200 bg-orange-50 px-4 py-3 text-sm leading-relaxed text-orange-950">这里集中展示 Agent 已建立具体静态攻击路径、但尚未获得平台危害 Oracle 的风险候选。它们不会计入最终 Finding；补齐 ADB、Probe APK、专用 PoC 或人工复现后可重新验证。</div>
+    {error && <div role="alert" className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">{error}</div>}
+    {sorted.map((signal) => {
+      const backlog = asRecord(signal.metadata_json.proof_backlog)
+      const taskId = textValue(backlog?.task_id) ?? textValue(signal.metadata_json.task_id)
+      const task = taskId ? tasksById.get(taskId) : undefined
+      const automationState = textValue(backlog?.automation_state) ?? "manual_or_poc_required"
+      const gaps = stringValues(backlog?.proof_gaps)
+      const stateLabel = {
+        attempted_not_proven: "已自动尝试，尚未证明危害",
+        blocked_before_execution: "自动测试在执行前受阻",
+        manual_or_poc_required: "需要专用 PoC 或人工复现",
+      }[automationState] ?? automationState
+      return <div key={signal.id} className="overflow-hidden rounded-xl border border-orange-200 bg-orange-50/40">
+        <div className="flex flex-col gap-3 border-b border-orange-200 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+          <div><div className="flex flex-wrap items-center gap-2"><Badge tone="warning">待动态证明</Badge><Badge>{stateLabel}</Badge></div>{gaps.length > 0 && <p className="mt-2 text-xs leading-5 text-orange-900">{gaps.slice(0, 2).join("；")}</p>}</div>
+          {task && isTerminalTask(task.status) && <Button variant="secondary" size="sm" onClick={() => retry(task)} disabled={retrying === task.id}>{retrying === task.id ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}重新验证</Button>}
+        </div>
+        <FindingCard finding={signal} onRefresh={onRefresh} />
+      </div>
+    })}
+    {!sorted.length && <EmptyRow text="没有等待动态证明的风险候选" />}
+  </div>
+}
+
+function isProofBacklogSignal(signal: Finding) {
+  const backlog = asRecord(signal.metadata_json.proof_backlog)
+  return backlog?.status === "proof_required"
+    || (["codex", "opencode"].includes(signal.source) && signal.status === "supported_static" && signal.severity !== "info")
 }
 
 function FindingCard({ finding, onRefresh }: { finding: Finding; onRefresh: () => Promise<void> }) {
@@ -881,12 +935,14 @@ function AuditConclusion({ audit, current, taskResult }: { audit: AgentAudit; cu
   const validatedOutput = asRecord(validation?.validated_output) ?? rawOutput
   if (!validatedOutput) return null
 
-  const result = (current ? taskResult : undefined) ?? textValue(validation?.final_result) ?? textValue(validatedOutput.result) ?? "unknown"
+  // The immutable platform-validation artifact is the authority for this audit.
+  // A task aggregate may briefly retain an older/inconclusive value during retries.
+  const result = textValue(validation?.final_result) ?? (current ? taskResult : undefined) ?? textValue(validatedOutput.result) ?? "unknown"
   const claimedResult = textValue(validation?.claimed_result)
   const summary = textValue(validatedOutput.summary) ?? "模型未提供结论摘要。"
   const proposedSeverity = textValue(validatedOutput.severity_proposal) ?? "—"
   const severity = result === "refuted_static"
-    ? "不适用"
+    ? "无风险"
     : result === "inconclusive"
     ? "未定"
     : (textValue(validation?.final_severity) ?? proposedSeverity).toUpperCase()
@@ -926,6 +982,16 @@ function AuditConclusion({ audit, current, taskResult }: { audit: AgentAudit; cu
           </div>
         </div>
       )}
+      {result === "refuted_static" && (
+        <div className="border-t border-emerald-200 bg-emerald-50 px-4 py-3 text-xs leading-5 text-emerald-950">
+          该入口点在当前 APK 版本、既定攻击者模型和已核验证据下未发现可利用风险，相关假设已关闭；这不代表整个 APK 无风险。
+        </div>
+      )}
+      {result === "supported_static" && (
+        <div className="border-t border-orange-200 bg-orange-50 px-4 py-3 text-xs leading-5 text-orange-950">
+          这是静态证据支持的风险线索，所示等级是验证优先级；在平台 Oracle 证明具体安全影响前，它只出现在“静态线索”，不会进入“已证实 Finding”。
+        </div>
+      )}
       {current && result === "inconclusive" && proposedSeverity !== "—" && (
         <div className="border-t border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-950">
           模型曾建议风险等级 {proposedSeverity.toUpperCase()}，但平台因证据不足未采纳；该值仅保留在原始审计中供后续补扫参考。
@@ -943,7 +1009,7 @@ function auditResultPresentation(result: string, current: boolean) {
   const prefix = current ? "" : "过程输出："
   if (result === "reproduced_blackbox") return { label: `${prefix}已完成黑盒复现`, container: "border-rose-200 bg-rose-50/80", iconContainer: "bg-rose-100 text-rose-700 ring-rose-200", eyebrow: "text-rose-700" }
   if (result === "supported_static") return { label: `${prefix}静态证据支持风险`, container: "border-orange-200 bg-orange-50/80", iconContainer: "bg-orange-100 text-orange-700 ring-orange-200", eyebrow: "text-orange-700" }
-  if (result === "refuted_static") return { label: `${prefix}静态证据已反驳风险`, container: "border-emerald-200 bg-emerald-50/80", iconContainer: "bg-emerald-100 text-emerald-700 ring-emerald-200", eyebrow: "text-emerald-700" }
+  if (result === "refuted_static") return { label: `${prefix}当前攻击模型下未发现可利用风险`, container: "border-emerald-200 bg-emerald-50/80", iconContainer: "bg-emerald-100 text-emerald-700 ring-emerald-200", eyebrow: "text-emerald-700" }
   if (result === "not_reproduced") return { label: `${prefix}当前测试未能复现`, container: "border-emerald-200 bg-emerald-50/80", iconContainer: "bg-emerald-100 text-emerald-700 ring-emerald-200", eyebrow: "text-emerald-700" }
   if (result === "inconclusive") return { label: current ? "本次任务未形成有效结论" : "历史调用当时未形成结论", container: "border-amber-200 bg-amber-50/80", iconContainer: "bg-amber-100 text-amber-800 ring-amber-200", eyebrow: "text-amber-800" }
   return { label: current ? `未识别的任务结果：${result}` : `未识别的过程输出：${result}`, container: "border-slate-200 bg-slate-50/80", iconContainer: "bg-slate-100 text-slate-700 ring-slate-200", eyebrow: "text-slate-700" }

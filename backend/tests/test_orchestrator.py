@@ -671,6 +671,15 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
                 )
             )
         )
+        proof_backlog = list(
+            session.scalars(
+                select(Finding).where(
+                    Finding.scan_id == scan_id,
+                    Finding.source == "codex",
+                    Finding.status == "supported_static",
+                )
+            )
+        )
     assert tasks
     assert len(audit_evidence) == len(tasks) * 4
     assert {item.kind for item in audit_evidence} == {
@@ -680,6 +689,16 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
         "agent.validation",
     }
     assert len(exploration_events) == len(tasks)
+    assert len(proof_backlog) == len(tasks)
+    assert all(
+        finding.metadata_json["proof_backlog"]["status"] == "proof_required"
+        for finding in proof_backlog
+    )
+    assert all(
+        finding.metadata_json["proof_backlog"]["automation_state"]
+        == "manual_or_poc_required"
+        for finding in proof_backlog
+    )
 
 
 def test_existing_scan_lazily_builds_target_code_context_from_partial_jadx(

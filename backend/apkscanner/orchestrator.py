@@ -4213,6 +4213,64 @@ class ScanOrchestrator:
             entry_names=[entry.name for entry in entries],
             claim=" | ".join(hypothesis.claim for hypothesis in hypotheses),
         )
+        supported_assessments = [
+            assessment
+            for assessment in payload.get("hypothesis_assessments", [])
+            if isinstance(assessment, dict)
+            and assessment.get("verdict") == FindingStatus.SUPPORTED_STATIC.value
+        ]
+        proof_gaps = list(
+            dict.fromkeys(
+                [
+                    *[
+                        str(gap)
+                        for assessment in supported_assessments
+                        for gap in assessment.get("proof_gaps", [])
+                        if isinstance(gap, str) and gap
+                    ],
+                    *[
+                        str(gap)
+                        for gap in payload.get("coverage_gaps", [])
+                        if isinstance(gap, str) and gap
+                    ],
+                ]
+            )
+        )
+        platform_context = (
+            payload.get("platform_context")
+            if isinstance(payload.get("platform_context"), dict)
+            else {}
+        )
+        executed_tests = platform_context.get("executed_agent_tests", [])
+        requested_tests = payload.get("requested_tests", [])
+        if isinstance(executed_tests, list) and executed_tests:
+            automation_state = "attempted_not_proven"
+            proof_reason = "platform_tests_completed_without_harm_oracle"
+        elif isinstance(requested_tests, list) and requested_tests:
+            automation_state = "blocked_before_execution"
+            proof_reason = "agent_requested_tests_not_executed"
+        else:
+            automation_state = "manual_or_poc_required"
+            proof_reason = "agent_did_not_produce_an_automatable_proof"
+        proof_backlog = {
+            "schema_version": "1.0",
+            "status": "proof_required",
+            "automation_state": automation_state,
+            "reason": proof_reason,
+            "task_id": task.id,
+            "hypothesis_ids": [
+                str(assessment["hypothesis_id"])
+                for assessment in supported_assessments
+                if isinstance(assessment.get("hypothesis_id"), str)
+            ],
+            "proof_gaps": proof_gaps,
+            "requested_test_count": (
+                len(requested_tests) if isinstance(requested_tests, list) else 0
+            ),
+            "executed_test_count": (
+                len(executed_tests) if isinstance(executed_tests, list) else 0
+            ),
+        }
         finding = session.scalar(
             select(Finding).where(
                 Finding.scan_id == scan.id,
@@ -4225,7 +4283,7 @@ class ScanOrchestrator:
                 dedupe_key=dedupe,
                 rule_id="AGENT-ENTRY-INVESTIGATION",
                 source=agent_backend,
-                title=f"Agent investigation: {entries[0].name if entries else task.id}",
+                title=f"待验证风险：{entries[0].name if entries else task.id}",
                 description=payload.get("summary", "Agent investigation result"),
                 remediation="Review the affected handler and enforce validation and caller authorization.",
                 masvs="MASVS-PLATFORM",
@@ -4241,12 +4299,14 @@ class ScanOrchestrator:
                     "model": model,
                     "coverage_gaps": payload.get("coverage_gaps", []),
                     "harm_demonstrated": False,
+                    "proof_backlog": proof_backlog,
                     "identity": signal_identity,
                 },
             )
             session.add(finding)
         else:
             finding.source = agent_backend
+            finding.title = f"待验证风险：{entries[0].name if entries else task.id}"
             finding.description = payload.get("summary", "Agent investigation result")
             finding.severity = payload.get("platform_severity") or payload.get(
                 "severity_proposal", "medium"
@@ -4260,6 +4320,7 @@ class ScanOrchestrator:
                 "model": model,
                 "coverage_gaps": payload.get("coverage_gaps", []),
                 "harm_demonstrated": False,
+                "proof_backlog": proof_backlog,
                 "identity": signal_identity,
             }
 

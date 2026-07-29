@@ -368,6 +368,39 @@ class AgentInvestigationResult(BaseModel):
     followups: list[str] = Field(max_length=100)
     requested_tests: list[AgentRequestedTest] = Field(max_length=1000)
 
+    @model_validator(mode="before")
+    @classmethod
+    def isolate_invalid_requested_tests(cls, value: Any) -> Any:
+        """An optional malformed action must not discard a valid static verdict."""
+
+        if not isinstance(value, dict):
+            return value
+        requested_tests = value.get("requested_tests")
+        if not isinstance(requested_tests, list):
+            return value
+        accepted: list[dict[str, Any]] = []
+        rejected = 0
+        for request in requested_tests:
+            try:
+                accepted.append(
+                    AgentRequestedTest.model_validate(request).model_dump(mode="python")
+                )
+            except (TypeError, ValueError):
+                rejected += 1
+        if not rejected:
+            return value
+        normalized = dict(value)
+        normalized["requested_tests"] = accepted
+        gaps = normalized.get("coverage_gaps")
+        normalized["coverage_gaps"] = [
+            *(gaps if isinstance(gaps, list) else []),
+            (
+                f"平台忽略了 {rejected} 个格式或能力不受支持的补充测试请求；"
+                "静态证据结论仍予保留。"
+            ),
+        ]
+        return normalized
+
     @model_validator(mode="after")
     def validate_explicit_verdict(self) -> Self:
         if self.result == "refuted_static" and self.severity_proposal != "info":
