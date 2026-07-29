@@ -1005,6 +1005,13 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
                 item["name"] != "com.example.vulnerable.TrustedService"
                 for item in entry_scope["catalog"]
             )
+            representatives = kwargs["platform_context"]["threat_model"][
+                "attack_surface"
+            ]["representative_entries"]
+            assert all(
+                item["name"] != "com.example.vulnerable.TrustedService"
+                for item in representatives
+            )
             code_context = kwargs["platform_context"]["target_code_context"]
             assert code_context["schema_version"] == "1.0"
             assert code_context["components"]

@@ -1411,6 +1411,30 @@ class ScanOrchestrator:
             if remaining <= 0:
                 return None, "task time budget exhausted during AI capability probe"
             try:
+                task_threat_model = deepcopy(
+                    (scan.stats or {}).get("threat_model")
+                )
+                if isinstance(task_threat_model, dict):
+                    attack_surface = task_threat_model.get("attack_surface")
+                    if isinstance(attack_surface, dict):
+                        seed_names = {
+                            entry.name
+                            for entry in entries
+                        } | {
+                            entry.owner_component
+                            for entry in entries
+                            if entry.owner_component
+                        }
+                        representatives = attack_surface.get(
+                            "representative_entries"
+                        )
+                        if isinstance(representatives, list):
+                            attack_surface["representative_entries"] = [
+                                item
+                                for item in representatives
+                                if isinstance(item, dict)
+                                and item.get("name") in seed_names
+                            ]
                 platform_context = {
                     "phase": phase,
                     "round_index": round_index,
@@ -1430,7 +1454,7 @@ class ScanOrchestrator:
                         "tests_per_round": self.settings.agent_tests_per_round,
                     },
                     "continuation": continuation_context or None,
-                    "threat_model": (scan.stats or {}).get("threat_model"),
+                    "threat_model": task_threat_model,
                     "security_hypotheses": hypothesis_context,
                     "candidate_under_review": candidate_under_review,
                     "debate": debate_context or None,
