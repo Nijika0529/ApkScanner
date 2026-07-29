@@ -240,6 +240,10 @@ class PocBuilder:
                 else [
                     str(dex_tool_path),
                     "--dex",
+                    # Legacy dx does not desugar Java 8 lambdas. Allow its
+                    # invoke-custom output on the modern audit devices where
+                    # Agent-authored PoCs execute.
+                    "--min-sdk-version=26",
                     f"--output={classes_dex}",
                     *[str(item.relative_to(classes)) for item in class_files],
                 ]
