@@ -59,6 +59,8 @@ def test_agent_adb_policy_keeps_full_access_with_hard_safety_boundary() -> None:
     assert "A zero-result search ends that proposed branch" in instructions
     assert "Treat raw ADB as a hypothesis probe, not an exploration loop" in instructions
     assert "If two ordinary-app PoC executions have already answered" in instructions
+    assert "never reconstruct a task UUID" in instructions
+    assert "One existence/path check for each PoC source is sufficient" in instructions
     assert "move directly to one platform-managed PoC" in instructions
     assert "return the requested test rather than continuing raw ADB" in instructions
     assert "without discovering or invoking an Android SDK toolchain" in instructions

@@ -70,6 +70,9 @@ def developer_instructions(
         "The assigned coverage seed is a hard workflow scope. Do not use a broad glob, directory "
         "listing, grep pattern, or manifest catalogue to enumerate application classes or exported "
         "components for later reading. Start with context.json and the materialized target_source. "
+        "Use the workspace paths from context.json exactly as written; never reconstruct a task UUID "
+        "or search from filesystem root to recover a guessed path. Evidence is already materialized "
+        "under the task workspace's evidence/ directory. "
         "Open another application class only after the current source or runtime output names its "
         "exact class, method, URI, Intent target, Binder interface, Provider authority, or native "
         "symbol. A search used to resolve that exact name may be broad in location but narrow in "
@@ -90,7 +93,9 @@ def developer_instructions(
         "state the remaining runtime-policy gap. "
         "When using the advertised platform source-only PoC builder, create and verify only "
         "the manifest and Java sources, then return the request without discovering or invoking an "
-        "Android SDK toolchain. "
+        "Android SDK toolchain. One existence/path check for each PoC source is sufficient; do not "
+        "re-read or re-verify an unchanged file with repeated cat, grep, stat, checksum, xxd, or "
+        "directory-listing commands. "
         if direct_tool_access
         else ""
     )
