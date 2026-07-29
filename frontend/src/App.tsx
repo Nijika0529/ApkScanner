@@ -337,8 +337,8 @@ function Sidebar({ scans, selectedId, health, onSelect, onUpload }: { scans: Sca
 
 function ScanDetailView({ data, health, onRefresh, onDelete }: { data: DetailData; health: Health | null; onRefresh: () => Promise<void>; onDelete: () => void }) {
   const { scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events } = data
-  const proofBacklog = signals.filter(isProofBacklogSignal)
-  const staticSignals = signals.filter((signal) => !isProofBacklogSignal(signal))
+  const verificationCandidates = signals.filter(isVerificationCandidate)
+  const staticSignals = signals.filter((signal) => !isVerificationCandidate(signal))
   const high = findings.filter((item) => ["critical", "high"].includes(item.severity)).length
   const reproduced = findings.filter((item) => item.status === "reproduced_blackbox").length
   const exported = entries.filter((item) => item.exported && item.kind !== "deep_link").length
@@ -363,18 +363,18 @@ function ScanDetailView({ data, health, onRefresh, onDelete }: { data: DetailDat
         <Metric label="黑盒复现" value={reproduced} icon={ShieldX} tone="rose" />
         <Metric label="导出组件" value={exported} icon={Box} tone="cyan" />
         <Metric label="Deep Link" value={links} icon={Link2} tone="cyan" />
-        <Metric label="待验证风险" value={proofBacklog.length} icon={Bot} tone="violet" />
+        <Metric label="待验证风险" value={verificationCandidates.length} icon={Bot} tone="violet" />
         <Metric label="覆盖项目" value={`${Math.round(coveragePercent)}%`} icon={Gauge} tone="emerald" />
       </div>
       <Card className="p-4 sm:p-6">
         <Tabs defaultValue="overview">
           <TabsList aria-label="扫描详情">
-            <TabsTrigger value="overview">总览</TabsTrigger><TabsTrigger value="entries">攻击面 <span className="ml-1 text-xs text-slate-500">{entries.length}</span></TabsTrigger><TabsTrigger value="findings">已证实 Finding <span className="ml-1 text-xs text-slate-500">{findings.length}</span></TabsTrigger><TabsTrigger value="proof-backlog">待验证风险 <span className="ml-1 text-xs text-slate-500">{proofBacklog.length}</span></TabsTrigger><TabsTrigger value="signals">静态线索 <span className="ml-1 text-xs text-slate-500">{staticSignals.length}</span></TabsTrigger><TabsTrigger value="coverage">覆盖矩阵</TabsTrigger><TabsTrigger value="tasks">探索任务</TabsTrigger><TabsTrigger value="proofs">验证链 <span className="ml-1 text-xs text-slate-500">{hypotheses.length}</span></TabsTrigger><TabsTrigger value="audits">AI 审计 <span className="ml-1 text-xs text-slate-500">{audits.length}</span></TabsTrigger>
+            <TabsTrigger value="overview">总览</TabsTrigger><TabsTrigger value="entries">攻击面 <span className="ml-1 text-xs text-slate-500">{entries.length}</span></TabsTrigger><TabsTrigger value="findings">已证实 Finding <span className="ml-1 text-xs text-slate-500">{findings.length}</span></TabsTrigger><TabsTrigger value="proof-backlog">待验证风险 <span className="ml-1 text-xs text-slate-500">{verificationCandidates.length}</span></TabsTrigger><TabsTrigger value="signals">静态线索 <span className="ml-1 text-xs text-slate-500">{staticSignals.length}</span></TabsTrigger><TabsTrigger value="coverage">覆盖矩阵</TabsTrigger><TabsTrigger value="tasks">探索任务</TabsTrigger><TabsTrigger value="proofs">验证链 <span className="ml-1 text-xs text-slate-500">{hypotheses.length}</span></TabsTrigger><TabsTrigger value="audits">AI 审计 <span className="ml-1 text-xs text-slate-500">{audits.length}</span></TabsTrigger>
           </TabsList>
           <TabsContent value="overview"><Overview scan={scan} events={events} health={health} coverage={coverage} /></TabsContent>
           <TabsContent value="entries"><EntryPoints entries={entries} /></TabsContent>
-          <TabsContent value="findings"><Findings findings={findings} scanStatus={scan.status} onRefresh={onRefresh} /></TabsContent>
-          <TabsContent value="proof-backlog"><ProofBacklog signals={proofBacklog} tasks={tasks} onRefresh={onRefresh} /></TabsContent>
+          <TabsContent value="findings"><Findings findings={findings} verificationCandidates={verificationCandidates} scanStatus={scan.status} onRefresh={onRefresh} /></TabsContent>
+          <TabsContent value="proof-backlog"><ProofBacklog signals={verificationCandidates} tasks={tasks} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="signals"><Signals signals={staticSignals} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="coverage"><CoverageMatrix coverage={coverage} /></TabsContent>
           <TabsContent value="tasks"><Tasks scan={scan} tasks={tasks} entries={entries} audits={audits} events={events} health={health} onRefresh={onRefresh} /></TabsContent>
@@ -402,10 +402,24 @@ function EntryPoints({ entries }: { entries: EntryPoint[] }) {
   return <div><div className="mb-5 flex flex-col gap-3 sm:flex-row"><label className="flex-1"><span className="sr-only">搜索入口</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索组件、URI 或 authority" className="field" /></label><label><span className="sr-only">入口类型</span><select value={kind} onChange={(event) => setKind(event.target.value)} className="field sm:w-48"><option value="all">全部入口</option><option value="activity">Activity</option><option value="service">Service</option><option value="receiver">Receiver</option><option value="provider">Provider</option><option value="deep_link">Deep Link</option></select></label></div><div className="overflow-x-auto rounded-xl border border-slate-200"><table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-slate-50 text-xs text-slate-500"><tr><th className="px-4 py-3 font-medium">类型</th><th className="px-4 py-3 font-medium">入口</th><th className="px-4 py-3 font-medium">可达性</th><th className="px-4 py-3 font-medium">权限</th><th className="px-4 py-3 font-medium">判定依据</th></tr></thead><tbody className="divide-y divide-slate-200">{filtered.map((entry) => <tr key={entry.id} className="hover:bg-slate-100"><td className="px-4 py-3"><EntryIcon kind={entry.kind} /></td><td className="max-w-md px-4 py-3"><p className="truncate font-mono text-xs text-slate-800" title={entry.name}>{entry.name}</p>{entry.owner_component && entry.owner_component !== entry.name && <p className="mt-1 truncate text-xs text-slate-600">handler · {entry.owner_component}</p>}</td><td className="px-4 py-3"><Badge tone={entry.exported ? "warning" : "good"}>{entry.exported ? "外部可达" : "私有"}</Badge></td><td className="px-4 py-3 text-xs text-slate-600">{entry.permission ?? "无"}{entry.permission_protection && <span className="block text-slate-600">{entry.permission_protection}</span>}</td><td className="px-4 py-3 text-xs text-slate-500">{entry.exported_reason}</td></tr>)}</tbody></table>{!filtered.length && <EmptyRow text="没有匹配的入口" />}</div></div>
 }
 
-function Findings({ findings, scanStatus, onRefresh }: { findings: Finding[]; scanStatus: string; onRefresh: () => Promise<void> }) {
+function Findings({ findings, verificationCandidates, scanStatus, onRefresh }: { findings: Finding[]; verificationCandidates: Finding[]; scanStatus: string; onRefresh: () => Promise<void> }) {
   const sorted = [...findings].sort((a, b) => ["critical", "high", "medium", "low", "info"].indexOf(a.severity) - ["critical", "high", "medium", "low", "info"].indexOf(b.severity))
+  const pending = [...verificationCandidates].sort((a, b) => ["critical", "high", "medium", "low", "info"].indexOf(a.severity) - ["critical", "high", "medium", "low", "info"].indexOf(b.severity))
   const isFinal = ["final", "failed"].includes(scanStatus)
-  return <div className="space-y-3"><div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm leading-relaxed text-emerald-950">这里只展示平台 Oracle 已证明具体安全影响、且所有 Evidence ID 均可核验的漏洞。静态规则与 AI 静态判断不会计入 Finding。</div>{!isFinal && <div className="rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-sm leading-relaxed text-cyan-950">扫描尚未完成，后续动态证明可能继续增加 Finding。</div>}{sorted.map((finding) => <FindingCard key={finding.id} finding={finding} onRefresh={onRefresh} />)}{!findings.length && <EmptyRow text="尚无经过动态证据证明的 Finding" />}</div>
+  return <div className="space-y-6">
+    <section className="space-y-3">
+      <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm leading-relaxed text-emerald-950">这里只展示平台 Oracle 已证明具体安全影响、且所有 Evidence ID 均可核验的漏洞。静态规则与 AI 静态判断不会计入 Finding。</div>
+      {!isFinal && <div className="rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-sm leading-relaxed text-cyan-950">扫描尚未完成，后续动态证明可能继续增加 Finding。</div>}
+      {sorted.map((finding) => <FindingCard key={finding.id} finding={finding} onRefresh={onRefresh} />)}
+      {!findings.length && <EmptyRow text="尚无经过动态证据证明的 Finding" />}
+    </section>
+    {pending.length > 0 && <section className="space-y-3 border-t border-slate-200 pt-6">
+      <div className="flex flex-col gap-3 rounded-xl border border-orange-200 bg-orange-50 px-4 py-4 sm:flex-row sm:items-center sm:justify-between">
+        <div><div className="flex items-center gap-2"><Bot className="h-4 w-4 text-orange-700" /><h3 className="font-bold text-orange-950">待验证风险</h3><Badge tone="warning">{pending.length}</Badge></div><p className="mt-2 text-sm leading-6 text-orange-900">以下风险已有静态证据支持，但尚未获得平台危害 Oracle。它们不会计入上方已证实 Finding 数量；可在“待验证风险”Tab 中重新验证。</p></div>
+      </div>
+      {pending.map((finding) => <FindingCard key={`pending-${finding.id}`} finding={finding} onRefresh={onRefresh} />)}
+    </section>}
+  </div>
 }
 
 function Signals({ signals, onRefresh }: { signals: Finding[]; onRefresh: () => Promise<void> }) {
@@ -458,10 +472,10 @@ function ProofBacklog({ signals, tasks, onRefresh }: { signals: Finding[]; tasks
   </div>
 }
 
-function isProofBacklogSignal(signal: Finding) {
+function isVerificationCandidate(signal: Finding) {
   const backlog = asRecord(signal.metadata_json.proof_backlog)
   return backlog?.status === "proof_required"
-    || (["codex", "opencode"].includes(signal.source) && signal.status === "supported_static" && signal.severity !== "info")
+    || signal.status === "supported_static"
 }
 
 function FindingCard({ finding, onRefresh }: { finding: Finding; onRefresh: () => Promise<void> }) {
@@ -989,7 +1003,7 @@ function AuditConclusion({ audit, current, taskResult }: { audit: AgentAudit; cu
       )}
       {result === "supported_static" && (
         <div className="border-t border-orange-200 bg-orange-50 px-4 py-3 text-xs leading-5 text-orange-950">
-          这是静态证据支持的风险线索，所示等级是验证优先级；在平台 Oracle 证明具体安全影响前，它只出现在“静态线索”，不会进入“已证实 Finding”。
+          这是静态证据支持的待验证风险，所示等级是验证优先级；在平台 Oracle 证明具体安全影响前，它会显示在“待验证风险”，不会进入“已证实 Finding”。
         </div>
       )}
       {current && result === "inconclusive" && proposedSeverity !== "—" && (
