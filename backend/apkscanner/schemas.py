@@ -410,18 +410,33 @@ class AgentInvestigationResult(BaseModel):
         for index, request in enumerate(requested_tests):
             normalized_request = request
             if isinstance(request, dict):
-                oracle = request.get("oracle")
+                uri = request.get("uri")
+                if (
+                    isinstance(uri, str)
+                    and uri.startswith("content://")
+                    and request.get("operation") != "call"
+                    and (
+                        request.get("method") is not None
+                        or request.get("argument") is not None
+                    )
+                ):
+                    normalized_request = {
+                        **request,
+                        "operation": "call",
+                    }
+                request_for_oracle = normalized_request
+                oracle = request_for_oracle.get("oracle")
                 if (
                     isinstance(oracle, dict)
                     and oracle.get("kind") == "log_contains"
                     and not oracle.get("expected_text")
-                    and isinstance(request.get("poc"), dict)
+                    and isinstance(request_for_oracle.get("poc"), dict)
                 ):
                     # Every platform-built PoC emits the structured result key.
                     # Recover this harmless model omission instead of discarding
                     # an otherwise executable app-UID proof request.
                     normalized_request = {
-                        **request,
+                        **request_for_oracle,
                         "oracle": {
                             **oracle,
                             "expected_text": "security_impact_observed",

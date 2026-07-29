@@ -256,6 +256,38 @@ def test_poc_log_oracle_recovers_an_omitted_expected_text() -> None:
     )
 
 
+def test_content_provider_method_implies_call_operation() -> None:
+    payload = {
+        "summary": "静态证据支持风险，申请验证 Provider 自定义调用。",
+        "result": "supported_static",
+        "hypotheses_tested": [],
+        "test_cases": [],
+        "evidence_ids": [],
+        "severity_proposal": "high",
+        "confidence": "high",
+        "coverage_gaps": [],
+        "followups": [],
+        "requested_tests": [
+            {
+                "hypothesis_id": "00000000-0000-0000-0000-000000000001",
+                "entry_point_id": "00000000-0000-0000-0000-000000000002",
+                "state": "guest",
+                "uri": "content://io.apkscanner.vulntest.secret/items",
+                "extras": {},
+                "operation": "auto",
+                "method": "getSecret",
+                "argument": "all",
+                "rationale": "调用导出 Provider 的自定义方法。",
+            }
+        ],
+    }
+
+    result = AgentInvestigationResult.model_validate(payload)
+
+    assert result.rejected_requested_tests == []
+    assert result.requested_tests[0].operation == "call"
+
+
 @pytest.mark.parametrize(
     ("kind", "impact"),
     [
