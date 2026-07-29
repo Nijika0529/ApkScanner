@@ -255,6 +255,27 @@ package="io.apkscanner.poc.providerprobe">
     assert "MainActivity" in text
 
 
+def test_source_build_drops_override_annotations_for_legacy_android_jar(
+    tmp_path,
+) -> None:
+    source = tmp_path / "MainActivity.java"
+    source.write_text(
+        """class MainActivity {
+    @Override
+    public void onNullBinding() {}
+}""",
+        encoding="utf-8",
+    )
+    output = tmp_path / "build"
+    output.mkdir()
+
+    normalized = PocBuilder._build_sources([source], output)
+
+    text = normalized[0].read_text(encoding="utf-8")
+    assert "@Override" not in text
+    assert "onNullBinding" in text
+
+
 def test_poc_builder_uses_legacy_dx_when_d8_is_unavailable(
     settings,
     tmp_path,

@@ -146,6 +146,7 @@ class PocBuilder:
             aligned_apk = output / "aligned.apk"
             signed_apk = output / "poc.apk"
             build_manifest = self._build_manifest(manifest, output)
+            build_sources = self._build_sources(sources, output)
             android_jar = self._android_jar()
             dex_tool = self._dex_tool()
             assert android_jar is not None and dex_tool is not None
@@ -187,7 +188,7 @@ class PocBuilder:
                         str(android_jar),
                         "-d",
                         str(classes),
-                        *[str(item) for item in sources],
+                        *[str(item) for item in build_sources],
                     ],
                 ),
             ]
@@ -380,6 +381,21 @@ class PocBuilder:
         target = output / "AndroidManifest.xml"
         tree.write(target, encoding="utf-8", xml_declaration=True)
         return target
+
+    @staticmethod
+    def _build_sources(sources: list[Path], output: Path) -> list[Path]:
+        target_root = output / "src"
+        target_root.mkdir()
+        normalized: list[Path] = []
+        for index, source in enumerate(sources):
+            target_dir = target_root / f"{index:03d}"
+            target_dir.mkdir()
+            target = target_dir / source.name
+            text = source.read_text(encoding="utf-8", errors="replace")
+            text = re.sub(r"(?m)^[ \t]*@Override[ \t]*\r?\n", "", text)
+            target.write_text(text, encoding="utf-8")
+            normalized.append(target)
+        return normalized
 
     def _ingest_prebuilt(
         self,
