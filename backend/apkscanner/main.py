@@ -104,7 +104,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             candidate = (frontend_dist / route).resolve()
             if candidate.is_relative_to(frontend_dist) and candidate.is_file():
                 return FileResponse(candidate)
-            return FileResponse(frontend_dist / "index.html")
+            # Asset filenames are content-hashed, but index.html selects the
+            # current hashes and must be revalidated after every local rebuild.
+            return FileResponse(
+                frontend_dist / "index.html",
+                headers={"Cache-Control": "no-cache"},
+            )
 
     return app
 

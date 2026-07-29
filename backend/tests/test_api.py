@@ -16,6 +16,23 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 
+def test_frontend_index_is_revalidated_after_a_rebuild(settings, tmp_path) -> None:  # noqa: ANN001
+    frontend = tmp_path / "frontend-dist"
+    frontend.mkdir()
+    (frontend / "index.html").write_text(
+        "<html><body>current frontend</body></html>",
+        encoding="utf-8",
+    )
+    app = create_app(replace(settings, frontend_dist=frontend))
+
+    with TestClient(app) as client:
+        response = client.get("/existing-scan")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-cache"
+    assert "current frontend" in response.text
+
+
 def test_local_api_requires_console_marker_for_mutations(settings) -> None:  # noqa: ANN001
     app = create_app(settings)
     with TestClient(app) as client:

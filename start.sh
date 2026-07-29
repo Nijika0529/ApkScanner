@@ -8,6 +8,22 @@ PID_FILE="$RUNTIME_DIR/scanctl.pid"
 mkdir -p "$RUNTIME_DIR"
 chmod 700 "$RUNTIME_DIR"
 
+build_frontend() {
+  local frontend_dir="$PROJECT_DIR/frontend"
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "npm is required to build the APKScanner frontend" >&2
+    exit 1
+  fi
+  if [ ! -d "$frontend_dir/node_modules" ]; then
+    npm ci --prefix "$frontend_dir"
+  fi
+  npm run build --prefix "$frontend_dir"
+  if [ ! -f "$frontend_dir/dist/index.html" ]; then
+    echo "frontend build completed without dist/index.html" >&2
+    exit 1
+  fi
+}
+
 stop_existing() {
   if [ ! -f "$PID_FILE" ]; then
     return
@@ -39,6 +55,9 @@ stop_existing() {
   rm -f "$PID_FILE"
 }
 
+# Build before stopping the running service. A failed frontend build therefore
+# cannot replace a working process or silently leave FastAPI serving an old bundle.
+build_frontend
 stop_existing
 
 export DEEPSEEK_API_KEY="DEEPSEEK_API_KEY_REMOVED"
