@@ -387,6 +387,11 @@ def test_device_task_keeps_one_lease_through_agent_investigation(
                 orchestrator.device.scheduler.snapshot()["active_task_id"]
                 == task_id
             )
+            device_context = _kwargs["platform_context"]["device"]
+            assert device_context["available"] is True
+            assert device_context["busy"] is False
+            assert device_context["lease_owned_by_current_task"] is True
+            assert device_context["active_task_id"] == task_id
             timeline.append("agent")
             return SimpleNamespace(
                 thread_id="thread-exclusive",
@@ -415,6 +420,11 @@ def test_device_task_keeps_one_lease_through_agent_investigation(
         "waiting": [],
     }
     with database.session_factory() as session:
+        completed_task = session.get(InvestigationTask, task_id)
+        assert completed_task is not None
+        terminal_device = completed_task.result["platform_context"]["device"]
+        assert terminal_device["lease_completed_by_current_task"] is True
+        assert terminal_device["busy"] is False
         events = list(
             session.scalars(
                 select(ScanEvent).where(

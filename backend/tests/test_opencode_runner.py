@@ -296,6 +296,26 @@ def test_structured_output_is_default_and_thinking_explorer_requires_opt_in() ->
     assert finalizer.name == OPENCODE_PROFILE_STRUCTURED_FINALIZER
     assert finalizer.output_mode == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
     assert finalizer.stages[0].workspace_tools is False
+    personal_lab_critic = opencode_execution_profile(
+        "adversarial_review",
+        enable_thinking_explorer=True,
+        enable_workspace_analyzer=True,
+    )
+    assert personal_lab_critic.name == OPENCODE_PROFILE_STRUCTURED_FINALIZER
+    assert len(personal_lab_critic.stages) == 1
+    assert personal_lab_critic.stages[0].workspace_tools is False
+    personal_lab_finalizer = opencode_execution_profile(
+        "final_evaluation",
+        enable_workspace_analyzer=True,
+    )
+    assert personal_lab_finalizer.name == OPENCODE_PROFILE_STRUCTURED_FINALIZER
+    assert len(personal_lab_finalizer.stages) == 1
+    assert personal_lab_finalizer.stages[0].workspace_tools is False
+    personal_lab_planner = opencode_execution_profile(
+        "test_planning",
+        enable_workspace_analyzer=True,
+    )
+    assert personal_lab_planner.name == OPENCODE_PROFILE_STABLE_ANALYZER
     prompt = opencode_prompt_for_model(
         "base prompt",
         model="deepseek-v4-pro",

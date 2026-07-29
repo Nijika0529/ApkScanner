@@ -59,11 +59,6 @@ async function main() {
   providerRequestLimit = payload.max_agent_steps + PROVIDER_REQUEST_HEADROOM
   loopbackProxyAPIKey = randomBytes(32).toString("hex")
   workerDeadline = Date.now() + payload.timeout_ms
-  const controller = new AbortController()
-  const timeout = setTimeout(
-    () => controller.abort(new Error("OpenCode worker deadline exceeded")),
-    payload.timeout_ms,
-  )
   const username = "apkscanner"
   const password = randomBytes(32).toString("hex")
   process.env.OPENCODE_SERVER_USERNAME = username
@@ -71,13 +66,17 @@ async function main() {
 
   try {
     providerProxy = await startProviderCompatibilityProxy(payload)
-    server = await createOpencodeServer({
-      hostname: "127.0.0.1",
-      port: await reservePort(),
-      signal: controller.signal,
-      timeout: Math.min(payload.timeout_ms, 15_000),
-      config: buildConfig(payload),
-    })
+    const serverStartupStartedAt = Date.now()
+    try {
+      server = await createOpencodeServer({
+        hostname: "127.0.0.1",
+        port: await reservePort(),
+        timeout: Math.min(payload.timeout_ms, 15_000),
+        config: buildConfig(payload),
+      })
+    } catch (error) {
+      throw new Error("OpenCode local server startup failed", { cause: error })
+    }
     const client = createOpencodeClient({
       baseUrl: server.url,
       directory: process.cwd(),
@@ -87,12 +86,15 @@ async function main() {
     })
     localServerURL = server.url
     localAuthorization = `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`
+    emitRuntimeEvent("model.local_server.started", "OpenCode 本地 Server 已启动", {
+      phase: payload.phase ?? payload.action,
+      startup_ms: Date.now() - serverStartupStartedAt,
+    })
     if (payload.action === "capability") {
       return await capability(client, payload)
     }
     return await investigate(client, payload)
   } finally {
-    clearTimeout(timeout)
     server?.close()
     providerProxy?.close()
   }
@@ -503,21 +505,32 @@ async function runStructuredStage(
   }
 }
 
-function promptSync(client, payload, promptText, format) {
-  return client.session
-    .prompt({
-      path: { id: sessionID },
-      body: {
-        ...promptBody(
-          payload,
-          promptText,
-          disabledWorkspaceToolFlags(),
-          "apkscanner-finalizer",
-        ),
-        format,
-      },
-    })
-    .then((response) => unwrap(response, "session.prompt"))
+async function promptSync(client, payload, promptText, format) {
+  try {
+    return unwrap(
+      await client.session.prompt({
+        path: { id: sessionID },
+        body: {
+          ...promptBody(
+            payload,
+            promptText,
+            disabledWorkspaceToolFlags(),
+            "apkscanner-finalizer",
+          ),
+          format,
+        },
+      }),
+      "session.prompt",
+    )
+  } catch (error) {
+    if (isFetchFailure(error)) {
+      throw new Error(
+        `OpenCode local server became unreachable during ${payload.phase} structured prompt`,
+        { cause: error },
+      )
+    }
+    throw error
+  }
 }
 
 async function withSession(client, title, operation) {

@@ -46,9 +46,12 @@ OPENCODE_PROFILE_THINKING_EXPLORER = "thinking_explorer_then_finalizer"
 OPENCODE_PROFILE_STRUCTURED_FINALIZER = "structured_finalizer"
 OPENCODE_PROVIDER_KEY_FIELD = "_provider_api_key"
 OPENCODE_THINKING_PHASES = frozenset(
-    {"test_planning", "adversarial_review", "exploration_round"}
+    {"test_planning", "exploration_round"}
 )
 OPENCODE_FINALIZER_PHASES = frozenset({"final_evaluation", "recovery_evaluation"})
+OPENCODE_BOUNDED_STRUCTURED_PHASES = OPENCODE_FINALIZER_PHASES | {
+    "adversarial_review"
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +103,24 @@ def opencode_execution_profile(
     enable_workspace_analyzer: bool = False,
 ) -> OpenCodeExecutionProfile:
     normalized = (phase or "").strip().lower()
+    # Critic and final decision phases already receive the full evidence context
+    # produced by earlier exploration. Running another workspace analyzer here
+    # consumes their short reserve and can strand the required StructuredOutput
+    # finalizer at the worker deadline.
+    if normalized in OPENCODE_BOUNDED_STRUCTURED_PHASES:
+        return OpenCodeExecutionProfile(
+            name=OPENCODE_PROFILE_STRUCTURED_FINALIZER,
+            output_mode=OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
+            stages=(
+                OpenCodeExecutionStage(
+                    name="finalizer",
+                    thinking_mode="disabled",
+                    reasoning_effort=None,
+                    output_mode=OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
+                    workspace_tools=False,
+                ),
+            ),
+        )
     if enable_thinking_explorer and normalized in OPENCODE_THINKING_PHASES:
         return OpenCodeExecutionProfile(
             name=OPENCODE_PROFILE_THINKING_EXPLORER,

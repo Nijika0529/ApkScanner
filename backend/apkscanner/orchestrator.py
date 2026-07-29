@@ -1323,6 +1323,37 @@ class ScanOrchestrator:
             "blackbox_attempted": False,
         }
         device_capability = self.device.capability(non_blocking=True)
+        device_lease_owned = False
+        device_lease_acquired = False
+
+        def current_device_capability() -> dict[str, Any]:
+            capability = dict(device_capability)
+            if device_lease_owned:
+                capability.update(
+                    {
+                        "available": True,
+                        "busy": False,
+                        "lease_owned_by_current_task": True,
+                        "active_task_id": task_id,
+                        "detail": (
+                            "当前任务已独占设备；本任务申请的测试会在该 lease 内"
+                            "直接串行执行，无需重新排队。"
+                        ),
+                    }
+                )
+            elif device_lease_acquired:
+                capability.update(
+                    {
+                        "available": True,
+                        "busy": False,
+                        "lease_owned_by_current_task": False,
+                        "lease_completed_by_current_task": True,
+                        "active_task_id": None,
+                        "detail": "当前任务的独占设备会话已完成并释放。",
+                    }
+                )
+            return capability
+
         agent_result = None
         agent_error = None
         executed_agent_tests: list[dict[str, Any]] = []
@@ -1370,7 +1401,7 @@ class ScanOrchestrator:
                     "phase": phase,
                     "round_index": round_index,
                     "output_language": "zh-CN",
-                    "device": device_capability,
+                    "device": current_device_capability(),
                     "poc_builder": self.poc_builder.capability(),
                     "coverage_gaps": coverage_gaps,
                     "target_code_context": target_code_context,
@@ -1663,6 +1694,8 @@ class ScanOrchestrator:
                 cancel_event=cancel_event,
             )
             lease_metadata = device_session.__enter__()
+            device_lease_owned = True
+            device_lease_acquired = True
             budget = budget.extend(
                 lease_metadata["wait_seconds"],
                 maximum_deadline=scan_deadline,
@@ -1998,6 +2031,7 @@ class ScanOrchestrator:
                         final_device_session = device_session
                         device_session = None
                         final_device_session.__exit__(None, None, None)
+                        device_lease_owned = False
 
         self._raise_if_cancelled(cancel_event)
         validated_payload: dict[str, Any] | None = None
@@ -2081,7 +2115,7 @@ class ScanOrchestrator:
                             "agent_backend": agent_backend,
                             "usage": agent_result.usage,
                             "platform_context": {
-                                "device": device_capability,
+                                "device": current_device_capability(),
                                 "executed_agent_tests": executed_agent_tests,
                             },
                         },
