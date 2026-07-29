@@ -4189,6 +4189,9 @@ class ScanOrchestrator:
             )
             if attempts:
                 proven_hypotheses.append((hypothesis, attempts))
+        proven_hypothesis_ids = {
+            hypothesis.id for hypothesis, _attempts in proven_hypotheses
+        }
 
         if proven_hypotheses:
             for hypothesis, attempts in proven_hypotheses:
@@ -4287,28 +4290,69 @@ class ScanOrchestrator:
                         **metadata,
                     }
                 hypothesis.final_finding_id = finding.id
-            return
 
-        if result_value in {
-            FindingStatus.REFUTED_STATIC.value,
-            FindingStatus.NOT_REPRODUCED.value,
-            FindingStatus.INCONCLUSIVE.value,
-        }:
-            return
-        dedupe = f"agent:{task.id}:{result_value}"
-        signal_identity = finding_identity(
-            scan=scan,
-            rule_id="AGENT-ENTRY-INVESTIGATION",
-            category=f"android.{task.task_type}",
-            entry_names=[entry.name for entry in entries],
-            claim=" | ".join(hypothesis.claim for hypothesis in hypotheses),
-        )
         supported_assessments = [
             assessment
             for assessment in payload.get("hypothesis_assessments", [])
             if isinstance(assessment, dict)
             and assessment.get("verdict") == FindingStatus.SUPPORTED_STATIC.value
+            and assessment.get("hypothesis_id") not in proven_hypothesis_ids
         ]
+        if (
+            result_value
+            in {
+                FindingStatus.REFUTED_STATIC.value,
+                FindingStatus.NOT_REPRODUCED.value,
+                FindingStatus.INCONCLUSIVE.value,
+            }
+            and not supported_assessments
+        ):
+            return
+        if proven_hypotheses and not supported_assessments:
+            # Hypothesis-level reproduced findings above fully represent the
+            # positive result. Avoid a duplicate task-level weaker record.
+            return
+        supported_hypothesis_ids = {
+            str(assessment["hypothesis_id"])
+            for assessment in supported_assessments
+            if isinstance(assessment.get("hypothesis_id"), str)
+        }
+        signal_hypotheses = [
+            hypothesis
+            for hypothesis in hypotheses
+            if not supported_hypothesis_ids or hypothesis.id in supported_hypothesis_ids
+        ]
+        signal_entry_ids = list(
+            dict.fromkeys(
+                entry_id
+                for hypothesis in signal_hypotheses
+                for entry_id in hypothesis.entry_point_ids
+            )
+        ) or list(task.target_entry_ids)
+        signal_evidence_ids = list(
+            dict.fromkeys(
+                evidence_id
+                for assessment in supported_assessments
+                for evidence_id in assessment.get("evidence_ids", [])
+                if isinstance(evidence_id, str) and evidence_id
+            )
+        ) or evidence_ids
+        signal_result_value = (
+            FindingStatus.SUPPORTED_STATIC.value
+            if supported_assessments
+            else result_value
+        )
+        dedupe = f"agent:{task.id}:{signal_result_value}"
+        signal_identity = finding_identity(
+            scan=scan,
+            rule_id="AGENT-ENTRY-INVESTIGATION",
+            category=f"android.{task.task_type}",
+            entry_names=[
+                entry_name_by_id.get(entry_id, entry_id)
+                for entry_id in signal_entry_ids
+            ],
+            claim=" | ".join(hypothesis.claim for hypothesis in signal_hypotheses),
+        )
         proof_gaps = list(
             dict.fromkeys(
                 [
@@ -4380,15 +4424,18 @@ class ScanOrchestrator:
                 severity=payload.get("platform_severity")
                 or payload.get("severity_proposal", "medium"),
                 confidence=payload.get("confidence", "medium"),
-                status=result_value,
-                entry_point_ids=task.target_entry_ids,
-                evidence_ids=evidence_ids,
+                status=signal_result_value,
+                entry_point_ids=signal_entry_ids,
+                evidence_ids=signal_evidence_ids,
                 metadata_json={
                     "task_id": task.id,
                     "agent_backend": agent_backend,
                     "model": model,
                     "coverage_gaps": payload.get("coverage_gaps", []),
                     "harm_demonstrated": False,
+                    "excluded_proven_hypothesis_ids": sorted(
+                        proven_hypothesis_ids
+                    ),
                     "proof_backlog": proof_backlog,
                     "identity": signal_identity,
                 },
@@ -4402,14 +4449,18 @@ class ScanOrchestrator:
                 "severity_proposal", "medium"
             )
             finding.confidence = payload.get("confidence", "medium")
-            finding.status = result_value
-            finding.evidence_ids = evidence_ids
+            finding.status = signal_result_value
+            finding.entry_point_ids = signal_entry_ids
+            finding.evidence_ids = signal_evidence_ids
             finding.metadata_json = {
                 "task_id": task.id,
                 "agent_backend": agent_backend,
                 "model": model,
                 "coverage_gaps": payload.get("coverage_gaps", []),
                 "harm_demonstrated": False,
+                "excluded_proven_hypothesis_ids": sorted(
+                    proven_hypothesis_ids
+                ),
                 "proof_backlog": proof_backlog,
                 "identity": signal_identity,
             }
