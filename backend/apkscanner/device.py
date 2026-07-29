@@ -1150,6 +1150,24 @@ class AdbDeviceAdapter:
                 probe_payload=payload or None,
                 output=output,
             )
+        if oracle.kind == "log_contains" and oracle.expected_text:
+            matched = bool(
+                payload.get("success") is True
+                and oracle.expected_text in output
+            )
+            return cls._oracle_metadata(
+                oracle,
+                matched=matched,
+                observation={
+                    "expected_text": oracle.expected_text,
+                    "structured_poc_result": bool(payload),
+                },
+                impact_observed=bool(
+                    matched
+                    and payload.get("security_impact_observed") is True
+                ),
+                refutation_observed=bool(payload),
+            )
         return {}
 
     @classmethod

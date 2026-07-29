@@ -256,7 +256,6 @@ def test_poc_log_oracle_recovers_an_omitted_expected_text() -> None:
     ("kind", "impact"),
     [
         ("reachability", "unauthorized_data_access"),
-        ("log_contains", "unauthorized_data_access"),
         ("ui_text", "privileged_action"),
         ("provider_rows", "unauthorized_state_change"),
     ],

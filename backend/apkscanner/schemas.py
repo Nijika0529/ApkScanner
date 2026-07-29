@@ -274,7 +274,12 @@ class AgentOracleSpec(BaseModel):
             "reachability": {"none"},
             "provider_rows": {"none", "unauthorized_data_access"},
             "ui_text": {"none", "unauthorized_data_access"},
-            "log_contains": {"none"},
+            "log_contains": {
+                "none",
+                "unauthorized_data_access",
+                "unauthorized_state_change",
+                "privileged_action",
+            },
             "process_crash": {"none", "denial_of_service"},
         }
         if self.impact not in allowed_impacts[self.kind]:

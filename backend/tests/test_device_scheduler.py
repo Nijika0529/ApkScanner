@@ -392,6 +392,54 @@ def test_provider_poc_claim_without_row_count_is_not_platform_proof() -> None:
     assert metadata["oracle"]["matched"] is False
 
 
+def test_correlated_poc_log_oracle_can_report_structured_impact() -> None:
+    oracle = AgentOracleSpec(
+        kind="log_contains",
+        expected_text="demo-password=hunter2",
+        impact="unauthorized_data_access",
+    )
+
+    metadata = AdbDeviceAdapter._evaluate_poc_oracle(
+        oracle,
+        poc_payload={
+            "request_id": "request-1",
+            "success": True,
+            "security_impact_observed": True,
+            "detail": "secret_disclosed:demo-password=hunter2",
+        },
+        output=(
+            '{"request_id":"request-1","success":true,'
+            '"security_impact_observed":true,'
+            '"detail":"secret_disclosed:demo-password=hunter2"}'
+        ),
+    )
+
+    assert metadata["security_impact_observed"] is True
+    assert metadata["oracle"]["matched"] is True
+
+
+def test_poc_log_claim_without_expected_observation_is_not_proof() -> None:
+    oracle = AgentOracleSpec(
+        kind="log_contains",
+        expected_text="demo-password=hunter2",
+        impact="unauthorized_data_access",
+    )
+
+    metadata = AdbDeviceAdapter._evaluate_poc_oracle(
+        oracle,
+        poc_payload={
+            "request_id": "request-1",
+            "success": True,
+            "security_impact_observed": True,
+            "detail": "no secret returned",
+        },
+        output='{"security_impact_observed":true,"detail":"no secret returned"}',
+    )
+
+    assert metadata["security_impact_observed"] is False
+    assert metadata["oracle"]["matched"] is False
+
+
 def test_missing_optional_probe_does_not_emit_a_failed_probe_broadcast(settings) -> None:  # noqa: ANN001
     calls: list[list[str]] = []
 
