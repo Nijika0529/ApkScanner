@@ -678,7 +678,7 @@ test("provider authentication failures are returned as classified audit errors",
   }
 })
 
-test("semantic validation rejects unknown evidence IDs and retries independently", async () => {
+test("semantic validation drops unknown evidence IDs without retrying", async () => {
   const requests = []
   const semanticSchema = {
     type: "object",
@@ -713,15 +713,18 @@ test("semantic validation rejects unknown evidence IDs and retries independently
     ],
     additionalProperties: false,
   }
-  const invalid = {
+  const mixed = {
     result: "supported_static",
     severity_proposal: "high",
     confidence: "high",
-    evidence_ids: ["ffffffff"],
+    evidence_ids: [
+      "00000000-0000-0000-0000-000000000001",
+      "ffffffff",
+    ],
     requested_tests: [],
   }
-  const corrected = {
-    ...invalid,
+  const normalized = {
+    ...mixed,
     evidence_ids: ["00000000-0000-0000-0000-000000000001"],
   }
   const api = createServer(async (request, response) => {
@@ -730,7 +733,7 @@ test("semantic validation rejects unknown evidence IDs and retries independently
     sendCompletion(response, body, {
       id: `semantic-${requests.length}`,
       toolCalls: [
-        structuredOutputCall(requests.length === 1 ? invalid : corrected),
+        structuredOutputCall(mixed),
       ],
       finish: "tool_calls",
     })
@@ -752,22 +755,12 @@ test("semantic validation rejects unknown evidence IDs and retries independently
     )
     assert.equal(completed.code, 0, completed.stderr)
     const { result, events } = parseWorkerOutput(completed.stdout)
-    assert.deepEqual(result.result, corrected)
-    assert.equal(requests.length, 2)
-    assert.equal(result.output_transport.model_calls.length, 2)
-    assert.equal(result.output_transport.model_calls[0].accepted, false)
-    assert.equal(result.output_transport.model_calls[1].accepted, true)
-    assert.deepEqual(
-      result.output_transport.model_calls[0].validation_errors.map(
-        (item) => item.instance_path,
-      ),
-      ["/evidence_ids/0"],
-    )
-    assert.match(
-      JSON.stringify(requests[1].body.messages),
-      /apkscannerSemantic/,
-    )
-    assert.ok(events.some((item) => item.event_type === "model.validation.failed"))
+    assert.deepEqual(result.result, normalized)
+    assert.equal(requests.length, 1)
+    assert.equal(result.output_transport.model_calls.length, 1)
+    assert.equal(result.output_transport.model_calls[0].accepted, true)
+    assert.deepEqual(result.output_transport.model_calls[0].validation_errors, [])
+    assert.ok(!events.some((item) => item.event_type === "model.validation.failed"))
   } finally {
     api.close()
     await rm(root, { recursive: true, force: true })

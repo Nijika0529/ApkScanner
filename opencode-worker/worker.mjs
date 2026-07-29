@@ -1479,19 +1479,24 @@ function semanticValidationErrors(value, payload) {
   }
   if (Array.isArray(value.evidence_ids)) {
     const allowedEvidence = payload.allowed_evidence_ids ?? []
-    value.evidence_ids = value.evidence_ids.map((evidenceID) => {
-      if (
-        typeof evidenceID !== "string" ||
-        allowedEvidence.includes(evidenceID) ||
-        evidenceID.length < 8
-      ) {
-        return evidenceID
-      }
-      const matches = allowedEvidence.filter((candidate) =>
-        candidate.startsWith(evidenceID),
-      )
-      return matches.length === 1 ? matches[0] : evidenceID
-    })
+    value.evidence_ids = value.evidence_ids
+      .map((evidenceID) => {
+        if (
+          typeof evidenceID !== "string" ||
+          allowedEvidence.includes(evidenceID) ||
+          evidenceID.length < 8
+        ) {
+          return evidenceID
+        }
+        const matches = allowedEvidence.filter((candidate) =>
+          candidate.startsWith(evidenceID),
+        )
+        return matches.length === 1 ? matches[0] : evidenceID
+      })
+      // Evidence attribution is platform-owned. An otherwise valid verdict
+      // should not fail because the model appended one invented ID; retain
+      // only IDs actually issued for this task.
+      .filter((evidenceID) => allowedEvidence.includes(evidenceID))
   }
   if (value.result === "refuted_static" && value.severity_proposal !== "info") {
     add(
@@ -1512,17 +1517,6 @@ function semanticValidationErrors(value, payload) {
       "/evidence_ids",
       `${value.result} requires at least one platform-issued evidence ID`,
     )
-  }
-  if (Array.isArray(value.evidence_ids)) {
-    const allowedEvidence = new Set(payload.allowed_evidence_ids ?? [])
-    value.evidence_ids.forEach((evidenceID, index) => {
-      if (typeof evidenceID === "string" && !allowedEvidence.has(evidenceID)) {
-        add(
-          `/evidence_ids/${index}`,
-          "evidence ID must exactly match a full platform-issued ID for this task",
-        )
-      }
-    })
   }
   if (
     ["final_evaluation", "recovery_evaluation"].includes(payload.phase) &&
