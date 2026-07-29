@@ -20,14 +20,14 @@ test("worker PATH adb shim refuses device access", () => {
   assert.match(blocked.stderr, /adb is disabled/)
 })
 
-test("non-thinking finalizer uses StructuredOutput with required tool choice", async () => {
+test("non-thinking finalizer unwraps StructuredOutput value envelopes", async () => {
   const requests = []
   const api = createServer(async (request, response) => {
     const body = await readJSON(request)
     requests.push({ url: request.url, body })
     sendCompletion(response, body, {
       id: "finalizer",
-      toolCalls: [structuredOutputCall(expected)],
+      toolCalls: [structuredOutputCall({ value: expected })],
       finish: "tool_calls",
     })
   })

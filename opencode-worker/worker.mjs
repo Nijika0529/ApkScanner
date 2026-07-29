@@ -1446,13 +1446,31 @@ function parseStructuredResult(response) {
     response.info?.structured ??
     response.info?.structured_output
   if (structured !== undefined) {
-    return { value: structured, error: null }
+    return { value: unwrapStructuredValue(structured), error: null }
   }
   const text = responseText(response.parts ?? [])
   if (!text) {
     return { value: undefined, error: "OpenCode returned no structured result" }
   }
-  return parseTextJson(text)
+  const parsed = parseTextJson(text)
+  return parsed.error
+    ? parsed
+    : { value: unwrapStructuredValue(parsed.value), error: null }
+}
+
+function unwrapStructuredValue(value) {
+  if (
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === 1 &&
+    value.value &&
+    typeof value.value === "object" &&
+    !Array.isArray(value.value)
+  ) {
+    return value.value
+  }
+  return value
 }
 
 function normalizeValidationErrors(errors) {
