@@ -235,3 +235,20 @@ Web 只允许删除已经 `final` 或 `failed` 的扫描；任务进入重试队
 - 构建并验证两个 Docker worker 镜像、企业 Codex/DeepSeek 凭据方式和各自网络出口策略。
 - 业务账号态 fixture 作为后续专项能力，不阻塞普通入口审计。
 - 根据发布风险决定人工 gate；当前产品刻意不自动 gate。
+## 威胁模型、逐假设收口与扫描封印
+
+静态分析完成后，控制面从 APK 元数据和入口点生成确定性的 Android 威胁模型。它固定
+普通第三方 App、guest 状态、无 root/system/adb-shell 权限的攻击者，列出资产、信任边界、
+攻击面摘要以及“静态只生成线索、最终 Finding 必须由平台危害 Oracle 证明”的证据策略。
+威胁模型摘要进入每个 Agent 上下文，防止不同任务自行发明攻击者能力或证据标准。
+
+Agent 的结构化结果包含逐 `hypothesis_id` 的 assessment。平台按 hypothesis 单独记录
+source、control、sink、reachable path、boundary、counterevidence、proof gaps、Evidence
+引用与 verdict。未评估的 hypothesis 会得到明确的 closure receipt，而不会继承同任务
+其他 hypothesis 的总判定。旧 worker 输出仍可走兼容路径，但新提示词要求精确 UUID。
+
+Finding 元数据同时保存稳定 `finding_id`、单次扫描 `occurrence_id` 与 semantic
+fingerprint。稳定身份由包名、签名者、规则、类别、入口语义和 claim 生成，不依赖源码
+行号或 Scan UUID。扫描结束时 `scan.seal` Evidence 对 APK SHA、威胁模型摘要、任务结果
+摘要、Finding 身份、Evidence 内容摘要和 Coverage 状态进行封印；seal Evidence ID 和
+SHA-256 写入 `scan.stats.seal`。

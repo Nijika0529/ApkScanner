@@ -314,6 +314,29 @@ class AgentRequestedTest(BaseModel):
         return self
 
 
+class AgentHypothesisAssessment(BaseModel):
+    """A hypothesis-specific closure receipt instead of a task-wide blanket verdict."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hypothesis_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
+    verdict: Literal[
+        "supported_static",
+        "refuted_static",
+        "reproduced_blackbox",
+        "not_reproduced",
+    ]
+    source: str = Field(default="", max_length=2000)
+    control: str = Field(default="", max_length=2000)
+    sink: str = Field(default="", max_length=2000)
+    reachable_path: str = Field(default="", max_length=4000)
+    boundary: str = Field(default="", max_length=2000)
+    counterevidence: list[str] = Field(default_factory=list, max_length=50)
+    proof_gaps: list[str] = Field(default_factory=list, max_length=50)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
+    confidence: Literal["high", "medium", "low"] = "medium"
+
+
 class AgentInvestigationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -326,6 +349,10 @@ class AgentInvestigationResult(BaseModel):
         "not_reproduced",
     ]
     hypotheses_tested: list[str] = Field(max_length=100)
+    hypothesis_assessments: list[AgentHypothesisAssessment] = Field(
+        default_factory=list,
+        max_length=100,
+    )
     test_cases: list[dict[str, Any]] = Field(max_length=200)
     evidence_ids: list[str] = Field(max_length=500)
     severity_proposal: Literal["critical", "high", "medium", "low", "info"]

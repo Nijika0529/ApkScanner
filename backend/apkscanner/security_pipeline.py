@@ -151,7 +151,28 @@ class HypothesisLedger:
                     select(SecurityHypothesis).where(SecurityHypothesis.task_id == task_id)
                 )
             )
-            for hypothesis in hypotheses:
+            hypothesis_ids = {hypothesis.id for hypothesis in hypotheses}
+            scoped_ids = {
+                value
+                for value in payload.get("hypotheses_tested", [])
+                if isinstance(value, str) and value in hypothesis_ids
+            }
+            for assessment in payload.get("hypothesis_assessments", []):
+                if not isinstance(assessment, dict):
+                    continue
+                hypothesis_id = assessment.get("hypothesis_id")
+                if isinstance(hypothesis_id, str) and hypothesis_id in hypothesis_ids:
+                    scoped_ids.add(hypothesis_id)
+            selected = (
+                [
+                    hypothesis
+                    for hypothesis in hypotheses
+                    if hypothesis.id in scoped_ids
+                ]
+                if scoped_ids
+                else hypotheses
+            )
+            for hypothesis in selected:
                 session.add(
                     HypothesisArgument(
                         scan_id=hypothesis.scan_id,
@@ -416,23 +437,7 @@ class HypothesisLedger:
         backend: str,
         model: str | None,
     ) -> None:
-        if result_value in {
-            FindingStatus.SUPPORTED_STATIC.value,
-            FindingStatus.REPRODUCED_BLACKBOX.value,
-        }:
-            status = HypothesisStatus.ACCEPTED_FOR_PROOF.value
-        elif result_value in {
-            FindingStatus.REFUTED_STATIC.value,
-            FindingStatus.NOT_REPRODUCED.value,
-        }:
-            status = HypothesisStatus.REFUTED.value
-        else:
-            status = HypothesisStatus.INCONCLUSIVE.value
-        confidence = {"high": 90, "medium": 65, "low": 35}.get(
-            str(payload.get("confidence")),
-            0,
-        )
-        evidence_ids = [
+        task_evidence_ids = [
             value for value in payload.get("evidence_ids", []) if isinstance(value, str)
         ]
         hypotheses = list(
@@ -440,8 +445,77 @@ class HypothesisLedger:
                 select(SecurityHypothesis).where(SecurityHypothesis.task_id == task_id)
             )
         )
-        argument_payload = {**payload, "platform_result": result_value}
+        hypothesis_ids = {hypothesis.id for hypothesis in hypotheses}
+        tested_ids = {
+            value
+            for value in payload.get("hypotheses_tested", [])
+            if isinstance(value, str) and value in hypothesis_ids
+        }
+        assessments = {
+            str(item["hypothesis_id"]): item
+            for item in payload.get("hypothesis_assessments", [])
+            if isinstance(item, dict)
+            and isinstance(item.get("hypothesis_id"), str)
+            and item["hypothesis_id"] in hypothesis_ids
+        }
+        tested_ids.update(assessments)
+        legacy_blanket = not assessments and not tested_ids
         for hypothesis in hypotheses:
+            assessment = assessments.get(hypothesis.id)
+            assessment_result = (
+                str(assessment.get("verdict"))
+                if assessment is not None
+                else result_value
+                if legacy_blanket or hypothesis.id in tested_ids
+                else ""
+            )
+            status = HypothesisLedger._status_for_verdict(assessment_result)
+            confidence_value = (
+                assessment.get("confidence")
+                if assessment is not None
+                else payload.get("confidence")
+            )
+            confidence = {"high": 90, "medium": 65, "low": 35}.get(
+                str(confidence_value),
+                0,
+            )
+            evidence_ids = (
+                [
+                    value
+                    for value in assessment.get("evidence_ids", [])
+                    if isinstance(value, str) and value in set(task_evidence_ids)
+                ]
+                if assessment is not None
+                else task_evidence_ids
+                if legacy_blanket or hypothesis.id in tested_ids
+                else []
+            )
+            disposition = (
+                "assessed"
+                if assessment is not None
+                else "legacy_task_verdict"
+                if legacy_blanket
+                else "tested_without_structured_assessment"
+                if hypothesis.id in tested_ids
+                else "not_assessed_by_agent"
+            )
+            closure_receipt = {
+                "schema_version": "1.0",
+                "hypothesis_id": hypothesis.id,
+                "disposition": disposition,
+                "verdict": assessment_result or None,
+                "evidence_ids": evidence_ids,
+                "proof_gaps": (
+                    list(assessment.get("proof_gaps", []))
+                    if assessment is not None
+                    else []
+                ),
+            }
+            argument_payload = {
+                "platform_result": result_value,
+                "assessment": assessment,
+                "closure_receipt": closure_receipt,
+            }
             session.add(
                 HypothesisArgument(
                     scan_id=hypothesis.scan_id,
@@ -471,7 +545,13 @@ class HypothesisLedger:
             )
             hypothesis.confidence_score = confidence
             hypothesis.impact = str(
-                payload.get("summary")
+                (
+                    assessment.get("sink")
+                    or assessment.get("reachable_path")
+                    if assessment is not None
+                    else None
+                )
+                or payload.get("summary")
                 or "No concrete security impact was established."
             )
             if status in {
@@ -490,6 +570,15 @@ class HypothesisLedger:
             hypothesis.metadata_json = {
                 **dict(hypothesis.metadata_json or {}),
                 "platform_result": result_value,
+                "assessment": assessment,
+                "closure_receipt": {
+                    **closure_receipt,
+                    "disposition": (
+                        "platform_proven"
+                        if harm_demonstrated is not None
+                        else disposition
+                    ),
+                },
                 "severity_proposal": payload.get("severity_proposal"),
                 "platform_severity": payload.get("platform_severity"),
             }
@@ -578,3 +667,17 @@ class HypothesisLedger:
     @staticmethod
     def _merge_ids(existing: list[str], added: list[str]) -> list[str]:
         return list(dict.fromkeys([*existing, *added]))
+
+    @staticmethod
+    def _status_for_verdict(verdict: str) -> str:
+        if verdict in {
+            FindingStatus.SUPPORTED_STATIC.value,
+            FindingStatus.REPRODUCED_BLACKBOX.value,
+        }:
+            return HypothesisStatus.ACCEPTED_FOR_PROOF.value
+        if verdict in {
+            FindingStatus.REFUTED_STATIC.value,
+            FindingStatus.NOT_REPRODUCED.value,
+        }:
+            return HypothesisStatus.REFUTED.value
+        return HypothesisStatus.INCONCLUSIVE.value

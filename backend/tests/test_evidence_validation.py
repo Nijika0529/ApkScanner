@@ -124,6 +124,29 @@ def test_reachability_without_concrete_harm_keeps_a_static_positive_verdict() ->
     assert any("static-evidence strength" in gap for gap in payload["coverage_gaps"])
 
 
+def test_each_hypothesis_assessment_is_validated_at_its_own_evidence_strength() -> None:
+    hypothesis_id = "00000000-0000-0000-0000-000000000001"
+    payload = _payload("supported_static", ["static"])
+    payload["hypothesis_assessments"] = [
+        {
+            "hypothesis_id": hypothesis_id,
+            "verdict": "reproduced_blackbox",
+            "evidence_ids": ["static"],
+            "proof_gaps": [],
+        }
+    ]
+
+    validated, result = ScanOrchestrator._validated_agent_payload(
+        payload,
+        [{"id": "static", "kind": "static.apktool", "metadata": {}}],
+    )
+
+    assert result == "supported_static"
+    assessment = validated["hypothesis_assessments"][0]
+    assert assessment["verdict"] == "supported_static"
+    assert any("static-evidence strength" in gap for gap in assessment["proof_gaps"])
+
+
 def test_not_reproduced_requires_correlated_explicit_negative_oracle() -> None:
     evidence = [
         {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import shutil
@@ -51,6 +52,7 @@ from .poc import PocBuilder, PocBuildResult
 from .repository import add_event, now
 from .rules import BuiltinRuleEngine
 from .schemas import AGENT_RESULT_JSON_SCHEMA, AgentRequestedTest
+from .security_design import build_android_threat_model, finding_identity
 from .security_pipeline import HypothesisLedger
 from .static_analysis import ApkInspector
 from .tools import CommandResult, TimeBudget, ToolRunner
@@ -483,6 +485,11 @@ class ScanOrchestrator:
                 session.add(entry)
                 entries.append(entry)
             session.flush()
+            threat_model = build_android_threat_model(scan, entries)
+            scan.stats = {
+                **scan.stats,
+                "threat_model": threat_model,
+            }
             entry_ids_by_name: dict[str, list[str]] = defaultdict(list)
             for entry in entries:
                 entry_ids_by_name[entry.name].append(entry.id)
@@ -490,6 +497,21 @@ class ScanOrchestrator:
                 entry_ids = [
                     entry_id for name in draft.entry_names for entry_id in entry_ids_by_name.get(name, [])
                 ]
+                identity = finding_identity(
+                    scan=scan,
+                    rule_id=draft.rule_id,
+                    category="static_signal",
+                    entry_names=[
+                        *draft.entry_names,
+                        *[
+                            str(location[key])
+                            for location in draft.locations
+                            for key in ("component", "path")
+                            if location.get(key)
+                        ],
+                    ],
+                    claim=draft.title,
+                )
                 session.add(
                     Finding(
                         scan_id=scan.id,
@@ -506,7 +528,7 @@ class ScanOrchestrator:
                         status=FindingStatus.CANDIDATE.value,
                         entry_point_ids=entry_ids,
                         locations=draft.locations,
-                        metadata_json=draft.metadata,
+                        metadata_json={**draft.metadata, "identity": identity},
                     )
                 )
             for item in coverage:
@@ -1267,6 +1289,7 @@ class ScanOrchestrator:
                         "tests_per_round": self.settings.agent_tests_per_round,
                     },
                     "continuation": continuation_context or None,
+                    "threat_model": (scan.stats or {}).get("threat_model"),
                     "security_hypotheses": hypothesis_context,
                     "candidate_under_review": candidate_under_review,
                     "debate": debate_context or None,
@@ -1976,6 +1999,10 @@ class ScanOrchestrator:
             raw_payload = agent_result.result.model_dump(mode="json")
             validated_payload, validated_result_value = self._validated_agent_payload(
                 deepcopy(raw_payload), evidence_summaries
+            )
+            validated_payload = self._validated_hypothesis_payload(
+                validated_payload,
+                hypothesis_context,
             )
             validated_payload["coverage_gaps"] = list(
                 dict.fromkeys(
@@ -3756,29 +3783,95 @@ class ScanOrchestrator:
         }
 
     @staticmethod
+    def _validated_hypothesis_payload(
+        payload: dict[str, Any],
+        hypothesis_context: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        valid_ids = {
+            str(item["id"])
+            for item in hypothesis_context
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+        assessments: list[dict[str, Any]] = []
+        rejected = 0
+        seen: set[str] = set()
+        for item in payload.get("hypothesis_assessments", []):
+            if not isinstance(item, dict):
+                rejected += 1
+                continue
+            hypothesis_id = item.get("hypothesis_id")
+            if (
+                not isinstance(hypothesis_id, str)
+                or hypothesis_id not in valid_ids
+                or hypothesis_id in seen
+            ):
+                rejected += 1
+                continue
+            seen.add(hypothesis_id)
+            assessments.append(item)
+        payload["hypothesis_assessments"] = assessments
+        if assessments:
+            payload["hypotheses_tested"] = list(
+                dict.fromkeys(
+                    [
+                        value
+                        for value in payload.get("hypotheses_tested", [])
+                        if isinstance(value, str) and value in valid_ids
+                    ]
+                    + [item["hypothesis_id"] for item in assessments]
+                )
+            )
+        if rejected:
+            payload["coverage_gaps"] = list(
+                dict.fromkeys(
+                    [
+                        *payload.get("coverage_gaps", []),
+                        (
+                            f"Ignored {rejected} hypothesis assessment(s) that did not "
+                            "belong to this task or duplicated another receipt."
+                        ),
+                    ]
+                )
+            )
+        return payload
+
+    @staticmethod
     def _validated_agent_payload(
         payload: dict[str, Any], evidence_summaries: list[dict[str, Any]]
     ) -> tuple[dict[str, Any], str]:
         evidence_by_id = {
             item["id"]: item for item in evidence_summaries if isinstance(item.get("id"), str)
         }
-        claimed = [value for value in payload.get("evidence_ids", []) if isinstance(value, str)]
-        resolved_claims: list[str] = []
         unknown: list[str] = []
-        for value in claimed:
-            if value in evidence_by_id:
-                resolved_claims.append(value)
+
+        def resolve_ids(values: Any) -> list[str]:
+            resolved: list[str] = []
+            for value in values if isinstance(values, list) else []:
+                if not isinstance(value, str):
+                    continue
+                if value in evidence_by_id:
+                    resolved.append(value)
+                    continue
+                prefix_matches = [
+                    evidence_id
+                    for evidence_id in evidence_by_id
+                    if len(value) >= 8 and evidence_id.startswith(value)
+                ]
+                if len(prefix_matches) == 1:
+                    resolved.append(prefix_matches[0])
+                else:
+                    unknown.append(value)
+            return list(dict.fromkeys(resolved))
+
+        resolved_claims = resolve_ids(payload.get("evidence_ids", []))
+        nested_ids: list[str] = []
+        for assessment in payload.get("hypothesis_assessments", []):
+            if not isinstance(assessment, dict):
                 continue
-            prefix_matches = [
-                evidence_id
-                for evidence_id in evidence_by_id
-                if len(value) >= 8 and evidence_id.startswith(value)
-            ]
-            if len(prefix_matches) == 1:
-                resolved_claims.append(prefix_matches[0])
-            else:
-                unknown.append(value)
+            assessment["evidence_ids"] = resolve_ids(assessment.get("evidence_ids", []))
+            nested_ids.extend(assessment["evidence_ids"])
         valid_ids = list(dict.fromkeys(resolved_claims))
+        valid_ids = list(dict.fromkeys([*valid_ids, *nested_ids]))
         unknown = sorted(set(unknown))
         payload["evidence_ids"] = valid_ids
         optional_static_tool_markers = (
@@ -3916,6 +4009,30 @@ class ScanOrchestrator:
                 raise ValueError(
                     f"{result_value} did not cite the platform evidence required for that verdict"
                 )
+        for assessment in payload.get("hypothesis_assessments", []):
+            if not isinstance(assessment, dict):
+                continue
+            assessment_payload, assessment_result = (
+                ScanOrchestrator._validated_agent_payload(
+                    {
+                        "result": assessment.get("verdict"),
+                        "evidence_ids": assessment.get("evidence_ids", []),
+                        "coverage_gaps": [],
+                        "hypothesis_assessments": [],
+                    },
+                    evidence_summaries,
+                )
+            )
+            assessment["verdict"] = assessment_result
+            assessment["evidence_ids"] = assessment_payload["evidence_ids"]
+            assessment["proof_gaps"] = list(
+                dict.fromkeys(
+                    [
+                        *assessment.get("proof_gaps", []),
+                        *assessment_payload.get("coverage_gaps", []),
+                    ]
+                )
+            )
         payload["coverage_gaps"] = gaps
         payload["result"] = result_value
         if result_value == FindingStatus.REFUTED_STATIC.value:
@@ -3980,6 +4097,7 @@ class ScanOrchestrator:
                 .order_by(SecurityHypothesis.created_at)
             )
         )
+        entry_name_by_id = {entry.id: entry.name for entry in entries}
         proven_hypotheses: list[
             tuple[SecurityHypothesis, list[ProofAttempt]]
         ] = []
@@ -4022,6 +4140,16 @@ class ScanOrchestrator:
                     "coverage_gaps": payload.get("coverage_gaps", []),
                     "harm_demonstrated": True,
                     "proof_attempt_ids": [attempt.id for attempt in attempts],
+                    "identity": finding_identity(
+                        scan=scan,
+                        rule_id="AGENT-ENTRY-INVESTIGATION",
+                        category=hypothesis.category,
+                        entry_names=[
+                            entry_name_by_id.get(entry_id, entry_id)
+                            for entry_id in hypothesis.entry_point_ids
+                        ],
+                        claim=hypothesis.claim,
+                    ),
                 }
                 if finding is None:
                     finding = Finding(
@@ -4077,6 +4205,13 @@ class ScanOrchestrator:
         }:
             return
         dedupe = f"agent:{task.id}:{result_value}"
+        signal_identity = finding_identity(
+            scan=scan,
+            rule_id="AGENT-ENTRY-INVESTIGATION",
+            category=f"android.{task.task_type}",
+            entry_names=[entry.name for entry in entries],
+            claim=" | ".join(hypothesis.claim for hypothesis in hypotheses),
+        )
         finding = session.scalar(
             select(Finding).where(
                 Finding.scan_id == scan.id,
@@ -4105,6 +4240,7 @@ class ScanOrchestrator:
                     "model": model,
                     "coverage_gaps": payload.get("coverage_gaps", []),
                     "harm_demonstrated": False,
+                    "identity": signal_identity,
                 },
             )
             session.add(finding)
@@ -4123,6 +4259,7 @@ class ScanOrchestrator:
                 "model": model,
                 "coverage_gaps": payload.get("coverage_gaps", []),
                 "harm_demonstrated": False,
+                "identity": signal_identity,
             }
 
     @staticmethod
@@ -4159,6 +4296,111 @@ class ScanOrchestrator:
                 None if complete else task.error or "Investigation coverage is incomplete"
             )
 
+    def _create_scan_seal(
+        self,
+        session,  # noqa: ANN001
+        scan: Scan,
+        finding_records: list[Finding],
+    ) -> Evidence:
+        tasks = list(
+            session.scalars(
+                select(InvestigationTask)
+                .where(InvestigationTask.scan_id == scan.id)
+                .order_by(InvestigationTask.id)
+            )
+        )
+        evidence_records = list(
+            session.scalars(
+                select(Evidence)
+                .where(
+                    Evidence.scan_id == scan.id,
+                    Evidence.kind != "scan.seal",
+                )
+                .order_by(Evidence.id)
+            )
+        )
+        coverage_records = list(
+            session.scalars(
+                select(CoverageItem)
+                .where(CoverageItem.scan_id == scan.id)
+                .order_by(CoverageItem.control_id, CoverageItem.id)
+            )
+        )
+        seal_payload = {
+            "schema_version": "1.0",
+            "scan_id": scan.id,
+            "artifact_sha256": scan.artifact_sha256,
+            "package": scan.package_name,
+            "threat_model_digest": (
+                ((scan.stats or {}).get("threat_model") or {}).get("digest")
+            ),
+            "tasks": [
+                {
+                    "id": task.id,
+                    "status": task.status,
+                    "result_sha256": hashlib.sha256(
+                        json.dumps(
+                            task.result or {},
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest(),
+                }
+                for task in tasks
+            ],
+            "findings": [
+                {
+                    "record_id": finding.id,
+                    "finding_id": (
+                        (finding.metadata_json or {})
+                        .get("identity", {})
+                        .get("finding_id")
+                    ),
+                    "occurrence_id": (
+                        (finding.metadata_json or {})
+                        .get("identity", {})
+                        .get("occurrence_id")
+                    ),
+                    "status": finding.status,
+                    "evidence_ids": sorted(finding.evidence_ids),
+                }
+                for finding in sorted(finding_records, key=lambda item: item.id)
+            ],
+            "evidence": [
+                {
+                    "id": item.id,
+                    "task_id": item.task_id,
+                    "kind": item.kind,
+                    "sha256": item.sha256,
+                }
+                for item in evidence_records
+            ],
+            "coverage": [
+                {
+                    "control_id": item.control_id,
+                    "entry_point_id": item.entry_point_id,
+                    "status": item.status,
+                }
+                for item in coverage_records
+            ],
+        }
+        return self.evidence.json(
+            session,
+            scan_id=scan.id,
+            task_id=None,
+            kind="scan.seal",
+            value=seal_payload,
+            summary=(
+                "Immutable receipt over the APK digest, threat model, tasks, "
+                "findings, evidence, and coverage ledger"
+            ),
+            metadata={
+                "schema_version": "1.0",
+                "threat_model_digest": seal_payload["threat_model_digest"],
+            },
+        )
+
     def _finish(self, scan_id: str) -> None:
         with self.database.session_factory() as session:
             scan = session.get(Scan, scan_id)
@@ -4174,6 +4416,8 @@ class ScanOrchestrator:
             confirmed_findings, signals = partition_findings(session, finding_records)
             finding_count = len(confirmed_findings)
             signal_count = len(signals)
+            # Re-analysis emits a fresh receipt; older seals remain as audit history.
+            seal = self._create_scan_seal(session, scan, finding_records)
             scan.status = ScanStatus.FINAL.value
             scan.completed_at = datetime.now(UTC)
             scan.stats = {
@@ -4181,6 +4425,11 @@ class ScanOrchestrator:
                 "task_status_counts": dict(counts),
                 "finding_count": finding_count,
                 "signal_count": signal_count,
+                "seal": {
+                    "schema_version": "1.0",
+                    "evidence_id": seal.id,
+                    "sha256": seal.sha256,
+                },
             }
             add_event(
                 session,
@@ -4191,6 +4440,8 @@ class ScanOrchestrator:
                     "task_status_counts": dict(counts),
                     "findings": finding_count,
                     "signals": signal_count,
+                    "seal_evidence_id": seal.id,
+                    "seal_sha256": seal.sha256,
                 },
             )
             session.commit()

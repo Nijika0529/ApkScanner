@@ -246,6 +246,13 @@ Agent 声称的、不属于当前 Scan/Task 的 Evidence ID 会被移除。动�
 证据不足时，平台只保留其由静态证据支撑的明确正向或负向判断；可选工具缺失不能成为
 “信息不足”结论。真正缺少判定所需 Evidence ID 的结构化输出会被拒绝并重试。
 
+每次扫描还会生成一份带摘要的 Android 威胁模型，固定普通第三方 App/guest 攻击者、
+资产、信任边界与最终证据策略。Agent 必须为每个已测试 hypothesis 独立返回
+source/control/sink/reachable path/boundary/counterevidence/proof gaps 证据元组；平台不会
+再把任务级总判定批量套到所有 hypothesis。Finding 使用跨版本稳定的 `finding_id` 和
+单次扫描唯一的 `occurrence_id`。扫描结束时会生成 `scan.seal` Evidence，对 APK、
+威胁模型、任务结果、Finding、Evidence 与 Coverage 账本做内容摘要，便于比较和审计。
+
 ## 环境变量
 
 | 变量 | 默认值 | 用途 |

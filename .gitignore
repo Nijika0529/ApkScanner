@@ -13,9 +13,10 @@ probe/app/build/
 config/auth-flow.json
 .DS_Store
 frontend/package-lock.json
-opencode
+opencode/
 opencode-worker/node_modules/
 .vscode
 start.sh
 opencode-worker/bin/
 testapk/
+codex-security/

@@ -309,3 +309,106 @@ def test_platform_proof_result_is_independent_from_model_verdict(settings) -> No
         "reproduced_blackbox",
         ["probe-proof", "log-proof"],
     )
+
+
+def test_finalize_closes_each_hypothesis_from_its_own_receipt(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="closure-receipts.apk",
+            artifact_sha256="f" * 64,
+            artifact_path=str(settings.data_dir / "closure-receipts.apk"),
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            target_entry_ids=["00000000-0000-0000-0000-000000000030"],
+            hypotheses=[
+                "A caller check blocks the path.",
+                "A separate exported action reaches a sensitive sink.",
+                "A third path was not assessed.",
+            ],
+        )
+        session.add_all([scan, task])
+        session.commit()
+
+    ledger = HypothesisLedger(database)
+    hypotheses = ledger.ensure_task_hypotheses(task)
+    by_claim = {hypothesis.claim: hypothesis for hypothesis in hypotheses}
+    blocked_id = by_claim["A caller check blocks the path."].id
+    supported_id = by_claim[
+        "A separate exported action reaches a sensitive sink."
+    ].id
+    unassessed_id = by_claim["A third path was not assessed."].id
+
+    ledger.finalize(
+        task_id=task.id,
+        payload={
+            "summary": "The task contains paths with different outcomes.",
+            "confidence": "high",
+            "severity_proposal": "high",
+            "platform_severity": "high",
+            "evidence_ids": ["static-block", "static-sink"],
+            "hypotheses_tested": [blocked_id, supported_id],
+            "hypothesis_assessments": [
+                {
+                    "hypothesis_id": blocked_id,
+                    "verdict": "refuted_static",
+                    "control": "Signature permission check",
+                    "reachable_path": "External call stops at the permission check.",
+                    "proof_gaps": [],
+                    "evidence_ids": ["static-block"],
+                    "confidence": "high",
+                },
+                {
+                    "hypothesis_id": supported_id,
+                    "verdict": "supported_static",
+                    "sink": "Sensitive preference mutation",
+                    "reachable_path": (
+                        "Exported receiver reaches the mutation without a guard."
+                    ),
+                    "proof_gaps": [
+                        "Ordinary-app replay remains required for a Finding."
+                    ],
+                    "evidence_ids": ["static-sink"],
+                    "confidence": "medium",
+                },
+            ],
+        },
+        result_value="supported_static",
+        backend="opencode",
+        model="test-model",
+    )
+
+    with database.session_factory() as session:
+        blocked = session.get(SecurityHypothesis, blocked_id)
+        supported = session.get(SecurityHypothesis, supported_id)
+        unassessed = session.get(SecurityHypothesis, unassessed_id)
+        assert blocked is not None
+        assert supported is not None
+        assert unassessed is not None
+        assert blocked.status == "refuted"
+        assert blocked.refute_evidence_ids == ["static-block"]
+        assert supported.status == "accepted_for_proof"
+        assert supported.support_evidence_ids == ["static-sink"]
+        assert unassessed.status == "inconclusive"
+        assert (
+            unassessed.metadata_json["closure_receipt"]["disposition"]
+            == "not_assessed_by_agent"
+        )
+        arguments = list(
+            session.scalars(
+                select(HypothesisArgument)
+                .where(HypothesisArgument.task_id == task.id)
+                .order_by(HypothesisArgument.hypothesis_id)
+            )
+        )
+        assert len(arguments) == 3
+        evidence_by_hypothesis = {
+            argument.hypothesis_id: argument.evidence_ids for argument in arguments
+        }
+        assert evidence_by_hypothesis[blocked_id] == ["static-block"]
+        assert evidence_by_hypothesis[supported_id] == ["static-sink"]
+        assert evidence_by_hypothesis[unassessed_id] == []

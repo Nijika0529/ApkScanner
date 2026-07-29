@@ -439,8 +439,19 @@ def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(setting
         assert scan.status == "final"
         assert scan.package_name == "com.example.vulnerable"
         assert scan.stats["investigator"] == "none"
+        assert scan.stats["threat_model"]["digest"]
+        seal = session.get(Evidence, scan.stats["seal"]["evidence_id"])
+        assert seal is not None
+        assert seal.kind == "scan.seal"
+        assert seal.sha256 == scan.stats["seal"]["sha256"]
         assert len(list(session.scalars(select(EntryPoint).where(EntryPoint.scan_id == scan_id)))) == 8
-        assert len(list(session.scalars(select(Finding).where(Finding.scan_id == scan_id)))) >= 5
+        findings = list(
+            session.scalars(select(Finding).where(Finding.scan_id == scan_id))
+        )
+        assert len(findings) >= 5
+        assert all(
+            finding.metadata_json["identity"]["finding_id"] for finding in findings
+        )
         tasks = list(session.scalars(select(InvestigationTask).where(InvestigationTask.scan_id == scan_id)))
         assert tasks
         assert {task.status for task in tasks} == {"blocked_device"}
@@ -454,6 +465,22 @@ def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(setting
             '<script type="application/json" id="report-data">', 1
         )[1].split("</script>", 1)[0]
         assert json.loads(embedded)["scan"]["id"] == scan_id
+        first_seal_id = seal.id
+
+    orchestrator._finish(scan_id)
+    with database.session_factory() as session:
+        scan = session.get(Scan, scan_id)
+        assert scan is not None
+        assert scan.stats["seal"]["evidence_id"] != first_seal_id
+        seals = list(
+            session.scalars(
+                select(Evidence).where(
+                    Evidence.scan_id == scan_id,
+                    Evidence.kind == "scan.seal",
+                )
+            )
+        )
+        assert len(seals) == 2
 
 
 def test_continuation_context_includes_prior_task_evidence(settings) -> None:  # noqa: ANN001

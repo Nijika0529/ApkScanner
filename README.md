@@ -147,6 +147,13 @@ Likewise, a model may emit `not_reproduced` only when a correlated executed test
 explicit platform `oracle_refuted=true` result. Without that Oracle the platform retains an explicit
 static verdict instead of manufacturing a generic “insufficient information” conclusion.
 
+Every scan also seals an Android threat model that fixes the ordinary third-party app/guest attacker,
+assets, trust boundaries, and final-evidence policy. Agents close each tested hypothesis separately
+with a source/control/sink/reachable-path/boundary/counterevidence/proof-gap tuple; a task-wide
+verdict is no longer copied across unrelated hypotheses. Findings carry a cross-version stable
+`finding_id` and a scan-specific `occurrence_id`. Finalization emits `scan.seal` Evidence over the
+APK, threat model, tasks, findings, Evidence ledger, and coverage ledger.
+
 ## Codex configuration
 
 Codex is opt-in. Docker is the secure default isolation mode. Build the pinned worker, provide either
