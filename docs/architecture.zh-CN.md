@@ -13,7 +13,7 @@ flowchart LR
     A[APK intake] --> B[ZIP/签名/Manifest/JADX·apktool/MobSF]
     B --> C[版本化 Security IR]
     C --> D[入口枚举与平台任务规划]
-    D --> E[普通应用 UID 黑盒 + Probe APK]
+    D --> E[普通应用 UID 黑盒：可选 Probe / Agent PoC]
     E --> I[选定 Agent 提出下一组测试]
     I --> J{需要补充测试?}
     J -- 是 --> K[平台校验并执行本轮最多 4 个用例]
@@ -80,8 +80,8 @@ Web 健康检查使用真正的非阻塞锁；设备繁忙时读取最近一次�
 | Codex host worker | 当前任务 attempt workspace 与模型网络 | 仅作为显式 `host` 降级模式；developer instructions 禁止 ADB/目标网络请求，设备动作仍走平台 |
 | OpenCode + DeepSeek Docker worker | 独立 task workspace、完整只读反编译根、`/tmp`、DeepSeek API | workspace 可写、rootfs 只读、临时 HOME；Analyzer 允许 read/glob/grep/bash 和本地构建，独立 Finalizer 只允许 StructuredOutput；容器无设备挂载 |
 | OpenCode + DeepSeek host worker | 独立 task workspace、完整反编译根、主机工具/网络、可选 ADB | personal-lab 模式可自由分析和构建；每次调用使用临时 HOME/XDG 与带随机 Basic Auth 的 loopback server；仅适合个人受控环境 |
-| 云真机 | 目标 APK、Probe APK、测试账号 | 固定 Android 16/API 36；串行 lease；任务前后 `pm clear`；不声称完整快照复位 |
-| Probe APK | 以普通 App UID 调用目标入口 | 只接受最初发送者为 shell/root 的调度；仍只允许安装在专用测试设备 |
+| 云真机 | 目标 APK、可选 Probe APK、Agent PoC、测试账号 | 固定 Android 16/API 36；串行 lease；任务前后 `pm clear`；不声称完整快照复位 |
+| Probe APK | 可选的普通 App UID 通用入口快速执行器 | 只接受最初发送者为 shell/root 的调度；复杂 Binder/AIDL/漏洞链改用 Agent 专用 PoC；仍只允许安装在专用测试设备 |
 | MobSF | 上传 APK并返回广度扫描报告 | 可选、显式 URL/API Key；失败不阻断内置基线，但标为 tool gap |
 
 APK、反编译代码、资源、日志、网页和工具输出都属于不可信数据。两个 Agent 后端的
@@ -109,7 +109,7 @@ test-case/request ID 的 Probe/PoC 与客观 Oracle 作为复现证据。模型�
 | --- | --- |
 | `supported_static` | 引用了本 scan 的 `static.*` Evidence ID |
 | `refuted_static` | 静态证据表明攻击路径受保护、不可达或无实际危害 |
-| `reproduced_blackbox` | 同一随机 request ID 的 Probe APK 调用、Probe 结果日志，且 Probe 返回 success；`adb shell` 成功不等价 |
+| `reproduced_blackbox` | 同一 request/test-case ID 的 Probe 调用+日志或专用 PoC 启动+日志成功关联，并由平台 Oracle 独立观察到具体危害；`adb shell` 成功不等价 |
 | `not_reproduced` | 同一 test-case/request ID 的普通 App UID 尝试与结果日志存在，且平台 Prover 明确产生 `oracle_refuted=true`；它只反驳该已执行用例，不证明全局安全 |
 
 Agent 声称但不属于本 scan/task 的 Evidence ID 会被删除。动态证据不足以支撑复现或负向
@@ -118,7 +118,7 @@ Oracle 时，平台保留由已引用静态证据支撑的明确正向/负向结
 
 ## 能力恢复后的增量补扫
 
-连接 ADB、补齐 Probe APK 或恢复模型后端后，不需要重新上传 APK。单任务“重新分析”
+连接 ADB、补齐可选 Probe/专用 PoC 执行能力或恢复模型后端后，不需要重新上传 APK。单任务“重新分析”
 和扫描级“补扫信息不全项”都会把目标任务重新置为 `queued`，将扫描恢复为
 `investigating`，随后复用已有 workspace、代码索引和静态 Evidence，重新执行设备租约、
 动态验证和按当前开关决定的 Agent 调用。批量补扫仅选择设备阻塞、证据不足、超时、失败及
@@ -231,7 +231,7 @@ Web 只允许删除已经 `final` 或 `failed` 的扫描；任务进入重试队
 ## 上线前仍需完成
 
 - 用公司真实签名 APK 建立回归语料和误报基线。
-- 在目标云真机供应商上编译/安装 Probe APK并跑 API 36 集成测试。
+- 在目标云真机供应商上同时覆盖可选 Probe 快速路径和 Agent 专用 PoC 的 API 36 集成测试。
 - 构建并验证两个 Docker worker 镜像、企业 Codex/DeepSeek 凭据方式和各自网络出口策略。
 - 业务账号态 fixture 作为后续专项能力，不阻塞普通入口审计。
 - 根据发布风险决定人工 gate；当前产品刻意不自动 gate。

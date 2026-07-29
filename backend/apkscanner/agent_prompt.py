@@ -51,7 +51,7 @@ def developer_instructions(
         )
     runtime_capabilities = (
         "Raw ADB is available for exploratory inspection, but adb-shell observations are not "
-        "ordinary-app proof; request a Probe/PoC replay for platform evidence. "
+        "ordinary-app proof; request an optional Probe replay or dedicated PoC for platform evidence. "
         if adb_access
         else "Raw ADB is unavailable. "
     )
@@ -158,7 +158,7 @@ def investigation_prompt(
             "context.json first; it lists the complete read-only JADX, "
             "apktool, and archive roots exposed by the platform. You may build arbitrary local "
             "analysis helpers and Android projects inside the task workspace. If the "
-            "generic Probe APK cannot express a required ordinary-app-UID test and "
+            "optional generic Probe fast path cannot express a required ordinary-app-UID test and "
             "platform_context.poc_builder.available is true, create a source-only project at "
             "poc/<name>/ containing AndroidManifest.xml and src/**/*.java, then attach a poc "
             "object to that requested test. Do not add Gradle files, binaries, native libraries, "
@@ -168,8 +168,10 @@ def investigation_prompt(
             "io.apkscanner.poc.; its "
             "declared launch Activity must read the apkscanner_request_id Intent extra and log a "
             "single JSON result using the requested log_tag. Include that request ID plus "
-            "success and security_impact_observed booleans. The platform, not you, builds, signs, "
-            "installs, launches, records, and uninstalls the APK. A PoC's self-reported "
+            "success and security_impact_observed booleans. For source-only projects the platform "
+            "builds and signs the APK; for prebuilt_apk_path you build and sign it. In both cases "
+            "the platform validates, hashes, installs, launches, records, and uninstalls it. "
+            "A PoC's self-reported "
             "security_impact_observed value is an auditable claim, not independent platform proof "
             "of harm; cite the concrete returned data or another platform observation."
         )
@@ -234,8 +236,10 @@ def investigation_prompt(
         "be reported as a coverage gap or used to justify an unresolved verdict. Continue with "
         "Apktool Smali, manifest XML, resources, archive contents, grep, and local helper scripts. "
         "Test each hypothesis where feasible. Do not infer successful exploitation merely from an exported declaration "
-        "or a zero exit code. For black-box reproduction, cite both the successful Probe APK "
-        "request evidence and the corresponding log evidence. During test_planning and "
+        "or a zero exit code. For black-box reproduction, cite a platform-correlated ordinary-app "
+        "execution pair: either Probe request plus Probe log, or dedicated PoC launch plus PoC log. "
+        "The same request ID and test-case ID must appear in both records, and a platform Oracle "
+        "must independently observe concrete security impact. During test_planning and "
         "exploration_round phases, use the limits in "
         "platform_context.exploration_limits and request only the next smallest set of bounded "
         "follow-up tests against supplied entry-point IDs. Link each requested test to one of "

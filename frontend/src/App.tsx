@@ -433,7 +433,7 @@ function ProofBacklog({ signals, tasks, onRefresh }: { signals: Finding[]; tasks
   }
 
   return <div className="space-y-4">
-    <div className="rounded-xl border border-orange-200 bg-orange-50 px-4 py-3 text-sm leading-relaxed text-orange-950">这里集中展示 Agent 已建立具体静态攻击路径、但尚未获得平台危害 Oracle 的风险候选。它们不会计入最终 Finding；补齐 ADB、Probe APK、专用 PoC 或人工复现后可重新验证。</div>
+    <div className="rounded-xl border border-orange-200 bg-orange-50 px-4 py-3 text-sm leading-relaxed text-orange-950">这里集中展示 Agent 已建立具体静态攻击路径、但尚未获得平台危害 Oracle 的风险候选。它们不会计入最终 Finding；接入 ADB 后可使用可选 Probe 快速路径、Agent 专用 PoC 或人工复现继续验证。</div>
     {error && <div role="alert" className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">{error}</div>}
     {sorted.map((signal) => {
       const backlog = asRecord(signal.metadata_json.proof_backlog)

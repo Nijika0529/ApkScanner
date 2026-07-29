@@ -1695,19 +1695,6 @@ class ScanOrchestrator:
                         coverage_gaps.append(f"Device preparation failed: {failures}")
                     else:
                         prepared = True
-                        if not self.settings.probe_apk_path:
-                            coverage_gaps.append(
-                                "Probe APK is not configured; adb-shell results do not prove "
-                                "ordinary third-party app reachability."
-                            )
-                        elif not any(
-                            kind in {"device.install_probe", "device.probe_cached"}
-                            and result.exit_code == 0
-                            for kind, result, _metadata in prepare_commands
-                        ):
-                            coverage_gaps.append(
-                                "Probe APK installation failed; ordinary-app-UID reachability is unverified."
-                            )
 
                         for entry in entries:
                             if budget.expired:
@@ -2795,9 +2782,11 @@ class ScanOrchestrator:
                         probe = self.device.execute_poc(
                             artifact.apk_path,
                             request.poc,
+                            target_package_name=package_name,
                             state=state,
                             budget=budget,
                             extras=dict(request.extras),
+                            oracle=request.oracle,
                             test_case_id=test_case_id,
                         )
                         for index, (kind, result, metadata) in enumerate(probe.commands):
@@ -2840,6 +2829,18 @@ class ScanOrchestrator:
                     for item in evidence_summaries[before:]
                     if item.get("metadata", {}).get("test_case_id") == test_case_id
                 ]
+                if (
+                    request.poc is None
+                    and not any(
+                        item.get("kind") == "blackbox.probe_app"
+                        and item.get("exit_code") == 0
+                        for item in proof_evidence
+                    )
+                ):
+                    gaps.append(
+                        f"Optional Probe fast path was unavailable for {test_case_id}; "
+                        "use an Agent-built ordinary-app PoC if app-UID proof is required."
+                    )
                 self.hypothesis_ledger.complete_proof(
                     proof_attempt_id,
                     proof_evidence,
@@ -3953,36 +3954,85 @@ class ScanOrchestrator:
             if item["kind"] == "blackbox.logcat"
             and item.get("metadata", {}).get("request_observed")
         }
-        correlated_request_tests = {
+        probe_correlated_tests = {
             (request_id, test_case_id)
             for request_id, test_case_id in probe_request_tests & log_request_tests
             if request_id is not None and test_case_id is not None
         }
+        poc_request_tests = {
+            (
+                item.get("metadata", {}).get("request_id"),
+                item.get("metadata", {}).get("test_case_id"),
+            )
+            for item in cited
+            if item["kind"] == "blackbox.poc_launch"
+            and item.get("exit_code") == 0
+            and item.get("metadata", {}).get("caller_identity") == "agent_poc_app"
+        }
+        poc_log_request_tests = {
+            (
+                item.get("metadata", {}).get("request_id"),
+                item.get("metadata", {}).get("test_case_id"),
+            )
+            for item in cited
+            if item["kind"] == "blackbox.poc_logcat"
+            and item.get("metadata", {}).get("request_observed")
+        }
+        poc_correlated_tests = {
+            (request_id, test_case_id)
+            for request_id, test_case_id in poc_request_tests & poc_log_request_tests
+            if request_id is not None and test_case_id is not None
+        }
+        correlated_request_tests = probe_correlated_tests | poc_correlated_tests
         correlated_blackbox = bool(correlated_request_tests)
         correlated_blackbox_test_ids = {
             test_case_id
             for _request_id, test_case_id in correlated_request_tests
         }
         successful_blackbox = correlated_blackbox and any(
-            item["kind"] == "blackbox.logcat"
-            and (
-                item.get("metadata", {}).get("request_id"),
-                item.get("metadata", {}).get("test_case_id"),
+            (
+                item["kind"] == "blackbox.logcat"
+                and item.get("metadata", {}).get("probe_success")
+                and (
+                    item.get("metadata", {}).get("request_id"),
+                    item.get("metadata", {}).get("test_case_id"),
+                )
+                in probe_correlated_tests
             )
-            in correlated_request_tests
-            and item.get("metadata", {}).get("probe_success")
+            or (
+                item["kind"] == "blackbox.poc_logcat"
+                and item.get("metadata", {}).get("poc_success")
+                and (
+                    item.get("metadata", {}).get("request_id"),
+                    item.get("metadata", {}).get("test_case_id"),
+                )
+                in poc_correlated_tests
+            )
             for item in cited
         )
         successful_blackbox_test_ids = {
             item.get("metadata", {}).get("test_case_id")
             for item in cited
-            if item["kind"] == "blackbox.logcat"
-            and (
-                item.get("metadata", {}).get("request_id"),
-                item.get("metadata", {}).get("test_case_id"),
+            if (
+                (
+                    item["kind"] == "blackbox.logcat"
+                    and item.get("metadata", {}).get("probe_success")
+                    and (
+                        item.get("metadata", {}).get("request_id"),
+                        item.get("metadata", {}).get("test_case_id"),
+                    )
+                    in probe_correlated_tests
+                )
+                or (
+                    item["kind"] == "blackbox.poc_logcat"
+                    and item.get("metadata", {}).get("poc_success")
+                    and (
+                        item.get("metadata", {}).get("request_id"),
+                        item.get("metadata", {}).get("test_case_id"),
+                    )
+                    in poc_correlated_tests
+                )
             )
-            in correlated_request_tests
-            and item.get("metadata", {}).get("probe_success")
         } - {None}
         impact_test_ids = {
             item.get("metadata", {}).get("test_case_id")

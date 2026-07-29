@@ -11,7 +11,7 @@ from apkscanner.device import (
     SingleDeviceScheduler,
 )
 from apkscanner.models import EntryPoint
-from apkscanner.schemas import AgentOracleSpec
+from apkscanner.schemas import AgentOracleSpec, AgentPocSpec
 from apkscanner.tools import CommandResult
 
 
@@ -346,6 +346,104 @@ def test_typed_provider_oracle_emits_platform_impact_signal() -> None:
     assert metadata["security_impact_observed"] is True
     assert metadata["oracle"]["matched"] is True
     assert metadata["oracle"]["observation"]["row_count"] == 3
+
+
+def test_missing_optional_probe_does_not_emit_a_failed_probe_broadcast(settings) -> None:  # noqa: ANN001
+    calls: list[list[str]] = []
+
+    class RecordingRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @staticmethod
+        def run(argv, **_kwargs):  # noqa: ANN001, ANN205
+            calls.append(argv)
+            return CommandResult(argv, 0, "", "")
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555", probe_apk_path=None),
+        RecordingRunner(),  # type: ignore[arg-type]
+    )
+    entry = EntryPoint(
+        id="11111111-1111-1111-1111-111111111111",
+        scan_id="scan",
+        kind="activity",
+        name="com.example.MainActivity",
+        exported=True,
+    )
+
+    result = adapter.probe(entry, "com.example")
+
+    assert adapter.probe_ready is False
+    assert [kind for kind, _result, _metadata in result.commands] == [
+        "blackbox.adb_shell",
+        "blackbox.ui_dump",
+    ]
+    assert not any("io.apkscanner.probe/.ProbeReceiver" in argv for argv in calls)
+
+
+def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    class PocRunner:
+        request_id = ""
+
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @classmethod
+        def run(cls, argv, **_kwargs):  # noqa: ANN001, ANN206
+            if "apkscanner_request_id" in argv:
+                cls.request_id = argv[argv.index("apkscanner_request_id") + 1]
+            if "APKSCANNER_POC:I" in argv:
+                stdout = (
+                    f'I/APKSCANNER_POC: {{"request_id":"{cls.request_id}",'
+                    '"success":true,"security_impact_observed":true}'
+                )
+            elif "uiautomator" in argv:
+                stdout = '<node text="Imported secret" />'
+            else:
+                stdout = ""
+            return CommandResult(argv, 0, stdout, "")
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        PocRunner(),  # type: ignore[arg-type]
+    )
+    apk = tmp_path / "poc.apk"
+    apk.write_bytes(b"APK")
+    spec = AgentPocSpec(
+        project_path="poc/test",
+        package_name="io.apkscanner.poc.test",
+        launch_component=".MainActivity",
+        log_tag="APKSCANNER_POC",
+    )
+    oracle = AgentOracleSpec(
+        kind="ui_text",
+        expected_text="Imported secret",
+        impact="unauthorized_data_access",
+    )
+
+    result = adapter.execute_poc(
+        apk,
+        spec,
+        target_package_name="com.example.target",
+        state="guest",
+        oracle=oracle,
+        test_case_id="agent-r1-1",
+    )
+    by_kind = {
+        kind: metadata for kind, _command_result, metadata in result.commands
+    }
+
+    assert by_kind["blackbox.poc_logcat"]["poc_success"] is True
+    assert by_kind["blackbox.poc_logcat"]["poc_claimed_security_impact"] is True
+    assert "security_impact_observed" not in by_kind["blackbox.poc_logcat"]
+    assert by_kind["blackbox.poc_ui_dump"]["security_impact_observed"] is True
+    assert by_kind["blackbox.poc_ui_dump"]["oracle"]["matched"] is True
 
 
 def test_activity_deep_link_probe_preserves_uri_and_expected_component() -> None:

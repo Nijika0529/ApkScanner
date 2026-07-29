@@ -55,6 +55,49 @@ def test_blackbox_reproduction_requires_correlated_concrete_harm() -> None:
     assert payload["evidence_ids"] == ["probe", "log"]
 
 
+def test_agent_poc_can_supply_the_correlated_ordinary_app_execution_pair() -> None:
+    evidence = [
+        {
+            "id": "launch",
+            "kind": "blackbox.poc_launch",
+            "exit_code": 0,
+            "metadata": {
+                "caller_identity": "agent_poc_app",
+                "request_id": "request-poc",
+                "test_case_id": "agent-r1-1",
+            },
+        },
+        {
+            "id": "log",
+            "kind": "blackbox.poc_logcat",
+            "exit_code": 0,
+            "metadata": {
+                "request_id": "request-poc",
+                "request_observed": True,
+                "poc_success": True,
+                "test_case_id": "agent-r1-1",
+            },
+        },
+        {
+            "id": "oracle",
+            "kind": "blackbox.poc_ui_dump",
+            "exit_code": 0,
+            "metadata": {
+                "test_case_id": "agent-r1-1",
+                "security_impact_observed": True,
+            },
+        },
+    ]
+
+    payload, result = ScanOrchestrator._validated_agent_payload(
+        _payload("reproduced_blackbox", ["launch", "log", "oracle"]),
+        evidence,
+    )
+
+    assert result == "reproduced_blackbox"
+    assert payload["evidence_ids"] == ["launch", "log", "oracle"]
+
+
 def test_optional_jadx_absence_is_not_preserved_as_a_verdict_gap() -> None:
     payload = _payload("refuted_static", ["static"])
     payload["coverage_gaps"] = [

@@ -21,7 +21,7 @@ finding without platform evidence IDs.
   and usage.
 - Three concurrent entry-investigation workers by default, with one global serialized ADB queue;
   model/review turns release the device between validated device-action phases.
-- Remote ADB adapter, ordinary-app-UID Probe APK protocol, objective Oracles, `pm clear` cleanup,
+- Remote ADB adapter, optional ordinary-app-UID Probe fast path, Agent PoCs, objective Oracles, `pm clear` cleanup,
   and App Link state inspection/reset.
 - Optional MobSF upload/report normalization with explicit degraded coverage when absent.
 - Official `openai-codex==0.144.4` integration with strict JSON Schema, streamed turn/item events,
@@ -82,25 +82,28 @@ adb connect cloud-device.example:5555
 export APKSCANNER_ADB_SERIAL=cloud-device.example:5555
 ```
 
-Build the deliberately exported helper in [`probe/`](probe/) on an Android SDK 36 workstation,
-install it only on a dedicated test device, and configure its path:
+For fast generic Activity, Service, Receiver, Provider, and deep-link calls from an ordinary app
+UID, optionally build the deliberately exported helper in [`probe/`](probe/) on an Android SDK 36
+workstation, install it only on a dedicated test device, and configure its path:
 
 ```bash
 export APKSCANNER_PROBE_APK="$PWD/probe/app/build/outputs/apk/debug/app-debug.apk"
 ```
 
-Without ADB or the Probe APK, scans still complete and explicitly mark dynamic coverage as blocked.
-An `adb shell` success is retained as a separate identity and is never treated as equivalent to an
-ordinary third-party application.
+Without ADB, scans still complete from static evidence. Without the optional Probe APK, raw ADB
+exploration and Agent-built dedicated PoCs remain available; the platform reports a gap only when
+a requested ordinary-app test actually lacks either execution route. An `adb shell` success is
+retained as a separate identity and is never treated as equivalent to an ordinary third-party app.
 
 When `APKSCANNER_ANDROID_SDK_ROOT` points to an SDK containing platform API 36 and build-tools,
 an OpenCode Agent may create a source-only PoC or build its own signed APK under the isolated
 `poc/` directory. The control plane validates paths, size, signature, package and launch metadata,
 records source/APK SHA-256 values, enters the same ADB queue, installs and launches the PoC as an
 ordinary application UID, correlates its nonce-tagged result, and uninstalls it. In host
-`personal_lab` mode raw ADB is available for exploration, but only platform Probe/PoC evidence can
-establish ordinary-app reachability. A PoC's own impact boolean remains a claim and cannot by itself
-satisfy the platform harm oracle.
+`personal_lab` mode raw ADB is available for exploration, but only platform-correlated Probe/PoC
+execution can establish ordinary-app reachability. A PoC's own impact boolean remains a claim and
+cannot by itself satisfy the platform harm oracle; an objective UI, target-log, crash, or other
+platform observation is still required.
 
 The default worker pool explores up to three entry points concurrently across all scans. Every
 install, reset, probe, and cleanup still passes through one global

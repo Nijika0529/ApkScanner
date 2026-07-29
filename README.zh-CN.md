@@ -15,7 +15,7 @@ v1 产品是一个单用户、仅限本机（localhost）的 Web 应用。它接
 - 持久化 Hypothesis、Hunter/Critic 论证、Proof Attempt、危害 Oracle 和平台 Verdict；模型文字不能自证漏洞成立。
 - 私有 APK ground-truth 评测：只对平台确认的最终 Finding 计分，默认要求动态证明，并用 F0.5 重罚不匹配真值的高危结论。
 - 默认 3 个入口探索 worker 并发；所有扫描共享 1 条优先级/FIFO ADB 队列，模型与 Review 阶段不占设备。
-- 远程 ADB 适配器、普通 App UID 的 Probe APK 协议、客观 Oracle、`pm clear` 清理和 App Link 状态检查/重置。
+- 远程 ADB 适配器、可选普通 App UID Probe 快速路径、Agent 专用 PoC、客观 Oracle、`pm clear` 清理和 App Link 状态检查/重置。
 - 可选的 MobSF 上传/报告归一化，缺失时显式标注降级覆盖。
 - 官方 `openai-codex==0.144.4` 集成：严格 JSON Schema、全新线程、无子 Agent fan-out、一轮平台介导的补充测试、证据支撑的结果降级。
 - 固定版本 `@opencode-ai/sdk`/OpenCode `1.18.4` 集成（适配 DeepSeek）：稳定的非思考工具分析器与独立 StructuredOutput 定稿器，带 Ajv/语义/平台 ID 校验、personal-lab 工作区/ADB 能力和完整调用审计。
@@ -86,20 +86,23 @@ adb connect cloud-device.example:5555
 export APKSCANNER_ADB_SERIAL=cloud-device.example:5555
 ```
 
-在 Android SDK 36 工作站上构建 [`probe/`](probe/) 中的故意导出辅助程序，仅安装在专用测试设备上，并配置其路径：
+如需快速以普通 App UID 调用 Activity、Service、Receiver、Provider 和 Deep Link，可选地在 Android SDK 36 工作站上构建 [`probe/`](probe/) 中的故意导出辅助程序；它只能安装在专用测试设备上：
 
 ```bash
 export APKSCANNER_PROBE_APK="$PWD/probe/app/build/outputs/apk/debug/app-debug.apk"
 ```
 
-没有 ADB 或 Probe APK 时，扫描仍会完成，并显式标注动态覆盖为 blocked。`adb shell` 成功会保留为独立身份，永远不会被视为等同于普通第三方应用。
+没有 ADB 时，扫描仍会依据静态证据完成。没有可选 Probe APK 时，Agent 仍可使用原始
+ADB 探索或构建专用 PoC；仅当某个实际申请的普通 App 测试两种执行路径都不可用时，
+平台才记录具体缺口。`adb shell` 成功会保留为独立身份，永远不会被视为普通第三方应用。
 
 当 `APKSCANNER_ANDROID_SDK_ROOT` 指向包含 API 36 platform 和 build-tools 的 Android SDK
 时，OpenCode Agent 可以在隔离工作区的 `poc/` 下生成 Manifest/Java 源码型 PoC，也可以
 自行构建签名 APK。控制面会校验路径、大小、签名、包名和启动组件，登记源码/APK SHA-256，
 再进入同一 ADB 队列，以普通应用 UID 安装和启动，通过随机 nonce 关联结果，最后卸载。
-host `personal_lab` 模式可用原始 ADB 做探索，但普通 App 可利用性仍须由平台 Probe/PoC
-证据确认。PoC 自报影响仍只是声明，不能单独满足平台实际危害证明条件。
+host `personal_lab` 模式可用原始 ADB 做探索，但普通 App 可利用性仍须由平台关联的
+Probe/PoC 执行证据确认。PoC 自报影响仍只是声明；还需要 UI、目标进程日志、崩溃等
+独立平台观察才能满足实际危害证明条件。
 
 单 ADB 模式默认允许 3 个入口 worker 并发分析，但所有 worker 共用一条全局显式设备队列：
 风险优先级高的任务先执行，相同优先级按入队顺序执行。设备租约只覆盖安装、探测和清理；
@@ -212,8 +215,8 @@ APK 上传
   → InvestigationPlanner 创建任务（每个导出组件一个，每个 Deep Link handler 一个）
   → 默认最多 3 个任务并发进入入口探索：
       → 任务 worker 按优先级领取
-      → 如配置 ADB：安装或复用 APK、安装 Probe APK、按策略重置测试状态
-      → 访客探测：对每个入口通过 adb shell 和 Probe APK 广播分发
+      → 如配置 ADB：安装或复用目标 APK、可选安装 Probe APK、按策略重置测试状态
+      → 访客基线：通过 adb shell 探索；Probe 可用时增加普通 App UID 快速调用
       → 清理并释放唯一 ADB，再由 AI 进行 test_planning
       → AI 默认最多请求 8 个限定补充测试（可配置上限 1000）
       → 平台验证申请；如需执行则重新进入单设备队列，prepare 后串行执行并再次释放
@@ -239,7 +242,7 @@ Apktool、JADX/Smali、代码索引和静态 Evidence，不再次反编译。
 | --- | --- |
 | `supported_static` | 静态证据支持风险，至少引用一个 `static.*` Evidence ID |
 | `refuted_static` | 静态证据表明攻击路径受保护、不可达或无实际安全影响 |
-| `reproduced_blackbox` | 同一随机 request ID 的 Probe APK 调用 + Probe 结果日志，且 Probe 返回 success |
+| `reproduced_blackbox` | 同一 request/test-case ID 的 Probe 调用+日志或专用 PoC 启动+日志成功关联，并由平台 Oracle 独立观察到具体危害 |
 | `not_reproduced` | 同一 test-case/request ID 的普通 App UID 尝试 + 结果日志存在，且平台 Prover 明确产生 `oracle_refuted=true`；仅反驳已执行用例，不证明全局安全 |
 
 Agent 声称的、不属于当前 Scan/Task 的 Evidence ID 会被移除。动态危害或负向 Oracle
@@ -380,7 +383,7 @@ ApkScanner/
 ## 上线前仍需完成
 
 - 用公司真实签名 APK 建立回归语料和误报基线。
-- 在目标云真机供应商上编译/安装 Probe APK 并跑 API 36 集成测试。
+- 在目标云真机供应商上同时覆盖可选 Probe 快速路径和 Agent 专用 PoC 的 API 36 集成测试。
 - 构建并验证 Docker Worker 镜像、企业 Codex 登录方式和网络出口策略。
 - 为需要业务账号态的专项测试另行设计显式 fixture，不让它阻塞普通入口审计。
 - 根据发布风险决定人工 gate；当前产品刻意不自动 gate。

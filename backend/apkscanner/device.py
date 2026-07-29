@@ -147,10 +147,16 @@ class AdbDeviceAdapter:
         self._last_capability_at: float | None = None
         self._active_cancel_event: threading.Event | None = None
         self._probe_apk_sha256: str | None = None
+        self._probe_ready = False
 
     @property
     def configured(self) -> bool:
         return bool(self.serial and self.runner.available("adb"))
+
+    @property
+    def probe_ready(self) -> bool:
+        """Whether the optional ordinary-app Probe fast path is usable."""
+        return self._probe_ready
 
     @contextmanager
     def lease(self):  # noqa: ANN201
@@ -319,6 +325,7 @@ class AdbDeviceAdapter:
         self, apk_path: Path, package_name: str, budget: TimeBudget | None = None
     ) -> list[tuple[str, CommandResult, dict]]:
         self._validate_package(package_name)
+        self._probe_ready = False
         commands: list[tuple[str, CommandResult, dict]] = []
         health = self._adb_budget(["get-state"], budget, 30)
         commands.append(("device.health", health, {}))
@@ -432,6 +439,7 @@ class AdbDeviceAdapter:
                         },
                     )
                 )
+                self._probe_ready = True
             else:
                 probe_install = self._adb_budget(
                     ["install", "-r", "-t", str(self.settings.probe_apk_path)],
@@ -450,6 +458,7 @@ class AdbDeviceAdapter:
                 )
                 if probe_install.exit_code == 0:
                     self._probe_apk_sha256 = probe_sha256
+                    self._probe_ready = True
         if self.settings.device_reset_policy != "never":
             commands.append(
                 (
@@ -572,16 +581,20 @@ class AdbDeviceAdapter:
                         },
                     )
                 )
-            probe_request = self._probe_request(
-                entry,
-                package_name,
-                uri_override=uri_override,
-                extras=extras,
-                operation=operation,
-                method=method,
-                argument=argument,
-                intent_action=intent_action,
-                categories=categories,
+            probe_request = (
+                self._probe_request(
+                    entry,
+                    package_name,
+                    uri_override=uri_override,
+                    extras=extras,
+                    operation=operation,
+                    method=method,
+                    argument=argument,
+                    intent_action=intent_action,
+                    categories=categories,
+                )
+                if self._probe_ready
+                else None
             )
             request_id = secrets.token_hex(8) if probe_request else None
             if probe_request:
@@ -615,55 +628,64 @@ class AdbDeviceAdapter:
                         },
                     )
                 )
-            log_result = self._adb_budget(
-                ["logcat", "-d", "-t", "300", "-s", "APKSCANNER_PROBE:I"],
-                budget,
-                60,
-            )
-            matching_log = [
-                line for line in log_result.stdout.splitlines() if request_id and request_id in line
-            ]
-            probe_payload = self._last_json_payload(matching_log)
-            oracle_metadata = self._evaluate_probe_oracle(
-                oracle,
-                probe_payload=probe_payload,
-                output=log_result.stdout,
-            )
-            commands.append(
-                (
-                    "blackbox.logcat",
-                    log_result,
-                    {
-                        "entry_point": entry.id,
-                        "session_state": state,
-                        "request_id": request_id,
-                        "test_case_id": test_case_id,
-                        "request_observed": bool(matching_log),
-                        "probe_success": any(
-                            '"success":true' in line.replace('\\"', '"')
-                            for line in matching_log
-                        ),
-                        "probe_result": probe_payload,
-                        **oracle_metadata,
-                    },
+            action_attempted = bool(direct_argv or probe_request)
+            if probe_request:
+                log_result = self._adb_budget(
+                    ["logcat", "-d", "-t", "300", "-s", "APKSCANNER_PROBE:I"],
+                    budget,
+                    60,
                 )
-            )
-            ui_result = self._adb_budget(
-                ["shell", "uiautomator", "dump", "/dev/tty"], budget, 45
-            )
-            commands.append(
-                (
-                    "blackbox.ui_dump",
-                    ui_result,
-                    {
-                        "entry_point": entry.id,
-                        "session_state": state,
-                        "test_case_id": test_case_id,
-                        **self._evaluate_ui_oracle(oracle, ui_result.stdout),
-                    },
+                matching_log = [
+                    line
+                    for line in log_result.stdout.splitlines()
+                    if request_id and request_id in line
+                ]
+                probe_payload = self._last_json_payload(matching_log)
+                oracle_metadata = self._evaluate_probe_oracle(
+                    oracle,
+                    probe_payload=probe_payload,
+                    output=log_result.stdout,
                 )
-            )
-            if oracle and oracle.kind in {"log_contains", "process_crash"}:
+                commands.append(
+                    (
+                        "blackbox.logcat",
+                        log_result,
+                        {
+                            "entry_point": entry.id,
+                            "session_state": state,
+                            "request_id": request_id,
+                            "test_case_id": test_case_id,
+                            "request_observed": bool(matching_log),
+                            "probe_success": any(
+                                '"success":true' in line.replace('\\"', '"')
+                                for line in matching_log
+                            ),
+                            "probe_result": probe_payload,
+                            **oracle_metadata,
+                        },
+                    )
+                )
+            if action_attempted:
+                ui_result = self._adb_budget(
+                    ["shell", "uiautomator", "dump", "/dev/tty"], budget, 45
+                )
+                commands.append(
+                    (
+                        "blackbox.ui_dump",
+                        ui_result,
+                        {
+                            "entry_point": entry.id,
+                            "session_state": state,
+                            "test_case_id": test_case_id,
+                            **self._evaluate_ui_oracle(oracle, ui_result.stdout),
+                        },
+                    )
+                )
+            if (
+                action_attempted
+                and oracle
+                and oracle.kind in {"log_contains", "process_crash"}
+            ):
                 target_log = self._adb_budget(["logcat", "-d", "-t", "800"], budget, 60)
                 commands.append(
                     (
@@ -697,15 +719,18 @@ class AdbDeviceAdapter:
         apk_path: Path,
         spec: AgentPocSpec,
         *,
+        target_package_name: str,
         state: str,
         budget: TimeBudget | None = None,
         extras: dict[str, str | int | bool] | None = None,
+        oracle: AgentOracleSpec | None = None,
         test_case_id: str | None = None,
     ) -> DeviceProbeResult:
-        """Install and launch a platform-built PoC as an ordinary application UID."""
+        """Install and launch a dedicated PoC as an ordinary application UID."""
         if not self.configured:
             raise RuntimeError("remote ADB device is not configured")
         self._validate_package(spec.package_name)
+        self._validate_package(target_package_name)
         if not apk_path.is_file():
             raise ValueError("platform-built PoC APK is unavailable")
         component = (
@@ -776,6 +801,16 @@ class AdbDeviceAdapter:
                     line for line in log_result.stdout.splitlines() if request_id in line
                 ]
                 normalized = [line.lower().replace(" ", "") for line in matching]
+                poc_success = any('"success":true' in line for line in normalized)
+                reachability_oracle = (
+                    self._oracle_metadata(
+                        oracle,
+                        matched=poc_success,
+                        observation={"poc_result_observed": bool(matching)},
+                    )
+                    if oracle is not None and oracle.kind == "reachability"
+                    else {}
+                )
                 commands.append(
                     (
                         "blackbox.poc_logcat",
@@ -783,15 +818,55 @@ class AdbDeviceAdapter:
                         {
                             **common,
                             "request_observed": bool(matching),
-                            "poc_success": any('"success":true' in line for line in normalized),
+                            "poc_success": poc_success,
                             "poc_claimed_security_impact": any(
                                 '"security_impact_observed":true' in line
                                 for line in normalized
                             ),
                             "matching_line_count": len(matching),
+                            **reachability_oracle,
                         },
                     )
                 )
+                if oracle is not None and oracle.kind == "ui_text":
+                    ui_result = self._adb_budget(
+                        ["shell", "uiautomator", "dump", "/dev/tty"],
+                        budget,
+                        45,
+                    )
+                    commands.append(
+                        (
+                            "blackbox.poc_ui_dump",
+                            ui_result,
+                            {
+                                **common,
+                                **self._evaluate_ui_oracle(oracle, ui_result.stdout),
+                            },
+                        )
+                    )
+                if oracle is not None and oracle.kind in {
+                    "log_contains",
+                    "process_crash",
+                }:
+                    target_log = self._adb_budget(
+                        ["logcat", "-d", "-t", "800"],
+                        budget,
+                        60,
+                    )
+                    commands.append(
+                        (
+                            "blackbox.poc_target_logcat",
+                            target_log,
+                            {
+                                **common,
+                                **self._evaluate_target_log_oracle(
+                                    oracle,
+                                    target_log.stdout,
+                                    target_package_name,
+                                ),
+                            },
+                        )
+                    )
             uninstall = self._adb(
                 ["uninstall", spec.package_name],
                 timeout=90,
