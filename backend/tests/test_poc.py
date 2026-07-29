@@ -53,18 +53,26 @@ def test_poc_builder_accepts_only_source_projects_under_workspace(
     workspace.mkdir()
     project = write_poc_project(workspace)
     builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
-    validated, sources, manifest = builder._validate_project(workspace, poc_spec())
+    validated, sources, manifest, effective = builder._validate_project(
+        workspace,
+        poc_spec(),
+    )
     assert validated == project
     assert manifest.name == "AndroidManifest.xml"
     assert [item.name for item in sources] == ["MainActivity.java"]
+    assert effective == poc_spec()
 
     (project / "build.gradle").write_text("ignored build hook", encoding="utf-8")
     (project / "build").mkdir()
     (project / "build" / "MainActivity.class").write_bytes(b"ignored")
-    validated, sources, manifest = builder._validate_project(workspace, poc_spec())
+    validated, sources, manifest, effective = builder._validate_project(
+        workspace,
+        poc_spec(),
+    )
     assert validated == project
     assert manifest.name == "AndroidManifest.xml"
     assert [item.name for item in sources] == ["MainActivity.java"]
+    assert effective == poc_spec()
 
 
 def test_poc_builder_recovers_a_unique_project_path_by_package(
@@ -79,11 +87,35 @@ def test_poc_builder_recovers_a_unique_project_path_by_package(
         update={"project_path": "poc/model_wrote_the_wrong_directory"}
     )
 
-    validated, sources, manifest = builder._validate_project(workspace, stale_spec)
+    validated, sources, manifest, effective = builder._validate_project(
+        workspace,
+        stale_spec,
+    )
 
     assert validated == project
     assert manifest == project / "AndroidManifest.xml"
     assert [item.name for item in sources] == ["MainActivity.java"]
+    assert effective.package_name == "io.apkscanner.poc.providerprobe"
+
+
+def test_poc_builder_uses_safe_manifest_package_as_source_of_truth(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    write_poc_project(workspace)
+    builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
+    mismatched = poc_spec().model_copy(
+        update={"package_name": "io.apkscanner.poc.modelguess"}
+    )
+
+    _project, _sources, _manifest, effective = builder._validate_project(
+        workspace,
+        mismatched,
+    )
+
+    assert effective.package_name == "io.apkscanner.poc.providerprobe"
 
 
 def test_poc_build_failure_includes_tool_diagnostic() -> None:

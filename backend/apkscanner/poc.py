@@ -33,6 +33,7 @@ class PocBuildResult:
     source_sha256: str | None = None
     source_path: Path | None = None
     metadata: dict[str, object] = field(default_factory=dict)
+    effective_spec: AgentPocSpec | None = None
 
 
 class PocBuilder:
@@ -117,9 +118,12 @@ class PocBuilder:
                 ),
             )
         try:
-            project, sources, manifest = self._validate_project(workspace, spec)
+            project, sources, manifest, effective_spec = self._validate_project(
+                workspace,
+                spec,
+            )
             effective_project_path = str(project.relative_to(workspace.resolve()))
-            effective_spec = spec.model_copy(
+            effective_spec = effective_spec.model_copy(
                 update={"project_path": effective_project_path}
             )
             source_bytes = self._source_archive(project, sources, manifest)
@@ -362,6 +366,7 @@ class PocBuilder:
                 "apk_path": str(apk_path),
                 "source_path": str(source_path),
             },
+            effective_spec=effective_spec,
         )
 
     def _ingest_prebuilt(
@@ -488,7 +493,7 @@ class PocBuilder:
         self,
         workspace: Path,
         spec: AgentPocSpec,
-    ) -> tuple[Path, list[Path], Path]:
+    ) -> tuple[Path, list[Path], Path, AgentPocSpec]:
         root = workspace.resolve()
         poc_root = (root / "poc").resolve()
         project = self._resolve_source_project(root, poc_root, spec)
@@ -518,8 +523,15 @@ class PocBuilder:
             )
         tree = ElementTree.parse(manifest)
         root_element = tree.getroot()
-        if root_element.tag != "manifest" or root_element.get("package") != spec.package_name:
-            raise ValueError("manifest package does not match the requested PoC package")
+        manifest_package = root_element.get("package")
+        if root_element.tag != "manifest" or not manifest_package:
+            raise ValueError("PoC manifest requires a package")
+        effective_spec = AgentPocSpec.model_validate(
+            {
+                **spec.model_dump(mode="python"),
+                "package_name": manifest_package,
+            }
+        )
         if root_element.get(f"{{{ANDROID_NAMESPACE}}}sharedUserId"):
             raise ValueError("android:sharedUserId is forbidden for Agent PoCs")
         application = root_element.find("application")
@@ -530,17 +542,21 @@ class PocBuilder:
             for item in application.findall("activity")
         }
         component = (
-            f"{spec.package_name}{spec.launch_component}"
+            f"{effective_spec.package_name}{effective_spec.launch_component}"
             if spec.launch_component.startswith(".")
             else spec.launch_component
         )
         normalized_declared = {
-            f"{spec.package_name}{name}" if name and name.startswith(".") else name
+            (
+                f"{effective_spec.package_name}{name}"
+                if name and name.startswith(".")
+                else name
+            )
             for name in declared
         }
         if component not in normalized_declared:
             raise ValueError("launch_component is not declared as an activity")
-        return project, sources, manifest
+        return project, sources, manifest, effective_spec
 
     @staticmethod
     def _resolve_source_project(

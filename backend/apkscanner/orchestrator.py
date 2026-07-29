@@ -2782,7 +2782,16 @@ class ScanOrchestrator:
                         },
                     )
             if outcome.ok:
-                accepted.append(request)
+                effective_request = request
+                if (
+                    outcome.effective_spec is not None
+                    and outcome.effective_spec != request.poc
+                ):
+                    effective_request = request.model_copy(
+                        update={"poc": outcome.effective_spec}
+                    )
+                    artifacts[self._poc_request_key(effective_request)] = outcome
+                accepted.append(effective_request)
             else:
                 gaps.append(
                     "Rejected Agent PoC test for "
