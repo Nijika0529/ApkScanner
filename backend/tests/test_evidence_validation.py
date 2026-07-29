@@ -22,6 +22,19 @@ def test_unknown_agent_evidence_is_removed_and_reproduction_is_downgraded() -> N
         )
 
 
+def test_static_verdict_recovers_platform_issued_evidence_omitted_by_model() -> None:
+    payload, result = ScanOrchestrator._validated_agent_payload(
+        _payload("supported_static", []),
+        [{"id": "static", "kind": "static.apktool", "metadata": {}}],
+    )
+
+    assert result == "supported_static"
+    assert payload["evidence_ids"] == ["static"]
+    assert payload["coverage_gaps"] == [
+        "Platform attached the issued static Evidence omitted by the model."
+    ]
+
+
 def test_blackbox_reproduction_requires_correlated_concrete_harm() -> None:
     evidence = [
         {

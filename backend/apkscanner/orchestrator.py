@@ -4094,6 +4094,29 @@ class ScanOrchestrator:
         valid_ids = list(dict.fromkeys(resolved_claims))
         valid_ids = list(dict.fromkeys([*valid_ids, *nested_ids]))
         unknown = sorted(set(unknown))
+        result_value = str(
+            payload.get("result", FindingStatus.REFUTED_STATIC.value)
+        )
+        static_evidence_attached = False
+        if (
+            result_value
+            in {
+                FindingStatus.SUPPORTED_STATIC.value,
+                FindingStatus.REFUTED_STATIC.value,
+            }
+            and not any(
+                evidence_by_id[evidence_id]["kind"].startswith("static.")
+                for evidence_id in valid_ids
+            )
+        ):
+            static_ids = [
+                evidence_id
+                for evidence_id, item in evidence_by_id.items()
+                if item["kind"].startswith("static.")
+            ]
+            if static_ids:
+                valid_ids = list(dict.fromkeys([*valid_ids, *static_ids]))
+                static_evidence_attached = True
         payload["evidence_ids"] = valid_ids
         optional_static_tool_markers = (
             "jadx",
@@ -4133,6 +4156,10 @@ class ScanOrchestrator:
         if unknown:
             gaps.append(
                 f"Ignored {len(unknown)} evidence ID(s) not issued for this scan and task."
+            )
+        if static_evidence_attached:
+            gaps.append(
+                "Platform attached the issued static Evidence omitted by the model."
             )
         cited = [evidence_by_id[value] for value in valid_ids]
         probe_request_tests = {
@@ -4250,7 +4277,6 @@ class ScanOrchestrator:
         explicitly_refuted = bool(
             refuted_test_ids & correlated_blackbox_test_ids
         )
-        result_value = str(payload.get("result", FindingStatus.REFUTED_STATIC.value))
         evidence_valid = True
         if result_value in {
             FindingStatus.SUPPORTED_STATIC.value,
