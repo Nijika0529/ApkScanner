@@ -348,6 +348,50 @@ def test_typed_provider_oracle_emits_platform_impact_signal() -> None:
     assert metadata["oracle"]["observation"]["row_count"] == 3
 
 
+def test_typed_provider_oracle_accepts_correlated_poc_row_count() -> None:
+    oracle = AgentOracleSpec(
+        kind="provider_rows",
+        minimum_rows=1,
+        impact="unauthorized_data_access",
+    )
+
+    metadata = AdbDeviceAdapter._evaluate_poc_oracle(
+        oracle,
+        poc_payload={
+            "request_id": "request-1",
+            "success": True,
+            "security_impact_observed": True,
+            "row_count": 2,
+        },
+        output="",
+    )
+
+    assert metadata["security_impact_observed"] is True
+    assert metadata["oracle"]["matched"] is True
+    assert metadata["oracle"]["observation"]["row_count"] == 2
+
+
+def test_provider_poc_claim_without_row_count_is_not_platform_proof() -> None:
+    oracle = AgentOracleSpec(
+        kind="provider_rows",
+        minimum_rows=1,
+        impact="unauthorized_data_access",
+    )
+
+    metadata = AdbDeviceAdapter._evaluate_poc_oracle(
+        oracle,
+        poc_payload={
+            "request_id": "request-1",
+            "success": True,
+            "security_impact_observed": True,
+        },
+        output="leaked data claimed by the PoC",
+    )
+
+    assert metadata["security_impact_observed"] is False
+    assert metadata["oracle"]["matched"] is False
+
+
 def test_missing_optional_probe_does_not_emit_a_failed_probe_broadcast(settings) -> None:  # noqa: ANN001
     calls: list[list[str]] = []
 

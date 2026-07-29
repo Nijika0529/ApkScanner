@@ -863,14 +863,11 @@ class AdbDeviceAdapter:
                 ]
                 normalized = [line.lower().replace(" ", "") for line in matching]
                 poc_success = any('"success":true' in line for line in normalized)
-                reachability_oracle = (
-                    self._oracle_metadata(
-                        oracle,
-                        matched=poc_success,
-                        observation={"poc_result_observed": bool(matching)},
-                    )
-                    if oracle is not None and oracle.kind == "reachability"
-                    else {}
+                poc_payload = self._last_json_payload(matching)
+                poc_oracle = self._evaluate_poc_oracle(
+                    oracle,
+                    poc_payload=poc_payload,
+                    output="\n".join(matching),
                 )
                 commands.append(
                     (
@@ -885,7 +882,7 @@ class AdbDeviceAdapter:
                                 for line in normalized
                             ),
                             "matching_line_count": len(matching),
-                            **reachability_oracle,
+                            **poc_oracle,
                         },
                     )
                 )
@@ -1131,6 +1128,27 @@ class AdbDeviceAdapter:
                 oracle,
                 matched=matched,
                 observation={"expected_text": oracle.expected_text},
+            )
+        return {}
+
+    @classmethod
+    def _evaluate_poc_oracle(
+        cls,
+        oracle: AgentOracleSpec | None,
+        *,
+        poc_payload: dict[str, Any] | None,
+        output: str,
+    ) -> dict[str, Any]:
+        if oracle is None:
+            return {}
+        payload = dict(poc_payload or {})
+        if "rowCount" not in payload and "row_count" in payload:
+            payload["rowCount"] = payload["row_count"]
+        if oracle.kind in {"reachability", "provider_rows"}:
+            return cls._evaluate_probe_oracle(
+                oracle,
+                probe_payload=payload or None,
+                output=output,
             )
         return {}
 
