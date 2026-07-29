@@ -437,6 +437,41 @@ def test_personal_lab_accepts_typed_provider_call_and_objective_oracle() -> None
     assert gaps == []
 
 
+def test_non_provider_request_ignores_provider_only_fields() -> None:
+    entry = EntryPoint(
+        id="11111111-1111-1111-1111-111111111111",
+        scan_id="scan",
+        kind="deep_link",
+        name="vulntest://open/",
+        owner_component="com.example.DeepLinkActivity",
+        exported=True,
+    )
+    request = AgentRequestedTest(
+        hypothesis_id="22222222-2222-2222-2222-222222222222",
+        entry_point_id=entry.id,
+        state="guest",
+        uri="vulntest://open/?url=https://example.invalid",
+        extras={},
+        operation="call",
+        method="accidentalProviderMethod",
+        argument="unused",
+        oracle={"kind": "reachability", "impact": "none"},
+        rationale="Replay the deep link from an ordinary application.",
+    )
+
+    accepted, gaps = ScanOrchestrator._validate_requested_tests(
+        [request],
+        [entry],
+        hypothesis_ids={request.hypothesis_id},
+    )
+
+    assert gaps == []
+    assert len(accepted) == 1
+    assert accepted[0].operation == "auto"
+    assert accepted[0].method is None
+    assert accepted[0].argument is None
+
+
 def test_provider_rows_oracle_rejects_a_non_query_operation() -> None:
     entry = EntryPoint(
         id="11111111-1111-1111-1111-111111111111",

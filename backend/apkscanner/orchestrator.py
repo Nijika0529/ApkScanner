@@ -2609,6 +2609,26 @@ class ScanOrchestrator:
         seen: set[str] = set()
         for request in requests[:limit]:
             entry = entries_by_id.get(request.entry_point_id)
+            if (
+                entry is not None
+                and entry.kind != "provider"
+                and (
+                    request.operation != "auto"
+                    or request.method is not None
+                    or request.argument is not None
+                )
+            ):
+                # These fields have no execution meaning outside a
+                # ContentProvider. Ignore model field contamination instead
+                # of discarding an otherwise valid Activity/Service/Receiver
+                # or deep-link PoC.
+                request = request.model_copy(
+                    update={
+                        "operation": "auto",
+                        "method": None,
+                        "argument": None,
+                    }
+                )
             reason = None
             if entry is None:
                 reason = "entry point is outside this task"
@@ -2637,8 +2657,6 @@ class ScanOrchestrator:
                         "provider query/delete probes do not accept values; use a call, "
                         "insert, or update operation"
                     )
-            elif request.operation != "auto" and entry.kind != "provider":
-                reason = "provider operations are allowed only for provider entries"
             elif (
                 request.oracle.kind == "provider_rows"
                 and entry.kind != "provider"
