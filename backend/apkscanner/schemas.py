@@ -385,7 +385,10 @@ class AgentInvestigationResult(BaseModel):
     confidence: Literal["high", "medium", "low"]
     coverage_gaps: list[str] = Field(max_length=100)
     followups: list[str] = Field(max_length=100)
-    requested_tests: list[AgentRequestedTest] = Field(max_length=1000)
+    requested_tests: list[AgentRequestedTest] = Field(
+        default_factory=list,
+        max_length=1000,
+    )
 
     @model_validator(mode="wrap")
     @classmethod

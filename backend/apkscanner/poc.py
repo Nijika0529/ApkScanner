@@ -117,6 +117,10 @@ class PocBuilder:
             )
         try:
             project, sources, manifest = self._validate_project(workspace, spec)
+            effective_project_path = str(project.relative_to(workspace.resolve()))
+            effective_spec = spec.model_copy(
+                update={"project_path": effective_project_path}
+            )
             source_bytes = self._source_archive(project, sources, manifest)
             source_sha256, source_path = self.store.put_bytes(
                 "poc_sources", source_bytes, suffix=".zip"
@@ -187,12 +191,18 @@ class PocBuilder:
                     timeout=self.settings.poc_build_timeout_seconds,
                     cancel_event=cancel_event,
                 )
-                commands.append((kind, result, self._command_metadata(spec, source_sha256)))
+                commands.append(
+                    (
+                        kind,
+                        result,
+                        self._command_metadata(effective_spec, source_sha256),
+                    )
+                )
                 if result.exit_code != 0:
                     return PocBuildResult(
                         ok=False,
                         commands=commands,
-                        error=f"{kind} failed with exit {result.exit_code}",
+                        error=self._command_failure(kind, result),
                         source_sha256=source_sha256,
                         source_path=source_path,
                     )
@@ -225,14 +235,14 @@ class PocBuilder:
                 (
                     "poc.build.d8",
                     d8_result,
-                    self._command_metadata(spec, source_sha256),
+                    self._command_metadata(effective_spec, source_sha256),
                 )
             )
             if d8_result.exit_code != 0:
                 return PocBuildResult(
                     ok=False,
                     commands=commands,
-                    error=f"poc.build.d8 failed with exit {d8_result.exit_code}",
+                    error=self._command_failure("poc.build.d8", d8_result),
                     source_sha256=source_sha256,
                     source_path=source_path,
                 )
@@ -255,13 +265,13 @@ class PocBuilder:
                     (
                         "poc.build.keystore",
                         keystore,
-                        self._command_metadata(spec, source_sha256),
+                        self._command_metadata(effective_spec, source_sha256),
                     )
                 )
                 return PocBuildResult(
                     ok=False,
                     commands=commands,
-                    error=f"PoC signing key generation failed with exit {keystore.exit_code}",
+                    error=self._command_failure("poc.build.keystore", keystore),
                     source_sha256=source_sha256,
                     source_path=source_path,
                 )
@@ -306,12 +316,18 @@ class PocBuilder:
                     timeout=self.settings.poc_build_timeout_seconds,
                     cancel_event=cancel_event,
                 )
-                commands.append((kind, result, self._command_metadata(spec, source_sha256)))
+                commands.append(
+                    (
+                        kind,
+                        result,
+                        self._command_metadata(effective_spec, source_sha256),
+                    )
+                )
                 if result.exit_code != 0:
                     return PocBuildResult(
                         ok=False,
                         commands=commands,
-                        error=f"{kind} failed with exit {result.exit_code}",
+                        error=self._command_failure(kind, result),
                         source_sha256=source_sha256,
                         source_path=source_path,
                     )
@@ -326,7 +342,7 @@ class PocBuilder:
             source_sha256=source_sha256,
             source_path=source_path,
             metadata={
-                **self._command_metadata(spec, source_sha256),
+                **self._command_metadata(effective_spec, source_sha256),
                 "apk_sha256": apk_sha256,
                 "apk_path": str(apk_path),
                 "source_path": str(source_path),
@@ -459,8 +475,8 @@ class PocBuilder:
         spec: AgentPocSpec,
     ) -> tuple[Path, list[Path], Path]:
         root = workspace.resolve()
-        project = (root / spec.project_path).resolve()
         poc_root = (root / "poc").resolve()
+        project = self._resolve_source_project(root, poc_root, spec)
         if (
             not project.is_relative_to(poc_root)
             or not project.is_dir()
@@ -512,6 +528,51 @@ class PocBuilder:
         return project, sources, manifest
 
     @staticmethod
+    def _resolve_source_project(
+        root: Path,
+        poc_root: Path,
+        spec: AgentPocSpec,
+    ) -> Path:
+        requested = (root / spec.project_path).resolve()
+        if (
+            requested.is_relative_to(poc_root)
+            and requested.is_dir()
+            and not requested.is_symlink()
+        ):
+            return requested
+        if not poc_root.is_dir():
+            return requested
+
+        matches: list[Path] = []
+        for manifest in sorted(poc_root.rglob("AndroidManifest.xml")):
+            project = manifest.parent
+            if (
+                project.is_symlink()
+                or not project.resolve().is_relative_to(poc_root)
+                or not (project / "src").is_dir()
+                or not any((project / "src").rglob("*.java"))
+            ):
+                continue
+            try:
+                manifest_root = ElementTree.parse(manifest).getroot()
+            except (OSError, ElementTree.ParseError):
+                continue
+            if (
+                manifest_root.tag == "manifest"
+                and manifest_root.get("package") == spec.package_name
+            ):
+                matches.append(project.resolve())
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            relative = ", ".join(str(item.relative_to(root)) for item in matches[:5])
+            raise ValueError(
+                "project_path is missing and multiple PoC projects match package "
+                f"{spec.package_name}: {relative}"
+            )
+        return requested
+
+    @staticmethod
     def _source_archive(project: Path, sources: list[Path], manifest: Path) -> bytes:
         stream = io.BytesIO()
         with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -551,6 +612,14 @@ class PocBuilder:
         if value is None:
             raise ValueError(f"required PoC build tool is unavailable: {name}")
         return str(value)
+
+    @staticmethod
+    def _command_failure(kind: str, result: CommandResult) -> str:
+        diagnostic = (result.stderr or result.stdout).strip()
+        if len(diagnostic) > 2000:
+            diagnostic = diagnostic[-2000:]
+        suffix = f": {diagnostic}" if diagnostic else ""
+        return f"{kind} failed with exit {result.exit_code}{suffix}"
 
     def _ensure_keystore(
         self,

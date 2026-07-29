@@ -96,6 +96,7 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     memo = _phase_prompt("test_planning", response_contract="analysis_memo")
 
     assert "single broad analysis pass" in planning
+    assert "open the actual target source or Smali" in planning
     assert "not a fresh audit" in continuation
     assert "changed PoC, input, or Oracle" in continuation
     assert "return requested_tests=[], and do not reopen" in critic
@@ -104,6 +105,25 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     assert "Do not assign the final platform verdict" in memo
     assert "Make an explicit evidence-weighted decision" not in memo
     assert "Unless the result is reproduced_blackbox" not in memo
+    assert "optional platform-replay action channel" in planning
+
+
+def test_requested_tests_can_be_omitted_when_no_platform_replay_is_needed() -> None:
+    result = AgentInvestigationResult.model_validate(
+        {
+            "summary": "静态证据表明普通第三方应用无法跨越签名权限边界。",
+            "result": "refuted_static",
+            "hypotheses_tested": [],
+            "test_cases": [],
+            "evidence_ids": [],
+            "severity_proposal": "info",
+            "confidence": "high",
+            "coverage_gaps": [],
+            "followups": [],
+        }
+    )
+
+    assert result.requested_tests == []
 
 
 def test_invalid_optional_requested_test_does_not_discard_static_verdict() -> None:

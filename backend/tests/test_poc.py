@@ -63,6 +63,39 @@ def test_poc_builder_accepts_only_source_projects_under_workspace(
         builder._validate_project(workspace, poc_spec())
 
 
+def test_poc_builder_recovers_a_unique_project_path_by_package(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = write_poc_project(workspace)
+    builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
+    stale_spec = poc_spec().model_copy(
+        update={"project_path": "poc/model_wrote_the_wrong_directory"}
+    )
+
+    validated, sources, manifest = builder._validate_project(workspace, stale_spec)
+
+    assert validated == project
+    assert manifest == project / "AndroidManifest.xml"
+    assert [item.name for item in sources] == ["MainActivity.java"]
+
+
+def test_poc_build_failure_includes_tool_diagnostic() -> None:
+    result = CommandResult(
+        ["aapt2", "link"],
+        1,
+        "",
+        "AndroidManifest.xml:7: error: resource style/Missing not found.",
+    )
+
+    assert PocBuilder._command_failure("poc.build.aapt2", result) == (
+        "poc.build.aapt2 failed with exit 1: "
+        "AndroidManifest.xml:7: error: resource style/Missing not found."
+    )
+
+
 def test_personal_lab_ingests_an_agent_built_prebuilt_apk(
     settings,
     tmp_path,

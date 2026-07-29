@@ -409,6 +409,7 @@ def test_personal_lab_investigate_uses_workspace_analysis_then_validates_result(
             "not_reproduced",
         ]
         assert payload["output_schema"]["properties"]["requested_tests"]["maxItems"] == 1_000
+        assert "requested_tests" not in payload["output_schema"]["required"]
         requested_test_schema = payload["output_schema"]["properties"][
             "requested_tests"
         ]["items"]
