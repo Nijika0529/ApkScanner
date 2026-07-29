@@ -18,5 +18,16 @@ opencode-worker/node_modules/
 .vscode
 start.sh
 opencode-worker/bin/
-testapk/
+testapk/*
+!testapk/README.md
+!testapk/build-vulntest.sh
+!testapk/vulntest.apk
+!testapk/vulntest-ground-truth.json
+!testapk/vulntest-test-signing.jks
+!testapk/vulntest-src/
+!testapk/vulntest-src/**
+testapk/vulntest-src/build/
+testapk/vulntest-src/dist/
+testapk/vulntest-unsigned.apk
+testapk/vulntest-aligned.apk
 codex-security/

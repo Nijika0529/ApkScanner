@@ -22,9 +22,6 @@ const PROFILE_STRUCTURED_FINALIZER = "structured_finalizer"
 const STRUCTURED_RETRY_COUNT = 2
 const WORKSPACE_TOOL_PROFILE = "workspace_shell"
 const WORKSPACE_TOOLS = ["read", "glob", "grep", "bash"]
-const DEFAULT_MAX_AGENT_STEPS = 1_000
-const MAX_CONFIGURED_AGENT_STEPS = 1_000
-const PROVIDER_REQUEST_HEADROOM = 100
 const MAX_EXPLORER_MEMO_BYTES = 128 * 1024
 const LOCAL_POLL_INTERVAL_MS = 250
 const LOCAL_READ_RETRY_COUNT = 3
@@ -47,8 +44,6 @@ let providerProxyURL
 let providerWireAudit = []
 let providerAPIKey
 let loopbackProxyAPIKey
-let providerRequestCount = 0
-let providerRequestLimit = DEFAULT_MAX_AGENT_STEPS + PROVIDER_REQUEST_HEADROOM
 
 async function main() {
   if (PROVIDER_API_KEY_IN_ENVIRONMENT) {
@@ -59,9 +54,11 @@ async function main() {
   const rawPayload = await readPayload()
   providerAPIKey = takeProviderAPIKey(rawPayload)
   const payload = validatePayload(rawPayload)
-  providerRequestLimit = payload.max_agent_steps + PROVIDER_REQUEST_HEADROOM
   loopbackProxyAPIKey = randomBytes(32).toString("hex")
-  workerDeadline = Date.now() + payload.timeout_ms
+  workerDeadline =
+    payload.timeout_ms === null
+      ? Number.POSITIVE_INFINITY
+      : Date.now() + payload.timeout_ms
   const username = "apkscanner"
   const password = randomBytes(32).toString("hex")
   process.env.OPENCODE_SERVER_USERNAME = username
@@ -74,7 +71,7 @@ async function main() {
       server = await createOpencodeServer({
         hostname: "127.0.0.1",
         port: await reservePort(),
-        timeout: Math.min(payload.timeout_ms, 15_000),
+        timeout: 15_000,
         config: buildConfig(payload),
       })
     } catch (error) {
@@ -123,8 +120,8 @@ async function capability(client, payload) {
     output_mode: executionProfile(payload).output_mode,
     tool_profile: WORKSPACE_TOOL_PROFILE,
     workspace_tools: WORKSPACE_TOOLS,
-    max_steps: payload.max_agent_steps,
-    max_provider_requests: payload.max_agent_steps + PROVIDER_REQUEST_HEADROOM,
+    max_steps: null,
+    max_provider_requests: null,
     ...(liveProbe ? { live_probe: liveProbe } : {}),
   }
 }
@@ -251,24 +248,6 @@ async function runTextStage(client, payload, { stage, promptText, title }) {
   let text = ""
   let terminalized = false
   let stageSessionID
-  const stageStartedAt = Date.now()
-  const remaining = Math.max(0, workerDeadline - stageStartedAt)
-  const finalizerReserve = Math.min(
-    120_000,
-    Math.max(15_000, Math.floor(remaining * 0.3)),
-  )
-  const memoReserve = Math.min(
-    30_000,
-    Math.max(5_000, Math.floor(remaining * 0.1)),
-  )
-  const analysisDeadline = Math.min(
-    workerDeadline,
-    Math.max(stageStartedAt + 1_000, workerDeadline - finalizerReserve - memoReserve),
-  )
-  const memoDeadline = Math.min(
-    workerDeadline,
-    Math.max(stageStartedAt + 1_000, workerDeadline - finalizerReserve),
-  )
   await withSession(client, title, async (createdSessionID) => {
     stageSessionID = createdSessionID
     emitRuntimeEvent("model.turn.started", "DeepSeek 分析阶段开始", {
@@ -286,10 +265,6 @@ async function runTextStage(client, payload, { stage, promptText, title }) {
       undefined,
       stage.name === "explorer" ? "apkscanner-explorer" : "apkscanner-analyzer",
       stage,
-      {
-        deadline: analysisDeadline,
-        returnPartialAtDeadline: true,
-      },
     )
     responses.push(response)
     text = responseText(response.parts ?? [])
@@ -318,32 +293,11 @@ async function runTextStage(client, payload, { stage, promptText, title }) {
           workspace_tools: false,
           wire_tool_choice: "omitted",
         },
-        {
-          deadline: memoDeadline,
-          returnPartialAtDeadline: true,
-        },
       )
       responses.push(terminalResponse)
       response = terminalResponse
       text = responseText(response.parts ?? [])
       terminalized = true
-    }
-    if (!response.info?.error && !text) {
-      text = [
-        "分析工具阶段在预算边界结束，未生成独立文本备忘录。",
-        "请由最终结构化阶段仅依据原始任务上下文、平台证据和已记录的工具事件作出保守结论；",
-        "不要把未完成的工具调用或模型猜测当作漏洞证据。",
-      ].join("")
-      terminalized = true
-      emitRuntimeEvent(
-        "model.memo.synthesized",
-        "分析阶段未能及时收尾，已生成受限备忘录并保留结构化结论预算",
-        {
-          stage: stage.name,
-          analysis_deadline_ms: analysisDeadline,
-          memo_deadline_ms: memoDeadline,
-        },
-      )
     }
   })
   emitRuntimeEvent("model.response.received", "DeepSeek 分析阶段已返回证据备忘录", {
@@ -614,10 +568,6 @@ async function promptAsyncAndWait(
   format,
   agent,
   stage,
-  {
-    deadline = workerDeadline,
-    returnPartialAtDeadline = false,
-  } = {},
 ) {
   const before = unwrap(
     await localRead(
@@ -657,9 +607,7 @@ async function promptAsyncAndWait(
 
   let toolLoopWaitReported = false
   let idleToolCallSince
-  let latestObserved
-  let assistantMessagesObserved = []
-  while (Date.now() < deadline) {
+  while (Date.now() < workerDeadline) {
     const messages = unwrap(
       await localRead(
         () => rawSessionMessages(sessionID),
@@ -692,8 +640,6 @@ async function promptAsyncAndWait(
         message.info.time?.completed ||
         message.info.finish,
     )
-    latestObserved = latestCompleted ?? latestObserved
-    assistantMessagesObserved = assistantMessages
     const statuses = unwrap(
       await localRead(
         () => client.session.status(),
@@ -737,46 +683,9 @@ async function promptAsyncAndWait(
         },
       )
     }
-    const remaining = deadline - Date.now()
+    const remaining = workerDeadline - Date.now()
     if (remaining <= 0) break
     await delay(Math.min(LOCAL_POLL_INTERVAL_MS, remaining))
-  }
-  if (returnPartialAtDeadline) {
-    emitRuntimeEvent(
-      "model.stage.deadline_reached",
-      "分析阶段达到内部截止时间，正在中止工具循环并保留后续收尾预算",
-      {
-        session_id: sessionID,
-        stage: stage.name,
-        latest_message_id: latestObserved?.info?.id ?? null,
-        latest_finish: latestObserved?.info?.finish ?? null,
-      },
-    )
-    await settleWithin(
-      client.session.abort({ path: { id: sessionID } }),
-      2_000,
-    )
-    if (latestObserved) {
-      return {
-        ...latestObserved,
-        apkscanner_turn_messages: assistantMessagesObserved,
-        apkscanner_stage_deadline_reached: true,
-      }
-    }
-    return {
-      info: {
-        id: randomBytes(16).toString("hex"),
-        role: "assistant",
-        finish: "stage-deadline",
-        time: {
-          created: Date.now(),
-          completed: Date.now(),
-        },
-      },
-      parts: [],
-      apkscanner_turn_messages: assistantMessagesObserved,
-      apkscanner_stage_deadline_reached: true,
-    }
   }
   throw new Error("OpenCode async prompt exceeded the worker deadline")
 }
@@ -1078,7 +987,7 @@ function outputTransport({ profile, calls, explorerSessionID, explorerMemo }) {
     provider_wire_requests: providerWireAudit.map((item) => ({ ...item })),
     schema_validator: "ajv@8.20.0",
     semantic_validator: "apkscanner@1.0",
-    max_provider_requests: providerRequestLimit,
+    max_provider_requests: null,
     structured_retry_count: STRUCTURED_RETRY_COUNT,
     model_calls: calls,
   }
@@ -1148,7 +1057,6 @@ function buildConfig(payload) {
         mode: "primary",
         model,
         prompt: payload.explorer_instructions ?? payload.developer_instructions,
-        steps: payload.max_agent_steps,
         options: thinkingOptions("disabled", null),
         permission: workspacePermission,
       },
@@ -1156,7 +1064,6 @@ function buildConfig(payload) {
         mode: "primary",
         model,
         prompt: payload.explorer_instructions ?? payload.developer_instructions,
-        steps: payload.max_agent_steps,
         options: thinkingOptions(
           "enabled",
           explorerStage(payload)?.reasoning_effort ?? "high",
@@ -1170,7 +1077,6 @@ function buildConfig(payload) {
           "用简体中文将已完成的调查总结为简洁的纯文本证据备忘录。保留 Evidence ID、" +
           "包名、类名、代码符号、路径、命令和 URI 原文。" +
           "Do not call tools and do not emit JSON or tool-call markup.",
-        steps: 20,
         options: thinkingOptions("disabled", null),
         permission: {
           "*": "deny",
@@ -1180,7 +1086,6 @@ function buildConfig(payload) {
         mode: "primary",
         model,
         prompt: payload.developer_instructions,
-        steps: 20,
         options: thinkingOptions("disabled", null),
         permission: finalizerPermission,
       },
@@ -1253,22 +1158,14 @@ function validatePayload(value) {
     throw new Error("invalid DeepSeek model ID")
   }
   if (
-    !Number.isInteger(value.timeout_ms) ||
-    value.timeout_ms < 1_000 ||
-    value.timeout_ms > 86_400_000
+    value.timeout_ms !== null &&
+    (!Number.isInteger(value.timeout_ms) ||
+      value.timeout_ms < 1_000 ||
+      value.timeout_ms > 86_400_000)
   ) {
     throw new Error("invalid OpenCode worker timeout")
   }
-  if (value.max_agent_steps === undefined || value.max_agent_steps === null) {
-    value.max_agent_steps = DEFAULT_MAX_AGENT_STEPS
-  }
-  if (
-    !Number.isInteger(value.max_agent_steps) ||
-    value.max_agent_steps < 50 ||
-    value.max_agent_steps > MAX_CONFIGURED_AGENT_STEPS
-  ) {
-    throw new Error("invalid OpenCode max agent steps")
-  }
+  value.max_agent_steps = null
   if (value.base_url !== null && value.base_url !== undefined) {
     validateBaseURL(value.base_url)
   }
@@ -1993,11 +1890,6 @@ async function startProviderCompatibilityProxy(payload) {
         sendProviderProxyError(response, 401, "invalid_proxy_authentication")
         return
       }
-      providerRequestCount += 1
-      if (providerRequestCount > providerRequestLimit) {
-        sendProviderProxyError(response, 429, "provider_request_limit_exceeded")
-        return
-      }
       const bodyBuffer = await readIncomingBody(request)
       let forwardedBody = bodyBuffer
       if (bodyBuffer.length > 0 && request.url?.includes("/chat/completions")) {
@@ -2045,6 +1937,9 @@ async function startProviderCompatibilityProxy(payload) {
       }
       headers.authorization = `Bearer ${providerAPIKey}`
       const remaining = Math.max(1, workerDeadline - Date.now())
+      const upstreamSignal = Number.isFinite(remaining)
+        ? AbortSignal.timeout(remaining)
+        : undefined
       const upstream = await fetch(target, {
         method: request.method,
         headers,
@@ -2052,7 +1947,7 @@ async function startProviderCompatibilityProxy(payload) {
           request.method === "GET" || request.method === "HEAD"
             ? undefined
             : forwardedBody,
-        signal: AbortSignal.timeout(remaining),
+        signal: upstreamSignal,
       })
       if (audit) audit.status_code = upstream.status
       response.statusCode = upstream.status

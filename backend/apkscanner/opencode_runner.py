@@ -8,7 +8,6 @@ import signal
 import subprocess
 import tempfile
 import threading
-import time
 import uuid
 from collections.abc import Callable
 from contextlib import suppress
@@ -37,10 +36,6 @@ OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL = "structured_output_tool"
 OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE = "analyze_then_finalize"
 OPENCODE_TOOL_PROFILE = "workspace_shell"
 OPENCODE_WORKSPACE_TOOLS = ("read", "glob", "grep", "bash")
-OPENCODE_DEFAULT_MAX_STEPS = 1_000
-OPENCODE_MAX_STEPS = OPENCODE_DEFAULT_MAX_STEPS
-OPENCODE_MAX_PROVIDER_REQUESTS = OPENCODE_MAX_STEPS + 100
-OPENCODE_EFFECTIVE_ANALYSIS_STEPS = 160
 OPENCODE_PROFILE_STABLE_ANALYZER = "stable_analyzer"
 OPENCODE_PROFILE_STRUCTURED_FINALIZER = "structured_finalizer"
 OPENCODE_PROVIDER_KEY_FIELD = "_provider_api_key"
@@ -157,10 +152,6 @@ def opencode_execution_profile(
     )
 
 
-def opencode_agent_step_limit(configured: int) -> int:
-    return max(50, min(configured, OPENCODE_EFFECTIVE_ANALYSIS_STEPS))
-
-
 def opencode_output_mode(
     model: str | None = None,
     *,
@@ -244,8 +235,8 @@ class OpenCodeInvestigator:
             "thinking_explorer_retired": True,
             "tool_profile": OPENCODE_TOOL_PROFILE,
             "workspace_tools": list(OPENCODE_WORKSPACE_TOOLS),
-            "max_steps": self.settings.opencode_agent_steps,
-            "max_provider_requests": self.settings.opencode_agent_steps + 100,
+            "max_steps": None,
+            "max_provider_requests": None,
         }
         detail = self._configuration_error()
         if detail:
@@ -296,14 +287,9 @@ class OpenCodeInvestigator:
                     str(item)
                     for item in probe.get("workspace_tools", OPENCODE_WORKSPACE_TOOLS)
                 ]
-                capability["max_steps"] = int(
-                    probe.get("max_steps", OPENCODE_MAX_STEPS)
-                )
-                capability["max_provider_requests"] = int(
-                    probe.get(
-                        "max_provider_requests",
-                        OPENCODE_MAX_PROVIDER_REQUESTS,
-                    )
+                capability["max_steps"] = probe.get("max_steps")
+                capability["max_provider_requests"] = probe.get(
+                    "max_provider_requests"
                 )
                 if (
                     capability.get("available")
@@ -338,11 +324,9 @@ class OpenCodeInvestigator:
         capability = self.capability(deep=False)
         if not capability.get("available"):
             raise RuntimeError(str(capability.get("detail")))
-        timeout = (
-            self.settings.task_timeout_seconds
-            if timeout_seconds is None
-            else timeout_seconds
-        )
+        # OpenCode analysis is deliberately not assigned a wall-clock deadline.
+        # The caller can still stop it through cancel_event or scanner shutdown.
+        timeout = None
         context = platform_context or {}
         phase = str(context.get("phase") or "static_only")
         execution_profile = opencode_execution_profile(
@@ -408,9 +392,7 @@ class OpenCodeInvestigator:
             "output_schema": AGENT_RESULT_JSON_SCHEMA,
             "tool_profile": OPENCODE_TOOL_PROFILE,
             "execution_profile": execution_profile.as_payload(),
-            "max_agent_steps": opencode_agent_step_limit(
-                self.settings.opencode_agent_steps
-            ),
+            "max_agent_steps": None,
             "permission_profile": self.settings.agent_permission_profile,
             "allow_adb": (
                 self.settings.agent_permission_profile == "personal_lab"
@@ -426,7 +408,7 @@ class OpenCodeInvestigator:
                 }
                 for name in shared_names
             ],
-            "timeout_ms": max(1, timeout) * 1000,
+            "timeout_ms": None,
             "allowed_hypothesis_ids": sorted(
                 str(item["id"])
                 for item in context.get("security_hypotheses", [])
@@ -514,31 +496,29 @@ class OpenCodeInvestigator:
         self,
         payload: dict[str, Any],
         *,
-        timeout_seconds: int,
+        timeout_seconds: int | None,
         workspace: Path,
         event_callback: AgentEventCallback | None,
         cancel_event: threading.Event | None,
     ) -> dict[str, Any]:
-        deadline = time.monotonic() + max(timeout_seconds, 0)
         transport_attempt = 1
-        attempt_timeout = max(timeout_seconds, 0)
         retry_history: list[dict[str, Any]] = []
         while True:
             attempt_payload = {
                 **payload,
-                "timeout_ms": max(1, attempt_timeout) * 1000,
+                "timeout_ms": None,
             }
             try:
                 if event_callback is None and cancel_event is None:
                     response = self._invoke(
                         attempt_payload,
-                        timeout_seconds=attempt_timeout + 15,
+                        timeout_seconds=None,
                         workspace=workspace,
                     )
                 else:
                     response = self._invoke(
                         attempt_payload,
-                        timeout_seconds=attempt_timeout + 15,
+                        timeout_seconds=None,
                         workspace=workspace,
                         event_callback=event_callback,
                         cancel_event=cancel_event,
@@ -546,10 +526,8 @@ class OpenCodeInvestigator:
             except (AgentCancelledError, TimeoutError):
                 raise
             except RuntimeError as exc:
-                remaining = int(deadline - time.monotonic())
                 if (
                     transport_attempt >= 2
-                    or remaining <= 0
                     or not self._retryable_transport_failure(exc)
                 ):
                     raise
@@ -561,7 +539,6 @@ class OpenCodeInvestigator:
                     }
                 )
                 transport_attempt += 1
-                attempt_timeout = remaining
                 with suppress(Exception):
                     emit_agent_event(
                         event_callback,
@@ -569,17 +546,15 @@ class OpenCodeInvestigator:
                         "OpenCode 本地 Server 连接中断，正在用剩余任务预算重建会话",
                         {
                             "attempt": transport_attempt,
-                            "remaining_seconds": remaining,
+                            "remaining_seconds": None,
                             "error": str(exc)[:1000],
                         },
                     )
                 continue
 
-            remaining = int(deadline - time.monotonic())
             if (
                 response.get("error")
                 and transport_attempt < 2
-                and remaining > 0
                 and self._retryable_worker_response(response)
             ):
                 retry_history.append(
@@ -594,7 +569,6 @@ class OpenCodeInvestigator:
                     }
                 )
                 transport_attempt += 1
-                attempt_timeout = remaining
                 with suppress(Exception):
                     emit_agent_event(
                         event_callback,
@@ -602,7 +576,7 @@ class OpenCodeInvestigator:
                         "DeepSeek 可重试调用失败，正在用剩余任务预算重建会话",
                         {
                             "attempt": transport_attempt,
-                            "remaining_seconds": remaining,
+                            "remaining_seconds": None,
                             "error": response.get("error"),
                         },
                     )
@@ -854,7 +828,7 @@ class OpenCodeInvestigator:
         self,
         payload: dict[str, Any],
         *,
-        timeout_seconds: int,
+        timeout_seconds: int | None,
         workspace: Path | None = None,
         event_callback: AgentEventCallback | None = None,
         cancel_event: threading.Event | None = None,
@@ -896,7 +870,7 @@ class OpenCodeInvestigator:
         self,
         payload: dict[str, Any],
         *,
-        timeout_seconds: int,
+        timeout_seconds: int | None,
         workspace: Path | None,
         event_callback: AgentEventCallback | None,
         cancel_event: threading.Event | None,
@@ -946,7 +920,7 @@ class OpenCodeInvestigator:
                     ) from exc
                 except WorkerTimeoutError as exc:
                     raise TimeoutError(
-                        f"OpenCode investigation exceeded {timeout_seconds} seconds"
+                        "OpenCode investigation exceeded its worker deadline"
                     ) from exc
                 except RuntimeError as exc:
                     raise RuntimeError(f"OpenCode worker failed: {exc}") from exc
@@ -1003,7 +977,7 @@ class OpenCodeInvestigator:
         self,
         payload: dict[str, Any],
         *,
-        timeout_seconds: int,
+        timeout_seconds: int | None,
         workspace: Path | None,
         event_callback: AgentEventCallback | None,
         cancel_event: threading.Event | None,
@@ -1130,7 +1104,7 @@ class OpenCodeInvestigator:
                 ) from exc
             except WorkerTimeoutError as exc:
                 raise TimeoutError(
-                    f"containerized OpenCode investigation exceeded {timeout_seconds} seconds"
+                    "containerized OpenCode investigation exceeded its worker deadline"
                 ) from exc
             except RuntimeError as exc:
                 raise RuntimeError(f"containerized OpenCode worker failed: {exc}") from exc

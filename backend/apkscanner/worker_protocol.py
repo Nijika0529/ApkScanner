@@ -26,7 +26,7 @@ def consume_worker_process(
     process: subprocess.Popen[str],
     *,
     payload: dict[str, Any],
-    timeout_seconds: int,
+    timeout_seconds: int | None,
     event_callback: AgentEventCallback | None = None,
     on_timeout: Callable[[], None] | None = None,
     cancel_event: threading.Event | None = None,
@@ -42,7 +42,11 @@ def consume_worker_process(
     stderr_chunks: list[str] = []
     writer_errors: list[BaseException] = []
     reader_errors: list[tuple[str, BaseException]] = []
-    deadline = time.monotonic() + timeout_seconds
+    deadline = (
+        None
+        if timeout_seconds is None
+        else time.monotonic() + max(timeout_seconds, 0)
+    )
     owns_process_group = False
     if os.name == "posix":
         with suppress(OSError):
@@ -125,12 +129,16 @@ def consume_worker_process(
             if cancel_event is not None and cancel_event.is_set():
                 terminate_process(on_cancel)
                 raise WorkerCancelledError("worker was cancelled by the user")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            remaining = (
+                None if deadline is None else deadline - time.monotonic()
+            )
+            if remaining is not None and remaining <= 0:
                 terminate_process(on_timeout)
                 raise WorkerTimeoutError(f"worker exceeded {timeout_seconds} seconds")
             try:
-                kind, raw = messages.get(timeout=min(0.25, remaining))
+                kind, raw = messages.get(
+                    timeout=0.25 if remaining is None else min(0.25, remaining)
+                )
             except queue.Empty:
                 continue
             if kind == "stdin_error":
@@ -171,23 +179,29 @@ def consume_worker_process(
             if cancel_event is not None and cancel_event.is_set():
                 terminate_process(on_cancel)
                 raise WorkerCancelledError("worker was cancelled by the user")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            remaining = (
+                None if deadline is None else deadline - time.monotonic()
+            )
+            if remaining is not None and remaining <= 0:
                 terminate_process(on_timeout)
                 raise WorkerTimeoutError(f"worker exceeded {timeout_seconds} seconds")
-            time.sleep(min(0.05, remaining))
+            time.sleep(0.05 if remaining is None else min(0.05, remaining))
 
         io_threads = (stdin_thread, stdout_thread, stderr_thread)
         while any(thread.is_alive() for thread in io_threads):
             if cancel_event is not None and cancel_event.is_set():
                 terminate_process(on_cancel)
                 raise WorkerCancelledError("worker was cancelled by the user")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            remaining = (
+                None if deadline is None else deadline - time.monotonic()
+            )
+            if remaining is not None and remaining <= 0:
                 terminate_process(on_timeout)
                 raise WorkerTimeoutError(f"worker exceeded {timeout_seconds} seconds")
             for thread in io_threads:
-                thread.join(timeout=min(0.02, remaining))
+                thread.join(
+                    timeout=0.02 if remaining is None else min(0.02, remaining)
+                )
         if writer_errors:
             raise RuntimeError("worker request write failed") from writer_errors[0]
         if reader_errors:

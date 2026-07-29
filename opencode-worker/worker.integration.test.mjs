@@ -126,6 +126,7 @@ test("stable analyzer uses non-thinking tools, then an isolated finalizer", asyn
         baseURL: `http://127.0.0.1:${address.port}`,
         profile: stableProfile(),
         explorerPrompt: "Read evidence.txt and produce an evidence memo.",
+        timeoutMs: null,
       }),
     )
     assert.equal(completed.code, 0, completed.stderr)
@@ -247,81 +248,6 @@ test("empty tool-loop completion is terminalized into a non-empty memo", async (
     assert.match(JSON.stringify(requests[2].body.messages), /MEMO_TERMINALIZATION/)
     assert.ok(
       events.some((item) => item.event_type === "model.memo.terminalizing"),
-    )
-  } finally {
-    api.close()
-    await rm(root, { recursive: true, force: true })
-  }
-})
-
-test("analysis tool loop deadline preserves the structured finalizer", async () => {
-  const requests = []
-  const api = createServer(async (request, response) => {
-    const body = await readJSON(request)
-    requests.push({ url: request.url, body })
-    if (toolNames(body).includes("StructuredOutput")) {
-      sendCompletion(response, body, {
-        id: "deadline-finalizer",
-        toolCalls: [structuredOutputCall(expected)],
-        finish: "tool_calls",
-      })
-      return
-    }
-    if (requests.length === 1) {
-      sendCompletion(response, body, {
-        id: "deadline-tool",
-        toolCalls: [
-          {
-            index: 0,
-            id: "call-deadline-bash",
-            type: "function",
-            function: {
-              name: "bash",
-              arguments: JSON.stringify({
-                command: "true",
-                description: "Continue an intentionally long analysis loop",
-              }),
-            },
-          },
-        ],
-        finish: "tool_calls",
-      })
-      return
-    }
-    if (requests.length === 2) {
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 3_000))
-      if (!response.destroyed) {
-        sendCompletion(response, body, {
-          id: "deadline-late-analysis",
-          content: "This response arrived after the analysis-stage deadline.",
-        })
-      }
-      return
-    }
-    sendCompletion(response, body, {
-      id: "deadline-memo",
-      content: "The tool loop was stopped at its internal deadline.",
-    })
-  })
-  await listen(api)
-  const address = api.address()
-  assert(address && typeof address !== "string")
-  const root = await mkdtemp(join(tmpdir(), "apkscanner-stage-deadline-test-"))
-  try {
-    const completed = await runWorker(
-      root,
-      investigationPayload({
-        baseURL: `http://127.0.0.1:${address.port}`,
-        profile: stableProfile(),
-        timeoutMs: 8_000,
-      }),
-    )
-    assert.equal(completed.code, 0, completed.stderr)
-    const { result, events } = parseWorkerOutput(completed.stdout)
-    assert.deepEqual(result.result, expected, completed.stdout)
-    assert.doesNotMatch(completed.stderr, /async prompt exceeded/)
-    assert.ok(
-      events.some((item) => item.event_type === "model.stage.deadline_reached"),
     )
   } finally {
     api.close()
@@ -681,8 +607,8 @@ test("deep capability performs a real non-thinking provider probe", async () => 
     const { result } = parseWorkerOutput(completed.stdout)
     assert.equal(result.live_probe.ok, true)
     assert.equal(result.live_probe.thinking_mode, "disabled")
-    assert.equal(result.max_steps, 1000)
-    assert.equal(result.max_provider_requests, 1100)
+    assert.equal(result.max_steps, null)
+    assert.equal(result.max_provider_requests, null)
     assert.equal(requests.length, 1)
     assert.equal(requests[0].body.thinking.type, "disabled")
     assert.equal(requests[0].body.tool_choice, "required")

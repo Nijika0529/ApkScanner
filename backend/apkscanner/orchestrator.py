@@ -45,7 +45,6 @@ from .opencode_runner import (
     OPENCODE_TOOL_PROFILE,
     OPENCODE_WORKSPACE_TOOLS,
     OpenCodeInvestigator,
-    opencode_agent_step_limit,
     opencode_execution_profile,
 )
 from .planner import InvestigationPlanner
@@ -58,15 +57,12 @@ from .security_pipeline import HypothesisLedger
 from .static_analysis import ApkInspector
 from .tools import CommandResult, TimeBudget, ToolRunner
 
-AGENT_PLANNING_TIMEOUT_CAP_SECONDS = 600
-AGENT_FINAL_TIMEOUT_CAP_SECONDS = 180
-AGENT_FINAL_RESERVE_SECONDS = 60
 AGENT_MIN_OPTIONAL_PHASE_SECONDS = 30
 
 
 def _critic_timeout_seconds(remaining_task_seconds: int) -> int:
-    """Give Critic all remaining task time except the final-decision reserve."""
-    return max(0, remaining_task_seconds - AGENT_FINAL_RESERVE_SECONDS)
+    """Do not impose a Critic-specific timeout below the task lifecycle."""
+    return max(0, remaining_task_seconds)
 
 
 class ScanOrchestrator:
@@ -1422,10 +1418,9 @@ class ScanOrchestrator:
                     "agent_round_history": deepcopy(agent_round_history),
                     "further_test_rounds_available": (
                         phase != "final_evaluation"
-                        and round_index < self.settings.agent_max_rounds
                     ),
                     "exploration_limits": {
-                        "max_rounds": self.settings.agent_max_rounds,
+                        "max_rounds": None,
                         "tests_per_round": self.settings.agent_tests_per_round,
                     },
                     "continuation": continuation_context or None,
@@ -1721,7 +1716,6 @@ class ScanOrchestrator:
         if not device_ready:
             agent_result, agent_error = invoke_agent(
                 phase="static_only",
-                timeout_cap=AGENT_PLANNING_TIMEOUT_CAP_SECONDS,
             )
         else:
             device_session = self._task_device_session(
@@ -1777,18 +1771,8 @@ class ScanOrchestrator:
                                 scan_id, task_id, probe.commands, evidence_summaries
                             )
 
-                    planning_reserve = min(
-                        AGENT_MIN_OPTIONAL_PHASE_SECONDS
-                        + AGENT_FINAL_RESERVE_SECONDS,
-                        max(0, budget.remaining() // 3),
-                    )
-                    phase_one_cap = min(
-                        AGENT_PLANNING_TIMEOUT_CAP_SECONDS,
-                        max(1, budget.remaining() - planning_reserve),
-                    )
                     agent_result, agent_error = invoke_agent(
                         phase="test_planning",
-                        timeout_cap=phase_one_cap,
                         round_index=0,
                     )
                     critic_budget = _critic_timeout_seconds(
@@ -1880,7 +1864,6 @@ class ScanOrchestrator:
                         agent_result
                         and self._has_requested_test_work(agent_result.result)
                         and prepared
-                        and completed_rounds < self.settings.agent_max_rounds
                         and not budget.expired
                     ):
                         planning_result = agent_result
@@ -2028,18 +2011,9 @@ class ScanOrchestrator:
                                 },
                             )
                             break
-                        if (
-                            budget.expired
-                            or completed_rounds >= self.settings.agent_max_rounds
-                        ):
+                        if budget.expired:
                             break
-                        exploration_budget = min(
-                            AGENT_PLANNING_TIMEOUT_CAP_SECONDS,
-                            max(
-                                0,
-                                budget.remaining() - AGENT_FINAL_RESERVE_SECONDS,
-                            ),
-                        )
+                        exploration_budget = budget.remaining()
                         if exploration_budget < AGENT_MIN_OPTIONAL_PHASE_SECONDS:
                             coverage_gaps.append(
                                 "Adaptive AI exploration was skipped to preserve the "
@@ -2061,10 +2035,7 @@ class ScanOrchestrator:
                         agent_result = next_result
                         agent_error = None
 
-                    final_budget = min(
-                        AGENT_FINAL_TIMEOUT_CAP_SECONDS,
-                        budget.remaining(),
-                    )
+                    final_budget = budget.remaining()
                     if (
                         (executed_agent_tests or debate_context)
                         and final_budget >= AGENT_MIN_OPTIONAL_PHASE_SECONDS
@@ -2101,7 +2072,6 @@ class ScanOrchestrator:
                     if agent_result is None:
                         agent_result, agent_error = invoke_agent(
                             phase="recovery_evaluation",
-                            timeout_cap=AGENT_FINAL_TIMEOUT_CAP_SECONDS,
                         )
                 finally:
                     if device_session is not None and target_installed:
@@ -3259,16 +3229,8 @@ class ScanOrchestrator:
                     if execution_profile is not None
                     else None
                 ),
-                "max_agent_steps": (
-                    opencode_agent_step_limit(self.settings.opencode_agent_steps)
-                    if backend == "opencode"
-                    else None
-                ),
-                "max_provider_requests": (
-                    opencode_agent_step_limit(self.settings.opencode_agent_steps) + 100
-                    if backend == "opencode"
-                    else None
-                ),
+                "max_agent_steps": None,
+                "max_provider_requests": None,
                 "structured_output_retries": (
                     2
                     if backend == "opencode"

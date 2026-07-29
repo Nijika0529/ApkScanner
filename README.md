@@ -281,7 +281,7 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_OPENCODE_MODEL` | `deepseek-v4-flash` | DeepSeek model ID; text-only V4 Pro is rejected |
 | `APKSCANNER_OPENCODE_THINKING_EXPLORER` | `false` | Experimental legacy thinking/tool-loop profile |
 | `APKSCANNER_OPENCODE_REASONING_EFFORT` | `high` | Experimental explorer effort: `high` or `max` |
-| `APKSCANNER_OPENCODE_AGENT_STEPS` | 1000 | Experimental explorer step budget (50–1000) |
+| `APKSCANNER_OPENCODE_AGENT_STEPS` | ignored | Retained for compatibility; Agent model/tool steps are not capped |
 | `APKSCANNER_OPENCODE_ISOLATION` | `docker` | `docker` or explicit `host` fallback |
 | `APKSCANNER_OPENCODE_DOCKER_IMAGE` | `apk-scanner-opencode-worker:0.1.0` | Worker image |
 | `APKSCANNER_OPENCODE_NODE_BIN` | `node` on PATH | Host-mode Node.js override |
@@ -295,10 +295,10 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_DEVICE_INSTALL_POLICY` | `install_or_reuse` | `replace`, `install_or_reuse`, or `reuse_installed` target policy |
 | `APKSCANNER_DEVICE_RESET_POLICY` | `per_round` | `per_test`, `per_round`, or `never`; each requested test may override it |
 | `APKSCANNER_MAX_UPLOAD_BYTES` | 512 MiB | Intake limit |
-| `APKSCANNER_TASK_TIMEOUT` | 1200 s | Per-investigation budget |
+| `APKSCANNER_TASK_TIMEOUT` | 1200 s | Deterministic/platform device workflow budget; does not cap an OpenCode Agent run |
 | `APKSCANNER_TASK_MAX_ATTEMPTS` | 2 | Retry budget |
 | `APKSCANNER_AGENT_CONCURRENCY` | 3 | Global entry-investigation worker limit (1–8); ADB remains single-concurrency |
-| `APKSCANNER_AGENT_MAX_ROUNDS` | 3 | Maximum adaptive AI/device rounds per task (1–5) |
+| `APKSCANNER_AGENT_MAX_ROUNDS` | ignored | Retained for compatibility; adaptive Agent rounds are not count-capped |
 | `APKSCANNER_AGENT_TESTS_PER_ROUND` | 8 | Maximum accepted AI-requested tests per round (1–1000) |
 
 ## Verification

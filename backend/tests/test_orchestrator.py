@@ -34,10 +34,10 @@ from apkscanner.tools import CommandResult
 from sqlalchemy import select
 
 
-def test_critic_uses_all_remaining_task_time_except_final_reserve() -> None:
-    assert _critic_timeout_seconds(3_000) == 2_940
-    assert _critic_timeout_seconds(181) == 121
-    assert _critic_timeout_seconds(60) == 0
+def test_critic_has_no_phase_specific_timeout_cap() -> None:
+    assert _critic_timeout_seconds(3_000) == 3_000
+    assert _critic_timeout_seconds(181) == 181
+    assert _critic_timeout_seconds(60) == 60
 
 
 def test_blocked_direct_entry_does_not_turn_a_finding_into_false_positive() -> None:

@@ -43,7 +43,7 @@ print(json.dumps({
     result, stderr = consume_worker_process(
         process,
         payload={"schema_version": "1.0"},
-        timeout_seconds=5,
+        timeout_seconds=None,
         event_callback=events.append,
     )
     assert stderr == ""

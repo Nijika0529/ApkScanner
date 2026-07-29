@@ -1034,8 +1034,8 @@ def test_opencode_audit_records_explicit_phase_execution_profile(settings) -> No
         )
         assert request["runtime_options"]["schema_validator"] == "ajv@8.20.0"
         assert request["runtime_options"]["semantic_validator"] == "apkscanner@1.0"
-        assert request["runtime_options"]["max_agent_steps"] == 160
-        assert request["runtime_options"]["max_provider_requests"] == 260
+        assert request["runtime_options"]["max_agent_steps"] is None
+        assert request["runtime_options"]["max_provider_requests"] is None
         assert request["tool_boundary"]["model_tools_enabled"] is True
         assert request["tool_boundary"]["workspace_tool_profile"] == "workspace_shell"
         assert request["tool_boundary"]["workspace_tools"] == ["read", "glob", "grep", "bash"]

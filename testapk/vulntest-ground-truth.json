@@ -1,0 +1,72 @@
+{
+  "schema_version": "1.0",
+  "name": "APKScanner minimal vulnerable Android fixture",
+  "vulnerabilities": [
+    {
+      "id": "VT-001",
+      "title": "Exported MainActivity permits arbitrary internal activity redirection",
+      "harm": "An ordinary third-party app controls target_activity, reaches Class.forName, and starts the selected internal Activity without an authorization check.",
+      "severity": "high",
+      "minimum_proof": "dynamic",
+      "match": {
+        "entry_names": ["io.apkscanner.vulntest.MainActivity"],
+        "title_contains": ["redirect", "重定向", "内部 Activity"]
+      }
+    },
+    {
+      "id": "VT-002",
+      "title": "Exported MainActivity launches an attacker-supplied nested Intent",
+      "harm": "The inner_intent Parcelable extra is cast to Intent and passed directly to startActivity.",
+      "severity": "high",
+      "minimum_proof": "dynamic",
+      "match": {
+        "entry_names": ["io.apkscanner.vulntest.MainActivity"],
+        "title_contains": ["nested Intent", "嵌套 Intent"]
+      }
+    },
+    {
+      "id": "VT-003",
+      "title": "Deep link loads attacker-controlled cleartext content into a JavaScript bridge WebView",
+      "harm": "The deep-link url parameter reaches WebView.loadUrl while JavaScript and a bridge exposing getSecret are enabled.",
+      "severity": "high",
+      "minimum_proof": "dynamic",
+      "match": {
+        "entry_names": ["io.apkscanner.vulntest.DeepLinkActivity"],
+        "title_contains": ["WebView", "JavaScript", "deep link"]
+      }
+    },
+    {
+      "id": "VT-004",
+      "title": "Exported ContentProvider discloses credentials without permission",
+      "harm": "An ordinary third-party app can query the provider and receive username and password rows.",
+      "severity": "high",
+      "minimum_proof": "dynamic",
+      "match": {
+        "entry_names": ["io.apkscanner.vulntest.SecretProvider"],
+        "title_contains": ["Provider", "credential", "凭据"]
+      }
+    },
+    {
+      "id": "VT-005",
+      "title": "Exported Binder service returns sensitive data without caller validation",
+      "harm": "An ordinary third-party app can bind and transact code 1 to receive service-secret.",
+      "severity": "high",
+      "minimum_proof": "dynamic",
+      "match": {
+        "entry_names": ["io.apkscanner.vulntest.CommandService"],
+        "title_contains": ["Binder", "Service", "服务"]
+      }
+    },
+    {
+      "id": "VT-006",
+      "title": "Exported receiver delegates access to a non-exported sensitive Activity",
+      "harm": "An untrusted broadcast causes the app to start SecretActivity in its own trusted context.",
+      "severity": "medium",
+      "minimum_proof": "dynamic",
+      "match": {
+        "entry_names": ["io.apkscanner.vulntest.CommandReceiver"],
+        "title_contains": ["Receiver", "Broadcast", "广播", "委托"]
+      }
+    }
+  ]
+}

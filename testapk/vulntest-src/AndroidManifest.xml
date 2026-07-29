@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.apkscanner.vulntest"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="28" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <permission
+        android:name="io.apkscanner.vulntest.SIGNATURE_ONLY"
+        android:protectionLevel="signature" />
+
+    <application
+        android:allowBackup="false"
+        android:debuggable="false"
+        android:label="APKScanner VulnTest"
+        android:theme="@android:style/Theme.Material.Light"
+        android:usesCleartextTraffic="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".DeepLinkActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="vulntest"
+                    android:host="open" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".SecretActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".SafeActivity"
+            android:exported="true"
+            android:permission="io.apkscanner.vulntest.SIGNATURE_ONLY" />
+
+        <provider
+            android:name=".SecretProvider"
+            android:authorities="io.apkscanner.vulntest.secrets"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+
+        <service
+            android:name=".CommandService"
+            android:exported="true" />
+
+        <receiver
+            android:name=".CommandReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.apkscanner.vulntest.OPEN_SECRET" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

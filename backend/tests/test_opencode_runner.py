@@ -21,7 +21,6 @@ from apkscanner.opencode_runner import (
     OPENCODE_SDK_VERSION,
     OpenCodeInvestigationError,
     OpenCodeInvestigator,
-    opencode_agent_step_limit,
     opencode_execution_profile,
     opencode_output_mode,
     opencode_prompt_for_model,
@@ -85,8 +84,8 @@ def test_host_capability_requires_key_and_pinned_packages(
     assert available["model"] == "deepseek-v4-flash"
     assert available["output_mode"] == OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE
     assert available["execution_profile"]["name"] == OPENCODE_PROFILE_STABLE_ANALYZER
-    assert available["max_steps"] == 1_000
-    assert available["max_provider_requests"] == 1_100
+    assert available["max_steps"] is None
+    assert available["max_provider_requests"] is None
 
     package = worker / "node_modules" / "@opencode-ai" / "sdk" / "package.json"
     package.write_text(json.dumps({"version": "0.0.0"}), encoding="utf-8")
@@ -316,7 +315,6 @@ def test_structured_output_is_default_and_thinking_explorer_is_retired() -> None
         enable_workspace_analyzer=True,
     )
     assert personal_lab_planner.name == OPENCODE_PROFILE_STABLE_ANALYZER
-    assert opencode_agent_step_limit(1_000) == 160
     prompt = opencode_prompt_for_model(
         "base prompt",
         model="deepseek-v4-pro",
@@ -370,7 +368,7 @@ def test_personal_lab_investigate_uses_workspace_analysis_then_validates_result(
         }
 
     def invoke(payload, *, timeout_seconds, workspace):  # noqa: ANN001
-        assert timeout_seconds == configured.task_timeout_seconds + 15
+        assert timeout_seconds is None
         assert workspace == expected_workspace
         assert payload["action"] == "investigate"
         assert payload["model"] == "deepseek-v4-flash"
@@ -383,6 +381,7 @@ def test_personal_lab_investigate_uses_workspace_analysis_then_validates_result(
         assert payload["tool_profile"] == "workspace_shell"
         assert payload["permission_profile"] == "personal_lab"
         assert payload["allow_network"] is True
+        assert payload["timeout_ms"] is None
         assert payload["execution_profile"]["name"] == OPENCODE_PROFILE_STABLE_ANALYZER
         assert (
             payload["execution_profile"]["output_mode"]
