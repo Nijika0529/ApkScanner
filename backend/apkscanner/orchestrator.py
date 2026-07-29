@@ -51,7 +51,7 @@ from .planner import InvestigationPlanner
 from .poc import PocBuilder, PocBuildResult
 from .repository import add_event, now
 from .rules import BuiltinRuleEngine
-from .schemas import AGENT_RESULT_JSON_SCHEMA, AgentRequestedTest
+from .schemas import AGENT_RESULT_JSON_SCHEMA, AgentOracleSpec, AgentRequestedTest
 from .security_design import build_android_threat_model, finding_identity
 from .security_pipeline import HypothesisLedger
 from .static_analysis import ApkInspector
@@ -2629,6 +2629,20 @@ class ScanOrchestrator:
                         "argument": None,
                     }
                 )
+            if (
+                entry is not None
+                and entry.kind != "provider"
+                and request.oracle.kind == "provider_rows"
+            ):
+                request = request.model_copy(
+                    update={
+                        "oracle": AgentOracleSpec(
+                            kind="reachability",
+                            impact="none",
+                            refute_on_miss=request.oracle.refute_on_miss,
+                        )
+                    }
+                )
             reason = None
             if entry is None:
                 reason = "entry point is outside this task"
@@ -2657,11 +2671,6 @@ class ScanOrchestrator:
                         "provider query/delete probes do not accept values; use a call, "
                         "insert, or update operation"
                     )
-            elif (
-                request.oracle.kind == "provider_rows"
-                and entry.kind != "provider"
-            ):
-                reason = "provider_rows Oracle requires a provider entry"
             elif (
                 request.oracle.kind == "provider_rows"
                 and request.operation not in {"auto", "query"}

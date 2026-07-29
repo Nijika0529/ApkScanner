@@ -455,7 +455,11 @@ def test_non_provider_request_ignores_provider_only_fields() -> None:
         operation="call",
         method="accidentalProviderMethod",
         argument="unused",
-        oracle={"kind": "reachability", "impact": "none"},
+        oracle={
+            "kind": "provider_rows",
+            "minimum_rows": 1,
+            "impact": "unauthorized_data_access",
+        },
         rationale="Replay the deep link from an ordinary application.",
     )
 
@@ -470,6 +474,8 @@ def test_non_provider_request_ignores_provider_only_fields() -> None:
     assert accepted[0].operation == "auto"
     assert accepted[0].method is None
     assert accepted[0].argument is None
+    assert accepted[0].oracle.kind == "reachability"
+    assert accepted[0].oracle.impact == "none"
 
 
 def test_provider_rows_oracle_rejects_a_non_query_operation() -> None:
