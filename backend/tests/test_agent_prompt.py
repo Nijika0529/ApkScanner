@@ -207,6 +207,51 @@ def test_invalid_optional_requested_test_does_not_discard_static_verdict() -> No
         AgentRequestedTest.model_validate(payload["requested_tests"][0])
 
 
+def test_poc_log_oracle_recovers_an_omitted_expected_text() -> None:
+    payload = {
+        "summary": "静态证据支持风险，申请普通应用身份的设备验证。",
+        "result": "supported_static",
+        "hypotheses_tested": [],
+        "test_cases": [],
+        "evidence_ids": [],
+        "severity_proposal": "high",
+        "confidence": "high",
+        "coverage_gaps": [],
+        "followups": [],
+        "requested_tests": [
+            {
+                "hypothesis_id": "00000000-0000-0000-0000-000000000001",
+                "entry_point_id": "00000000-0000-0000-0000-000000000002",
+                "state": "guest",
+                "uri": "vulntest://open/",
+                "extras": {},
+                "operation": "auto",
+                "oracle": {
+                    "kind": "log_contains",
+                    "impact": "none",
+                },
+                "poc": {
+                    "project_path": "poc/deep_link",
+                    "package_name": "io.apkscanner.poc.deep_link",
+                    "launch_component": (
+                        "io.apkscanner.poc.deep_link.MainActivity"
+                    ),
+                },
+                "rationale": "用独立 PoC 应用验证目标入口。",
+            }
+        ],
+    }
+
+    result = AgentInvestigationResult.model_validate(payload)
+
+    assert result.rejected_requested_tests == []
+    assert len(result.requested_tests) == 1
+    assert (
+        result.requested_tests[0].oracle.expected_text
+        == "security_impact_observed"
+    )
+
+
 @pytest.mark.parametrize(
     ("kind", "impact"),
     [

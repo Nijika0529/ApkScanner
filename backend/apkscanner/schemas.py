@@ -403,9 +403,30 @@ class AgentInvestigationResult(BaseModel):
         accepted: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
         for index, request in enumerate(requested_tests):
+            normalized_request = request
+            if isinstance(request, dict):
+                oracle = request.get("oracle")
+                if (
+                    isinstance(oracle, dict)
+                    and oracle.get("kind") == "log_contains"
+                    and not oracle.get("expected_text")
+                    and isinstance(request.get("poc"), dict)
+                ):
+                    # Every platform-built PoC emits the structured result key.
+                    # Recover this harmless model omission instead of discarding
+                    # an otherwise executable app-UID proof request.
+                    normalized_request = {
+                        **request,
+                        "oracle": {
+                            **oracle,
+                            "expected_text": "security_impact_observed",
+                        },
+                    }
             try:
                 accepted.append(
-                    AgentRequestedTest.model_validate(request).model_dump(mode="python")
+                    AgentRequestedTest.model_validate(normalized_request).model_dump(
+                        mode="python"
+                    )
                 )
             except ValidationError as exc:
                 rejected.append(
@@ -430,10 +451,10 @@ class AgentInvestigationResult(BaseModel):
                         ],
                     }
                 )
-        if not rejected:
-            return handler(value)
         normalized = dict(value)
         normalized["requested_tests"] = accepted
+        if not rejected:
+            return handler(normalized)
         gaps = normalized.get("coverage_gaps")
         normalized["coverage_gaps"] = [
             *((gaps if isinstance(gaps, list) else [])[:99]),
