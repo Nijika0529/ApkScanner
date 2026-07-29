@@ -25,7 +25,7 @@ from .codex_runner import CodexInvestigator
 from .config import Settings
 from .db import Database
 from .device import AdbDeviceAdapter, DeviceLeaseCancelledError
-from .enums import FindingStatus, ScanStatus, TaskStatus
+from .enums import CoverageStatus, FindingStatus, ScanStatus, TaskStatus
 from .evidence import EvidenceRecorder
 from .finding_policy import partition_findings
 from .mobsf import MobSFAdapter
@@ -493,6 +493,7 @@ class ScanOrchestrator:
             entry_ids_by_name: dict[str, list[str]] = defaultdict(list)
             for entry in entries:
                 entry_ids_by_name[entry.name].append(entry.id)
+            persisted_findings: list[Finding] = []
             for draft in findings:
                 entry_ids = [
                     entry_id for name in draft.entry_names for entry_id in entry_ids_by_name.get(name, [])
@@ -512,25 +513,25 @@ class ScanOrchestrator:
                     ],
                     claim=draft.title,
                 )
-                session.add(
-                    Finding(
-                        scan_id=scan.id,
-                        dedupe_key=draft.dedupe_key,
-                        rule_id=draft.rule_id,
-                        source=draft.source,
-                        title=draft.title,
-                        description=draft.description,
-                        remediation=draft.remediation,
-                        masvs=draft.masvs,
-                        cwe=draft.cwe,
-                        severity=draft.severity,
-                        confidence=draft.confidence,
-                        status=FindingStatus.CANDIDATE.value,
-                        entry_point_ids=entry_ids,
-                        locations=draft.locations,
-                        metadata_json={**draft.metadata, "identity": identity},
-                    )
+                persisted_finding = Finding(
+                    scan_id=scan.id,
+                    dedupe_key=draft.dedupe_key,
+                    rule_id=draft.rule_id,
+                    source=draft.source,
+                    title=draft.title,
+                    description=draft.description,
+                    remediation=draft.remediation,
+                    masvs=draft.masvs,
+                    cwe=draft.cwe,
+                    severity=draft.severity,
+                    confidence=draft.confidence,
+                    status=FindingStatus.CANDIDATE.value,
+                    entry_point_ids=entry_ids,
+                    locations=draft.locations,
+                    metadata_json={**draft.metadata, "identity": identity},
                 )
+                session.add(persisted_finding)
+                persisted_findings.append(persisted_finding)
             for item in coverage:
                 session.add(
                     CoverageItem(
@@ -567,24 +568,25 @@ class ScanOrchestrator:
                     ),
                 )
             )
+            entry_coverage: dict[str, CoverageItem] = {}
             for entry in entries:
-                session.add(
-                    CoverageItem(
-                        scan_id=scan.id,
-                        control_id=f"ENTRY-{entry.id}",
-                        domain="MASVS-PLATFORM",
-                        title=f"Entry point: {entry.name}",
-                        status="partial",
-                        stages={
-                            "static": "completed",
-                            "deterministic_dynamic": "pending",
-                            "agent": "pending",
-                            "blackbox": "pending",
-                        },
-                        gap_reason="Dynamic and semantic investigation pending.",
-                        entry_point_id=entry.id,
-                    )
+                coverage_item = CoverageItem(
+                    scan_id=scan.id,
+                    control_id=f"ENTRY-{entry.id}",
+                    domain="MASVS-PLATFORM",
+                    title=f"Entry point: {entry.name}",
+                    status=CoverageStatus.PARTIAL.value,
+                    stages={
+                        "static": "completed",
+                        "deterministic_dynamic": "pending",
+                        "agent": "pending",
+                        "blackbox": "pending",
+                    },
+                    gap_reason="Dynamic and semantic investigation pending.",
+                    entry_point_id=entry.id,
                 )
+                session.add(coverage_item)
+                entry_coverage[entry.id] = coverage_item
             for tool, payload in result.tool_results.items():
                 metadata = (
                     {
@@ -628,14 +630,64 @@ class ScanOrchestrator:
                 android_version=self.settings.device_android_version,
                 adb_configured=self.device.configured,
             )
-            tasks = planner.plan(scan.id, entries)
+            investigation_plan = planner.plan_with_decisions(scan.id, entries)
+            tasks = investigation_plan.tasks
+            static_closures = investigation_plan.static_closures
+            closures_by_entry = {
+                closure.entry_point_id: closure for closure in static_closures
+            }
+            closed_entry_ids = set(closures_by_entry)
+            for entry_id, closure in closures_by_entry.items():
+                coverage_item = entry_coverage[entry_id]
+                coverage_item.status = CoverageStatus.COVERED.value
+                coverage_item.stages = {
+                    "static": "completed",
+                    "deterministic_dynamic": "not_applicable",
+                    "agent": "not_applicable",
+                    "blackbox": "not_applicable",
+                }
+                coverage_item.gap_reason = closure.reason
+            for finding in persisted_findings:
+                linked_entries = set(finding.entry_point_ids)
+                if linked_entries and linked_entries <= closed_entry_ids:
+                    finding.status = FindingStatus.FALSE_POSITIVE.value
+                    finding.metadata_json = {
+                        **finding.metadata_json,
+                        "closed_by_static_reachability": {
+                            "threat_model": "ordinary_app_uid",
+                            "entry_decisions": [
+                                closures_by_entry[entry_id].as_dict()
+                                for entry_id in sorted(linked_entries)
+                            ],
+                        },
+                    }
             session.add_all(tasks)
+            if static_closures:
+                add_event(
+                    session,
+                    scan.id,
+                    "planning.static_closed",
+                    f"{len(static_closures)} 个入口已由平台静态可达性策略明确关闭",
+                    {
+                        "count": len(static_closures),
+                        "threat_model": "ordinary_app_uid",
+                        "decisions": [
+                            closure.as_dict() for closure in static_closures[:200]
+                        ],
+                        "truncated": len(static_closures) > 200,
+                    },
+                )
             scan.status = ScanStatus.PRELIMINARY_READY.value
             scan.preliminary_at = now()
+            dispatched_entry_ids = {
+                entry_id for task in tasks for entry_id in task.target_entry_ids
+            }
             scan.stats = {
                 **scan.stats,
                 "entry_point_count": len(entries),
                 "task_count": len(tasks),
+                "static_closed_entry_count": len(static_closures),
+                "agent_dispatched_entry_count": len(dispatched_entry_ids),
             }
             if scan.preliminary_at > preliminary_deadline:
                 late_by = int((scan.preliminary_at - preliminary_deadline).total_seconds())
@@ -652,7 +704,12 @@ class ScanOrchestrator:
                 scan.id,
                 "static.completed",
                 "Static analysis and attack-surface planning completed",
-                {"entries": len(entries), "findings": len(findings), "tasks": len(tasks)},
+                {
+                    "entries": len(entries),
+                    "findings": len(findings),
+                    "tasks": len(tasks),
+                    "static_closed_entries": len(static_closures),
+                },
             )
             add_event(
                 session,

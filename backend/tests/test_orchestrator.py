@@ -825,6 +825,29 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
                 )
             )
         )
+        trusted_service = session.scalar(
+            select(EntryPoint).where(
+                EntryPoint.scan_id == scan_id,
+                EntryPoint.name == "com.example.vulnerable.TrustedService",
+            )
+        )
+        trusted_coverage = (
+            session.scalar(
+                select(CoverageItem).where(
+                    CoverageItem.entry_point_id == trusted_service.id,
+                )
+            )
+            if trusted_service is not None
+            else None
+        )
+        static_closure_events = list(
+            session.scalars(
+                select(ScanEvent).where(
+                    ScanEvent.scan_id == scan_id,
+                    ScanEvent.event_type == "planning.static_closed",
+                )
+            )
+        )
     assert tasks
     assert len(audit_evidence) == len(tasks) * 4
     assert {item.kind for item in audit_evidence} == {
@@ -843,6 +866,18 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
         finding.metadata_json["proof_backlog"]["automation_state"]
         == "manual_or_poc_required"
         for finding in proof_backlog
+    )
+    assert trusted_service is not None
+    assert all(trusted_service.id not in task.target_entry_ids for task in tasks)
+    assert trusted_coverage is not None
+    assert trusted_coverage.status == "covered"
+    assert trusted_coverage.stages["agent"] == "not_applicable"
+    assert "普通第三方应用无法直接调用" in str(trusted_coverage.gap_reason)
+    assert len(static_closure_events) == 1
+    assert any(
+        item["entry_point_id"] == trusted_service.id
+        and item["reason_code"] == "strong_permission_guard"
+        for item in static_closure_events[0].data["decisions"]
     )
 
 

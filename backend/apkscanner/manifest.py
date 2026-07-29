@@ -330,6 +330,18 @@ def parse_manifest(xml_text: str) -> ManifestDocument:
                         )
                     )
                 provider_permissions["path_permissions"] = path_permissions
+                provider_permissions["grant_uri_permission_paths"] = [
+                    {
+                        key: value
+                        for key in (
+                            "path",
+                            "pathPrefix",
+                            "pathPattern",
+                        )
+                        if (value := android_attr(grant, key)) is not None
+                    }
+                    for grant in component.findall("grant-uri-permission")
+                ]
                 access_boundaries = (
                     (read_permission, read_protection),
                     (write_permission, write_protection),

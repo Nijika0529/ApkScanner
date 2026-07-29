@@ -50,6 +50,7 @@ export function statusLabel(status: string) {
     refuted: "已反驳",
     covered: "已覆盖",
     partial: "部分覆盖",
+    not_applicable: "不适用",
     not_tested: "未测试",
     tool_failed: "工具失败",
     degraded: "降级覆盖",

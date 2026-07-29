@@ -34,6 +34,156 @@ def test_signature_permission_is_inherited_by_component() -> None:
     assert service.permission_protection == "signature"
 
 
+def test_planner_statically_closes_signature_guarded_component() -> None:
+    entry = EntryPoint(
+        id="00000000-0000-0000-0000-000000000010",
+        scan_id="scan",
+        kind="service",
+        name="com.example.TrustedService",
+        owner_component="com.example.TrustedService",
+        exported=True,
+        permission="com.example.TRUSTED",
+        permission_protection="signature|privileged",
+    )
+
+    plan = InvestigationPlanner(
+        android_version="16",
+        adb_configured=True,
+    ).plan_with_decisions("scan", [entry])
+
+    assert plan.tasks == []
+    assert len(plan.static_closures) == 1
+    closure = plan.static_closures[0]
+    assert closure.reason_code == "strong_permission_guard"
+    assert closure.permission == "com.example.TRUSTED"
+    assert closure.permission_protection == "signature|privileged"
+    assert closure.resolution_source == "manifest_declaration"
+
+
+def test_planner_resolves_framework_signature_binding_permission() -> None:
+    entry = EntryPoint(
+        id="00000000-0000-0000-0000-000000000011",
+        scan_id="scan",
+        kind="service",
+        name="com.example.AutofillService",
+        owner_component="com.example.AutofillService",
+        exported=True,
+        permission="android.permission.BIND_AUTOFILL_SERVICE",
+        permission_protection=None,
+    )
+
+    plan = InvestigationPlanner(
+        android_version="16",
+        adb_configured=True,
+    ).plan_with_decisions("scan", [entry])
+
+    assert plan.tasks == []
+    assert len(plan.static_closures) == 1
+    assert plan.static_closures[0].permission_protection == "signature"
+    assert (
+        plan.static_closures[0].resolution_source
+        == "android_framework_catalog"
+    )
+
+
+def test_planner_keeps_unknown_permission_and_provider_uri_grants_for_review() -> None:
+    unresolved = EntryPoint(
+        id="00000000-0000-0000-0000-000000000012",
+        scan_id="scan",
+        kind="receiver",
+        name="com.example.UnknownReceiver",
+        owner_component="com.example.UnknownReceiver",
+        exported=True,
+        permission="com.vendor.UNKNOWN",
+        permission_protection=None,
+    )
+    grantable_provider = EntryPoint(
+        id="00000000-0000-0000-0000-000000000013",
+        scan_id="scan",
+        kind="provider",
+        name="com.example.GrantableProvider",
+        owner_component="com.example.GrantableProvider",
+        exported=True,
+        permission="com.example.TRUSTED",
+        permission_protection="signature",
+        metadata_json={
+            "grant_uri_permission_paths": [{"pathPrefix": "/shared"}],
+        },
+    )
+
+    plan = InvestigationPlanner(
+        android_version="16",
+        adb_configured=True,
+    ).plan_with_decisions("scan", [unresolved, grantable_provider])
+
+    assert {task.target_entry_ids[0] for task in plan.tasks} == {
+        unresolved.id,
+        grantable_provider.id,
+    }
+    assert plan.static_closures == []
+
+
+def test_planner_does_not_close_provider_with_one_unresolved_boundary() -> None:
+    provider = EntryPoint(
+        id="00000000-0000-0000-0000-000000000014",
+        scan_id="scan",
+        kind="provider",
+        name="com.example.MixedProvider",
+        owner_component="com.example.MixedProvider",
+        exported=True,
+        permission="android.permission.BIND_AUTOFILL_SERVICE",
+        permission_protection=None,
+        metadata_json={
+            "effective_read_permission": (
+                "android.permission.BIND_AUTOFILL_SERVICE"
+            ),
+            "effective_read_permission_protection": None,
+            "effective_write_permission": "com.vendor.UNKNOWN",
+            "effective_write_permission_protection": None,
+            "path_permissions": [],
+        },
+    )
+
+    plan = InvestigationPlanner(
+        android_version="16",
+        adb_configured=True,
+    ).plan_with_decisions("scan", [provider])
+
+    assert len(plan.tasks) == 1
+    assert plan.static_closures == []
+
+
+def test_planner_closes_provider_only_when_every_boundary_is_strong() -> None:
+    provider = EntryPoint(
+        id="00000000-0000-0000-0000-000000000015",
+        scan_id="scan",
+        kind="provider",
+        name="com.example.StrongProvider",
+        owner_component="com.example.StrongProvider",
+        exported=True,
+        permission="com.example.TRUSTED",
+        permission_protection="signature",
+        metadata_json={
+            "effective_read_permission": "com.example.TRUSTED",
+            "effective_read_permission_protection": "signature",
+            "effective_write_permission": "com.example.TRUSTED",
+            "effective_write_permission_protection": "signature",
+            "path_permissions": [],
+            "grant_uri_permission_paths": [],
+            "grant_uri_permissions": "false",
+        },
+    )
+
+    plan = InvestigationPlanner(
+        android_version="16",
+        adb_configured=True,
+    ).plan_with_decisions("scan", [provider])
+
+    assert plan.tasks == []
+    assert len(plan.static_closures) == 1
+    assert plan.static_closures[0].reason_code == "strong_permission_guard"
+
+
 def test_manifest_defaults_use_effective_target_sdk() -> None:
     modern = parse_manifest(
         """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
@@ -140,6 +290,31 @@ def test_provider_path_permission_contributes_weakest_access_boundary() -> None:
     ]
     findings = BuiltinRuleEngine()._manifest_rules(document)
     assert any(item.rule_id == "EXPORTED-PROVIDER" for item in findings)
+
+
+def test_provider_grant_uri_permission_paths_are_preserved() -> None:
+    document = parse_manifest(
+        """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+        package="com.example.grants">
+          <uses-sdk android:targetSdkVersion="35" />
+          <permission android:name="com.example.SIGNATURE"
+              android:protectionLevel="signature" />
+          <application>
+            <provider android:name=".Data"
+                android:authorities="com.example.grants.data"
+                android:exported="true"
+                android:readPermission="com.example.SIGNATURE"
+                android:writePermission="com.example.SIGNATURE">
+              <grant-uri-permission android:pathPrefix="/shared" />
+            </provider>
+          </application>
+        </manifest>"""
+    )
+    provider = next(entry for entry in document.entries if entry.kind == "provider")
+
+    assert provider.metadata["grant_uri_permission_paths"] == [
+        {"pathPrefix": "/shared"}
+    ]
 
 
 def test_private_or_disabled_deep_links_are_not_reported_or_scheduled() -> None:
