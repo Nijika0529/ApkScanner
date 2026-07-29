@@ -17,10 +17,18 @@ def developer_instructions(
     response_contract: Literal["structured_result", "analysis_memo"] = "structured_result",
 ) -> str:
     if direct_tool_access and shell_access and workspace_write:
+        adb_boundary = (
+            "ADB is available for this task and may be used freely for authorized exploration, "
+            "PoC installation, execution, and observation while the platform holds the device "
+            "exclusively for this task. "
+            if adb_access
+            else "Do not run ADB; request device checks through requested_tests. "
+        )
         tool_boundary = (
             "File and shell tools may inspect the supplied scan workspace. Shell commands may "
-            "create or modify files only inside that workspace or /tmp. Do not run ADB or make "
-            "target/network requests; request device checks through requested_tests. When the "
+            "create or modify files only inside that workspace or /tmp. "
+            f"{adb_boundary}"
+            "Do not make unrelated target/network requests. When the "
             "platform advertises poc_builder.available=true, you may create a source-only Android "
             "PoC under poc/<name>/ and reference it from requested_tests.poc."
         )

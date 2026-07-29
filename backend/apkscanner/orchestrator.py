@@ -1625,12 +1625,6 @@ class ScanOrchestrator:
                                 scan_id, task_id, probe.commands, evidence_summaries
                             )
 
-                    if target_installed:
-                        cleanup = self.device.cleanup(package_name)
-                        self._record_commands(scan_id, task_id, cleanup, None)
-                    completed_device_session = device_session
-                    device_session = None
-                    completed_device_session.__exit__(None, None, None)
                     planning_reserve = min(
                         AGENT_CRITIC_TIMEOUT_CAP_SECONDS
                         + AGENT_FINAL_RESERVE_SECONDS,
@@ -1805,78 +1799,20 @@ class ScanOrchestrator:
                         execution_gaps: list[str] = []
                         executed_this_round: list[dict[str, Any]] = []
                         if requested and not budget.expired:
-                            with self._task_device_session(
-                                scan_id,
-                                task_id,
-                                priority=int(task.priority),
-                                cancel_event=cancel_event,
-                            ) as requested_lease:
-                                budget = budget.extend(
-                                    requested_lease["wait_seconds"],
-                                    maximum_deadline=scan_deadline,
-                                )
-                                round_target_installed = False
-                                try:
-                                    round_prepare = self.device.prepare(
-                                        Path(scan.artifact_path),
-                                        package_name,
-                                        budget,
-                                    )
-                                    self._record_commands(
-                                        scan_id,
-                                        task_id,
-                                        round_prepare,
-                                        evidence_summaries,
-                                    )
-                                    round_target_installed = any(
-                                        kind == "device.install"
-                                        and result.exit_code == 0
-                                        for kind, result, _metadata in round_prepare
-                                    )
-                                    round_critical = {
-                                        kind: result
-                                        for kind, result, _metadata in round_prepare
-                                        if kind
-                                        in {
-                                            "device.health",
-                                            "device.install",
-                                            "device.clear",
-                                        }
-                                        and result.exit_code != 0
-                                    }
-                                    if round_critical:
-                                        failures = ", ".join(
-                                            f"{kind}=exit {result.exit_code}"
-                                            for kind, result in round_critical.items()
-                                        )
-                                        execution_gaps.append(
-                                            "Device preparation failed before "
-                                            f"agent-requested tests: {failures}"
-                                        )
-                                    else:
-                                        (
-                                            executed_this_round,
-                                            execution_gaps,
-                                        ) = self._execute_requested_tests(
-                                            scan_id=scan_id,
-                                            task_id=task_id,
-                                            package_name=package_name,
-                                            entries=entries,
-                                            requests=requested,
-                                            budget=budget,
-                                            evidence_summaries=evidence_summaries,
-                                            round_index=completed_rounds + 1,
-                                            poc_artifacts=poc_artifacts,
-                                        )
-                                finally:
-                                    if round_target_installed:
-                                        cleanup = self.device.cleanup(package_name)
-                                        self._record_commands(
-                                            scan_id,
-                                            task_id,
-                                            cleanup,
-                                            None,
-                                        )
+                            (
+                                executed_this_round,
+                                execution_gaps,
+                            ) = self._execute_requested_tests(
+                                scan_id=scan_id,
+                                task_id=task_id,
+                                package_name=package_name,
+                                entries=entries,
+                                requests=requested,
+                                budget=budget,
+                                evidence_summaries=evidence_summaries,
+                                round_index=completed_rounds + 1,
+                                poc_artifacts=poc_artifacts,
+                            )
                             executed_agent_tests.extend(executed_this_round)
                             coverage_gaps.extend(execution_gaps)
                         elif requested:
@@ -1966,18 +1902,6 @@ class ScanOrchestrator:
                 except AgentCancelledError:
                     raise
                 except Exception as exc:
-                    if device_session is not None:
-                        if target_installed:
-                            cleanup = self.device.cleanup(package_name)
-                            self._record_commands(
-                                scan_id,
-                                task_id,
-                                cleanup,
-                                None,
-                            )
-                        failed_device_session = device_session
-                        device_session = None
-                        failed_device_session.__exit__(None, None, None)
                     coverage_gaps.append(f"Dynamic investigation failed safely: {exc}")
                     if agent_result is None:
                         agent_result, agent_error = invoke_agent(

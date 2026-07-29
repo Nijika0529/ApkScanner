@@ -29,6 +29,7 @@ from apkscanner.models import (
 from apkscanner.orchestrator import ScanOrchestrator
 from apkscanner.reports import ReportBuilder
 from apkscanner.schemas import AgentInvestigationResult
+from apkscanner.tools import CommandResult
 from sqlalchemy import select
 
 
@@ -287,6 +288,150 @@ def test_parallel_workers_share_only_one_device_session(settings) -> None:  # no
             for task in persisted
             if task is not None
         )
+
+
+def test_device_task_keeps_one_lease_through_agent_investigation(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    configured = replace(
+        settings,
+        adb_serial="exclusive-device:5555",
+        codex_enabled=True,
+    )
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="exclusive.apk",
+            package_name="com.example.exclusive",
+            artifact_sha256="7" * 64,
+            artifact_path=str(configured.data_dir / "exclusive.apk"),
+            stats={"investigator": "codex"},
+        )
+        entry = EntryPoint(
+            scan=scan,
+            kind="activity",
+            name="com.example.exclusive.MainActivity",
+            owner_component="com.example.exclusive.MainActivity",
+            exported=True,
+        )
+        session.add_all([scan, entry])
+        session.flush()
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="queued",
+            target_entry_ids=[entry.id],
+        )
+        session.add(task)
+        session.commit()
+        scan_id = scan.id
+        task_id = task.id
+
+    orchestrator = ScanOrchestrator(
+        configured,
+        database,
+        ArtifactStore(configured),
+    )
+    timeline: list[str] = []
+    monkeypatch.setattr(
+        orchestrator.device.runner,
+        "available",
+        lambda executable: executable == "adb",
+    )
+    monkeypatch.setattr(
+        orchestrator.device,
+        "capability",
+        lambda *, non_blocking=False: {"available": True},
+    )
+    monkeypatch.setattr(
+        orchestrator.device,
+        "prepare",
+        lambda *_args, **_kwargs: [
+            (
+                "device.install",
+                CommandResult(["adb", "install"], 0, "", ""),
+                {},
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        orchestrator.device,
+        "probe",
+        lambda *_args, **_kwargs: SimpleNamespace(commands=[]),
+    )
+
+    def cleanup(_package_name: str):  # noqa: ANN202
+        assert orchestrator.device.scheduler.snapshot()["active_task_id"] == task_id
+        timeline.append("cleanup")
+        return []
+
+    monkeypatch.setattr(orchestrator.device, "cleanup", cleanup)
+    monkeypatch.setattr(
+        orchestrator,
+        "_validated_agent_payload",
+        lambda payload, _evidence: (payload, "refuted_static"),
+    )
+
+    class FakeInvestigator:
+        @staticmethod
+        def capability(*, deep=False):  # noqa: ANN001, ANN205
+            return {"available": True, "version": "fake-sdk", "deep": deep}
+
+        @staticmethod
+        def investigate(**_kwargs):  # noqa: ANN003, ANN205
+            assert (
+                orchestrator.device.scheduler.snapshot()["active_task_id"]
+                == task_id
+            )
+            timeline.append("agent")
+            return SimpleNamespace(
+                thread_id="thread-exclusive",
+                turn_id="turn-exclusive",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                result=AgentInvestigationResult(
+                    summary="静态证据未显示普通应用可利用的安全风险。",
+                    result="refuted_static",
+                    hypotheses_tested=[],
+                    test_cases=[],
+                    evidence_ids=[],
+                    severity_proposal="info",
+                    confidence="high",
+                    coverage_gaps=[],
+                    followups=[],
+                    requested_tests=[],
+                ),
+            )
+
+    orchestrator.investigators["codex"] = FakeInvestigator()
+    orchestrator._run_task(scan_id, task_id, 30)
+
+    assert timeline == ["agent", "cleanup"]
+    assert orchestrator.device.scheduler.snapshot() == {
+        "active_task_id": None,
+        "waiting": [],
+    }
+    with database.session_factory() as session:
+        events = list(
+            session.scalars(
+                select(ScanEvent).where(
+                    ScanEvent.scan_id == scan_id,
+                    ScanEvent.event_type.in_(
+                        {
+                            "exploration.device.acquired",
+                            "exploration.device.released",
+                        }
+                    ),
+                )
+            )
+        )
+    assert [event.event_type for event in events] == [
+        "exploration.device.acquired",
+        "exploration.device.released",
+    ]
 
 
 def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # noqa: ANN001
