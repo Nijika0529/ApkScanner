@@ -408,7 +408,7 @@ def test_personal_lab_accepts_typed_provider_call_and_objective_oracle() -> None
         oracle={
             "kind": "log_contains",
             "expected_text": "private-item",
-            "impact": "unauthorized_data_access",
+            "impact": "none",
         },
         rationale="Call the exported provider as an ordinary application UID.",
     )
@@ -422,3 +422,39 @@ def test_personal_lab_accepts_typed_provider_call_and_objective_oracle() -> None
 
     assert accepted == [request]
     assert gaps == []
+
+
+def test_provider_rows_oracle_rejects_a_non_query_operation() -> None:
+    entry = EntryPoint(
+        id="11111111-1111-1111-1111-111111111111",
+        scan_id="scan",
+        kind="provider",
+        name="com.example.ExportedProvider",
+        owner_component="com.example.ExportedProvider",
+        exported=True,
+        metadata_json={"authorities": "com.example.provider"},
+    )
+    request = AgentRequestedTest(
+        hypothesis_id="22222222-2222-2222-2222-222222222222",
+        entry_point_id=entry.id,
+        state="guest",
+        uri="content://com.example.provider/items",
+        extras={},
+        operation="call",
+        method="getPrivateItems",
+        oracle={
+            "kind": "provider_rows",
+            "minimum_rows": 1,
+            "impact": "unauthorized_data_access",
+        },
+        rationale="A call result cannot satisfy a row-count predicate.",
+    )
+
+    accepted, gaps = ScanOrchestrator._validate_requested_tests(
+        [request],
+        [entry],
+        hypothesis_ids={request.hypothesis_id},
+    )
+
+    assert accepted == []
+    assert any("requires a provider query operation" in gap for gap in gaps)

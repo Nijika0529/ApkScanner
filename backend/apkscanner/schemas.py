@@ -3,7 +3,17 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    ValidationError,
+    model_validator,
+)
 
 
 class ApiModel(BaseModel):
@@ -260,13 +270,18 @@ class AgentOracleSpec(BaseModel):
             raise ValueError(f"{self.kind} requires expected_text")
         if self.kind == "provider_rows" and self.minimum_rows is None:
             self.minimum_rows = 1
-        if self.kind == "process_crash" and self.impact not in {
-            "none",
-            "denial_of_service",
-        }:
-            raise ValueError("process_crash only supports denial_of_service impact")
-        if self.kind == "reachability" and self.impact != "none":
-            raise ValueError("reachability alone cannot claim security impact")
+        allowed_impacts = {
+            "reachability": {"none"},
+            "provider_rows": {"none", "unauthorized_data_access"},
+            "ui_text": {"none", "unauthorized_data_access"},
+            "log_contains": {"none"},
+            "process_crash": {"none", "denial_of_service"},
+        }
+        if self.impact not in allowed_impacts[self.kind]:
+            supported = ", ".join(sorted(allowed_impacts[self.kind]))
+            raise ValueError(
+                f"{self.kind} Oracle supports only these impacts: {supported}"
+            )
         return self
 
 
@@ -340,6 +355,10 @@ class AgentHypothesisAssessment(BaseModel):
 class AgentInvestigationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    _rejected_requested_tests: list[dict[str, Any]] = PrivateAttr(
+        default_factory=list
+    )
+
     schema_version: Literal["1.0"] = "1.0"
     summary: str = Field(
         min_length=1,
@@ -368,38 +387,67 @@ class AgentInvestigationResult(BaseModel):
     followups: list[str] = Field(max_length=100)
     requested_tests: list[AgentRequestedTest] = Field(max_length=1000)
 
-    @model_validator(mode="before")
+    @model_validator(mode="wrap")
     @classmethod
-    def isolate_invalid_requested_tests(cls, value: Any) -> Any:
-        """An optional malformed action must not discard a valid static verdict."""
+    def isolate_invalid_requested_tests(cls, value: Any, handler):  # noqa: ANN001, ANN206
+        """Keep malformed optional actions as auditable feedback for the next turn."""
 
         if not isinstance(value, dict):
-            return value
+            return handler(value)
         requested_tests = value.get("requested_tests")
         if not isinstance(requested_tests, list):
-            return value
+            return handler(value)
         accepted: list[dict[str, Any]] = []
-        rejected = 0
-        for request in requested_tests:
+        rejected: list[dict[str, Any]] = []
+        for index, request in enumerate(requested_tests):
             try:
                 accepted.append(
                     AgentRequestedTest.model_validate(request).model_dump(mode="python")
                 )
-            except (TypeError, ValueError):
-                rejected += 1
+            except ValidationError as exc:
+                rejected.append(
+                    {
+                        "index": index,
+                        "request": (
+                            dict(request)
+                            if isinstance(request, dict)
+                            else {"unparsed_value": repr(request)}
+                        ),
+                        "errors": [
+                            {
+                                "location": ".".join(str(part) for part in error["loc"]),
+                                "message": error["msg"],
+                                "type": error["type"],
+                            }
+                            for error in exc.errors(
+                                include_url=False,
+                                include_context=False,
+                                include_input=False,
+                            )
+                        ],
+                    }
+                )
         if not rejected:
-            return value
+            return handler(value)
         normalized = dict(value)
         normalized["requested_tests"] = accepted
         gaps = normalized.get("coverage_gaps")
         normalized["coverage_gaps"] = [
-            *(gaps if isinstance(gaps, list) else []),
+            *((gaps if isinstance(gaps, list) else [])[:99]),
             (
-                f"平台忽略了 {rejected} 个格式或能力不受支持的补充测试请求；"
-                "静态证据结论仍予保留。"
+                f"平台拒绝了 {len(rejected)} 个格式或能力不受支持的补充测试请求；"
+                "具体校验错误已保留，下一轮必须修正或改用其他验证策略。"
             ),
         ]
-        return normalized
+        result = handler(normalized)
+        result._rejected_requested_tests = rejected
+        return result
+
+    @property
+    def rejected_requested_tests(self) -> list[dict[str, Any]]:
+        """Malformed model actions excluded from execution but retained for audit."""
+
+        return [dict(item) for item in self._rejected_requested_tests]
 
     @model_validator(mode="after")
     def validate_explicit_verdict(self) -> Self:

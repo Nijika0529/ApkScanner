@@ -389,6 +389,7 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
 ) -> None:  # noqa: ANN001
     class PocRunner:
         request_id = ""
+        ui_dump_count = 0
 
         @staticmethod
         def available(_name: str) -> bool:
@@ -404,7 +405,16 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
                     '"success":true,"security_impact_observed":true}'
                 )
             elif "uiautomator" in argv:
-                stdout = '<node text="Imported secret" />'
+                cls.ui_dump_count += 1
+                stdout = (
+                    '<hierarchy><node package="com.example.target" text="" />'
+                    "</hierarchy>"
+                    if cls.ui_dump_count == 1
+                    else (
+                        '<hierarchy><node package="com.example.target" '
+                        'text="Imported secret" /></hierarchy>'
+                    )
+                )
             else:
                 stdout = ""
             return CommandResult(argv, 0, stdout, "")
@@ -442,8 +452,97 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
     assert by_kind["blackbox.poc_logcat"]["poc_success"] is True
     assert by_kind["blackbox.poc_logcat"]["poc_claimed_security_impact"] is True
     assert "security_impact_observed" not in by_kind["blackbox.poc_logcat"]
+    assert (
+        by_kind["blackbox.poc_ui_baseline"]["target_text_present"]
+        is False
+    )
     assert by_kind["blackbox.poc_ui_dump"]["security_impact_observed"] is True
     assert by_kind["blackbox.poc_ui_dump"]["oracle"]["matched"] is True
+    assert (
+        by_kind["blackbox.poc_ui_dump"]["oracle"]["observation"][
+            "target_text_transition"
+        ]
+        is True
+    )
+
+
+def test_poc_owned_ui_cannot_forge_a_target_security_impact() -> None:
+    oracle = AgentOracleSpec(
+        kind="ui_text",
+        expected_text="Imported secret",
+        impact="unauthorized_data_access",
+    )
+
+    metadata = AdbDeviceAdapter._evaluate_ui_oracle(
+        oracle,
+        (
+            '<hierarchy><node package="io.apkscanner.poc.test" '
+            'text="Imported secret" /></hierarchy>'
+        ),
+        package_name="com.example.target",
+        baseline_output=(
+            '<hierarchy><node package="com.example.target" text="" /></hierarchy>'
+        ),
+        baseline_valid=True,
+    )
+
+    assert metadata["oracle"]["matched"] is False
+    assert metadata["security_impact_observed"] is False
+
+
+def test_preexisting_target_ui_text_is_not_a_new_impact() -> None:
+    oracle = AgentOracleSpec(
+        kind="ui_text",
+        expected_text="Imported secret",
+        impact="unauthorized_data_access",
+    )
+    target_ui = (
+        '<hierarchy><node package="com.example.target" '
+        'text="Imported secret" /></hierarchy>'
+    )
+
+    metadata = AdbDeviceAdapter._evaluate_ui_oracle(
+        oracle,
+        target_ui,
+        package_name="com.example.target",
+        baseline_output=target_ui,
+        baseline_valid=True,
+    )
+
+    assert metadata["oracle"]["matched"] is True
+    assert (
+        metadata["oracle"]["observation"]["target_text_transition"]
+        is False
+    )
+    assert metadata["security_impact_observed"] is False
+
+
+def test_process_crash_oracle_requires_the_target_process() -> None:
+    oracle = AgentOracleSpec(
+        kind="process_crash",
+        impact="denial_of_service",
+    )
+    unrelated = AdbDeviceAdapter._evaluate_target_log_oracle(
+        oracle,
+        (
+            "Process: com.example.target, PID: 99\n"
+            "FATAL EXCEPTION: main\n"
+            "Process: io.apkscanner.poc.test, PID: 123\n"
+            "noise mentioning com.example.target"
+        ),
+        "com.example.target",
+    )
+    target = AdbDeviceAdapter._evaluate_target_log_oracle(
+        oracle,
+        (
+            "FATAL EXCEPTION: main\n"
+            "Process: com.example.target:remote, PID: 456"
+        ),
+        "com.example.target",
+    )
+
+    assert unrelated["security_impact_observed"] is False
+    assert target["security_impact_observed"] is True
 
 
 def test_activity_deep_link_probe_preserves_uri_and_expected_component() -> None:

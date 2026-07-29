@@ -27,6 +27,7 @@ from apkscanner.models import (
     SecurityHypothesis,
 )
 from apkscanner.orchestrator import ScanOrchestrator, _critic_timeout_seconds
+from apkscanner.planner import StaticEntryClosure
 from apkscanner.reports import ReportBuilder
 from apkscanner.schemas import AgentInvestigationResult
 from apkscanner.tools import CommandResult
@@ -37,6 +38,45 @@ def test_critic_uses_all_remaining_task_time_except_final_reserve() -> None:
     assert _critic_timeout_seconds(3_000) == 2_940
     assert _critic_timeout_seconds(181) == 121
     assert _critic_timeout_seconds(60) == 0
+
+
+def test_blocked_direct_entry_does_not_turn_a_finding_into_false_positive() -> None:
+    entry_id = "00000000-0000-0000-0000-000000000010"
+    finding = Finding(
+        scan_id="scan",
+        dedupe_key="finding",
+        rule_id="TEST",
+        source="builtin",
+        title="Potential delegated access",
+        description="An exported seed may delegate access to this component.",
+        remediation="Validate the complete caller chain.",
+        masvs="MASVS-PLATFORM",
+        severity="high",
+        confidence="medium",
+        status="candidate",
+        entry_point_ids=[entry_id],
+        metadata_json={},
+    )
+    closure = StaticEntryClosure(
+        entry_point_id=entry_id,
+        kind="service",
+        name="com.example.TrustedService",
+        reason_code="strong_permission_guard",
+        reason="Ordinary apps cannot invoke this service directly.",
+        permission="com.example.TRUSTED",
+        permission_protection="signature",
+    )
+
+    annotated = ScanOrchestrator._annotate_direct_reachability(
+        finding,
+        {entry_id: closure},
+    )
+
+    assert annotated is True
+    assert finding.status == "candidate"
+    assessment = finding.metadata_json["direct_reachability_assessment"]
+    assert assessment["scope"] == "ordinary_app_direct_invocation_only"
+    assert assessment["indirect_chain_paths_evaluated"] is False
 
 
 def test_task_fails_closed_when_entry_belongs_to_another_scan(settings) -> None:  # noqa: ANN001
@@ -450,9 +490,11 @@ def test_device_task_keeps_one_lease_through_agent_investigation(
     ]
 
 
+@pytest.mark.parametrize("rejection_mode", ["platform_policy", "model_schema"])
 def test_rejected_agent_test_is_handed_to_next_exploration_round(
     settings,
     monkeypatch,
+    rejection_mode,
 ) -> None:  # noqa: ANN001
     configured = replace(
         settings,
@@ -491,6 +533,7 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
         session.commit()
         scan_id = scan.id
         task_id = task.id
+        entry_id = entry.id
 
     orchestrator = ScanOrchestrator(
         configured,
@@ -544,16 +587,27 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
             hypothesis_id = context["security_hypotheses"][0]["id"]
             requested_tests = []
             if phase == "test_planning":
-                requested_tests = [
-                    {
-                        "hypothesis_id": hypothesis_id,
-                        "entry_point_id": "00000000-0000-0000-0000-000000000099",
-                        "state": "guest",
-                        "uri": None,
-                        "extras": {},
-                        "rationale": "先尝试一个需要平台修正作用域的入口。",
-                    }
-                ]
+                request = {
+                    "hypothesis_id": hypothesis_id,
+                    "entry_point_id": (
+                        "00000000-0000-0000-0000-000000000099"
+                        if rejection_mode == "platform_policy"
+                        else entry_id
+                    ),
+                    "state": "guest",
+                    "uri": None,
+                    "extras": {},
+                    "rationale": "先尝试一个需要根据平台反馈修正的测试。",
+                }
+                if rejection_mode == "model_schema":
+                    request.update(
+                        {
+                            "operation": "auto",
+                            "method": "bindOrTransact",
+                            "argument": "1",
+                        }
+                    )
+                requested_tests = [request]
             elif phase == "exploration_round":
                 history = context["agent_round_history"]
                 planning = next(
@@ -563,9 +617,21 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
                 assert len(validation["submitted"]) == 1
                 assert validation["accepted"] == []
                 assert validation["executed"] == []
-                assert any(
-                    "outside this task" in gap for gap in validation["gaps"]
-                )
+                if rejection_mode == "platform_policy":
+                    assert validation["model_rejected"] == []
+                    assert any(
+                        "outside this task" in gap for gap in validation["gaps"]
+                    )
+                else:
+                    assert len(validation["model_rejected"]) == 1
+                    assert validation["model_rejected"][0]["request"]["method"] == (
+                        "bindOrTransact"
+                    )
+                    assert any(
+                        "schema validation failed" in gap
+                        and "only valid for provider call" in gap
+                        for gap in validation["gaps"]
+                    )
             return SimpleNamespace(
                 thread_id=f"thread-{phase}",
                 turn_id=f"turn-{phase}",
@@ -597,6 +663,10 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
             "exploration_round",
         ]
         assert history[0]["test_validation"]["accepted"] == []
+        if rejection_mode == "model_schema":
+            assert len(
+                history[0]["model_validation"]["rejected_requested_tests"]
+            ) == 1
 
 
 def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # noqa: ANN001
@@ -931,6 +1001,12 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
                 if item["name"] == "com.example.vulnerable.TrustedService"
             )
             assert trusted_catalog_item["direct_test_allowed"] is False
+            assert trusted_catalog_item["direct_reachability"] == "blocked"
+            assert trusted_catalog_item["indirect_chain_target_allowed"] is True
+            assert (
+                trusted_catalog_item["direct_reachability_decision"]["reason_code"]
+                == "strong_permission_guard"
+            )
             code_context = kwargs["platform_context"]["target_code_context"]
             assert code_context["schema_version"] == "1.0"
             assert code_context["components"]
@@ -1048,6 +1124,10 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
     assert trusted_coverage is not None
     assert trusted_coverage.status == "covered"
     assert trusted_coverage.stages["agent"] == "not_applicable"
+    assert (
+        trusted_coverage.stages["indirect_chain"]
+        == "retained_for_scan_wide_seed_exploration"
+    )
     assert "普通第三方应用无法直接调用" in str(trusted_coverage.gap_reason)
     assert len(static_closure_events) == 1
     assert any(

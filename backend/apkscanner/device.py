@@ -8,6 +8,7 @@ import re
 import secrets
 import threading
 import time
+import xml.etree.ElementTree as ElementTree
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -568,19 +569,6 @@ class AdbDeviceAdapter:
                 )
                 else None
             )
-            if direct_argv:
-                commands.append(
-                    (
-                        "blackbox.adb_shell",
-                        self._adb_budget(direct_argv, budget, 90),
-                        {
-                            "caller_identity": "adb_shell",
-                            "entry_point": entry.id,
-                            "session_state": state,
-                            "test_case_id": test_case_id,
-                        },
-                    )
-                )
             probe_request = (
                 self._probe_request(
                     entry,
@@ -597,6 +585,45 @@ class AdbDeviceAdapter:
                 else None
             )
             request_id = secrets.token_hex(8) if probe_request else None
+            action_attempted = bool(direct_argv or probe_request)
+            ui_baseline: CommandResult | None = None
+            if action_attempted and oracle is not None and oracle.kind == "ui_text":
+                ui_baseline = self._adb_budget(
+                    ["shell", "uiautomator", "dump", "/dev/tty"],
+                    budget,
+                    45,
+                )
+                commands.append(
+                    (
+                        "blackbox.ui_baseline",
+                        ui_baseline,
+                        {
+                            "entry_point": entry.id,
+                            "session_state": state,
+                            "test_case_id": test_case_id,
+                            "observation_role": "pre_action_baseline",
+                            "target_package": package_name,
+                            "target_text_present": self._ui_text_in_package(
+                                ui_baseline.stdout,
+                                oracle.expected_text or "",
+                                package_name,
+                            ),
+                        },
+                    )
+                )
+            if direct_argv:
+                commands.append(
+                    (
+                        "blackbox.adb_shell",
+                        self._adb_budget(direct_argv, budget, 90),
+                        {
+                            "caller_identity": "adb_shell",
+                            "entry_point": entry.id,
+                            "session_state": state,
+                            "test_case_id": test_case_id,
+                        },
+                    )
+                )
             if probe_request:
                 probe_request["request_id"] = request_id
                 encoded = base64.urlsafe_b64encode(json.dumps(probe_request).encode()).decode()
@@ -628,7 +655,6 @@ class AdbDeviceAdapter:
                         },
                     )
                 )
-            action_attempted = bool(direct_argv or probe_request)
             if probe_request:
                 log_result = self._adb_budget(
                     ["logcat", "-d", "-t", "300", "-s", "APKSCANNER_PROBE:I"],
@@ -677,7 +703,19 @@ class AdbDeviceAdapter:
                             "entry_point": entry.id,
                             "session_state": state,
                             "test_case_id": test_case_id,
-                            **self._evaluate_ui_oracle(oracle, ui_result.stdout),
+                            **self._evaluate_ui_oracle(
+                                oracle,
+                                ui_result.stdout,
+                                package_name=package_name,
+                                baseline_output=(
+                                    ui_baseline.stdout if ui_baseline is not None else None
+                                ),
+                                baseline_valid=bool(
+                                    ui_baseline is not None
+                                    and ui_baseline.exit_code == 0
+                                ),
+                                observation_valid=ui_result.exit_code == 0,
+                            ),
                         },
                     )
                 )
@@ -773,6 +811,29 @@ class AdbDeviceAdapter:
                     60,
                 )
                 commands.append(("blackbox.poc_clear", clear, dict(common)))
+                ui_baseline: CommandResult | None = None
+                if oracle is not None and oracle.kind == "ui_text":
+                    ui_baseline = self._adb_budget(
+                        ["shell", "uiautomator", "dump", "/dev/tty"],
+                        budget,
+                        45,
+                    )
+                    commands.append(
+                        (
+                            "blackbox.poc_ui_baseline",
+                            ui_baseline,
+                            {
+                                **common,
+                                "observation_role": "pre_action_baseline",
+                                "target_package": target_package_name,
+                                "target_text_present": self._ui_text_in_package(
+                                    ui_baseline.stdout,
+                                    oracle.expected_text or "",
+                                    target_package_name,
+                                ),
+                            },
+                        )
+                    )
                 launch = self._adb_budget(
                     [
                         "shell",
@@ -840,7 +901,21 @@ class AdbDeviceAdapter:
                             ui_result,
                             {
                                 **common,
-                                **self._evaluate_ui_oracle(oracle, ui_result.stdout),
+                                **self._evaluate_ui_oracle(
+                                    oracle,
+                                    ui_result.stdout,
+                                    package_name=target_package_name,
+                                    baseline_output=(
+                                        ui_baseline.stdout
+                                        if ui_baseline is not None
+                                        else None
+                                    ),
+                                    baseline_valid=bool(
+                                        ui_baseline is not None
+                                        and ui_baseline.exit_code == 0
+                                    ),
+                                    observation_valid=ui_result.exit_code == 0,
+                                ),
                             },
                         )
                     )
@@ -988,17 +1063,28 @@ class AdbDeviceAdapter:
         *,
         matched: bool,
         observation: dict[str, Any],
+        impact_observed: bool = False,
+        refutation_observed: bool = False,
     ) -> dict[str, Any]:
-        impact = oracle.impact != "none" and matched
+        impact = bool(
+            oracle.impact != "none"
+            and matched
+            and impact_observed
+        )
         return {
             "oracle": {
                 "kind": oracle.kind,
                 "impact": oracle.impact,
                 "matched": matched,
                 "observation": observation,
+                "impact_predicate_satisfied": impact,
             },
             "security_impact_observed": impact,
-            "oracle_refuted": bool(oracle.refute_on_miss and not matched),
+            "oracle_refuted": bool(
+                oracle.refute_on_miss
+                and not matched
+                and refutation_observed
+            ),
         }
 
     @classmethod
@@ -1017,6 +1103,7 @@ class AdbDeviceAdapter:
                 oracle,
                 matched=success,
                 observation={"probe_success": success},
+                refutation_observed=probe_payload is not None,
             )
         if oracle.kind == "provider_rows":
             rows = (
@@ -1033,6 +1120,10 @@ class AdbDeviceAdapter:
                 oracle,
                 matched=matched,
                 observation={"row_count": rows, "minimum_rows": oracle.minimum_rows or 1},
+                impact_observed=(
+                    matched and oracle.impact == "unauthorized_data_access"
+                ),
+                refutation_observed=success,
             )
         if oracle.kind == "log_contains" and oracle.expected_text:
             matched = oracle.expected_text in output
@@ -1048,14 +1139,90 @@ class AdbDeviceAdapter:
         cls,
         oracle: AgentOracleSpec | None,
         output: str,
+        *,
+        package_name: str | None = None,
+        baseline_output: str | None = None,
+        baseline_valid: bool = False,
+        observation_valid: bool = True,
     ) -> dict[str, Any]:
         if oracle is None or oracle.kind != "ui_text" or not oracle.expected_text:
             return {}
+        target_match = bool(
+            package_name
+            and observation_valid
+            and cls._ui_text_in_package(
+                output,
+                oracle.expected_text,
+                package_name,
+            )
+        )
+        baseline_match = bool(
+            package_name
+            and baseline_valid
+            and baseline_output is not None
+            and cls._ui_text_in_package(
+                baseline_output,
+                oracle.expected_text,
+                package_name,
+            )
+        )
+        target_transition = bool(
+            baseline_valid
+            and observation_valid
+            and target_match
+            and not baseline_match
+        )
         return cls._oracle_metadata(
             oracle,
-            matched=oracle.expected_text in output,
-            observation={"expected_text": oracle.expected_text},
+            matched=target_match,
+            observation={
+                "expected_text": oracle.expected_text,
+                "target_package": package_name,
+                "target_text_present_before": baseline_match,
+                "target_text_present_after": target_match,
+                "target_text_transition": target_transition,
+                "baseline_valid": baseline_valid,
+                "observation_valid": observation_valid,
+            },
+            impact_observed=(
+                target_transition
+                and oracle.impact == "unauthorized_data_access"
+            ),
         )
+
+    @staticmethod
+    def _ui_text_in_package(
+        output: str,
+        expected_text: str,
+        package_name: str,
+    ) -> bool:
+        """Match UI text only when uiautomator attributes it to the target app."""
+
+        if not output or not expected_text or not package_name:
+            return False
+        starts = [
+            position
+            for marker in ("<?xml", "<hierarchy", "<node")
+            if (position := output.find(marker)) >= 0
+        ]
+        if not starts:
+            return False
+        fragment = output[min(starts):]
+        hierarchy_end = fragment.rfind("</hierarchy>")
+        if hierarchy_end >= 0:
+            fragment = fragment[: hierarchy_end + len("</hierarchy>")]
+        try:
+            root = ElementTree.fromstring(fragment)
+        except ElementTree.ParseError:
+            return False
+        for node in root.iter():
+            if node.attrib.get("package") != package_name:
+                continue
+            if expected_text in node.attrib.get("text", ""):
+                return True
+            if expected_text in node.attrib.get("content-desc", ""):
+                return True
+        return False
 
     @classmethod
     def _evaluate_target_log_oracle(
@@ -1067,12 +1234,44 @@ class AdbDeviceAdapter:
         if oracle.kind == "log_contains" and oracle.expected_text:
             matched = oracle.expected_text in output
             observation = {"expected_text": oracle.expected_text}
+            impact_observed = False
         elif oracle.kind == "process_crash":
-            matched = "FATAL EXCEPTION" in output and package_name in output
-            observation = {"package": package_name, "fatal_exception": matched}
+            matched = cls._target_process_crashed(output, package_name)
+            observation = {
+                "package": package_name,
+                "target_process_fatal_exception": matched,
+            }
+            impact_observed = (
+                matched and oracle.impact == "denial_of_service"
+            )
         else:
             return {}
-        return cls._oracle_metadata(oracle, matched=matched, observation=observation)
+        return cls._oracle_metadata(
+            oracle,
+            matched=matched,
+            observation=observation,
+            impact_observed=impact_observed,
+        )
+
+    @staticmethod
+    def _target_process_crashed(output: str, package_name: str) -> bool:
+        """Require a FATAL EXCEPTION block owned by the exact target process."""
+
+        process_pattern = re.compile(
+            rf"Process:\s*{re.escape(package_name)}"
+            r"(?::[A-Za-z0-9_.-]+)?(?:,|\s|$)"
+        )
+        fatal_markers = list(re.finditer(r"FATAL EXCEPTION", output))
+        for index, fatal in enumerate(fatal_markers):
+            next_fatal = (
+                fatal_markers[index + 1].start()
+                if index + 1 < len(fatal_markers)
+                else len(output)
+            )
+            block_end = min(next_fatal, fatal.end() + 4000)
+            if process_pattern.search(output[fatal.start():block_end]):
+                return True
+        return False
 
     def _adb(
         self,

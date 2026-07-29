@@ -26,6 +26,7 @@ const PROVIDER_REQUEST_HEADROOM = 100
 const MAX_EXPLORER_MEMO_BYTES = 128 * 1024
 const LOCAL_POLL_INTERVAL_MS = 250
 const LOCAL_READ_RETRY_COUNT = 3
+const LOCAL_READ_TIMEOUT_MS = 5_000
 const SANITIZED_BASH = fileURLToPath(new URL("./bin/bash", import.meta.url))
 const PROVIDER_API_KEY_FIELD = "_provider_api_key"
 const PROVIDER_API_KEY_IN_ENVIRONMENT = Object.prototype.hasOwnProperty.call(
@@ -694,7 +695,7 @@ async function rawSessionMessages(id) {
     new URL(`/session/${encodeURIComponent(id)}/message`, localServerURL),
     {
       headers: { Authorization: localAuthorization },
-      signal: AbortSignal.timeout(remaining),
+      signal: AbortSignal.timeout(Math.min(remaining, LOCAL_READ_TIMEOUT_MS)),
     },
   )
   const text = await response.text()
@@ -757,8 +758,15 @@ async function localRead(operation, label) {
 function isFetchFailure(error) {
   if (!(error instanceof Error)) return false
   if (error.name === "TypeError" && /fetch failed/i.test(error.message)) return true
+  if (
+    error.name === "TimeoutError" &&
+    /aborted|timeout/i.test(error.message)
+  ) {
+    return true
+  }
   const code = error.cause?.code
   return [
+    "ABORT_ERR",
     "ECONNREFUSED",
     "ECONNRESET",
     "EPIPE",

@@ -640,7 +640,6 @@ class ScanOrchestrator:
             closures_by_entry = {
                 closure.entry_point_id: closure for closure in static_closures
             }
-            closed_entry_ids = set(closures_by_entry)
             for entry_id, closure in closures_by_entry.items():
                 coverage_item = entry_coverage[entry_id]
                 coverage_item.status = CoverageStatus.COVERED.value
@@ -649,32 +648,26 @@ class ScanOrchestrator:
                     "deterministic_dynamic": "not_applicable",
                     "agent": "not_applicable",
                     "blackbox": "not_applicable",
+                    "indirect_chain": "retained_for_scan_wide_seed_exploration",
                 }
                 coverage_item.gap_reason = closure.reason
             for finding in persisted_findings:
-                linked_entries = set(finding.entry_point_ids)
-                if linked_entries and linked_entries <= closed_entry_ids:
-                    finding.status = FindingStatus.FALSE_POSITIVE.value
-                    finding.metadata_json = {
-                        **finding.metadata_json,
-                        "closed_by_static_reachability": {
-                            "threat_model": "ordinary_app_uid",
-                            "entry_decisions": [
-                                closures_by_entry[entry_id].as_dict()
-                                for entry_id in sorted(linked_entries)
-                            ],
-                        },
-                    }
+                self._annotate_direct_reachability(
+                    finding,
+                    closures_by_entry,
+                )
             session.add_all(tasks)
             if static_closures:
                 add_event(
                     session,
                     scan.id,
                     "planning.static_closed",
-                    f"{len(static_closures)} 个入口已由平台静态可达性策略明确关闭",
+                    f"{len(static_closures)} 个入口的普通应用直接调用路径已静态判定为阻断",
                     {
                         "count": len(static_closures),
                         "threat_model": "ordinary_app_uid",
+                        "scope": "direct_invocation_only",
+                        "indirect_chain_targets_retained": True,
                         "decisions": [
                             closure.as_dict() for closure in static_closures[:200]
                         ],
@@ -1293,9 +1286,11 @@ class ScanOrchestrator:
             android_version=self.settings.device_android_version,
             adb_configured=self.device.configured,
         ).plan_with_decisions(scan_id, scan_entries)
-        statically_closed_entry_ids = {
-            closure.entry_point_id for closure in scope_plan.static_closures
+        static_closures_by_entry = {
+            closure.entry_point_id: closure
+            for closure in scope_plan.static_closures
         }
+        statically_closed_entry_ids = set(static_closures_by_entry)
         testable_entries = [
             entry
             for entry in scan_entries
@@ -1316,6 +1311,17 @@ class ScanOrchestrator:
                     "permission": entry.permission,
                     "permission_protection": entry.permission_protection,
                     "direct_test_allowed": entry.id in direct_test_entry_ids,
+                    "direct_reachability": (
+                        "blocked"
+                        if entry.id in statically_closed_entry_ids
+                        else "testable"
+                    ),
+                    "direct_reachability_decision": (
+                        static_closures_by_entry[entry.id].as_dict()
+                        if entry.id in static_closures_by_entry
+                        else None
+                    ),
+                    "indirect_chain_target_allowed": True,
                     "assigned_seed": entry.id in set(task.target_entry_ids),
                 }
                 for entry in scan_entries
@@ -1524,6 +1530,14 @@ class ScanOrchestrator:
                     attempt=task.attempts,
                     result=result,
                 )
+                rejected_requested_tests = self._rejected_requested_tests(
+                    result.result
+                )
+                argument_payload = result.result.model_dump(mode="json")
+                if rejected_requested_tests:
+                    argument_payload["platform_model_validation"] = {
+                        "rejected_requested_tests": rejected_requested_tests,
+                    }
                 role = (
                     "critic"
                     if phase == "adversarial_review"
@@ -1541,7 +1555,7 @@ class ScanOrchestrator:
                         if agent_backend == "codex"
                         else self.settings.opencode_model
                     ),
-                    payload=result.result.model_dump(mode="json"),
+                    payload=argument_payload,
                 )
                 self._record_agent_runtime_events(
                     scan_id=scan_id,
@@ -1565,6 +1579,9 @@ class ScanOrchestrator:
                         "thread_id": result.thread_id,
                         "turn_id": result.turn_id,
                         "requested_test_count": len(result.result.requested_tests),
+                        "rejected_requested_test_count": len(
+                            rejected_requested_tests
+                        ),
                     },
                 )
                 for hypothesis in result.result.hypotheses_tested[:12]:
@@ -1612,6 +1629,9 @@ class ScanOrchestrator:
                         "thread_id": result.thread_id,
                         "turn_id": result.turn_id,
                         "model_result": result.result.model_dump(mode="json"),
+                        "model_validation": {
+                            "rejected_requested_tests": rejected_requested_tests,
+                        },
                         "test_validation": None,
                     }
                 )
@@ -1805,7 +1825,7 @@ class ScanOrchestrator:
                                     continue
                                 seen_requests.add(signature)
                                 merged_requests.append(request)
-                            agent_result.result = agent_result.result.model_copy(
+                            merged_result = agent_result.result.model_copy(
                                 update={
                                     "requested_tests": merged_requests[
                                         : self.settings.agent_tests_per_round
@@ -1820,6 +1840,15 @@ class ScanOrchestrator:
                                     ),
                                 }
                             )
+                            merged_result._rejected_requested_tests = [  # noqa: SLF001
+                                *self._rejected_requested_tests(
+                                    agent_result.result
+                                ),
+                                *self._rejected_requested_tests(
+                                    critic_result.result
+                                ),
+                            ]
+                            agent_result.result = merged_result
                             self._record_exploration_event(
                                 scan_id,
                                 task_id,
@@ -1847,24 +1876,36 @@ class ScanOrchestrator:
                     completed_rounds = 0
                     while (
                         agent_result
-                        and agent_result.result.requested_tests
+                        and self._has_requested_test_work(agent_result.result)
                         and prepared
                         and completed_rounds < self.settings.agent_max_rounds
                         and not budget.expired
                     ):
                         planning_result = agent_result
                         planning_turn_id = planning_result.turn_id
+                        model_rejections = self._rejected_requested_tests(
+                            planning_result.result
+                        )
                         submitted_tests = [
                             item.model_dump(mode="json")
                             for item in planning_result.result.requested_tests
                         ]
-                        requested, request_gaps = self._validate_requested_tests(
+                        submitted_tests.extend(
+                            rejection["request"]
+                            for rejection in model_rejections
+                            if isinstance(rejection.get("request"), dict)
+                        )
+                        requested, platform_request_gaps = self._validate_requested_tests(
                             planning_result.result.requested_tests,
                             testable_entries,
                             limit=self.settings.agent_tests_per_round,
                             hypothesis_ids=hypothesis_ids,
                             permission_profile=self.settings.agent_permission_profile,
                         )
+                        request_gaps = [
+                            *self._rejected_requested_test_gaps(model_rejections),
+                            *platform_request_gaps,
+                        ]
                         poc_artifacts: dict[str, PocBuildResult] = {}
                         if requested:
                             agent_workspace = (
@@ -1957,6 +1998,7 @@ class ScanOrchestrator:
                             ],
                             executed=executed_this_round,
                             gaps=[*request_gaps, *execution_gaps],
+                            model_rejected=model_rejections,
                         )
                         for round_handoff in reversed(agent_round_history):
                             if round_handoff.get("turn_id") == planning_turn_id:
@@ -1968,6 +2010,7 @@ class ScanOrchestrator:
                                     ],
                                     "executed": executed_this_round,
                                     "gaps": [*request_gaps, *execution_gaps],
+                                    "model_rejected": model_rejections,
                                 }
                                 break
                         completed_rounds += 1
@@ -2021,7 +2064,7 @@ class ScanOrchestrator:
                         if final_result is not None:
                             agent_result = final_result
                             agent_error = None
-                            if final_result.result.requested_tests:
+                            if self._has_requested_test_work(final_result.result):
                                 coverage_gaps.append(
                                     "Final evaluation requested additional tests, but final turns "
                                     "cannot schedule new device actions."
@@ -2304,6 +2347,31 @@ class ScanOrchestrator:
         if cancel_event.is_set():
             raise AgentCancelledError("investigation was cancelled by the user")
 
+    @staticmethod
+    def _annotate_direct_reachability(
+        finding: Finding,
+        closures_by_entry: dict[str, Any],
+    ) -> bool:
+        """Record a blocked direct edge without closing indirect vulnerability chains."""
+
+        linked_entries = set(finding.entry_point_ids)
+        if not linked_entries or not linked_entries <= set(closures_by_entry):
+            return False
+        finding.metadata_json = {
+            **finding.metadata_json,
+            "direct_reachability_assessment": {
+                "status": "blocked",
+                "scope": "ordinary_app_direct_invocation_only",
+                "indirect_chain_paths_evaluated": False,
+                "threat_model": "ordinary_app_uid",
+                "entry_decisions": [
+                    closures_by_entry[entry_id].as_dict()
+                    for entry_id in sorted(linked_entries)
+                ],
+            },
+        }
+        return True
+
     def _mark_task_canceled(self, scan_id: str, task_id: str) -> None:
         with self.database.session_factory() as session:
             for _attempt in range(3):
@@ -2472,6 +2540,47 @@ class ScanOrchestrator:
         return json.dumps(payload, sort_keys=True)
 
     @staticmethod
+    def _rejected_requested_tests(result: Any) -> list[dict[str, Any]]:
+        rejected = getattr(result, "rejected_requested_tests", [])
+        if not isinstance(rejected, list):
+            return []
+        return deepcopy(
+            [item for item in rejected if isinstance(item, dict)]
+        )
+
+    @classmethod
+    def _has_requested_test_work(cls, result: Any) -> bool:
+        return bool(
+            getattr(result, "requested_tests", [])
+            or cls._rejected_requested_tests(result)
+        )
+
+    @staticmethod
+    def _rejected_requested_test_gaps(
+        rejected: list[dict[str, Any]],
+    ) -> list[str]:
+        gaps: list[str] = []
+        for fallback_index, item in enumerate(rejected):
+            index = item.get("index", fallback_index)
+            errors = item.get("errors")
+            if not isinstance(errors, list) or not errors:
+                gaps.append(
+                    f"requested_tests[{index}] failed model schema validation."
+                )
+                continue
+            for error in errors:
+                if not isinstance(error, dict):
+                    continue
+                location = str(error.get("location") or "<request>")
+                message = str(error.get("message") or "invalid request")
+                error_type = str(error.get("type") or "validation_error")
+                gaps.append(
+                    f"requested_tests[{index}] schema validation failed at "
+                    f"{location}: {message} ({error_type})"
+                )
+        return gaps
+
+    @staticmethod
     def _validate_requested_tests(
         requests: list[AgentRequestedTest],
         entries: list[EntryPoint],
@@ -2521,6 +2630,11 @@ class ScanOrchestrator:
                 and entry.kind != "provider"
             ):
                 reason = "provider_rows Oracle requires a provider entry"
+            elif (
+                request.oracle.kind == "provider_rows"
+                and request.operation not in {"auto", "query"}
+            ):
+                reason = "provider_rows Oracle requires a provider query operation"
             elif (
                 (request.intent_action or request.categories)
                 and entry.kind == "provider"
@@ -3213,6 +3327,11 @@ class ScanOrchestrator:
             "thread_id": result.thread_id,
             "turn_id": result.turn_id,
             "structured_output": result.result.model_dump(mode="json"),
+            "model_validation": {
+                "rejected_requested_tests": self._rejected_requested_tests(
+                    result.result
+                ),
+            },
             "usage": result.usage,
             "output_transport": getattr(result, "output_transport", {}),
         }
@@ -3373,6 +3492,7 @@ class ScanOrchestrator:
         accepted: list[dict[str, Any]],
         executed: list[dict[str, Any]],
         gaps: list[str],
+        model_rejected: list[dict[str, Any]] | None = None,
     ) -> None:
         match = self._agent_response_for_turn(task_id, turn_id)
         if match is None:
@@ -3390,6 +3510,7 @@ class ScanOrchestrator:
                     "accepted": accepted,
                     "executed": executed,
                     "gaps": gaps,
+                    "model_rejected": model_rejected or [],
                 },
                 summary="Platform validation of AI-requested tests",
                 metadata=metadata,
