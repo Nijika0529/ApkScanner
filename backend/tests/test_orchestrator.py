@@ -26,11 +26,17 @@ from apkscanner.models import (
     ScanEvent,
     SecurityHypothesis,
 )
-from apkscanner.orchestrator import ScanOrchestrator
+from apkscanner.orchestrator import ScanOrchestrator, _critic_timeout_seconds
 from apkscanner.reports import ReportBuilder
 from apkscanner.schemas import AgentInvestigationResult
 from apkscanner.tools import CommandResult
 from sqlalchemy import select
+
+
+def test_critic_uses_all_remaining_task_time_except_final_reserve() -> None:
+    assert _critic_timeout_seconds(3_000) == 2_940
+    assert _critic_timeout_seconds(181) == 121
+    assert _critic_timeout_seconds(60) == 0
 
 
 def test_task_fails_closed_when_entry_belongs_to_another_scan(settings) -> None:  # noqa: ANN001

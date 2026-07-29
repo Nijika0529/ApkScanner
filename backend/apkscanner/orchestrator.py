@@ -58,10 +58,14 @@ from .static_analysis import ApkInspector
 from .tools import CommandResult, TimeBudget, ToolRunner
 
 AGENT_PLANNING_TIMEOUT_CAP_SECONDS = 300
-AGENT_CRITIC_TIMEOUT_CAP_SECONDS = 120
 AGENT_FINAL_TIMEOUT_CAP_SECONDS = 180
 AGENT_FINAL_RESERVE_SECONDS = 60
 AGENT_MIN_OPTIONAL_PHASE_SECONDS = 30
+
+
+def _critic_timeout_seconds(remaining_task_seconds: int) -> int:
+    """Give Critic all remaining task time except the final-decision reserve."""
+    return max(0, remaining_task_seconds - AGENT_FINAL_RESERVE_SECONDS)
 
 
 class ScanOrchestrator:
@@ -1741,7 +1745,7 @@ class ScanOrchestrator:
                             )
 
                     planning_reserve = min(
-                        AGENT_CRITIC_TIMEOUT_CAP_SECONDS
+                        AGENT_MIN_OPTIONAL_PHASE_SECONDS
                         + AGENT_FINAL_RESERVE_SECONDS,
                         max(0, budget.remaining() // 3),
                     )
@@ -1754,12 +1758,8 @@ class ScanOrchestrator:
                         timeout_cap=phase_one_cap,
                         round_index=0,
                     )
-                    critic_budget = min(
-                        AGENT_CRITIC_TIMEOUT_CAP_SECONDS,
-                        max(
-                            0,
-                            budget.remaining() - AGENT_FINAL_RESERVE_SECONDS,
-                        ),
+                    critic_budget = _critic_timeout_seconds(
+                        budget.remaining()
                     )
                     if (
                         agent_result is not None
