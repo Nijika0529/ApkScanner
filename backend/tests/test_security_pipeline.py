@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from apkscanner.db import Database
 from apkscanner.models import (
+    EntryPoint,
     HypothesisArgument,
     InvestigationTask,
     ProofAttempt,
@@ -243,6 +244,61 @@ def test_plan_proof_rejects_cross_task_hypothesis_without_fallback(settings) -> 
             session.scalars(select(ProofAttempt).where(ProofAttempt.task_id == first.id))
         )
         assert attempts == []
+
+
+def test_plan_proof_allows_related_exported_entry_in_same_scan(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="chain-proof.apk",
+            artifact_sha256="f" * 64,
+            artifact_path=str(settings.data_dir / "chain-proof.apk"),
+        )
+        seed = EntryPoint(
+            scan=scan,
+            kind="activity",
+            name="com.example.SeedActivity",
+            exported=True,
+        )
+        related = EntryPoint(
+            scan=scan,
+            kind="service",
+            name="com.example.RelatedService",
+            exported=True,
+        )
+        session.add_all([scan, seed, related])
+        session.flush()
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            target_entry_ids=[seed.id],
+            hypotheses=["The seed can delegate attacker input to the related service."],
+        )
+        session.add(task)
+        session.commit()
+        related_id = related.id
+
+    ledger = HypothesisLedger(database)
+    hypothesis = ledger.ensure_task_hypotheses(task)[0]
+    proof_id = ledger.plan_proof(
+        task_id=task.id,
+        test_case_id="cross-entry-chain",
+        request=AgentRequestedTest(
+            hypothesis_id=hypothesis.id,
+            entry_point_id=related_id,
+            uri=None,
+            extras={},
+            rationale="Validate a same-scan cross-component chain.",
+        ),
+    )
+
+    assert proof_id is not None
+    with database.session_factory() as session:
+        proof = session.get(ProofAttempt, proof_id)
+        assert proof is not None
+        assert proof.plan["entry_point_id"] == related_id
 
 
 def test_platform_proof_result_is_independent_from_model_verdict(settings) -> None:  # noqa: ANN001

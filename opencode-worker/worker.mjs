@@ -1195,12 +1195,16 @@ function validatePayload(value) {
     value.permission_profile ??= "strict"
     value.allow_adb ??= false
     value.allow_network ??= false
+    value.require_hypothesis_receipts ??= false
     value.external_read_roots ??= []
     if (!["strict", "personal_lab"].includes(value.permission_profile)) {
       throw new Error("unsupported Agent permission profile")
     }
     if (typeof value.allow_adb !== "boolean" || typeof value.allow_network !== "boolean") {
       throw new Error("Agent runtime capabilities must be booleans")
+    }
+    if (typeof value.require_hypothesis_receipts !== "boolean") {
+      throw new Error("require_hypothesis_receipts must be a boolean")
     }
     if (
       !Array.isArray(value.external_read_roots) ||
@@ -1537,10 +1541,36 @@ function semanticValidationErrors(value, payload) {
       ) {
         add(
           `/requested_tests/${index}/entry_point_id`,
-          "requested test must reference an entry point issued for this task",
+          "requested test must reference an entry point authorized in this scan-wide exploration scope",
         )
       }
     })
+  }
+  if (payload.require_hypothesis_receipts) {
+    const requiredHypotheses = new Set(payload.allowed_hypothesis_ids ?? [])
+    const receivedHypotheses = new Set(
+      (Array.isArray(value.hypothesis_assessments)
+        ? value.hypothesis_assessments
+        : []
+      )
+        .filter(
+          (assessment) =>
+            assessment &&
+            typeof assessment === "object" &&
+            !Array.isArray(assessment) &&
+            typeof assessment.hypothesis_id === "string",
+        )
+        .map((assessment) => assessment.hypothesis_id),
+    )
+    const missingHypotheses = [...requiredHypotheses].filter(
+      (hypothesisID) => !receivedHypotheses.has(hypothesisID),
+    )
+    if (missingHypotheses.length > 0) {
+      add(
+        "/hypothesis_assessments",
+        `every platform-issued hypothesis requires one coverage receipt; missing: ${missingHypotheses.join(", ")}`,
+      )
+    }
   }
   return errors
 }

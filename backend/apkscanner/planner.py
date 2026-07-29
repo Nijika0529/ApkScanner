@@ -248,7 +248,8 @@ class InvestigationPlanner:
         }
 
     def _component_task(self, scan_id: str, entry: EntryPoint) -> InvestigationTask:
-        hypotheses = {
+        hypotheses = [
+            *{
             EntryPointKind.ACTIVITY.value: [
                 "A third-party application can launch the activity.",
                 "External extras or data can bypass authentication or reach a sensitive screen.",
@@ -270,7 +271,13 @@ class InvestigationPlanner:
                 "An untrusted application can query or open provider data.",
                 "Provider paths, selections, or URI grants expose data or permit injection.",
             ],
-        }[entry.kind]
+            }[entry.kind],
+            (
+                "Attacker-controlled data from this assigned entry can traverse helper classes, "
+                "non-exported components, WebView or Binder boundaries, files, databases, or "
+                "other application code and reach a concrete sensitive sink."
+            ),
+        ]
         priority = {
             EntryPointKind.PROVIDER.value: 95,
             EntryPointKind.SERVICE.value: 90,

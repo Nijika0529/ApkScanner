@@ -59,6 +59,23 @@ def test_planner_statically_closes_signature_guarded_component() -> None:
     assert closure.permission_protection == "signature|privileged"
     assert closure.resolution_source == "manifest_declaration"
 
+    unguarded = EntryPoint(
+        id="00000000-0000-0000-0000-000000000016",
+        scan_id="scan",
+        kind="activity",
+        name="com.example.PublicActivity",
+        owner_component="com.example.PublicActivity",
+        exported=True,
+    )
+    task = InvestigationPlanner(
+        android_version="16",
+        adb_configured=True,
+    ).plan("scan", [unguarded])[0]
+    assert any(
+        "Attacker-controlled data from this assigned entry" in hypothesis
+        for hypothesis in task.hypotheses
+    )
+
 
 def test_planner_resolves_framework_signature_binding_permission() -> None:
     entry = EntryPoint(

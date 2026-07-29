@@ -755,6 +755,17 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
             task = kwargs["task"]
             evidence = kwargs["evidence"]
             assert kwargs["platform_context"]["output_language"] == "zh-CN"
+            entry_scope = kwargs["platform_context"]["entry_scope"]
+            assert entry_scope["policy"] == (
+                "seed_entry_with_scan_wide_chain_exploration"
+            )
+            assert entry_scope["seed_entry_point_ids"] == task.target_entry_ids
+            trusted_catalog_item = next(
+                item
+                for item in entry_scope["catalog"]
+                if item["name"] == "com.example.vulnerable.TrustedService"
+            )
+            assert trusted_catalog_item["direct_test_allowed"] is False
             code_context = kwargs["platform_context"]["target_code_context"]
             assert code_context["schema_version"] == "1.0"
             assert code_context["components"]

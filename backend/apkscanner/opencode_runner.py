@@ -431,7 +431,24 @@ class OpenCodeInvestigator:
                 for item in context.get("security_hypotheses", [])
                 if isinstance(item, dict) and isinstance(item.get("id"), str)
             ),
-            "allowed_entry_point_ids": sorted(entry.id for entry in entries),
+            "require_hypothesis_receipts": True,
+            "allowed_entry_point_ids": sorted(
+                {
+                    entry.id for entry in entries
+                }
+                | {
+                    str(entry_id)
+                    for entry_id in (
+                        (context.get("entry_scope") or {}).get(
+                            "direct_test_entry_point_ids",
+                            [],
+                        )
+                        if isinstance(context.get("entry_scope"), dict)
+                        else []
+                    )
+                    if isinstance(entry_id, str)
+                }
+            ),
             "allowed_evidence_ids": sorted(
                 str(item["id"])
                 for item in evidence

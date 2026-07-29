@@ -355,6 +355,8 @@ def test_personal_lab_investigate_uses_workspace_analysis_then_validates_result(
         assert payload["model"] == "deepseek-v4-flash"
         assert payload["phase"] == "static_only"
         assert "Inspect context.json first" in payload["prompt"]
+        assert "mandatory coverage seed" in payload["prompt"]
+        assert "scan-wide entry directory" in payload["prompt"]
         assert "explorer_prompt" in payload
         assert "explorer_instructions" in payload
         assert payload["tool_profile"] == "workspace_shell"
@@ -372,9 +374,11 @@ def test_personal_lab_investigate_uses_workspace_analysis_then_validates_result(
         assert payload["execution_profile"]["stages"][0]["workspace_tools"] is True
         assert payload["execution_profile"]["stages"][1]["wire_tool_choice"] == "required"
         assert payload["allowed_entry_point_ids"] == [
-            "00000000-0000-0000-0000-000000000003"
+            "00000000-0000-0000-0000-000000000003",
+            "00000000-0000-0000-0000-000000000004",
         ]
         assert payload["allowed_hypothesis_ids"] == []
+        assert payload["require_hypothesis_receipts"] is True
         assert payload["output_schema"]["title"] == "AgentInvestigationResult"
         assert payload["output_schema"]["additionalProperties"] is False
         result_values = payload["output_schema"]["properties"]["result"]["enum"]
@@ -426,6 +430,13 @@ def test_personal_lab_investigate_uses_workspace_analysis_then_validates_result(
         entries=[entry],
         workspace=workspace,
         evidence=[],
+        platform_context={
+            "entry_scope": {
+                "direct_test_entry_point_ids": [
+                    "00000000-0000-0000-0000-000000000004"
+                ],
+            },
+        },
     )
     assert result.thread_id == "session-test"
     assert result.turn_id == "message-test"

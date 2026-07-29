@@ -848,6 +848,82 @@ test("semantic validation rejects requested tests outside platform-issued IDs", 
   }
 })
 
+test("semantic validation requires one receipt per platform hypothesis", async () => {
+  const requests = []
+  const requiredHypothesis = "33333333-3333-3333-3333-333333333333"
+  const receiptSchema = {
+    type: "object",
+    properties: {
+      result: { type: "string", const: "inconclusive" },
+      answer: { type: "string" },
+      hypothesis_assessments: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            hypothesis_id: { type: "string" },
+          },
+          required: ["hypothesis_id"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["result", "answer", "hypothesis_assessments"],
+    additionalProperties: false,
+  }
+  const corrected = {
+    result: "inconclusive",
+    answer: "covered",
+    hypothesis_assessments: [{ hypothesis_id: requiredHypothesis }],
+  }
+  const api = createServer(async (request, response) => {
+    const body = await readJSON(request)
+    requests.push({ url: request.url, body })
+    sendCompletion(response, body, {
+      id: `receipt-${requests.length}`,
+      toolCalls: [
+        structuredOutputCall(
+          requests.length === 1
+            ? {
+                result: "inconclusive",
+                answer: "missed",
+                hypothesis_assessments: [],
+              }
+            : corrected,
+        ),
+      ],
+      finish: "tool_calls",
+    })
+  })
+  await listen(api)
+  const address = api.address()
+  assert(address && typeof address !== "string")
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-receipt-test-"))
+  try {
+    const completed = await runWorker(
+      root,
+      investigationPayload({
+        baseURL: `http://127.0.0.1:${address.port}`,
+        profile: finalizerProfile(),
+        outputSchema: receiptSchema,
+        allowedHypothesisIDs: [requiredHypothesis],
+        requireHypothesisReceipts: true,
+      }),
+    )
+    assert.equal(completed.code, 0, completed.stderr)
+    const { result } = parseWorkerOutput(completed.stdout)
+    assert.deepEqual(result.result, corrected)
+    assert.equal(requests.length, 2)
+    assert.equal(
+      result.output_transport.model_calls[0].validation_errors[0].instance_path,
+      "/hypothesis_assessments",
+    )
+  } finally {
+    api.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 function investigationPayload({
   baseURL,
   profile,
@@ -858,6 +934,7 @@ function investigationPayload({
   allowedHypothesisIDs = [],
   allowedEntryPointIDs = [],
   allowedEvidenceIDs = [],
+  requireHypothesisReceipts = false,
 }) {
   return {
     schema_version: "1.0",
@@ -876,6 +953,7 @@ function investigationPayload({
     allowed_hypothesis_ids: allowedHypothesisIDs,
     allowed_entry_point_ids: allowedEntryPointIDs,
     allowed_evidence_ids: allowedEvidenceIDs,
+    require_hypothesis_receipts: requireHypothesisReceipts,
   }
 }
 

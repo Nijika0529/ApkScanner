@@ -1136,14 +1136,19 @@ class ScanOrchestrator:
                 TaskStatus.RUNNING.value,
             }:
                 return
-            entries = list(
+            scan_entries = list(
                 session.scalars(
                     select(EntryPoint).where(
                         EntryPoint.scan_id == scan.id,
-                        EntryPoint.id.in_(task.target_entry_ids),
                     )
                 )
             )
+            entries_by_id = {entry.id: entry for entry in scan_entries}
+            entries = [
+                entries_by_id[entry_id]
+                for entry_id in task.target_entry_ids
+                if entry_id in entries_by_id
+            ]
             loaded_entry_ids = {entry.id for entry in entries}
             expected_entry_ids = set(task.target_entry_ids)
             if not expected_entry_ids or loaded_entry_ids != expected_entry_ids:
@@ -1280,6 +1285,38 @@ class ScanOrchestrator:
                 },
             )
         target_code_context = self._target_code_context(scan_id, entries)
+        scope_plan = InvestigationPlanner(
+            android_version=self.settings.device_android_version,
+            adb_configured=self.device.configured,
+        ).plan_with_decisions(scan_id, scan_entries)
+        statically_closed_entry_ids = {
+            closure.entry_point_id for closure in scope_plan.static_closures
+        }
+        testable_entries = [
+            entry
+            for entry in scan_entries
+            if entry.id not in statically_closed_entry_ids
+        ]
+        direct_test_entry_ids = {entry.id for entry in testable_entries}
+        entry_scope = {
+            "policy": "seed_entry_with_scan_wide_chain_exploration",
+            "seed_entry_point_ids": list(task.target_entry_ids),
+            "direct_test_entry_point_ids": sorted(direct_test_entry_ids),
+            "catalog": [
+                {
+                    "id": entry.id,
+                    "kind": entry.kind,
+                    "name": entry.name,
+                    "owner_component": entry.owner_component,
+                    "exported": entry.exported,
+                    "permission": entry.permission,
+                    "permission_protection": entry.permission_protection,
+                    "direct_test_allowed": entry.id in direct_test_entry_ids,
+                    "assigned_seed": entry.id in set(task.target_entry_ids),
+                }
+                for entry in scan_entries
+            ],
+        }
         coverage_gaps: list[str] = []
         stages: dict[str, Any] = {
             "device_attempted": False,
@@ -1337,6 +1374,7 @@ class ScanOrchestrator:
                     "poc_builder": self.poc_builder.capability(),
                     "coverage_gaps": coverage_gaps,
                     "target_code_context": target_code_context,
+                    "entry_scope": entry_scope,
                     "executed_agent_tests": executed_tests or [],
                     "further_test_rounds_available": (
                         phase != "final_evaluation"
@@ -1790,7 +1828,7 @@ class ScanOrchestrator:
                         ]
                         requested, request_gaps = self._validate_requested_tests(
                             planning_result.result.requested_tests,
-                            entries,
+                            testable_entries,
                             limit=self.settings.agent_tests_per_round,
                             hypothesis_ids=hypothesis_ids,
                             permission_profile=self.settings.agent_permission_profile,
@@ -1863,7 +1901,7 @@ class ScanOrchestrator:
                                 scan_id=scan_id,
                                 task_id=task_id,
                                 package_name=package_name,
-                                entries=entries,
+                                entries=testable_entries,
                                 requests=requested,
                                 budget=budget,
                                 evidence_summaries=evidence_summaries,
@@ -4079,7 +4117,12 @@ class ScanOrchestrator:
                 .order_by(SecurityHypothesis.created_at)
             )
         )
-        entry_name_by_id = {entry.id: entry.name for entry in entries}
+        entry_name_by_id = {
+            entry.id: entry.name
+            for entry in session.scalars(
+                select(EntryPoint).where(EntryPoint.scan_id == scan.id)
+            )
+        }
         proven_hypotheses: list[
             tuple[SecurityHypothesis, list[ProofAttempt]]
         ] = []
@@ -4099,6 +4142,22 @@ class ScanOrchestrator:
 
         if proven_hypotheses:
             for hypothesis, attempts in proven_hypotheses:
+                chain_entry_ids = list(
+                    dict.fromkeys(
+                        [
+                            *hypothesis.entry_point_ids,
+                            *[
+                                str(attempt.plan["entry_point_id"])
+                                for attempt in attempts
+                                if isinstance(attempt.plan, dict)
+                                and isinstance(
+                                    attempt.plan.get("entry_point_id"),
+                                    str,
+                                )
+                            ],
+                        ]
+                    )
+                )
                 proof_status = FindingStatus.REPRODUCED_BLACKBOX.value
                 proof_evidence_ids = list(
                     dict.fromkeys(
@@ -4128,7 +4187,7 @@ class ScanOrchestrator:
                         category=hypothesis.category,
                         entry_names=[
                             entry_name_by_id.get(entry_id, entry_id)
-                            for entry_id in hypothesis.entry_point_ids
+                            for entry_id in chain_entry_ids
                         ],
                         claim=hypothesis.claim,
                     ),
@@ -4153,7 +4212,7 @@ class ScanOrchestrator:
                         or payload.get("severity_proposal", "medium"),
                         confidence=payload.get("confidence", "medium"),
                         status=proof_status,
-                        entry_point_ids=list(hypothesis.entry_point_ids),
+                        entry_point_ids=chain_entry_ids,
                         evidence_ids=proof_evidence_ids,
                         metadata_json=metadata,
                     )
@@ -4171,7 +4230,7 @@ class ScanOrchestrator:
                     )
                     finding.confidence = payload.get("confidence", "medium")
                     finding.status = proof_status
-                    finding.entry_point_ids = list(hypothesis.entry_point_ids)
+                    finding.entry_point_ids = chain_entry_ids
                     finding.evidence_ids = proof_evidence_ids
                     finding.metadata_json = {
                         **dict(finding.metadata_json or {}),

@@ -125,6 +125,7 @@ def investigation_prompt(
         "task": {
             "id": task.id,
             "type": task.task_type,
+            "coverage_seed_entry_point_ids": list(task.target_entry_ids),
             "hypotheses": task.hypotheses,
             "preconditions": task.preconditions,
             "allowed_side_effects": task.allowed_side_effects,
@@ -151,9 +152,10 @@ def investigation_prompt(
     if direct_tool_access and shell_access and workspace_write:
         access_instruction = (
             "You may inspect the complete task workspace and run shell commands there. Temporary "
-            "scripts and analysis artifacts may be created only in the workspace or /tmp. ADB, "
-            "device, and target-network actions that must count as proof must be requested through "
-            "requested_tests. Inspect context.json first; it lists the complete read-only JADX, "
+            "scripts and analysis artifacts may be created only in the workspace or /tmp. Use raw "
+            "ADB freely for exploration when the runtime capability permits it; observations that "
+            "must count as ordinary-app proof must be replayed through requested_tests. Inspect "
+            "context.json first; it lists the complete read-only JADX, "
             "apktool, and archive roots exposed by the platform. You may build arbitrary local "
             "analysis helpers and Android projects inside the task workspace. If the "
             "generic Probe APK cannot express a required ordinary-app-UID test and "
@@ -212,7 +214,17 @@ def investigation_prompt(
         )
     )
     return (
-        "Assess the assigned Android entry point. Correlate manifest facts, decompiled-code "
+        "Treat the assigned Android entry point as a mandatory coverage seed, not as the boundary "
+        "of the investigation. Inspect the complete APK workspace and freely trace attacker-controlled "
+        "data across helper classes, callbacks, non-exported components, Binder/AIDL, Providers, "
+        "WebViews, files, databases, native boundaries, and other application code until the path "
+        "is blocked or reaches a concrete sensitive sink. Use platform_context.entry_scope.catalog "
+        "as the scan-wide entry directory. Related entries may be examined and, when marked "
+        "direct_test_allowed, may be referenced by a requested test needed to prove a chain that "
+        "originates from the assigned seed. Do not stop merely because a path crosses into a "
+        "non-exported internal component. The final result must still provide one hypothesis "
+        "assessment receipt for every platform-issued hypothesis so exploration cannot skip the "
+        "assigned seed. Correlate manifest facts, decompiled-code "
         f"summaries, and supplied dynamic evidence. {role_instruction}{access_instruction} "
         "Use platform_context.target_code_context to decide target-specific source availability. "
         "Treat platform_context.threat_model as the fixed scan contract: reason from its attacker, "

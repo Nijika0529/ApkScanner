@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from .db import Database
 from .enums import FindingStatus, HypothesisStatus, ProofAttemptStatus
 from .models import (
+    EntryPoint,
     HypothesisArgument,
     InvestigationTask,
     ProofAttempt,
@@ -223,7 +224,16 @@ class HypothesisLedger:
     ) -> str | None:
         with self.database.session_factory() as session:
             task = session.get(InvestigationTask, task_id)
-            if task is None or request.entry_point_id not in set(task.target_entry_ids):
+            requested_entry = session.get(EntryPoint, request.entry_point_id)
+            if task is None:
+                return None
+            assigned_seed = request.entry_point_id in set(task.target_entry_ids)
+            if not assigned_seed and (
+                requested_entry is None
+                or requested_entry.scan_id != task.scan_id
+                or not requested_entry.exported
+                or (requested_entry.metadata_json or {}).get("effective_enabled") is False
+            ):
                 return None
             hypothesis = None
             if request.hypothesis_id:
