@@ -14,15 +14,14 @@ from apkscanner.opencode_runner import (
     AJV_VERSION,
     OPENCODE_CLI_VERSION,
     OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE,
-    OPENCODE_OUTPUT_MODE_EXPLORE_THEN_FINALIZE,
     OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
     OPENCODE_PROFILE_STABLE_ANALYZER,
     OPENCODE_PROFILE_STRUCTURED_FINALIZER,
-    OPENCODE_PROFILE_THINKING_EXPLORER,
     OPENCODE_PROVIDER_KEY_FIELD,
     OPENCODE_SDK_VERSION,
     OpenCodeInvestigationError,
     OpenCodeInvestigator,
+    opencode_agent_step_limit,
     opencode_execution_profile,
     opencode_output_mode,
     opencode_prompt_for_model,
@@ -269,7 +268,7 @@ def test_shutdown_terminates_registered_worker_process(settings) -> None:  # noq
     assert process.returncode is not None
 
 
-def test_structured_output_is_default_and_thinking_explorer_requires_opt_in() -> None:
+def test_structured_output_is_default_and_thinking_explorer_is_retired() -> None:
     assert (
         opencode_output_mode("deepseek-v4-pro")
         == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
@@ -286,11 +285,12 @@ def test_structured_output_is_default_and_thinking_explorer_requires_opt_in() ->
         "exploration_round",
         reasoning_effort="max",
         enable_thinking_explorer=True,
+        enable_workspace_analyzer=True,
     )
-    assert thinking.name == OPENCODE_PROFILE_THINKING_EXPLORER
-    assert thinking.output_mode == OPENCODE_OUTPUT_MODE_EXPLORE_THEN_FINALIZE
-    assert thinking.stages[0].thinking_mode == "enabled"
-    assert thinking.stages[0].reasoning_effort == "max"
+    assert thinking.name == OPENCODE_PROFILE_STABLE_ANALYZER
+    assert thinking.output_mode == OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE
+    assert thinking.stages[0].thinking_mode == "disabled"
+    assert thinking.stages[0].reasoning_effort is None
     assert thinking.stages[1].thinking_mode == "disabled"
     finalizer = opencode_execution_profile("final_evaluation")
     assert finalizer.name == OPENCODE_PROFILE_STRUCTURED_FINALIZER
@@ -316,6 +316,7 @@ def test_structured_output_is_default_and_thinking_explorer_requires_opt_in() ->
         enable_workspace_analyzer=True,
     )
     assert personal_lab_planner.name == OPENCODE_PROFILE_STABLE_ANALYZER
+    assert opencode_agent_step_limit(1_000) == 160
     prompt = opencode_prompt_for_model(
         "base prompt",
         model="deepseek-v4-pro",

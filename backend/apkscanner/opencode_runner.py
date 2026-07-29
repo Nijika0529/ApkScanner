@@ -35,19 +35,15 @@ OPENCODE_WORKER_PROTOCOL_VERSION = "7"
 OPENCODE_PROVIDER = "deepseek"
 OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL = "structured_output_tool"
 OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE = "analyze_then_finalize"
-OPENCODE_OUTPUT_MODE_EXPLORE_THEN_FINALIZE = "explore_then_finalize"
 OPENCODE_TOOL_PROFILE = "workspace_shell"
 OPENCODE_WORKSPACE_TOOLS = ("read", "glob", "grep", "bash")
 OPENCODE_DEFAULT_MAX_STEPS = 1_000
 OPENCODE_MAX_STEPS = OPENCODE_DEFAULT_MAX_STEPS
 OPENCODE_MAX_PROVIDER_REQUESTS = OPENCODE_MAX_STEPS + 100
+OPENCODE_EFFECTIVE_ANALYSIS_STEPS = 160
 OPENCODE_PROFILE_STABLE_ANALYZER = "stable_analyzer"
-OPENCODE_PROFILE_THINKING_EXPLORER = "thinking_explorer_then_finalizer"
 OPENCODE_PROFILE_STRUCTURED_FINALIZER = "structured_finalizer"
 OPENCODE_PROVIDER_KEY_FIELD = "_provider_api_key"
-OPENCODE_THINKING_PHASES = frozenset(
-    {"test_planning", "exploration_round"}
-)
 OPENCODE_FINALIZER_PHASES = frozenset({"final_evaluation", "recovery_evaluation"})
 OPENCODE_BOUNDED_STRUCTURED_PHASES = OPENCODE_FINALIZER_PHASES | {
     "adversarial_review"
@@ -121,27 +117,6 @@ def opencode_execution_profile(
                 ),
             ),
         )
-    if enable_thinking_explorer and normalized in OPENCODE_THINKING_PHASES:
-        return OpenCodeExecutionProfile(
-            name=OPENCODE_PROFILE_THINKING_EXPLORER,
-            output_mode=OPENCODE_OUTPUT_MODE_EXPLORE_THEN_FINALIZE,
-            stages=(
-                OpenCodeExecutionStage(
-                    name="explorer",
-                    thinking_mode="enabled",
-                    reasoning_effort=reasoning_effort,
-                    output_mode="text",
-                    workspace_tools=True,
-                ),
-                OpenCodeExecutionStage(
-                    name="finalizer",
-                    thinking_mode="disabled",
-                    reasoning_effort=None,
-                    output_mode=OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
-                    workspace_tools=False,
-                ),
-            ),
-        )
     if enable_workspace_analyzer:
         return OpenCodeExecutionProfile(
             name=OPENCODE_PROFILE_STABLE_ANALYZER,
@@ -163,11 +138,10 @@ def opencode_execution_profile(
                 ),
             ),
         )
-    # DeepSeek V4 Flash is most reliable when the complete, bounded task context
-    # is sent through one non-thinking StructuredOutput turn. Text analysis
-    # stages depend on OpenCode observing a terminal memo after a tool loop;
-    # DeepSeek may instead finish on ``tool-calls`` indefinitely. Keep the
-    # thinking explorer available only as an explicit experimental opt-in.
+    # Without workspace tools, DeepSeek V4 Flash is most reliable when the
+    # complete bounded context is sent through one non-thinking StructuredOutput
+    # turn. The former thinking explorer is retired even when its legacy setting
+    # remains present.
     return OpenCodeExecutionProfile(
         name=OPENCODE_PROFILE_STRUCTURED_FINALIZER,
         output_mode=OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
@@ -181,6 +155,10 @@ def opencode_execution_profile(
             ),
         ),
     )
+
+
+def opencode_agent_step_limit(configured: int) -> int:
+    return max(50, min(configured, OPENCODE_EFFECTIVE_ANALYSIS_STEPS))
 
 
 def opencode_output_mode(
@@ -261,9 +239,9 @@ class OpenCodeInvestigator:
             "execution_profile": default_profile.as_payload(),
             "execution_profiles": [
                 OPENCODE_PROFILE_STABLE_ANALYZER,
-                OPENCODE_PROFILE_THINKING_EXPLORER,
                 OPENCODE_PROFILE_STRUCTURED_FINALIZER,
             ],
+            "thinking_explorer_retired": True,
             "tool_profile": OPENCODE_TOOL_PROFILE,
             "workspace_tools": list(OPENCODE_WORKSPACE_TOOLS),
             "max_steps": self.settings.opencode_agent_steps,
@@ -430,7 +408,9 @@ class OpenCodeInvestigator:
             "output_schema": AGENT_RESULT_JSON_SCHEMA,
             "tool_profile": OPENCODE_TOOL_PROFILE,
             "execution_profile": execution_profile.as_payload(),
-            "max_agent_steps": self.settings.opencode_agent_steps,
+            "max_agent_steps": opencode_agent_step_limit(
+                self.settings.opencode_agent_steps
+            ),
             "permission_profile": self.settings.agent_permission_profile,
             "allow_adb": (
                 self.settings.agent_permission_profile == "personal_lab"

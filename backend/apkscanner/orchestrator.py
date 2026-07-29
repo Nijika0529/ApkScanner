@@ -45,6 +45,7 @@ from .opencode_runner import (
     OPENCODE_TOOL_PROFILE,
     OPENCODE_WORKSPACE_TOOLS,
     OpenCodeInvestigator,
+    opencode_agent_step_limit,
     opencode_execution_profile,
 )
 from .planner import InvestigationPlanner
@@ -57,7 +58,7 @@ from .security_pipeline import HypothesisLedger
 from .static_analysis import ApkInspector
 from .tools import CommandResult, TimeBudget, ToolRunner
 
-AGENT_PLANNING_TIMEOUT_CAP_SECONDS = 300
+AGENT_PLANNING_TIMEOUT_CAP_SECONDS = 600
 AGENT_FINAL_TIMEOUT_CAP_SECONDS = 180
 AGENT_FINAL_RESERVE_SECONDS = 60
 AGENT_MIN_OPTIONAL_PHASE_SECONDS = 30
@@ -3259,12 +3260,12 @@ class ScanOrchestrator:
                     else None
                 ),
                 "max_agent_steps": (
-                    self.settings.opencode_agent_steps
+                    opencode_agent_step_limit(self.settings.opencode_agent_steps)
                     if backend == "opencode"
                     else None
                 ),
                 "max_provider_requests": (
-                    self.settings.opencode_agent_steps + 100
+                    opencode_agent_step_limit(self.settings.opencode_agent_steps) + 100
                     if backend == "opencode"
                     else None
                 ),
