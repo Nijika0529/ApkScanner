@@ -1,7 +1,9 @@
 import type { ComponentPropsWithoutRef } from "react"
+import { useMemo } from "react"
 import ReactMarkdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
 import { cn } from "../lib"
+import { normalizeModelMarkdown } from "../markdown"
 
 const components: Components = {
   h1: ({ children }) => <h1 className="mt-6 text-xl font-bold tracking-tight text-slate-950 first:mt-0">{children}</h1>,
@@ -50,10 +52,12 @@ const components: Components = {
 }
 
 export function MarkdownContent({ children, className }: { children: string; className?: string }) {
+  const normalizedMarkdown = useMemo(() => normalizeModelMarkdown(children), [children])
+
   return (
     <div className={cn("markdown-content min-w-0 break-words", className)}>
       <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={components}>
-        {children}
+        {normalizedMarkdown}
       </ReactMarkdown>
     </div>
   )
