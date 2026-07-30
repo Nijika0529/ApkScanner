@@ -14,7 +14,7 @@ v1 产品是一个单用户、仅限本机（localhost）的 Web 应用。它接
 - 持久化的 SQLite Scan/Task/Finding/Evidence/Coverage/Event 模型。
 - 持久化 Hypothesis、Hunter/Critic 论证、Proof Attempt、危害 Oracle 和平台 Verdict；模型文字不能自证漏洞成立。
 - 私有 APK ground-truth 评测：只对平台确认的最终 Finding 计分，默认要求动态证明，并用 F0.5 重罚不匹配真值的高危结论。
-- 默认 3 个入口探索 worker 并发；所有扫描共享 1 条优先级/FIFO ADB 队列，模型与 Review 阶段不占设备。
+- 所有扫描全局只运行一个入口调查任务；该任务从设备准备、多轮 Agent/PoC 回放到清理始终独占 ADB。
 - 远程 ADB 适配器、可选普通 App UID Probe 快速路径、Agent 专用 PoC、客观 Oracle、`pm clear` 清理和 App Link 状态检查/重置。
 - 可选的 MobSF 上传/报告归一化，缺失时显式标注降级覆盖。
 - 官方 `openai-codex==0.144.4` 集成：严格 JSON Schema、全新线程、无子 Agent fan-out、一轮平台介导的补充测试、证据支撑的结果降级。
@@ -104,14 +104,10 @@ host `personal_lab` 模式可用原始 ADB 做探索，但普通 App 可利用�
 Probe/PoC 执行证据确认。PoC 自报影响仍只是声明；还需要 UI、目标进程日志、崩溃等
 独立平台观察才能满足实际危害证明条件。
 
-单 ADB 模式默认允许 3 个入口 worker 并发分析，但所有 worker 共用一条全局显式设备队列：
-风险优先级高的任务先执行，相同优先级按入队顺序执行。设备租约只覆盖安装、探测和清理；
-模型思考阶段释放 ADB，等待设备的时间不消耗单任务 20 分钟预算。
-任务在 Web 中依次显示 `等待云真机 → 正在分析 → 已判断/未形成判断`，排队阶段可以立即
-取消。每次租约只覆盖健康检查、安装、普通应用 UID 探测、经平台接受的补充测试和最终清理；
-完成一段设备操作后先清理并释放，再进入 AI 规划、Critic、Review 或最终判断。AI 后续申请
-测试时会重新排队并再次 prepare，避免不同 APK 的应用状态、logcat 和 App Link 状态相互
-污染。队列等待时间、设备占用时间和每次获取/释放事件都会写入任务结果。
+单 ADB 模式下，控制面在领取任务前执行全局串行化。一个任务从健康检查、安装和初始探索，
+到 Agent 多轮分析、实时 PoC 回放、Review 和最终清理始终占有设备；其他任务保持 `queued`，
+不会提前显示成“运行中”或“等待设备”。设备层仍保留一个轻量互斥作为误并发保护，但不再
+承担 3 个 worker 之间的优先级排队。
 
 ## Codex 配置
 
@@ -217,13 +213,12 @@ APK 上传
   → 可选 MobSF 广度静态扫描
   → 发布 preliminary 报告
   → InvestigationPlanner 创建任务（每个导出组件一个，每个 Deep Link handler 一个）
-  → 默认最多 3 个任务并发进入入口探索：
-      → 任务 worker 按优先级领取
+  → 按风险优先级逐个进入入口探索：
+      → 全局一次只领取一个任务，并在整个任务期间独占 ADB
       → 如配置 ADB：安装或复用目标 APK、可选安装 Probe APK、按策略重置测试状态
       → 访客基线：通过 adb shell 探索；Probe 可用时增加普通 App UID 快速调用
-      → 清理并释放唯一 ADB，再由 AI 进行 test_planning
-      → AI 默认最多请求 8 个限定补充测试（可配置上限 1000）
-      → 平台验证申请；如需执行则重新进入单设备队列，prepare 后串行执行并再次释放
+      → Agent 可持续分析并通过 apkscanner-proof 实时提交最终 PoC
+      → 平台在同一设备会话中构建、回放、返回 Oracle 结果，失败后允许 Agent 修正再测
       → Codex 第二阶段（final_evaluation）：AI 做出最终判定
       → 证据校验：平台检查引用的 Evidence ID 是否存在，降级无效声明
       → 持久化带 Agent 判定的发现
@@ -301,7 +296,6 @@ source/control/sink/reachable path/boundary/counterevidence/proof gaps 证据元
 | `APKSCANNER_MAX_UPLOAD_BYTES` | 512 MiB | 上传大小限制 |
 | `APKSCANNER_TASK_TIMEOUT` | 1200 s | 每个调查任务的时间预算 |
 | `APKSCANNER_TASK_MAX_ATTEMPTS` | 2 | 重试次数预算 |
-| `APKSCANNER_AGENT_CONCURRENCY` | 3 | 全局入口探索 worker 上限（1–8）；ADB 仍固定单并发 |
 | `APKSCANNER_AGENT_MAX_ROUNDS` | 3 | 每任务最大自适应 AI/设备轮数（1–5） |
 | `APKSCANNER_AGENT_TESTS_PER_ROUND` | 8 | 每轮最多接受的 AI 测试数（1–1000） |
 

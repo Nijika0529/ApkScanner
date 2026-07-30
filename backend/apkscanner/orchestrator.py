@@ -9,7 +9,6 @@ import shutil
 import threading
 import uuid
 from collections import defaultdict
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager, suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -120,7 +119,10 @@ class ScanOrchestrator:
         # Bound task workers across all scans handled by this control-plane
         # process. Per-scan executors may queue work, but model/device orchestration
         # cannot exceed this shared limit.
-        self._agent_slots = threading.BoundedSemaphore(settings.agent_concurrency)
+        # A task owns the only ADB device for its complete multi-round
+        # investigation. Serialize before claiming a task so other scans leave
+        # their work visibly queued instead of creating idle "running" workers.
+        self._investigation_lock = threading.Lock()
 
     def _register_live_proof_context(
         self,
@@ -887,16 +889,15 @@ class ScanOrchestrator:
             session.commit()
 
     def _run_tasks(self, scan_id: str) -> None:
-        max_workers = self.settings.agent_concurrency
         with self.database.session_factory() as session:
             scan = session.get(Scan, scan_id)
             assert scan is not None
             scan.stats = {
                 **dict(scan.stats or {}),
                 "execution_policy": {
-                    "agent_concurrency": max_workers,
+                    "investigation_concurrency": 1,
                     "adb_concurrency": 1,
-                    "device_wait_excluded_from_task_budget": True,
+                    "device_ownership": "complete_task",
                     "agent_workspace_scope": "task_attempt",
                 },
             }
@@ -904,43 +905,24 @@ class ScanOrchestrator:
                 session,
                 scan_id,
                 "investigation.pool.started",
-                f"入口探索池已启动：最多 {max_workers} 个并发任务，ADB 固定单并发",
+                "单任务探索已启动：每次只有一个任务完整占有 ADB",
                 {
-                    "agent_concurrency": max_workers,
+                    "investigation_concurrency": 1,
                     "adb_concurrency": 1,
+                    "device_ownership": "complete_task",
                 },
             )
             session.commit()
-        futures: dict[Future[None], str] = {}
-        with ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix=f"apk-investigation-{scan_id[:8]}",
-        ) as executor:
-            while True:
-                while len(futures) < max_workers:
-                    claimed = self._claim_next_task(scan_id)
-                    if claimed is None:
-                        break
-                    task_id, timeout_seconds = claimed
-                    future = executor.submit(
-                        self._run_task,
-                        scan_id,
-                        task_id,
-                        timeout_seconds,
-                    )
-                    futures[future] = task_id
-                if not futures:
+        while True:
+            with self._investigation_lock:
+                claimed = self._claim_next_task(scan_id)
+                if claimed is None:
                     return
-                completed, _pending = wait(
-                    futures,
-                    return_when=FIRST_COMPLETED,
-                )
-                for future in completed:
-                    task_id = futures.pop(future)
-                    try:
-                        future.result()
-                    except Exception as exc:
-                        self._mark_task_worker_failed(scan_id, task_id, exc)
+                task_id, timeout_seconds = claimed
+                try:
+                    self._run_task(scan_id, task_id, timeout_seconds)
+                except Exception as exc:
+                    self._mark_task_worker_failed(scan_id, task_id, exc)
 
     def _claim_next_task(self, scan_id: str) -> tuple[str, int] | None:
         with self.database.session_factory() as session:
@@ -1261,13 +1243,9 @@ class ScanOrchestrator:
         timeout_seconds: int | None = None,
     ) -> None:
         cancel_event = threading.Event()
-        slot_acquired = False
         with self._task_cancellations_lock:
             self._task_cancellations[task_id] = cancel_event
         try:
-            while not self._agent_slots.acquire(timeout=0.25):
-                self._raise_if_cancelled(cancel_event)
-            slot_acquired = True
             self._raise_if_cancelled(cancel_event)
             self._run_task_impl(
                 scan_id,
@@ -1278,8 +1256,6 @@ class ScanOrchestrator:
         except AgentCancelledError:
             self._mark_task_canceled(scan_id, task_id)
         finally:
-            if slot_acquired:
-                self._agent_slots.release()
             with self._task_cancellations_lock:
                 if self._task_cancellations.get(task_id) is cancel_event:
                     self._task_cancellations.pop(task_id, None)
@@ -1401,7 +1377,7 @@ class ScanOrchestrator:
                         "continuation_number"
                     ),
                     "reusing_task_evidence": bool(continuation_context),
-                    "agent_concurrency": self.settings.agent_concurrency,
+                    "investigation_concurrency": 1,
                 },
             )
             session.commit()

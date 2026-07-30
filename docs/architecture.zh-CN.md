@@ -25,8 +25,7 @@ flowchart LR
     M --> N[Web / JSON / HTML / SARIF + 人工复核]
 ```
 
-平台而不是 Codex/OpenCode 负责 fan-out。默认有 3 个全局入口探索 worker，可通过
-`APKSCANNER_AGENT_CONCURRENCY` 调整为 1–8；多个扫描也共享这一上限。一个导出组件对应
+平台按风险优先级逐个领取入口任务；多个扫描共享同一个全局任务执行锁。一个导出组件对应
 一个任务；同一 handler 的 Deep Links 合并成一个任务。Agent 不能创建子 Agent，也不能
 直接把自己的文字当作复现证据。默认最多进行 3 个自适应测试轮次、每轮接受 8 个受限
 测试：只能使用当前任务的入口 ID；Deep Link 和 Provider URI 必须保持 Manifest 声明的
@@ -48,25 +47,19 @@ JADX 的非零退出码不直接等同于反编译不可用。平台把结果归
 
 ## 单云真机调度
 
-v1 只有一个 `APKSCANNER_ADB_SERIAL`，因此所有并行 worker、所有扫描共享一个显式
-`SingleDeviceScheduler`。任务按风险优先级降序排队，相同优先级按入队序号 FIFO；已运行
-的 worker 在申请设备时进入 `awaiting_device`，获取租约后恢复为 `running`。任务结果按
-每次租约记录 `position_at_enqueue`、`requested_at`、`acquired_at`、`wait_seconds`、
-`released_at` 和 `held_seconds`，旧租约进入 `history`；Web 同步展示排队状态和设备关键
-事件。
+v1 只有一个 `APKSCANNER_ADB_SERIAL`，因此所有扫描共享一个全局调查任务锁。控制面先获取
+该锁，再按扫描内风险优先级领取任务；未获得锁的工作保持 `queued`，不会提前占用 worker
+或显示成 `awaiting_device`。当前任务从健康检查、安装/复用、初始探索、Agent 多轮分析、
+实时 PoC 回放、Review 到最终清理持续拥有设备，其他 APK 的状态和日志不能在中途穿插。
 
-设备租约只覆盖真实设备操作：健康/安装或复用、按策略重置、普通应用 UID 探测、
-Agent 已申请且经平台校验的补充测试，以及清理。初始动态证据收集完毕后先清理并释放设备，
-再调用模型；模型思考、Critic/Review 和最终总结均不占用 ADB。若模型申请下一轮测试，任务
-重新排队，获取租约后重新执行 `prepare`，避免其他并发任务改变设备状态。
-因此最多可有 3 个入口同时进行 AI/证据分析，但任意时刻只有 1 个入口能执行 ADB。设备排队
-时间不计入单任务 20 分钟预算，整单 24 小时截止时间仍然生效。
+设备适配器内部仍保留命令互斥和所有者检查，作为意外重入的防线；它不再承担正常流程中的
+多 worker 优先级排队。任务结果继续记录 `requested_at`、`acquired_at`、`released_at`
+和 `held_seconds`，Web 展示当前任务的设备关键事件。
 
-排队任务取消时，控制面同时设置任务 cancellation event 并唤醒调度 Condition，无需等待
-前一任务释放后才能确认。运行中的 ADB 子进程使用独立进程组；停止任务会终止当前命令，
+运行中的 ADB 子进程使用独立进程组；停止任务会终止当前命令，
 后续设备命令直接返回 canceled，但 `pm clear` 和 App Link reset 清理仍会忽略取消信号执行。
 Web 健康检查使用真正的非阻塞锁；设备繁忙时读取最近一次能力结果，不会插入或等待当前
-设备会话。控制面重启时，`awaiting_device` 任务安全恢复为 `queued`；
+设备会话。控制面重启时，历史 `awaiting_device` 任务安全恢复为 `queued`；
 `cancel_requested` 直接确认为 `canceled`；在模型或平台计算阶段中断的 `running` 任务可
 安全重新排队，只有数据库显示“已获取但尚未释放设备租约”的任务才标为 `inconclusive`
 并要求人工重试，避免重复外部副作用。

@@ -137,8 +137,8 @@ def test_task_fails_closed_when_entry_belongs_to_another_scan(settings) -> None:
         assert events[0].data["loaded_entry_point_ids"] == []
 
 
-def test_task_dispatch_uses_configured_agent_concurrency(settings) -> None:  # noqa: ANN001
-    configured = replace(settings, agent_concurrency=3)
+def test_task_dispatch_runs_one_investigation_at_a_time(settings) -> None:  # noqa: ANN001
+    configured = settings
     configured.ensure_directories()
     database = Database(configured)
     database.create_all()
@@ -192,7 +192,7 @@ def test_task_dispatch_uses_configured_agent_concurrency(settings) -> None:  # n
     orchestrator._run_task = fake_run_task  # type: ignore[method-assign]
     orchestrator._run_tasks(scan_id)
 
-    assert max_active == 3
+    assert max_active == 1
     with database.session_factory() as session:
         persisted_scan = session.get(Scan, scan_id)
         statuses = list(
@@ -204,63 +204,86 @@ def test_task_dispatch_uses_configured_agent_concurrency(settings) -> None:  # n
         )
     assert persisted_scan is not None
     assert persisted_scan.stats["execution_policy"] == {
-        "agent_concurrency": 3,
+        "investigation_concurrency": 1,
         "adb_concurrency": 1,
-        "device_wait_excluded_from_task_budget": True,
+        "device_ownership": "complete_task",
         "agent_workspace_scope": "task_attempt",
     }
     assert statuses == ["completed"] * 6
 
 
-def test_agent_concurrency_limit_is_shared_across_scan_workers(settings) -> None:  # noqa: ANN001
-    configured = replace(settings, agent_concurrency=3)
-    orchestrator = ScanOrchestrator(
-        configured,
-        Database(configured),
-        ArtifactStore(configured),
-    )
+def test_single_investigation_limit_is_shared_across_scans(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        scans = [
+            Scan(
+                status="preliminary_ready",
+                filename=f"scan-{index}.apk",
+                artifact_sha256=str(index + 1) * 64,
+                artifact_path=str(settings.data_dir / f"scan-{index}.apk"),
+            )
+            for index in range(2)
+        ]
+        session.add_all(scans)
+        session.flush()
+        session.add_all(
+            [
+                InvestigationTask(
+                    scan_id=scan.id,
+                    task_type="component",
+                    status="queued",
+                    priority=90,
+                )
+                for scan in scans
+            ]
+        )
+        session.commit()
+        scan_ids = [scan.id for scan in scans]
+
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
     state_lock = threading.Lock()
+    start = threading.Barrier(2)
     active = 0
     max_active = 0
-    start = threading.Barrier(6)
 
-    def fake_run_task_impl(
+    def fake_run_task(
         _scan_id: str,
-        _task_id: str,
-        _timeout_seconds: int | None,
-        *,
-        cancel_event: threading.Event,
+        task_id: str,
+        _timeout_seconds: int | None = None,
     ) -> None:
         nonlocal active, max_active
-        assert not cancel_event.is_set()
         with state_lock:
             active += 1
             max_active = max(max_active, active)
-        time.sleep(0.06)
+        time.sleep(0.08)
+        with database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            assert task is not None
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            session.commit()
         with state_lock:
             active -= 1
 
-    orchestrator._run_task_impl = fake_run_task_impl  # type: ignore[method-assign]
+    orchestrator._run_task = fake_run_task  # type: ignore[method-assign]
 
-    def run(index: int) -> None:
+    def run(scan_id: str) -> None:
         start.wait(timeout=5)
-        orchestrator._run_task(
-            f"scan-{index % 2}",
-            f"task-{index}",
-            60,
-        )
+        orchestrator._run_tasks(scan_id)
 
-    workers = [threading.Thread(target=run, args=(index,)) for index in range(6)]
+    workers = [threading.Thread(target=run, args=(scan_id,)) for scan_id in scan_ids]
     for worker in workers:
         worker.start()
     for worker in workers:
         worker.join(timeout=5)
         assert not worker.is_alive()
-    assert max_active == 3
+    assert max_active == 1
 
 
 def test_parallel_workers_share_only_one_device_session(settings) -> None:  # noqa: ANN001
-    configured = replace(settings, agent_concurrency=3)
+    configured = settings
     configured.ensure_directories()
     database = Database(configured)
     database.create_all()
@@ -1295,6 +1318,7 @@ def test_running_agent_is_interrupted_and_audited_as_cancelled(settings) -> None
 )
 def test_cancellation_after_runtime_registration_is_acknowledged_before_task_load(
     settings,
+    monkeypatch,
     winning_status: str,
     expected_status: str,
 ) -> None:  # noqa: ANN001
@@ -1330,34 +1354,33 @@ def test_cancellation_after_runtime_registration_is_acknowledged_before_task_loa
 
     orchestrator = ScanOrchestrator(settings, database, store)
 
-    class CancelOnAcquire:
-        @staticmethod
-        def acquire(*, timeout: float) -> bool:
-            del timeout
-            with database.session_factory() as session:
-                task = session.get(InvestigationTask, task_id)
-                assert task is not None
-                task.status = winning_status
-                task.result = {
-                    "cancellation": {
-                        "requested": True,
-                        "acknowledged": False,
-                    },
-                    **(
-                        {"deletion": {"soft_deleted": True}}
-                        if winning_status == "deleted"
-                        else {}
-                    ),
-                }
-                session.commit()
-            assert orchestrator.request_task_cancellation(task_id) is True
-            return True
+    def cancel_before_task_load(
+        _scan_id: str,
+        _task_id: str,
+        _timeout_seconds: int | None,
+        *,
+        cancel_event: threading.Event,
+    ) -> None:
+        with database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            assert task is not None
+            task.status = winning_status
+            task.result = {
+                "cancellation": {
+                    "requested": True,
+                    "acknowledged": False,
+                },
+                **(
+                    {"deletion": {"soft_deleted": True}}
+                    if winning_status == "deleted"
+                    else {}
+                ),
+            }
+            session.commit()
+        assert orchestrator.request_task_cancellation(task_id) is True
+        orchestrator._raise_if_cancelled(cancel_event)
 
-        @staticmethod
-        def release() -> None:
-            return None
-
-    orchestrator._agent_slots = CancelOnAcquire()  # type: ignore[assignment]
+    monkeypatch.setattr(orchestrator, "_run_task_impl", cancel_before_task_load)
     orchestrator._run_task(scan_id, task_id, 10)
 
     with database.session_factory() as session:

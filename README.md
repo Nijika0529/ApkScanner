@@ -19,8 +19,8 @@ finding without platform evidence IDs.
 - Tamper-evident AI audit trail for exact prompts, normalized SDK runtime events, structured
   outputs, test-policy decisions, evidence downgrades, provider/model identity, thread/turn IDs,
   and usage.
-- Three concurrent entry-investigation workers by default, with one global serialized ADB queue;
-  model/review turns release the device between validated device-action phases.
+- One global investigation task at a time; it owns the single ADB device through all Agent,
+  PoC replay, review, and cleanup rounds.
 - Remote ADB adapter, optional ordinary-app-UID Probe fast path, Agent PoCs, objective Oracles, `pm clear` cleanup,
   and App Link state inspection/reset.
 - Optional MobSF upload/report normalization with explicit degraded coverage when absent.
@@ -307,7 +307,6 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_MAX_UPLOAD_BYTES` | 512 MiB | Intake limit |
 | `APKSCANNER_TASK_TIMEOUT` | 1200 s | Deterministic/platform device workflow budget; does not cap an OpenCode Agent run |
 | `APKSCANNER_TASK_MAX_ATTEMPTS` | 2 | Retry budget |
-| `APKSCANNER_AGENT_CONCURRENCY` | 3 | Global entry-investigation worker limit (1–8); ADB remains single-concurrency |
 | `APKSCANNER_AGENT_MAX_ROUNDS` | ignored | Retained for compatibility; adaptive Agent rounds are not count-capped |
 | `APKSCANNER_AGENT_TESTS_PER_ROUND` | 8 | Maximum accepted AI-requested tests per round (1–1000) |
 

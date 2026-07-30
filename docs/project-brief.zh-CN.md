@@ -35,8 +35,8 @@ APK Scanner 是一个运行在安全人员本地电脑上的 Android 上线前�
 | 部署边界 | 单用户、本机 loopback 控制面；可访问已授权远程云真机 |
 | 输入限制 | 单 APK；默认最大 512 MiB |
 | 动态基线 | Android 16 / API 36；单测试账号；`pm clear` 复位 |
-| AI/入口并发 | 默认全局 3 个 worker，可配置 1–8；不同扫描共享上限 |
-| 单设备调度 | 并发 worker 共享 1 条 ADB 通道；优先级队列 + FIFO；只在设备操作期间持有租约 |
+| AI/入口并发 | 全局单任务；不同扫描也共享同一个任务执行锁 |
+| 单设备调度 | 当前任务从准备、多轮 PoC 回放到清理持续独占 ADB |
 | 入口类型 | 6 类：Activity、Activity Alias、Service、Receiver、Provider、Deep Link |
 | 内置规则 | 17 条固定规则 + 5 类导出组件动态规则，共 22 个规则 ID 类型 |
 | 覆盖模型 | 8 个 MASVS 域；static、deterministic、blackbox、agent 多阶段记录 |
@@ -62,7 +62,7 @@ Activity、Activity Alias、Service、Receiver、Provider 5 类按入口动态�
 
 - **覆盖面可解释**：不仅列出漏洞，还展示每个 MASVS 域和入口在哪个阶段被覆盖、为何未覆盖。
 - **AI 有边界**：Agent 不持有 ADB，不能创建子 Agent；测试参数、目标入口和副作用由平台校验。
-- **并行但不串设备**：模型分析可并发，ADB 安装、探测和清理始终全局串行；模型思考阶段会释放设备。
+- **单任务闭环**：每次只有一个入口任务运行，设备状态和多轮 PoC 结果不会被其他任务穿插修改。
 - **结论有证据**：黑盒复现必须包含普通 App UID 的请求与结果证据；`adb shell` 成功不等价于漏洞。
 - **全过程可审计**：保留精确 prompt、模型/SDK、关键事件、原始结构化响应、token usage、
   平台接受/拒绝的证据和用户中止记录，但不展示或持久化隐藏思维链。
