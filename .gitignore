@@ -21,8 +21,13 @@ opencode-worker/bin/
 testapk/*
 !testapk/README.md
 !testapk/build-vulntest.sh
+!testapk/build-rescuetest.sh
 !testapk/build-version-evolution-fixtures.sh
 !testapk/version-evolution-manifest.xml
+!testapk/rescuetest.apk
+!testapk/rescuetest-ground-truth.json
+!testapk/rescuetest-src/
+!testapk/rescuetest-src/**
 !testapk/vulntest.apk
 !testapk/vulntest-ground-truth.json
 !testapk/vulntest-test-signing.jks
@@ -30,6 +35,10 @@ testapk/*
 !testapk/vulntest-src/**
 testapk/vulntest-src/build/
 testapk/vulntest-src/dist/
+testapk/rescuetest-src/build/
+testapk/rescuetest-src/dist/
+testapk/rescuetest-unsigned.apk
+testapk/rescuetest-aligned.apk
 testapk/vulntest-unsigned.apk
 testapk/vulntest-aligned.apk
 codex-security/

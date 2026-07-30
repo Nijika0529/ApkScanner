@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from xml.etree import ElementTree
 
+import pytest
 from apkscanner.artifacts import ArtifactStore
 from apkscanner.db import Database
 from apkscanner.models import EntryPoint, InvestigationTask, ProofAttempt, Scan
@@ -28,6 +32,21 @@ def poc_spec() -> AgentPocSpec:
         log_tag="APKSCANNER_POC",
         timeout_seconds=30,
     )
+
+
+def test_live_proof_replay_requires_an_explicit_hypothesis() -> None:
+    with pytest.raises(ValueError, match="hypothesis_id"):
+        AgentProofReplay.model_validate(
+            {
+                "oracle": {
+                    "kind": "log_contains",
+                    "expected_text": "impact",
+                    "impact": "unauthorized_data_access",
+                },
+                "rationale": "The platform must not guess proof ownership.",
+                "poc": poc_spec().model_dump(mode="json"),
+            }
+        )
 
 
 def write_poc_project(workspace: Path) -> Path:
@@ -673,7 +692,7 @@ def test_platform_builds_poc_before_device_queue_and_records_artifact(
     assert any(item["kind"] == "poc.build_artifact" for item in evidence)
 
 
-def test_live_proof_replay_auto_associates_current_task_and_deduplicates(
+def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
     settings,
     tmp_path,
     monkeypatch,
@@ -742,8 +761,8 @@ def test_live_proof_replay_auto_associates_current_task_and_deduplicates(
     monkeypatch.setattr(orchestrator, "_execute_requested_tests", execute)
     monkeypatch.setattr(
         orchestrator.hypothesis_ledger,
-        "task_proof_result",
-        lambda _task_id: ("reproduced_blackbox", ["evidence-live"]),
+        "task_proven_hypotheses",
+        lambda _task_id: {hypothesis.id: ["evidence-live"]},
     )
     evidence: list[dict] = []
     context = _LiveProofContext(
@@ -757,6 +776,7 @@ def test_live_proof_replay_auto_associates_current_task_and_deduplicates(
         hypotheses=[
             {
                 "id": hypothesis.id,
+                "claim": hypothesis.claim,
                 "impact": hypothesis.impact,
             }
         ],
@@ -767,6 +787,7 @@ def test_live_proof_replay_auto_associates_current_task_and_deduplicates(
     )
     orchestrator._register_live_proof_context(context)
     replay = AgentProofReplay(
+        hypothesis_id=hypothesis.id,
         poc=poc_spec(),
         oracle=AgentOracleSpec(
             kind="log_contains",
@@ -776,11 +797,36 @@ def test_live_proof_replay_auto_associates_current_task_and_deduplicates(
         rationale="Replay the final working ordinary-app PoC.",
     )
 
+    context.hypotheses[0]["claim"] = (
+        "A third-party application can launch the activity."
+    )
+    with pytest.raises(ValueError, match="reachability-only"):
+        orchestrator.execute_live_proof_replay(
+            task_id,
+            "secret-token",
+            replay,
+        )
+    context.hypotheses[0]["claim"] = hypothesis.claim
     first = orchestrator.execute_live_proof_replay(
         task_id, "secret-token", replay
     )
     second = orchestrator.execute_live_proof_replay(
         task_id, "secret-token", replay
+    )
+    unrelated_hypothesis_id = "11111111-2222-4333-8444-555555555555"
+    context.hypotheses.append(
+        {
+            "id": unrelated_hypothesis_id,
+            "claim": "A separate attacker-controlled path may reach another sensitive sink.",
+            "impact": None,
+        }
+    )
+    unrelated = orchestrator.execute_live_proof_replay(
+        task_id,
+        "secret-token",
+        replay.model_copy(
+            update={"hypothesis_id": unrelated_hypothesis_id}
+        ),
     )
 
     assert captured[0].hypothesis_id == hypothesis.id
@@ -788,8 +834,23 @@ def test_live_proof_replay_auto_associates_current_task_and_deduplicates(
     assert first["result"] == "reproduced_blackbox"
     assert first["evidence_ids"] == ["evidence-live"]
     assert first["deduplicated"] is False
+    first_unsigned = {
+        key: value
+        for key, value in first.items()
+        if key != "receipt_signature"
+    }
+    assert first["receipt_signature"] == hmac.new(
+        b"secret-token",
+        json.dumps(
+            first_unsigned,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode(),
+        hashlib.sha256,
+    ).hexdigest()
     assert second["deduplicated"] is True
-    assert len(captured) == 1
+    assert unrelated["result"] == "inconclusive"
+    assert len(captured) == 2
 
 
 def test_poc_execution_is_correlated_into_the_hypothesis_proof(

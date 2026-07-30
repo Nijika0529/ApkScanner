@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import re
 import secrets
@@ -64,6 +65,14 @@ from .security_pipeline import HypothesisLedger
 from .static_analysis import ApkInspector
 from .tools import CommandResult, TimeBudget, ToolRunner
 from .versioning import SecurityEvolutionService
+
+REACHABILITY_ONLY_HYPOTHESIS_CLAIMS = frozenset(
+    {
+        "A third-party application can launch the activity.",
+        "A third-party application can start or bind to the service.",
+        "An untrusted application can deliver a broadcast to the receiver.",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -157,26 +166,44 @@ class ScanOrchestrator:
         with context.lock:
             cached = context.responses.get(signature)
             if cached is not None:
-                return {**cached, "deduplicated": True}
+                deduplicated = {
+                    key: value
+                    for key, value in cached.items()
+                    if key != "receipt_signature"
+                }
+                deduplicated["deduplicated"] = True
+                receipt_payload = json.dumps(
+                    deduplicated,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                deduplicated["receipt_signature"] = hmac.new(
+                    token.encode(),
+                    receipt_payload,
+                    hashlib.sha256,
+                ).hexdigest()
+                return deduplicated
             self._raise_if_cancelled(context.cancel_event)
             if context.budget.expired:
                 raise TimeoutError("task budget expired before proof replay")
             hypothesis_ids = [str(item["id"]) for item in context.hypotheses]
             hypothesis_id = replay.hypothesis_id
-            if hypothesis_id is None:
-                candidates = context.hypotheses
-                if replay.oracle.impact != "none":
-                    impactful = [
-                        item
-                        for item in candidates
-                        if str(item.get("impact") or "").strip()
-                        and str(item.get("impact") or "").strip().lower()
-                        not in {"none", "n/a", "unknown"}
-                    ]
-                    candidates = impactful or candidates
-                hypothesis_id = str(candidates[0]["id"])
             if hypothesis_id not in hypothesis_ids:
                 raise ValueError("proof replay hypothesis is outside this task")
+            selected_hypothesis = next(
+                item
+                for item in context.hypotheses
+                if str(item["id"]) == hypothesis_id
+            )
+            if (
+                replay.oracle.impact != "none"
+                and selected_hypothesis.get("claim")
+                in REACHABILITY_ONLY_HYPOTHESIS_CLAIMS
+            ):
+                raise ValueError(
+                    "an impactful proof replay must target the concrete harm or "
+                    "cross-boundary hypothesis, not a reachability-only hypothesis"
+                )
             entry_id = replay.entry_point_id
             if entry_id is None:
                 entry_id = context.default_entry_id
@@ -229,14 +256,25 @@ class ScanOrchestrator:
                     poc_artifacts=artifacts,
                 )
             new_evidence = context.evidence_summaries[before:]
-            proof = self.hypothesis_ledger.task_proof_result(context.task_id)
+            proven_hypotheses = (
+                self.hypothesis_ledger.task_proven_hypotheses(context.task_id)
+            )
+            proof_evidence_ids = proven_hypotheses.get(hypothesis_id)
             response = {
                 "schema_version": "1.0",
                 "accepted": bool(accepted),
                 "executed": bool(executed),
                 "hypothesis_id": hypothesis_id,
                 "entry_point_id": entry_id,
-                "result": proof[0] if proof is not None else "inconclusive",
+                # A proof attached to another hypothesis in the same task must
+                # never make this replay look proven. The task-level aggregate
+                # remains useful for terminating exploration, but live receipts
+                # are claim-specific security evidence.
+                "result": (
+                    FindingStatus.REPRODUCED_BLACKBOX.value
+                    if proof_evidence_ids
+                    else "inconclusive"
+                ),
                 "evidence_ids": [
                     str(item["id"])
                     for item in new_evidence
@@ -249,6 +287,16 @@ class ScanOrchestrator:
                 ],
                 "deduplicated": False,
             }
+            receipt_payload = json.dumps(
+                response,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            response["receipt_signature"] = hmac.new(
+                token.encode(),
+                receipt_payload,
+                hashlib.sha256,
+            ).hexdigest()
             context.responses[signature] = response
             self._record_exploration_event(
                 context.scan_id,
@@ -1572,6 +1620,8 @@ class ScanOrchestrator:
         executed_agent_tests: list[dict[str, Any]] = []
         agent_round_history: list[dict[str, Any]] = []
         debate_context: dict[str, Any] = {}
+        rescue_context: dict[str, Any] = {}
+        rescue_gate: dict[str, Any] = {}
         package_name = scan.package_name
         investigator = self.investigators.get(agent_backend)
         agent_enabled = self.settings.investigator_enabled(agent_backend)
@@ -1583,6 +1633,7 @@ class ScanOrchestrator:
             executed_tests: list[dict[str, Any]] | None = None,
             candidate_under_review: dict[str, Any] | None = None,
             round_index: int = 0,
+            blind_rescue: bool = False,
         ):  # noqa: ANN202
             audit_id: str | None = None
             runtime_events: list[dict[str, Any]] = []
@@ -1641,11 +1692,13 @@ class ScanOrchestrator:
                     "output_language": "zh-CN",
                     "device": current_device_capability(),
                     "poc_builder": self.poc_builder.capability(),
-                    "coverage_gaps": coverage_gaps,
+                    "coverage_gaps": [] if blind_rescue else coverage_gaps,
                     "target_code_context": target_code_context,
                     "entry_scope": entry_scope,
                     "executed_agent_tests": executed_tests or [],
-                    "agent_round_history": deepcopy(agent_round_history),
+                    "agent_round_history": (
+                        [] if blind_rescue else deepcopy(agent_round_history)
+                    ),
                     "further_test_rounds_available": (
                         phase != "final_evaluation"
                     ),
@@ -1659,14 +1712,30 @@ class ScanOrchestrator:
                     "platform_proven_hypotheses": (
                         self.hypothesis_ledger.task_proven_hypotheses(task_id)
                     ),
-                    "candidate_under_review": candidate_under_review,
-                    "debate": debate_context or None,
+                    "candidate_under_review": (
+                        None if blind_rescue else candidate_under_review
+                    ),
+                    "debate": None if blind_rescue else debate_context or None,
+                    "rescue": None if blind_rescue else rescue_context or None,
+                    "blind_rescue": (
+                        {
+                            "mode": "independent_negative_closure_review",
+                            "prior_model_conclusion_withheld": True,
+                        }
+                        if blind_rescue
+                        else None
+                    ),
                     "proof_replay": {
                         "available": bool(
                             device_prepared
                             and agent_backend == "opencode"
                             and self.settings.opencode_isolation == "host"
-                            and phase != "final_evaluation"
+                            and phase
+                            not in {
+                                "adversarial_review",
+                                "rescue_review",
+                                "final_evaluation",
+                            }
                         ),
                         "command": "apkscanner-proof <proof-replay.json>",
                         "mode": "single_final_platform_attestation",
@@ -1712,6 +1781,7 @@ class ScanOrchestrator:
                     device_prepared
                     and agent_backend == "opencode"
                     and self.settings.opencode_isolation == "host"
+                    and phase not in {"adversarial_review", "rescue_review"}
                 ):
                     proof_token = secrets.token_urlsafe(32)
                     self._register_live_proof_context(
@@ -1810,6 +1880,8 @@ class ScanOrchestrator:
                 role = (
                     "critic"
                     if phase == "adversarial_review"
+                    else "rescuer"
+                    if phase == "rescue_review"
                     else "hunter"
                     if phase in {"static_only", "test_planning"}
                     else "advocate"
@@ -1824,7 +1896,7 @@ class ScanOrchestrator:
                         if agent_backend == "codex"
                         else (
                             self.settings.opencode_critic_model
-                            if phase == "adversarial_review"
+                            if phase in {"adversarial_review", "rescue_review"}
                             else self.settings.opencode_model
                         )
                     ),
@@ -1979,6 +2051,216 @@ class ScanOrchestrator:
                 )
                 return None, str(exc)
 
+        def run_negative_rescue(current_result, *, round_index: int):  # noqa: ANN202
+            """Require an independent blind review before accepting a model negative."""
+
+            nonlocal debate_context, rescue_context
+            if (
+                current_result is None
+                or not self._needs_rescue_review(current_result.result)
+                or self.hypothesis_ledger.task_proof_result(task_id) is not None
+            ):
+                return current_result
+
+            rescue_gate.update(
+                {
+                    "triggered": True,
+                    "passed": False,
+                    "candidate_turn_id": current_result.turn_id,
+                    "candidate_result": current_result.result.result,
+                    "mode": "blind_independent_review",
+                }
+            )
+            self._record_exploration_event(
+                scan_id,
+                task_id,
+                "rescue.started",
+                "负面结论进入盲审救援，上一轮模型结论已从救援上下文中移除",
+                {
+                    "source": "platform",
+                    "round_index": round_index,
+                    "candidate_turn_id": current_result.turn_id,
+                    "candidate_result": current_result.result.result,
+                    "prior_model_conclusion_withheld": True,
+                },
+            )
+            review_result, review_error = invoke_agent(
+                phase="rescue_review",
+                executed_tests=executed_agent_tests,
+                round_index=round_index,
+                blind_rescue=True,
+            )
+            if review_result is None:
+                rescue_gate.update(
+                    {
+                        "outcome": "review_unavailable",
+                        "error": review_error,
+                    }
+                )
+                coverage_gaps.append(
+                    "Blind rescue review was unavailable; the model negative was not accepted: "
+                    f"{review_error}"
+                )
+                self._record_exploration_event(
+                    scan_id,
+                    task_id,
+                    "rescue.failed",
+                    "盲审救援不可用，平台未接受原模型的负面关闭结论",
+                    {
+                        "source": "platform",
+                        "round_index": round_index,
+                        "error": review_error,
+                    },
+                )
+                return current_result
+
+            rescue_gate.update(
+                {
+                    "review_thread_id": review_result.thread_id,
+                    "review_turn_id": review_result.turn_id,
+                    "review_result": review_result.result.result,
+                }
+            )
+            if self._needs_rescue_review(review_result.result):
+                rescue_gate.update(
+                    {
+                        "passed": True,
+                        "outcome": "independent_closure_confirmed",
+                    }
+                )
+                self._record_exploration_event(
+                    scan_id,
+                    task_id,
+                    "rescue.closed",
+                    "独立盲审未发现替代攻击链，并为负面结论提供了逐假设关闭依据",
+                    {
+                        "source": "platform",
+                        "round_index": round_index,
+                        "review_turn_id": review_result.turn_id,
+                    },
+                )
+                return review_result
+
+            rescue_context = {
+                "strategy": review_result.result.model_dump(mode="json"),
+                "review_thread_id": review_result.thread_id,
+                "review_turn_id": review_result.turn_id,
+                "prior_model_conclusion_withheld_during_review": True,
+            }
+            self._record_exploration_event(
+                scan_id,
+                task_id,
+                "rescue.lead_found",
+                "独立救援发现替代攻击链，已交给工具 Agent 继续验证",
+                {
+                    "source": "platform",
+                    "round_index": round_index,
+                    "review_turn_id": review_result.turn_id,
+                    "followups": review_result.result.followups[:12],
+                },
+            )
+            exploration_result, exploration_error = invoke_agent(
+                phase="rescue_exploration",
+                executed_tests=executed_agent_tests,
+                round_index=round_index + 1,
+            )
+            if exploration_result is None:
+                rescue_gate.update(
+                    {
+                        "outcome": "lead_verification_unavailable",
+                        "error": exploration_error,
+                    }
+                )
+                coverage_gaps.append(
+                    "Rescue found an alternate exploit lead, but tool verification was unavailable; "
+                    f"the prior negative was not accepted: {exploration_error}"
+                )
+                self._record_exploration_event(
+                    scan_id,
+                    task_id,
+                    "rescue.failed",
+                    "救援已发现替代攻击链，但工具验证不可用，原负面结论未被接受",
+                    {
+                        "source": "platform",
+                        "round_index": round_index + 1,
+                        "error": exploration_error,
+                    },
+                )
+                return current_result
+
+            current_result = exploration_result
+            rescue_gate.update(
+                {
+                    "passed": True,
+                    "exploration_thread_id": exploration_result.thread_id,
+                    "exploration_turn_id": exploration_result.turn_id,
+                    "exploration_result": exploration_result.result.result,
+                    "outcome": (
+                        "lead_closed_after_tool_exploration"
+                        if self._needs_rescue_review(exploration_result.result)
+                        else "negative_closure_reopened"
+                    ),
+                }
+            )
+            self._record_exploration_event(
+                scan_id,
+                task_id,
+                "rescue.completed",
+                (
+                    "替代攻击链经工具探索后关闭"
+                    if self._needs_rescue_review(exploration_result.result)
+                    else "原负面结论已被救援推翻，任务恢复为风险验证"
+                ),
+                {
+                    "source": "platform",
+                    "round_index": round_index + 1,
+                    "exploration_turn_id": exploration_result.turn_id,
+                    "result": exploration_result.result.result,
+                    "platform_proof": (
+                        self.hypothesis_ledger.task_proof_result(task_id) is not None
+                    ),
+                },
+            )
+
+            if (
+                self._needs_adversarial_review(current_result.result)
+                and not self._has_requested_test_work(current_result.result)
+                and self.hypothesis_ledger.task_proof_result(task_id) is None
+            ):
+                candidate_payload = current_result.result.model_dump(mode="json")
+                critic_result, critic_error = invoke_agent(
+                    phase="adversarial_review",
+                    candidate_under_review=candidate_payload,
+                    round_index=round_index + 1,
+                )
+                if critic_result is not None:
+                    critic_payload = critic_result.result.model_dump(mode="json")
+                    debate_context = {
+                        "candidate": candidate_payload,
+                        "critic": critic_payload,
+                        "critic_thread_id": critic_result.thread_id,
+                        "critic_turn_id": critic_result.turn_id,
+                        "origin": "negative_closure_rescue",
+                    }
+                    final_result, final_error = invoke_agent(
+                        phase="final_evaluation",
+                        executed_tests=executed_agent_tests,
+                        round_index=round_index + 1,
+                    )
+                    if final_result is not None:
+                        current_result = final_result
+                    else:
+                        coverage_gaps.append(
+                            "Final evaluation of the rescued candidate failed; retained the "
+                            f"tool-verified rescue result: {final_error}"
+                        )
+                elif critic_error:
+                    coverage_gaps.append(
+                        "Adversarial review of the rescued candidate was unavailable; retained "
+                        f"the tool-verified rescue result: {critic_error}"
+                    )
+            return current_result
+
         # A busy non-blocking snapshot remains eligible for the device queue, but
         # an explicit unavailable result should degrade directly to static AI.
         device_ready = bool(
@@ -1994,6 +2276,7 @@ class ScanOrchestrator:
             agent_result, agent_error = invoke_agent(
                 phase="static_only",
             )
+            agent_result = run_negative_rescue(agent_result, round_index=0)
         else:
             device_session = self._task_device_session(
                 scan_id,
@@ -2374,6 +2657,10 @@ class ScanOrchestrator:
                             "Final AI evaluation could not start because the parent task "
                             "lifecycle had already ended; retained the latest validated result."
                         )
+                    agent_result = run_negative_rescue(
+                        agent_result,
+                        round_index=completed_rounds + 1,
+                    )
                 except AgentCancelledError:
                     raise
                 except Exception as exc:
@@ -2393,6 +2680,17 @@ class ScanOrchestrator:
                         device_lease_owned = False
 
         self._raise_if_cancelled(cancel_event)
+        if (
+            agent_result is not None
+            and self._needs_rescue_review(agent_result.result)
+            and rescue_gate.get("triggered")
+            and not rescue_gate.get("passed")
+        ):
+            agent_error = (
+                "negative conclusion withheld because the mandatory blind rescue gate "
+                "did not complete"
+            )
+            agent_result = None
         validated_payload: dict[str, Any] | None = None
         validated_result_value: str | None = None
         if agent_result:
@@ -2412,6 +2710,10 @@ class ScanOrchestrator:
                     ]
                 )
             )
+            if rescue_gate:
+                validated_payload["negative_closure_rescue"] = deepcopy(
+                    rescue_gate
+                )
             proven_hypotheses = (
                 self.hypothesis_ledger.task_proven_hypotheses(task_id)
             )
@@ -2492,6 +2794,7 @@ class ScanOrchestrator:
                             "deterministic_evidence": evidence_summaries,
                             "coverage_gaps": coverage_gaps,
                             "agent_backend": agent_backend,
+                            "negative_closure_rescue": deepcopy(rescue_gate),
                         },
                     },
                 )
@@ -2511,6 +2814,7 @@ class ScanOrchestrator:
                                 ),
                             ],
                             "agent_backend": agent_backend,
+                            "negative_closure_rescue": deepcopy(rescue_gate),
                         },
                     },
                 )
@@ -2524,6 +2828,7 @@ class ScanOrchestrator:
                             "coverage_gaps": coverage_gaps,
                             "static_agent_attempted": agent_enabled,
                             "agent_backend": agent_backend,
+                            "negative_closure_rescue": deepcopy(rescue_gate),
                         },
                     },
                 )
@@ -2818,6 +3123,17 @@ class ScanOrchestrator:
                 or str(getattr(result, "confidence", "low")) == "high"
             )
         )
+
+    @staticmethod
+    def _needs_rescue_review(result: Any) -> bool:
+        """Independently review every model-derived negative on a dispatched seed."""
+
+        return str(
+            getattr(result, "result", FindingStatus.REFUTED_STATIC.value)
+        ) in {
+            FindingStatus.REFUTED_STATIC.value,
+            FindingStatus.NOT_REPRODUCED.value,
+        }
 
     @staticmethod
     def _requested_test_signature(request: AgentRequestedTest) -> str:
@@ -3587,7 +3903,7 @@ class ScanOrchestrator:
             if backend == "codex"
             else (
                 self.settings.opencode_critic_model
-                if phase == "adversarial_review"
+                if phase in {"adversarial_review", "rescue_review"}
                 else self.settings.opencode_model
             )
         )
@@ -3866,7 +4182,7 @@ class ScanOrchestrator:
                 if backend == "codex"
                 else (
                     self.settings.opencode_critic_model
-                    if phase == "adversarial_review"
+                    if phase in {"adversarial_review", "rescue_review"}
                     else self.settings.opencode_model
                 )
             ),
@@ -3925,7 +4241,7 @@ class ScanOrchestrator:
                 if backend == "codex"
                 else (
                     self.settings.opencode_critic_model
-                    if phase == "adversarial_review"
+                    if phase in {"adversarial_review", "rescue_review"}
                     else self.settings.opencode_model
                 )
             ),

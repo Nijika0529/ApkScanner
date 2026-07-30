@@ -398,8 +398,7 @@ class AgentProofReplay(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    hypothesis_id: str | None = Field(
-        default=None,
+    hypothesis_id: str = Field(
         pattern=r"^[a-f0-9-]{36}$",
     )
     entry_point_id: str | None = Field(

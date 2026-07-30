@@ -336,6 +336,25 @@ def test_structured_output_is_default_and_thinking_explorer_is_retired() -> None
         personal_lab_critic.stages[1].output_mode
         == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
     )
+    rescue_review = opencode_execution_profile(
+        "rescue_review",
+        enable_workspace_analyzer=True,
+        default_model="deepseek-v4-flash",
+        critic_model="deepseek-v4-pro",
+    )
+    assert rescue_review.name == OPENCODE_PROFILE_CRITIC_ANALYZER
+    assert [stage.model for stage in rescue_review.stages] == [
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+    ]
+    assert all(stage.workspace_tools is False for stage in rescue_review.stages)
+    rescue_exploration = opencode_execution_profile(
+        "rescue_exploration",
+        enable_workspace_analyzer=True,
+        default_model="deepseek-v4-flash",
+    )
+    assert rescue_exploration.name == OPENCODE_PROFILE_STABLE_ANALYZER
+    assert rescue_exploration.stages[0].workspace_tools is True
     personal_lab_finalizer = opencode_execution_profile(
         "final_evaluation",
         enable_workspace_analyzer=True,

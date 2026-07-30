@@ -191,7 +191,12 @@ def investigation_prompt(
         "existing_evidence": prompt_evidence,
         "platform_context": prompt_platform_context,
     }
-    if direct_tool_access and shell_access and workspace_write:
+    if phase in {"adversarial_review", "rescue_review"}:
+        access_instruction = (
+            "This independent review has no workspace, shell, device, or network tools. Use only "
+            "the supplied platform dossier and return requested_tests=[]."
+        )
+    elif direct_tool_access and shell_access and workspace_write:
         access_instruction = (
             "Inspect the task workspace and run shell commands as needed. Temporary "
             "scripts and analysis artifacts may be created only in the workspace or /tmp. Use raw "
@@ -205,7 +210,10 @@ def investigation_prompt(
             "phone-verified ordinary-app test, prefer a dedicated PoC. When "
             "platform_context.proof_replay.available=true, write a proof JSON and run "
             "`apkscanner-proof <proof-replay.json>` only after raw ADB has established the final "
-            "working input; the platform immediately builds/replays, records, and cleans it. If "
+            "working input; the platform immediately builds/replays, records, and cleans it. The "
+            "proof JSON hypothesis_id is mandatory: use the exact hypothesis whose concrete impact "
+            "the Oracle tests, never omit it or attach a distinct exploit chain to a generic "
+            "reachability hypothesis. If "
             "platform_context.poc_builder.source_build_available is true, create a source-only "
             "project at "
             "poc/<name>/ containing AndroidManifest.xml and src/**/*.java, then reference it from "
@@ -249,20 +257,35 @@ def investigation_prompt(
             "You cannot inspect files or execute commands directly. Treat TASK_CONTEXT_JSON as "
             "the complete input for this turn and use requested_tests for bounded platform actions."
         )
-    role_instruction = (
-        "Act as the independent Critic. Examine platform_context.candidate_under_review and try "
-        "to falsify it. Identify permission checks, caller validation, unreachable paths, required "
-        "authentication or configuration, harmless behavior, and missing impact. Use only supplied "
-        "evidence, return requested_tests=[], and do not reopen workspace or device exploration. "
-        "Do not restate the candidate as fact. Give each material objection a stable ID OBJ-1, "
-        "OBJ-2, and so on, and return it in review_objections with its exact evidence basis. "
-        "If no material objection survives the supplied evidence, return review_objections=[]. "
-        "platform_context.platform_proven_hypotheses contains immutable platform harm receipts. "
-        "Never object to, refute, or downgrade those hypothesis IDs; a static disagreement may "
-        "only be noted as a non-dispositive model limitation. "
-        if phase == "adversarial_review"
-        else ""
-    )
+    if phase == "adversarial_review":
+        role_instruction = (
+            "Act as the independent Critic. Examine platform_context.candidate_under_review and try "
+            "to falsify it. Identify permission checks, caller validation, unreachable paths, "
+            "required authentication or configuration, harmless behavior, and missing impact. Use "
+            "only supplied evidence, return requested_tests=[], and do not reopen workspace or "
+            "device exploration. Do not restate the candidate as fact. Give each material objection "
+            "a stable ID OBJ-1, OBJ-2, and so on, and return it in review_objections with its exact "
+            "evidence basis. If no material objection survives the supplied evidence, return "
+            "review_objections=[]. platform_context.platform_proven_hypotheses contains immutable "
+            "platform harm receipts. Never object to, refute, or downgrade those hypothesis IDs; a "
+            "static disagreement may only be noted as a non-dispositive model limitation. "
+        )
+    elif phase == "rescue_review":
+        role_instruction = (
+            "Act as an independent blind Rescue Strategist. A previous model conclusion has been "
+            "deliberately withheld. Do not infer or reconstruct what it said. Starting only from "
+            "the seed, hypotheses, static/runtime evidence, and threat model, search for a plausible "
+            "alternative exploit chain that a first analyst could miss: cross-component delegation, "
+            "nested Intent or PendingIntent, Binder/AIDL, Provider or URI grant, WebView, callback, "
+            "reflection, file, database, or native transitions. Return requested_tests=[]. If any "
+            "concrete code/evidence edge warrants tool exploration, use supported_static and describe "
+            "the exact lead and next verification action in hypothesis_assessments and followups. "
+            "Use refuted_static only when every issued hypothesis has a concrete closure basis in the "
+            "supplied evidence; absence of a discovered chain, incomplete decompilation, or missing "
+            "dynamic proof is not a closure basis. "
+        )
+    else:
+        role_instruction = ""
     phase_instruction = {
         "test_planning": (
             "This is the seed-focused analysis pass, not a request to rescan the APK. Start from "
@@ -301,6 +324,23 @@ def investigation_prompt(
             "only concrete objections supported by the supplied candidate and evidence. The text "
             "analysis pass is an argument memo, not the structured verdict; enumerate objections "
             "as OBJ-1, OBJ-2, ... so the non-thinking finalizer can preserve them exactly."
+        ),
+        "rescue_review": (
+            "This is a blind negative-closure review. The previous model answer, its summary, and "
+            "its reasoning are intentionally absent to prevent anchoring. Do not perform a generic "
+            "manifest inventory. Independently derive one or more alternate seed-rooted paths from "
+            "the supplied dossier. The text analysis pass is a rescue strategy memo; the separate "
+            "non-thinking finalizer converts it into the structured schema."
+        ),
+        "rescue_exploration": (
+            "This is a tool-enabled continuation driven by platform_context.rescue.strategy. Open "
+            "the exact source/Smali edges named by the blind Rescue Strategist, then follow only "
+            "concrete references needed to prove or close those alternate chains. Do not repeat the "
+            "first analyst's completed work and do not stop at a plausible story. When the device "
+            "lease and proof_replay are available, build and run the smallest complete ordinary-app "
+            "PoC needed to demonstrate impact. Use raw ADB for diagnosis and the platform proof "
+            "bridge for final attestation. Do not return requested_tests; perform the verification "
+            "with the available workspace, ADB, and proof tools."
         ),
         "final_evaluation": (
             "This is the terminal decision turn. Do not inspect files, use ADB, build a PoC, or "

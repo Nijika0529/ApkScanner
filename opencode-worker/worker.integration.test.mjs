@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { spawn, spawnSync } from "node:child_process"
+import { createHmac } from "node:crypto"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { createServer } from "node:http"
 import { tmpdir } from "node:os"
@@ -175,6 +176,115 @@ test("stable analyzer uses non-thinking tools, then an isolated finalizer", asyn
           item.event_type === "model.tool.completed" &&
           item.data.tool === "read" &&
           item.data.input?.filePath === workspaceFile,
+      ),
+    )
+  } finally {
+    api.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("same-turn platform proof receipts become authoritative finalizer evidence", async () => {
+  const requests = []
+  const hypothesisID = "11111111-1111-1111-1111-111111111111"
+  const evidenceID = "22222222-2222-2222-2222-222222222222"
+  const proofToken = "proof-token-for-worker-integration"
+  const receipt = {
+    schema_version: "1.0",
+    accepted: true,
+    executed: true,
+    hypothesis_id: hypothesisID,
+    entry_point_id: "33333333-3333-3333-3333-333333333333",
+    result: "reproduced_blackbox",
+    evidence_ids: [evidenceID],
+    gaps: [],
+    deduplicated: false,
+  }
+  const signedReceipt = {
+    ...receipt,
+    receipt_signature: createHmac("sha256", proofToken)
+      .update(canonicalForTest(receipt))
+      .digest("hex"),
+  }
+  const proofSchema = {
+    type: "object",
+    properties: {
+      result: {
+        type: "string",
+        enum: ["supported_static", "reproduced_blackbox"],
+      },
+      severity_proposal: { type: "string", const: "high" },
+      confidence: { type: "string", const: "high" },
+      evidence_ids: { type: "array", items: { type: "string" } },
+      requested_tests: { type: "array", maxItems: 0 },
+    },
+    required: [
+      "result",
+      "severity_proposal",
+      "confidence",
+      "evidence_ids",
+      "requested_tests",
+    ],
+    additionalProperties: false,
+  }
+  const modelProof = {
+    result: "supported_static",
+    severity_proposal: "high",
+    confidence: "high",
+    evidence_ids: [],
+    requested_tests: [],
+  }
+  const expectedProof = {
+    ...modelProof,
+    result: "reproduced_blackbox",
+    evidence_ids: [evidenceID],
+  }
+  const api = createServer(async (request, response) => {
+    const body = await readJSON(request)
+    requests.push(body)
+    if (requests.length === 1) {
+      sendCompletion(response, body, {
+        id: "proof-memo",
+        content: "The platform proof replay completed and returned an authenticated receipt.",
+      })
+      return
+    }
+    sendCompletion(response, body, {
+      id: "proof-finalizer",
+      toolCalls: [structuredOutputCall(modelProof)],
+      finish: "tool_calls",
+    })
+  })
+  await listen(api)
+  const address = api.address()
+  assert(address && typeof address !== "string")
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-proof-receipt-test-"))
+  await writeFile(
+    join(root, ".apkscanner-proof-receipts.jsonl"),
+    `${JSON.stringify(signedReceipt)}\n`,
+  )
+  try {
+    const completed = await runWorker(
+      root,
+      investigationPayload({
+        baseURL: `http://127.0.0.1:${address.port}`,
+        profile: stableProfile(),
+        outputSchema: proofSchema,
+        allowedHypothesisIDs: [hypothesisID],
+      }),
+      { proofToken },
+    )
+    assert.equal(completed.code, 0, completed.stderr)
+    const { result, events } = parseWorkerOutput(completed.stdout)
+    assert.deepEqual(result.result, expectedProof)
+    assert.match(
+      JSON.stringify(requests[1].messages),
+      /PLATFORM_LIVE_PROOF_RECEIPTS/,
+    )
+    assert.match(JSON.stringify(requests[1].messages), new RegExp(evidenceID))
+    assert.ok(
+      events.some(
+        (item) => item.event_type === "platform.proof.receipts.loaded",
       ),
     )
   } finally {
@@ -1384,6 +1494,7 @@ function runWorker(
   {
     providerAPIKey = "integration-test-only",
     includeProviderAPIKey = true,
+    proofToken,
   } = {},
 ) {
   return new Promise((resolvePromise, reject) => {
@@ -1401,6 +1512,7 @@ function runWorker(
         OPENCODE_DISABLE_MODELS_FETCH: "1",
         OPENCODE_DISABLE_AUTOUPDATE: "1",
         OPENCODE_PURE: "1",
+        ...(proofToken ? { APKSCANNER_PROOF_TOKEN: proofToken } : {}),
       },
       stdio: ["pipe", "pipe", "pipe"],
     })
@@ -1432,6 +1544,19 @@ function runWorker(
       }),
     )
   })
+}
+
+function canonicalForTest(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalForTest(item)).join(",")}]`
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalForTest(value[key])}`)
+      .join(",")}}`
+  }
+  return JSON.stringify(value)
 }
 
 function readJSON(request) {

@@ -874,10 +874,36 @@ class AdbDeviceAdapter:
                     spec.timeout_seconds,
                 )
                 commands.append(("blackbox.poc_launch", launch, dict(common)))
+                process = self._adb_budget(
+                    ["shell", "pidof", spec.package_name],
+                    budget,
+                    15,
+                )
+                poc_process_ids = {
+                    value
+                    for value in process.stdout.split()
+                    if value.isdigit()
+                }
+                commands.append(
+                    (
+                        "blackbox.poc_process",
+                        process,
+                        {
+                            **common,
+                            "process_ids": sorted(poc_process_ids),
+                        },
+                    )
+                )
                 log_result, matching, poll_attempts, observation_seconds = (
                     self._poll_poc_logcat(
                         log_tag=spec.log_tag,
                         request_id=request_id,
+                        process_ids=poc_process_ids,
+                        wait_for_security_impact=bool(
+                            oracle is not None
+                            and oracle.kind in {"log_contains", "provider_rows"}
+                            and oracle.impact != "none"
+                        ),
                         timeout_seconds=(
                             spec.timeout_seconds if launch.exit_code == 0 else 1
                         ),
@@ -885,12 +911,18 @@ class AdbDeviceAdapter:
                     )
                 )
                 normalized = [line.lower().replace(" ", "") for line in matching]
-                poc_success = any('"success":true' in line for line in normalized)
                 poc_payload = self._last_json_payload(matching)
                 poc_oracle = self._evaluate_poc_oracle(
                     oracle,
                     poc_payload=poc_payload,
                     output="\n".join(matching),
+                )
+                oracle_matched = bool(
+                    (poc_oracle.get("oracle") or {}).get("matched")
+                )
+                poc_success = (
+                    any('"success":true' in line for line in normalized)
+                    or oracle_matched
                 )
                 commands.append(
                     (
@@ -899,9 +931,19 @@ class AdbDeviceAdapter:
                         {
                             **common,
                             "request_observed": bool(matching),
+                            "correlation_mode": (
+                                "request_id"
+                                if any(request_id in line for line in matching)
+                                else "poc_process_id"
+                                if matching and poc_process_ids
+                                else None
+                            ),
                             "poc_success": poc_success,
                             "poc_claimed_security_impact": any(
-                                '"security_impact_observed":true' in line
+                                (
+                                    '"security_impact_observed":true' in line
+                                    or "security_impact_observed=true" in line
+                                )
                                 for line in normalized
                             ),
                             "matching_line_count": len(matching),
@@ -988,6 +1030,8 @@ class AdbDeviceAdapter:
         request_id: str,
         timeout_seconds: int,
         budget: TimeBudget | None,
+        process_ids: set[str] | None = None,
+        wait_for_security_impact: bool = False,
     ) -> tuple[CommandResult, list[str], int, float]:
         started = time.monotonic()
         deadline = started + max(timeout_seconds, 1)
@@ -1004,13 +1048,40 @@ class AdbDeviceAdapter:
                 min(15, remaining),
             )
             matching = [
-                line for line in last.stdout.splitlines() if request_id in line
+                line
+                for line in last.stdout.splitlines()
+                if request_id in line
+                or self._logcat_process_id(line) in (process_ids or set())
             ]
-            if matching or last.exit_code != 0:
+            normalized = [
+                line.lower().replace(" ", "") for line in matching
+            ]
+            impact_observed = any(
+                (
+                    '"security_impact_observed":true' in line
+                    or "security_impact_observed=true" in line
+                )
+                for line in normalized
+            )
+            if (
+                (matching and (not wait_for_security_impact or impact_observed))
+                or last.exit_code != 0
+            ):
                 return last, matching, attempts, time.monotonic() - started
             if time.monotonic() >= deadline or (budget is not None and budget.expired):
-                return last, [], attempts, time.monotonic() - started
+                return last, matching, attempts, time.monotonic() - started
             time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+
+    @staticmethod
+    def _logcat_process_id(line: str) -> str | None:
+        # `logcat -v threadtime` and the default device format both place PID
+        # immediately after the timestamp. Ignore short/tag-only formats,
+        # which remain correlated through the injected request ID.
+        match = re.match(
+            r"^\s*\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+\s+(\d+)\s+\d+\s",
+            line,
+        )
+        return match.group(1) if match else None
 
     def _direct_probe_args(self, entry: EntryPoint, package_name: str) -> list[str] | None:
         if entry.kind in {"activity", "activity_alias"}:
@@ -1207,8 +1278,13 @@ class AdbDeviceAdapter:
                 output=output,
             )
         if oracle.kind == "log_contains" and oracle.expected_text:
+            normalized_output = output.lower().replace(" ", "")
+            structured_success = payload.get("success") is True
+            plain_impact_claim = (
+                "security_impact_observed=true" in normalized_output
+            )
             matched = bool(
-                payload.get("success") is True
+                (structured_success or plain_impact_claim)
                 and oracle.expected_text in output
             )
             return cls._oracle_metadata(
@@ -1220,9 +1296,12 @@ class AdbDeviceAdapter:
                 },
                 impact_observed=bool(
                     matched
-                    and payload.get("security_impact_observed") is True
+                    and (
+                        payload.get("security_impact_observed") is True
+                        or plain_impact_claim
+                    )
                 ),
-                refutation_observed=bool(payload),
+                refutation_observed=bool(payload) or plain_impact_claim,
             )
         return {}
 

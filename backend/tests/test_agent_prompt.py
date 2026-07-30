@@ -109,6 +109,8 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     continuation = _phase_prompt("exploration_round")
     assert "A log_contains Oracle attached to a structured PoC may use" in planning
     critic = _phase_prompt("adversarial_review")
+    rescue_review = _phase_prompt("rescue_review")
+    rescue_exploration = _phase_prompt("rescue_exploration")
     final = _phase_prompt("final_evaluation")
     memo = _phase_prompt("test_planning", response_contract="analysis_memo")
 
@@ -132,6 +134,13 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     assert "review_objections" in critic
     assert "platform_proven_hypotheses" in critic
     assert "Never object to, refute, or downgrade" in critic
+    assert "previous model conclusion has been deliberately withheld" in rescue_review
+    assert "absence of a discovered chain" in rescue_review
+    assert "blind negative-closure review" in rescue_review
+    assert "return requested_tests=[]" in rescue_review
+    assert "platform_context.rescue.strategy" in rescue_exploration
+    assert "smallest complete ordinary-app PoC" in rescue_exploration
+    assert "Do not return requested_tests" in rescue_exploration
     assert "terminal decision turn" in final
     assert "objection_resolutions" in final
     assert "must remain reproduced_blackbox" in final
@@ -140,6 +149,7 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     assert "Unless the result is reproduced_blackbox" not in memo
     assert "requested_tests is a deprecated compatibility field" in planning
     assert "apkscanner-proof" in planning
+    assert "proof JSON hypothesis_id is mandatory" in planning
 
 
 def test_requested_tests_can_be_omitted_when_no_platform_replay_is_needed() -> None:

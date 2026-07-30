@@ -4,6 +4,11 @@
 end-to-end scanner testing. Its reproducible source is in `vulntest-src/` and
 its expected vulnerability catalogue is in `vulntest-ground-truth.json`.
 
+`rescuetest.apk` is a one-seed fixture for the blind negative-closure rescue
+gate. Its exported `EntryActivity` looks shallow, but delegates an attacker
+`PendingIntent` through `TelemetryRoute` to the non-exported `VaultRelay`,
+which returns a secret to the ordinary third-party caller.
+
 Covered paths:
 
 - exported `MainActivity` with `target_activity` → `Class.forName` →
@@ -20,6 +25,7 @@ Build from the repository root:
 
 ```bash
 testapk/build-vulntest.sh
+testapk/build-rescuetest.sh
 ```
 
 The checked-in keystore is a public, test-only key used solely to make fixture

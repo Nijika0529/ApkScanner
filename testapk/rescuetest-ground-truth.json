@@ -1,0 +1,17 @@
+{
+  "schema_version": "1.0",
+  "name": "APKScanner blind-rescue cross-component fixture",
+  "vulnerabilities": [
+    {
+      "id": "RT-001",
+      "title": "Exported entry delegates an attacker PendingIntent to an internal secret relay",
+      "harm": "An ordinary third-party app supplies delivery_token to EntryActivity. TelemetryRoute forwards it through the non-exported VaultRelay, which returns vault_secret=rescue-chain-secret through PendingIntent.send without caller authorization.",
+      "severity": "high",
+      "minimum_proof": "dynamic",
+      "match": {
+        "entry_names": ["io.apkscanner.rescuetest.EntryActivity"],
+        "title_contains": ["PendingIntent", "secret", "敏感", "委托"]
+      }
+    }
+  ]
+}

@@ -44,6 +44,25 @@ def main() -> None:
         raise SystemExit(f"proof replay rejected ({exc.code}): {detail}") from exc
     except URLError as exc:
         raise SystemExit(f"proof replay service unavailable: {exc.reason}") from exc
+    try:
+        receipt = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise SystemExit("proof replay service returned an invalid receipt") from exc
+    if not isinstance(receipt, dict) or not isinstance(
+        receipt.get("receipt_signature"),
+        str,
+    ):
+        raise SystemExit("proof replay service returned an unsigned receipt")
+    receipt_path = workspace / ".apkscanner-proof-receipts.jsonl"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(receipt_path, flags, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(receipt, separators=(",", ":")) + "\n")
+    except OSError as exc:
+        raise SystemExit(f"could not persist the platform proof receipt: {exc}") from exc
     print(body)
 
 

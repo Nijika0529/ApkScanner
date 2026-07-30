@@ -459,6 +459,26 @@ def test_correlated_poc_log_oracle_can_report_structured_impact() -> None:
     assert metadata["oracle"]["matched"] is True
 
 
+def test_process_correlated_plain_poc_log_can_report_impact() -> None:
+    oracle = AgentOracleSpec(
+        kind="log_contains",
+        expected_text="vault_secret=rescue-chain-secret",
+        impact="unauthorized_data_access",
+    )
+
+    metadata = AdbDeviceAdapter._evaluate_poc_oracle(
+        oracle,
+        poc_payload=None,
+        output=(
+            "I APKSCANNER_POC: vault_secret=rescue-chain-secret\n"
+            "I APKSCANNER_POC: security_impact_observed=true"
+        ),
+    )
+
+    assert metadata["security_impact_observed"] is True
+    assert metadata["oracle"]["matched"] is True
+
+
 def test_poc_log_claim_without_expected_observation_is_not_proof() -> None:
     oracle = AgentOracleSpec(
         kind="log_contains",
@@ -635,6 +655,88 @@ def test_poc_log_evidence_waits_for_delayed_correlated_result(
 
     assert result.exit_code == 0
     assert len(matching) == 1
+    assert attempts == 2
+
+
+def test_poc_log_accepts_lines_from_the_launched_poc_process(
+    settings,
+) -> None:  # noqa: ANN001
+    class ProcessLogRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @staticmethod
+        def run(argv, **_kwargs):  # noqa: ANN001, ANN205
+            return CommandResult(
+                argv,
+                0,
+                (
+                    "07-30 17:51:49.595 20460 20460 I APKSCANNER_POC: "
+                    "security_impact_observed=true\n"
+                ),
+                "",
+            )
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        ProcessLogRunner(),  # type: ignore[arg-type]
+    )
+
+    _result, matching, attempts, _elapsed = adapter._poll_poc_logcat(
+        log_tag="APKSCANNER_POC",
+        request_id="not-logged-by-agent",
+        process_ids={"20460"},
+        timeout_seconds=5,
+        budget=None,
+    )
+
+    assert len(matching) == 1
+    assert attempts == 1
+
+
+def test_poc_log_does_not_stop_on_an_intermediate_negative_result(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    class IntermediateLogRunner:
+        attempts = 0
+
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @classmethod
+        def run(cls, argv, **_kwargs):  # noqa: ANN001, ANN206
+            cls.attempts += 1
+            impact = "true" if cls.attempts == 2 else "false"
+            return CommandResult(
+                argv,
+                0,
+                (
+                    "07-30 17:51:49.595 20460 20460 I APKSCANNER_POC: "
+                    f'{{"success":true,"security_impact_observed":{impact}}}\n'
+                ),
+                "",
+            )
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        IntermediateLogRunner(),  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr("apkscanner.device.time.sleep", lambda _seconds: None)
+
+    _result, matching, attempts, _elapsed = adapter._poll_poc_logcat(
+        log_tag="APKSCANNER_POC",
+        request_id="not-logged-by-agent",
+        process_ids={"20460"},
+        wait_for_security_impact=True,
+        timeout_seconds=5,
+        budget=None,
+    )
+
+    assert len(matching) == 1
+    assert '"security_impact_observed":true' in matching[0]
     assert attempts == 2
 
 

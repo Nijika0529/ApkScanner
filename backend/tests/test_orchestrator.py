@@ -477,7 +477,7 @@ def test_device_task_keeps_one_lease_through_agent_investigation(
     orchestrator.investigators["codex"] = FakeInvestigator()
     orchestrator._run_task(scan_id, task_id, 30)
 
-    assert timeline == ["agent", "cleanup"]
+    assert timeline == ["agent", "agent", "cleanup"]
     assert orchestrator.device.scheduler.snapshot() == {
         "active_task_id": None,
         "waiting": [],
@@ -649,6 +649,15 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
                         and "only valid for provider call" in gap
                         for gap in validation["gaps"]
                     )
+            elif phase == "rescue_review":
+                assert context["agent_round_history"] == []
+                assert context["candidate_under_review"] is None
+                assert context["debate"] is None
+                assert context["rescue"] is None
+                assert context["blind_rescue"] == {
+                    "mode": "independent_negative_closure_review",
+                    "prior_model_conclusion_withheld": True,
+                }
             return SimpleNamespace(
                 thread_id=f"thread-{phase}",
                 turn_id=f"turn-{phase}",
@@ -670,7 +679,7 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
     orchestrator.investigators["codex"] = FakeInvestigator()
     orchestrator._run_task(scan_id, task_id, 120)
 
-    assert phases == ["test_planning", "exploration_round"]
+    assert phases == ["test_planning", "exploration_round", "rescue_review"]
     with database.session_factory() as session:
         completed_task = session.get(InvestigationTask, task_id)
         assert completed_task is not None
@@ -678,12 +687,181 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
         assert [item["phase"] for item in history] == [
             "test_planning",
             "exploration_round",
+            "rescue_review",
         ]
         assert history[0]["test_validation"]["accepted"] == []
         if rejection_mode == "model_schema":
             assert len(
                 history[0]["model_validation"]["rejected_requested_tests"]
             ) == 1
+
+
+def test_blind_rescue_reopens_a_model_negative_before_closure(
+    settings,
+) -> None:  # noqa: ANN001
+    configured = replace(settings, codex_enabled=True, adb_serial=None)
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    store = ArtifactStore(configured)
+    static_sha, static_path = store.put_json(
+        "evidence",
+        {
+            "kind": "static.manifest",
+            "component": "com.example.rescue.EntryActivity",
+            "exported": True,
+        },
+    )
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="blind-rescue.apk",
+            package_name="com.example.rescue",
+            artifact_sha256="9" * 64,
+            artifact_path=str(configured.data_dir / "blind-rescue.apk"),
+            stats={"investigator": "codex"},
+        )
+        entry = EntryPoint(
+            scan=scan,
+            kind="activity",
+            name="com.example.rescue.EntryActivity",
+            owner_component="com.example.rescue.EntryActivity",
+            exported=True,
+        )
+        session.add_all([scan, entry])
+        session.flush()
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="queued",
+            target_entry_ids=[entry.id],
+            hypotheses=[
+                "The exported entry may delegate attacker data to an internal sensitive sink."
+            ],
+        )
+        static_evidence = Evidence(
+            scan_id=scan.id,
+            kind="static.manifest",
+            sha256=static_sha,
+            path=str(static_path),
+            summary="Exported rescue fixture entry",
+        )
+        session.add_all([task, static_evidence])
+        session.commit()
+        scan_id = scan.id
+        task_id = task.id
+
+    phases: list[str] = []
+
+    class RescueInvestigator:
+        @staticmethod
+        def capability(*, deep=False):  # noqa: ANN001, ANN205
+            return {"available": True, "version": "fake-sdk", "deep": deep}
+
+        @staticmethod
+        def investigate(**kwargs):  # noqa: ANN003, ANN205
+            context = kwargs["platform_context"]
+            phase = context["phase"]
+            phases.append(phase)
+            hypothesis_id = context["security_hypotheses"][0]["id"]
+            evidence_id = kwargs["evidence"][0]["id"]
+            result = "refuted_static" if phase == "static_only" else "supported_static"
+            assessments = []
+            tested = []
+            if phase != "adversarial_review":
+                tested = [hypothesis_id]
+                assessments = [
+                    {
+                        "hypothesis_id": hypothesis_id,
+                        "verdict": result,
+                        "source": "EntryActivity attacker-controlled extra",
+                        "control": "No caller validation",
+                        "sink": "InternalDispatcher sensitive action",
+                        "reachable_path": (
+                            "EntryActivity -> RouteHelper -> InternalDispatcher"
+                        ),
+                        "boundary": "android_component_export_boundary",
+                        "counterevidence": (
+                            ["Initial analyst did not follow RouteHelper"]
+                            if phase == "static_only"
+                            else []
+                        ),
+                        "proof_gaps": [],
+                        "evidence_ids": [evidence_id],
+                        "confidence": "high",
+                    }
+                ]
+            if phase == "rescue_review":
+                assert context["agent_round_history"] == []
+                assert context["candidate_under_review"] is None
+                assert context["blind_rescue"][
+                    "prior_model_conclusion_withheld"
+                ] is True
+            if phase == "rescue_exploration":
+                assert context["rescue"]["strategy"]["result"] == "supported_static"
+                assert context["rescue"][
+                    "prior_model_conclusion_withheld_during_review"
+                ] is True
+            return SimpleNamespace(
+                thread_id=f"thread-{phase}",
+                turn_id=f"turn-{phase}",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                result=AgentInvestigationResult(
+                    summary=(
+                        "独立救援发现并确认了从导出入口到内部敏感操作的委托链。"
+                        if result == "supported_static"
+                        else "第一轮分析未发现可利用链。"
+                    ),
+                    result=result,
+                    hypotheses_tested=tested,
+                    hypothesis_assessments=assessments,
+                    review_objections=[],
+                    objection_resolutions=[],
+                    test_cases=[],
+                    evidence_ids=[evidence_id],
+                    severity_proposal=(
+                        "high" if result == "supported_static" else "info"
+                    ),
+                    confidence="high",
+                    coverage_gaps=[],
+                    followups=(
+                        ["沿 RouteHelper 验证 InternalDispatcher 的具体敏感影响。"]
+                        if phase == "rescue_review"
+                        else []
+                    ),
+                    requested_tests=[],
+                ),
+            )
+
+    orchestrator = ScanOrchestrator(configured, database, store)
+    orchestrator.investigators["codex"] = RescueInvestigator()
+    orchestrator._run_task(scan_id, task_id, 120)
+
+    assert phases == [
+        "static_only",
+        "rescue_review",
+        "rescue_exploration",
+        "adversarial_review",
+        "final_evaluation",
+    ]
+    with database.session_factory() as session:
+        completed = session.get(InvestigationTask, task_id)
+        assert completed is not None
+        assert completed.status == "completed"
+        assert completed.result["result"] == "supported_static"
+        rescue = completed.result["negative_closure_rescue"]
+        assert rescue["passed"] is True
+        assert rescue["outcome"] == "negative_closure_reopened"
+        assert rescue["candidate_result"] == "refuted_static"
+        arguments = list(
+            session.scalars(
+                select(HypothesisArgument).where(
+                    HypothesisArgument.task_id == task_id
+                )
+            )
+        )
+        assert any(argument.role == "rescuer" for argument in arguments)
+        assert any(argument.role == "critic" for argument in arguments)
 
 
 def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # noqa: ANN001
@@ -1968,3 +2146,14 @@ def test_platform_proof_overrides_refuting_arbiter_payload() -> None:
     assert overridden["hypothesis_assessments"][0]["proof_gaps"] == []
     assert overridden["objection_resolutions"][0]["disposition"] == "overruled"
     assert overridden["platform_proof_overrides"][hypothesis_id]["immutable"] is True
+
+
+def test_negative_model_results_require_blind_rescue_review() -> None:
+    for result in ("refuted_static", "not_reproduced"):
+        assert ScanOrchestrator._needs_rescue_review(
+            SimpleNamespace(result=result)
+        )
+    for result in ("supported_static", "reproduced_blackbox"):
+        assert not ScanOrchestrator._needs_rescue_review(
+            SimpleNamespace(result=result)
+        )

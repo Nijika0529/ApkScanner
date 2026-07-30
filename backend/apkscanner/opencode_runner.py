@@ -41,9 +41,12 @@ OPENCODE_PROFILE_CRITIC_ANALYZER = "critic_analyzer"
 OPENCODE_PROFILE_STRUCTURED_FINALIZER = "structured_finalizer"
 OPENCODE_PROVIDER_KEY_FIELD = "_provider_api_key"
 OPENCODE_FINALIZER_PHASES = frozenset({"final_evaluation", "recovery_evaluation"})
-OPENCODE_BOUNDED_STRUCTURED_PHASES = OPENCODE_FINALIZER_PHASES | {
-    "adversarial_review"
-}
+OPENCODE_INDEPENDENT_REVIEW_PHASES = frozenset(
+    {"adversarial_review", "rescue_review"}
+)
+OPENCODE_BOUNDED_STRUCTURED_PHASES = (
+    OPENCODE_FINALIZER_PHASES | OPENCODE_INDEPENDENT_REVIEW_PHASES
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,7 +102,7 @@ def opencode_execution_profile(
     critic_model: str | None = None,
 ) -> OpenCodeExecutionProfile:
     normalized = (phase or "").strip().lower()
-    if normalized == "adversarial_review":
+    if normalized in OPENCODE_INDEPENDENT_REVIEW_PHASES:
         return OpenCodeExecutionProfile(
             name=OPENCODE_PROFILE_CRITIC_ANALYZER,
             output_mode=OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE,
