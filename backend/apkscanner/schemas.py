@@ -82,6 +82,65 @@ class FindingOut(ApiModel):
     updated_at: datetime
 
 
+class SecuritySnapshotOut(ApiModel):
+    id: str
+    scan_id: str
+    schema_version: str
+    package_name: str
+    signer_digest: str | None
+    version_name: str | None
+    version_code: str | None
+    snapshot_hash: str
+    payload: dict[str, Any]
+    created_at: datetime
+
+
+class VersionDiffOut(ApiModel):
+    id: str
+    baseline_scan_id: str
+    target_scan_id: str
+    schema_version: str
+    status: str
+    summary: dict[str, Any]
+    entry_mapping: list[dict[str, Any]]
+    deltas: list[dict[str, Any]]
+    replay_candidates: list[dict[str, Any]]
+    created_at: datetime
+
+
+class VulnerabilityPatternOut(ApiModel):
+    id: str
+    schema_version: str
+    fingerprint: str
+    status: str
+    source_finding_id: str | None
+    source_scan_id: str | None
+    vulnerability_class: str
+    title: str
+    attacker_model: dict[str, Any]
+    entry_signature: dict[str, Any]
+    code_signature: dict[str, Any]
+    missing_guards: list[str]
+    exclusion_conditions: list[str]
+    proof_recipe: dict[str, Any]
+    metadata_json: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+class PatternMatchOut(ApiModel):
+    id: str
+    schema_version: str
+    pattern_id: str
+    scan_id: str
+    entry_point_id: str
+    status: str
+    score: int
+    reasons: list[str]
+    metadata_json: dict[str, Any]
+    created_at: datetime
+
+
 class FindingReview(BaseModel):
     status: Literal["accepted", "false_positive", "candidate"]
     note: str = Field(min_length=1, max_length=4000)

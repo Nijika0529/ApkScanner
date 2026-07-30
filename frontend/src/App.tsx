@@ -36,7 +36,7 @@ import { MarkdownContent } from "./components/MarkdownContent"
 import { Badge, Button, Card, Dialog, DialogContent, DialogDescription, DialogTitle, Progress, Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui"
 import { cn, formatDate, shortHash, statusLabel } from "./lib"
 import { markdownToPlainText } from "./markdown"
-import type { AgentAudit, BenchmarkEvaluation, CoverageItem, EntryPoint, Finding, Health, InvestigationTask, InvestigatorChoice, Scan, ScanEvent, SecurityHypothesis } from "./types"
+import type { AgentAudit, BenchmarkEvaluation, CoverageItem, EntryPoint, Finding, Health, InvestigationTask, InvestigatorChoice, PatternMatch, Scan, ScanEvent, SecurityHypothesis, SecuritySnapshot, VersionDiff } from "./types"
 
 const severityTone = {
   critical: "danger",
@@ -99,6 +99,9 @@ interface DetailData {
   hypotheses: SecurityHypothesis[]
   evaluations: BenchmarkEvaluation[]
   events: ScanEvent[]
+  securitySnapshot: SecuritySnapshot | null
+  versionDiff: VersionDiff | null
+  patternMatches: PatternMatch[]
 }
 
 function App() {
@@ -130,7 +133,7 @@ function App() {
   const loadDetail = useCallback(async (id: string, signal?: AbortSignal) => {
     const requestId = ++detailRequestRef.current
     try {
-      const [scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events] = await Promise.all([
+      const [scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events, securitySnapshot, versionDiff, patternMatches] = await Promise.all([
         api.scan(id, signal),
         api.entries(id, signal),
         api.findings(id, signal),
@@ -141,9 +144,12 @@ function App() {
         api.hypotheses(id, signal),
         api.evaluations(id, signal),
         api.events(id, signal),
+        api.securitySnapshot(id, signal),
+        api.versionDiff(id, signal),
+        api.patternMatches(id, signal),
       ])
       if (signal?.aborted || requestId !== detailRequestRef.current) return false
-      setDetail({ scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events })
+      setDetail({ scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events, securitySnapshot, versionDiff, patternMatches })
       setScans((items) => items.map((item) => item.id === scan.id ? scan : item))
       return true
     } catch (reason) {
@@ -338,7 +344,7 @@ function Sidebar({ scans, selectedId, health, onSelect, onUpload }: { scans: Sca
 }
 
 function ScanDetailView({ data, health, onRefresh, onDelete }: { data: DetailData; health: Health | null; onRefresh: () => Promise<void>; onDelete: () => void }) {
-  const { scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events } = data
+  const { scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events, securitySnapshot, versionDiff, patternMatches } = data
   const verificationCandidates = signals.filter(isVerificationCandidate)
   const staticSignals = signals.filter((signal) => !isVerificationCandidate(signal))
   const high = findings.filter((item) => ["critical", "high"].includes(item.severity)).length
@@ -371,13 +377,14 @@ function ScanDetailView({ data, health, onRefresh, onDelete }: { data: DetailDat
       <Card className="p-4 sm:p-6">
         <Tabs defaultValue="overview">
           <TabsList aria-label="扫描详情">
-            <TabsTrigger value="overview">总览</TabsTrigger><TabsTrigger value="entries">攻击面 <span className="ml-1 text-xs text-slate-500">{entries.length}</span></TabsTrigger><TabsTrigger value="findings">已证实 Finding <span className="ml-1 text-xs text-slate-500">{findings.length}</span></TabsTrigger><TabsTrigger value="proof-backlog">待验证风险 <span className="ml-1 text-xs text-slate-500">{verificationCandidates.length}</span></TabsTrigger><TabsTrigger value="signals">静态线索 <span className="ml-1 text-xs text-slate-500">{staticSignals.length}</span></TabsTrigger><TabsTrigger value="coverage">覆盖矩阵</TabsTrigger><TabsTrigger value="tasks">探索任务</TabsTrigger><TabsTrigger value="proofs">验证链 <span className="ml-1 text-xs text-slate-500">{hypotheses.length}</span></TabsTrigger><TabsTrigger value="audits">AI 审计 <span className="ml-1 text-xs text-slate-500">{audits.length}</span></TabsTrigger>
+            <TabsTrigger value="overview">总览</TabsTrigger><TabsTrigger value="entries">攻击面 <span className="ml-1 text-xs text-slate-500">{entries.length}</span></TabsTrigger><TabsTrigger value="findings">已证实 Finding <span className="ml-1 text-xs text-slate-500">{findings.length}</span></TabsTrigger><TabsTrigger value="proof-backlog">待验证风险 <span className="ml-1 text-xs text-slate-500">{verificationCandidates.length}</span></TabsTrigger><TabsTrigger value="signals">静态线索 <span className="ml-1 text-xs text-slate-500">{staticSignals.length}</span></TabsTrigger><TabsTrigger value="versions">版本演进 <span className="ml-1 text-xs text-slate-500">{patternMatches.length}</span></TabsTrigger><TabsTrigger value="coverage">覆盖矩阵</TabsTrigger><TabsTrigger value="tasks">探索任务</TabsTrigger><TabsTrigger value="proofs">验证链 <span className="ml-1 text-xs text-slate-500">{hypotheses.length}</span></TabsTrigger><TabsTrigger value="audits">AI 审计 <span className="ml-1 text-xs text-slate-500">{audits.length}</span></TabsTrigger>
           </TabsList>
           <TabsContent value="overview"><Overview scan={scan} events={events} health={health} coverage={coverage} /></TabsContent>
           <TabsContent value="entries"><EntryPoints entries={entries} /></TabsContent>
           <TabsContent value="findings"><Findings findings={findings} verificationCandidates={verificationCandidates} scanStatus={scan.status} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="proof-backlog"><ProofBacklog signals={verificationCandidates} tasks={tasks} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="signals"><Signals signals={staticSignals} onRefresh={onRefresh} /></TabsContent>
+          <TabsContent value="versions"><VersionEvolution snapshot={securitySnapshot} diff={versionDiff} matches={patternMatches} entries={entries} /></TabsContent>
           <TabsContent value="coverage"><CoverageMatrix coverage={coverage} /></TabsContent>
           <TabsContent value="tasks"><Tasks scan={scan} tasks={tasks} entries={entries} audits={audits} events={events} health={health} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="proofs"><HypothesisPipeline scanId={scan.id} scanStatus={scan.status} hypotheses={hypotheses} evaluations={evaluations} entries={entries} onRefresh={onRefresh} /></TabsContent>
@@ -402,6 +409,26 @@ function EntryPoints({ entries }: { entries: EntryPoint[] }) {
   const [kind, setKind] = useState("all")
   const filtered = entries.filter((entry) => (kind === "all" || entry.kind === kind) && `${entry.name} ${entry.owner_component}`.toLowerCase().includes(query.toLowerCase()))
   return <div><div className="mb-5 flex flex-col gap-3 sm:flex-row"><label className="flex-1"><span className="sr-only">搜索入口</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索组件、URI 或 authority" className="field" /></label><label><span className="sr-only">入口类型</span><select value={kind} onChange={(event) => setKind(event.target.value)} className="field sm:w-48"><option value="all">全部入口</option><option value="activity">Activity</option><option value="service">Service</option><option value="receiver">Receiver</option><option value="provider">Provider</option><option value="deep_link">Deep Link</option></select></label></div><div className="overflow-x-auto rounded-xl border border-slate-200"><table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-slate-50 text-xs text-slate-500"><tr><th className="px-4 py-3 font-medium">类型</th><th className="px-4 py-3 font-medium">入口</th><th className="px-4 py-3 font-medium">可达性</th><th className="px-4 py-3 font-medium">权限</th><th className="px-4 py-3 font-medium">判定依据</th></tr></thead><tbody className="divide-y divide-slate-200">{filtered.map((entry) => <tr key={entry.id} className="hover:bg-slate-100"><td className="px-4 py-3"><EntryIcon kind={entry.kind} /></td><td className="max-w-md px-4 py-3"><p className="truncate font-mono text-xs text-slate-800" title={entry.name}>{entry.name}</p>{entry.owner_component && entry.owner_component !== entry.name && <p className="mt-1 truncate text-xs text-slate-600">handler · {entry.owner_component}</p>}</td><td className="px-4 py-3"><Badge tone={entry.exported ? "warning" : "good"}>{entry.exported ? "外部可达" : "私有"}</Badge></td><td className="px-4 py-3 text-xs text-slate-600">{entry.permission ?? "无"}{entry.permission_protection && <span className="block text-slate-600">{entry.permission_protection}</span>}</td><td className="px-4 py-3 text-xs text-slate-500">{entry.exported_reason}</td></tr>)}</tbody></table>{!filtered.length && <EmptyRow text="没有匹配的入口" />}</div></div>
+  }
+
+function VersionEvolution({ snapshot, diff, matches, entries }: { snapshot: SecuritySnapshot | null; diff: VersionDiff | null; matches: PatternMatch[]; entries: EntryPoint[] }) {
+  const entryNames = new Map(entries.map((entry) => [entry.id, entry.name]))
+  const counts = diff?.summary.counts && typeof diff.summary.counts === "object"
+    ? diff.summary.counts as Record<string, number>
+    : {}
+  return <div className="space-y-5">
+    <div className="rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-sm leading-relaxed text-cyan-950">
+      安全快照只记录稳定的入口、权限、关键 API、校验与敏感汇点事实。同签名历史版本才会自动成为 Diff 和 PoC 回放基线。
+    </div>
+    <div className="grid gap-3 md:grid-cols-3">
+      <Metric label="快照" value={snapshot ? "已生成" : "等待静态分析"} icon={Fingerprint} tone="cyan" />
+      <Metric label="PoC 回放候选" value={diff?.replay_candidates.length ?? 0} icon={RefreshCw} tone="violet" />
+      <Metric label="同类漏洞候选" value={matches.length} icon={Network} tone="rose" />
+    </div>
+    {snapshot && <div className="rounded-xl border border-slate-200 p-4"><p className="text-sm font-semibold text-slate-800">当前版本安全快照</p><p className="mt-2 font-mono text-xs text-slate-500">SHA256 {snapshot.snapshot_hash}</p><p className="mt-1 text-xs text-slate-500">签名身份 {snapshot.signer_digest ? shortHash(snapshot.signer_digest) : "未知"} · versionCode {snapshot.version_code ?? "—"}</p></div>}
+    {diff ? <div className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-center justify-between gap-2"><p className="text-sm font-semibold text-slate-800">相对版本 {String(diff.summary.baseline_version_name ?? diff.baseline_scan_id)}</p><Badge tone="good">语义 Diff 完成</Badge></div><div className="mt-3 flex flex-wrap gap-2">{Object.entries(counts).map(([category, count]) => <Badge key={category}>{category} {count}</Badge>)}</div><div className="mt-4 space-y-2">{diff.deltas.filter((item) => item.category !== "unchanged").map((item, index) => <div key={index} className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600"><span className="font-semibold text-slate-800">{String(item.category)}</span> · {Array.isArray(item.changes) ? item.changes.join("、") : "入口变化"}</div>)}</div></div> : <EmptyRow text="尚无同包名、同签名的历史版本基线" />}
+    <div><SectionTitle icon={Network} title="Finding 模式卡命中" description="这些只是待验证候选，不会直接计入 Finding" /><div className="mt-3 space-y-2">{matches.map((match) => <div key={match.id} className="rounded-xl border border-slate-200 p-3"><div className="flex items-center justify-between gap-3"><p className="truncate text-sm font-medium text-slate-800">{entryNames.get(match.entry_point_id) ?? match.entry_point_id}</p><Badge tone="warning">{match.score}%</Badge></div><p className="mt-2 text-xs text-slate-500">{match.reasons.join(" · ")}</p></div>)}{!matches.length && <EmptyRow text="当前版本没有模式卡候选" />}</div></div>
+  </div>
 }
 
 function Findings({ findings, verificationCandidates, scanStatus, onRefresh }: { findings: Finding[]; verificationCandidates: Finding[]; scanStatus: string; onRefresh: () => Promise<void> }) {

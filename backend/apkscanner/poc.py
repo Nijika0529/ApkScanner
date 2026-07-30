@@ -1007,15 +1007,38 @@ class PocBuilder:
         return max(self._requested_target_api(), self._effective_min_api())
 
     def _android_jar(self) -> Path | None:
-        if self.settings.android_sdk_root is None:
+        sdk_root = self._sdk_root()
+        if sdk_root is None:
             return None
         candidate = (
-            self.settings.android_sdk_root
+            sdk_root
             / "platforms"
             / f"android-{self._requested_compile_api()}"
             / "android.jar"
         )
-        return candidate if candidate.is_file() else None
+        if candidate.is_file():
+            return candidate
+        installed = [
+            (int(match.group(1)), item)
+            for item in (sdk_root / "platforms").glob("android-*/android.jar")
+            if item.is_file()
+            and (
+                match := re.fullmatch(r"android-(\d+)", item.parent.name)
+            )
+        ]
+        installed.sort(key=lambda item: item[0], reverse=True)
+        return installed[0][1] if installed else None
+
+    def _sdk_root(self) -> Path | None:
+        if self.settings.android_sdk_root is not None:
+            return self.settings.android_sdk_root
+        for candidate in (
+            Path("/usr/lib/android-sdk"),
+            Path.home() / "Android" / "Sdk",
+        ):
+            if (candidate / "platforms").is_dir():
+                return candidate
+        return None
 
     @staticmethod
     def _version_key(
@@ -1030,9 +1053,10 @@ class PocBuilder:
         )
 
     def _build_tools_directories(self) -> list[Path]:
-        if self.settings.android_sdk_root is None:
+        sdk_root = self._sdk_root()
+        if sdk_root is None:
             return []
-        root = self.settings.android_sdk_root / "build-tools"
+        root = sdk_root / "build-tools"
         if not root.is_dir():
             return []
         if self.settings.android_build_tools_version:

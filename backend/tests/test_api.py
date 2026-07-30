@@ -77,7 +77,18 @@ def test_in_memory_sqlite_is_shared_with_app_worker_threads(settings) -> None:  
 
 @pytest.mark.parametrize(
     "suffix",
-    ["entries", "findings", "signals", "tasks", "hypotheses", "coverage", "events"],
+    [
+        "entries",
+        "findings",
+        "signals",
+        "tasks",
+        "hypotheses",
+        "coverage",
+        "events",
+        "security-snapshot",
+        "version-diff",
+        "pattern-matches",
+    ],
 )
 def test_scan_child_collections_return_not_found_for_unknown_scan(
     settings,

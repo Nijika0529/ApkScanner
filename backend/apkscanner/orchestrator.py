@@ -8,6 +8,7 @@ import secrets
 import shutil
 import threading
 import uuid
+import zipfile
 from collections import defaultdict
 from contextlib import contextmanager, suppress
 from copy import deepcopy
@@ -62,6 +63,7 @@ from .security_design import build_android_threat_model, finding_identity
 from .security_pipeline import HypothesisLedger
 from .static_analysis import ApkInspector
 from .tools import CommandResult, TimeBudget, ToolRunner
+from .versioning import SecurityEvolutionService
 
 AGENT_MIN_OPTIONAL_PHASE_SECONDS = 30
 
@@ -101,6 +103,7 @@ class ScanOrchestrator:
         self.hypothesis_ledger = HypothesisLedger(database)
         self.device = AdbDeviceAdapter(settings, self.runner)
         self.poc_builder = PocBuilder(settings, self.runner, store)
+        self.security_evolution = SecurityEvolutionService()
         self.mobsf = MobSFAdapter(settings)
         self.codex = CodexInvestigator(settings)
         self.opencode = OpenCodeInvestigator(settings)
@@ -829,6 +832,54 @@ class ScanOrchestrator:
                     closures_by_entry,
                 )
             session.add_all(tasks)
+            session.flush()
+            security_snapshot = self.security_evolution.build_snapshot(
+                session,
+                scan=scan,
+                entries=entries,
+                code_index=result.code_index,
+            )
+            version_diff = self.security_evolution.build_version_diff(
+                session,
+                scan=scan,
+                snapshot=security_snapshot,
+            )
+            pattern_matches = self.security_evolution.apply_diff_and_patterns(
+                session,
+                scan=scan,
+                entries=entries,
+                tasks=tasks,
+                diff=version_diff,
+            )
+            for replay_task in (
+                task for task in tasks if task.task_type == "version_replay"
+            ):
+                for entry_id in replay_task.target_entry_ids:
+                    coverage_item = entry_coverage.get(entry_id)
+                    if coverage_item is None:
+                        continue
+                    coverage_item.status = CoverageStatus.PARTIAL.value
+                    coverage_item.stages = {
+                        **dict(coverage_item.stages or {}),
+                        "deterministic_dynamic": "pending",
+                        "agent": "pending",
+                        "blackbox": "pending",
+                        "version_replay": "pending",
+                        "indirect_chain": (
+                            "retained_for_scan_wide_seed_exploration"
+                        ),
+                    }
+                    coverage_item.gap_reason = (
+                        "普通应用直接入口已静态阻断；历史漏洞 PoC 仍需在"
+                        "当前版本回放，以验证修复并防止回归。"
+                    )
+            self.security_evolution.record_static_events(
+                session,
+                scan_id=scan.id,
+                snapshot=security_snapshot,
+                diff=version_diff,
+                pattern_matches=pattern_matches,
+            )
             if static_closures:
                 add_event(
                     session,
@@ -857,6 +908,12 @@ class ScanOrchestrator:
                 "task_count": len(tasks),
                 "static_closed_entry_count": len(static_closures),
                 "agent_dispatched_entry_count": len(dispatched_entry_ids),
+                "security_snapshot_hash": security_snapshot.snapshot_hash,
+                "version_diff_id": version_diff.id if version_diff else None,
+                "version_replay_candidate_count": (
+                    len(version_diff.replay_candidates) if version_diff else 0
+                ),
+                "pattern_match_count": len(pattern_matches),
             }
             if scan.preliminary_at > preliminary_deadline:
                 late_by = int((scan.preliminary_at - preliminary_deadline).total_seconds())
@@ -1613,6 +1670,7 @@ class ScanOrchestrator:
                             device_prepared
                             and agent_backend == "opencode"
                             and self.settings.opencode_isolation == "host"
+                            and phase != "final_evaluation"
                         ),
                         "command": "apkscanner-proof <proof-replay.json>",
                         "mode": "single_final_platform_attestation",
@@ -1991,8 +2049,36 @@ class ScanOrchestrator:
                                 scan_id, task_id, probe.commands, evidence_summaries
                             )
 
+                        replay_candidates = list(
+                            (task.preconditions or {}).get("version_replays", [])
+                        )
+                        if replay_candidates and not budget.expired:
+                            replay_results, replay_gaps = self._execute_version_replays(
+                                scan_id=scan_id,
+                                task_id=task_id,
+                                package_name=package_name,
+                                attempt=task.attempts,
+                                replay_candidates=replay_candidates,
+                                entries=entries,
+                                hypothesis_context=hypothesis_context,
+                                hypothesis_ids=hypothesis_ids,
+                                budget=budget,
+                                evidence_summaries=evidence_summaries,
+                                cancel_event=cancel_event,
+                            )
+                            executed_agent_tests.extend(replay_results)
+                            coverage_gaps.extend(replay_gaps)
+
+                    replay_proof_terminal = (
+                        self.hypothesis_ledger.task_proof_result(task_id) is not None
+                    )
                     agent_result, agent_error = invoke_agent(
-                        phase="test_planning",
+                        phase=(
+                            "final_evaluation"
+                            if replay_proof_terminal
+                            else "test_planning"
+                        ),
+                        executed_tests=executed_agent_tests,
                         round_index=0,
                     )
                     critic_budget = _critic_timeout_seconds(
@@ -2261,6 +2347,7 @@ class ScanOrchestrator:
                     final_budget = budget.remaining()
                     if (
                         (executed_agent_tests or debate_context)
+                        and not replay_proof_terminal
                         and final_budget >= AGENT_MIN_OPTIONAL_PHASE_SECONDS
                     ):
                         final_result, final_error = invoke_agent(
@@ -2904,6 +2991,199 @@ class ScanOrchestrator:
         if request.poc is None:
             return ""
         return json.dumps(request.poc.model_dump(mode="json"), sort_keys=True)
+
+    def _execute_version_replays(
+        self,
+        *,
+        scan_id: str,
+        task_id: str,
+        package_name: str,
+        attempt: int,
+        replay_candidates: list[dict[str, Any]],
+        entries: list[EntryPoint],
+        hypothesis_context: list[dict[str, Any]],
+        hypothesis_ids: set[str],
+        budget: TimeBudget,
+        evidence_summaries: list[dict[str, Any]],
+        cancel_event: threading.Event,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Migrate proven source PoCs and replay them before fresh exploration."""
+        workspace = (
+            self.settings.data_dir
+            / "workspaces"
+            / scan_id
+            / "agent_context"
+            / task_id
+            / f"attempt-{attempt}"
+        )
+        poc_root = workspace / "poc"
+        poc_root.mkdir(parents=True, exist_ok=True)
+        entries_by_id = {entry.id: entry for entry in entries}
+        requests: list[AgentRequestedTest] = []
+        gaps: list[str] = []
+        for index, replay in enumerate(replay_candidates, start=1):
+            target_entry_id = str(replay.get("target_entry_id") or "")
+            if target_entry_id not in entries_by_id:
+                gaps.append(
+                    f"Version replay skipped: target entry {target_entry_id} is not testable."
+                )
+                continue
+            source_hypothesis = dict(replay.get("source_hypothesis") or {})
+            hypothesis_id = next(
+                (
+                    str(item["id"])
+                    for item in hypothesis_context
+                    if (
+                        item.get("claim") == source_hypothesis.get("claim")
+                        or item.get("category") == source_hypothesis.get("category")
+                    )
+                    and target_entry_id in item.get("entry_point_ids", [])
+                ),
+                next(
+                    (
+                        str(item["id"])
+                        for item in hypothesis_context
+                        if target_entry_id in item.get("entry_point_ids", [])
+                    ),
+                    next(iter(hypothesis_ids), ""),
+                ),
+            )
+            source_path = Path(str(replay.get("source_archive_path") or ""))
+            if not hypothesis_id or not source_path.is_file():
+                gaps.append(
+                    "Version replay skipped: migrated hypothesis or archived PoC "
+                    "source is unavailable."
+                )
+                continue
+            source_bytes = source_path.read_bytes()
+            actual_sha = hashlib.sha256(source_bytes).hexdigest()
+            expected_sha = str(replay.get("source_archive_sha256") or "")
+            if expected_sha and actual_sha != expected_sha:
+                gaps.append("Version replay skipped: archived PoC source hash mismatch.")
+                continue
+            project = poc_root / f"version-replay-{index}"
+            if project.exists():
+                shutil.rmtree(project)
+            project.mkdir(parents=True)
+            try:
+                with zipfile.ZipFile(source_path) as archive:
+                    members = [
+                        member for member in archive.infolist() if not member.is_dir()
+                    ]
+                    source_size = sum(item.file_size for item in members)
+                    if (
+                        len(members) > 64
+                        or source_size > self.settings.poc_max_source_bytes
+                    ):
+                        raise ValueError("archived PoC exceeds source safety limits")
+                    for member in members:
+                        destination = (project / member.filename).resolve()
+                        if (
+                            not destination.is_relative_to(project.resolve())
+                            or member.filename.startswith("/")
+                            or ".." in Path(member.filename).parts
+                        ):
+                            raise ValueError("archived PoC contains an unsafe path")
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        destination.write_bytes(archive.read(member))
+            except (OSError, ValueError, zipfile.BadZipFile) as exc:
+                gaps.append(f"Version replay source migration failed: {exc}.")
+                continue
+            substitutions: dict[str, str] = {}
+            old_manifest = dict(
+                (replay.get("baseline_entry") or {}).get("manifest") or {}
+            )
+            new_manifest = dict(
+                (replay.get("target_entry") or {}).get("manifest") or {}
+            )
+            for key in ("name", "owner_component", "authorities"):
+                old_value = old_manifest.get(key)
+                new_value = new_manifest.get(key)
+                if old_value and new_value and old_value != new_value:
+                    substitutions[str(old_value)] = str(new_value)
+            for source in [*project.rglob("*.java"), *project.rglob("*.xml")]:
+                content = source.read_text(encoding="utf-8")
+                for old_value, new_value in substitutions.items():
+                    content = content.replace(old_value, new_value)
+                source.write_text(content, encoding="utf-8")
+            raw_plan = dict(replay.get("plan") or {})
+            raw_poc = dict(raw_plan.get("poc") or {})
+            raw_poc["project_path"] = str(project.relative_to(workspace))
+            raw_poc.pop("prebuilt_apk_path", None)
+            raw_plan.update(
+                {
+                    "hypothesis_id": hypothesis_id,
+                    "entry_point_id": target_entry_id,
+                    "poc": raw_poc,
+                    "rationale": (
+                        "自动迁移并回放上一版本由平台危害 Oracle 证实的 PoC；"
+                        "结果只作为当前版本的新证据。"
+                    ),
+                }
+            )
+            try:
+                requests.append(AgentRequestedTest.model_validate(raw_plan))
+            except Exception as exc:
+                gaps.append(f"Version replay plan migration failed validation: {exc}.")
+                continue
+            self._record_exploration_event(
+                scan_id,
+                task_id,
+                "version_replay.migrated",
+                "旧版本 PoC 已迁移到当前版本任务工作区",
+                {
+                    "source_finding_id": replay.get("source_finding_id"),
+                    "source_proof_attempt_id": replay.get("source_proof_attempt_id"),
+                    "target_entry_id": target_entry_id,
+                    "source_sha256": actual_sha,
+                    "substitutions": substitutions,
+                },
+            )
+        accepted, validation_gaps = self._validate_requested_tests(
+            requests,
+            entries,
+            limit=max(len(requests), 1),
+            hypothesis_ids=hypothesis_ids,
+            permission_profile=self.settings.agent_permission_profile,
+        )
+        gaps.extend(validation_gaps)
+        if not accepted:
+            return [], gaps
+        accepted, artifacts, build_gaps = self._build_requested_pocs(
+            scan_id=scan_id,
+            task_id=task_id,
+            workspace=workspace,
+            requests=accepted,
+            evidence_summaries=evidence_summaries,
+            cancel_event=cancel_event,
+        )
+        gaps.extend(build_gaps)
+        if not accepted or budget.expired:
+            return [], gaps
+        executed, execution_gaps = self._execute_requested_tests(
+            scan_id=scan_id,
+            task_id=task_id,
+            package_name=package_name,
+            entries=entries,
+            requests=accepted,
+            budget=budget,
+            evidence_summaries=evidence_summaries,
+            round_index=0,
+            poc_artifacts=artifacts,
+        )
+        gaps.extend(execution_gaps)
+        self._record_exploration_event(
+            scan_id,
+            task_id,
+            "version_replay.completed",
+            "旧 Finding 的 PoC 已在当前版本完成平台回放",
+            {
+                "requested_count": len(requests),
+                "executed_count": len(executed),
+                "gaps": gaps,
+            },
+        )
+        return executed, gaps
 
     def _build_requested_pocs(
         self,
@@ -4737,6 +5017,27 @@ class ScanOrchestrator:
                         **metadata,
                     }
                 hypothesis.final_finding_id = finding.id
+                pattern = self.security_evolution.create_pattern_from_finding(
+                    session,
+                    scan=scan,
+                    finding=finding,
+                )
+                if pattern is not None:
+                    all_entries = list(
+                        session.scalars(
+                            select(EntryPoint).where(EntryPoint.scan_id == scan.id)
+                        )
+                    )
+                    new_matches = self.security_evolution.search_patterns(
+                        session,
+                        scan=scan,
+                        entries=all_entries,
+                    )
+                    self.security_evolution.annotate_new_pattern_matches(
+                        session,
+                        scan_id=scan.id,
+                        matches=new_matches,
+                    )
 
         supported_assessments = [
             assessment

@@ -51,6 +51,24 @@ public final class MainActivity extends android.app.Activity {}""",
     return project
 
 
+def test_poc_builder_falls_back_to_highest_installed_compile_platform(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    sdk = tmp_path / "sdk"
+    for api in (23, 34):
+        platform = sdk / "platforms" / f"android-{api}"
+        platform.mkdir(parents=True)
+        (platform / "android.jar").write_bytes(str(api).encode())
+    builder = PocBuilder(
+        replace(settings, android_sdk_root=sdk, poc_compile_api=36),
+        ToolRunner(),
+        ArtifactStore(settings),
+    )
+
+    assert builder._android_jar() == sdk / "platforms" / "android-34" / "android.jar"
+
+
 def test_poc_builder_accepts_only_source_projects_under_workspace(
     settings,
     tmp_path,

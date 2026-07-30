@@ -65,6 +65,42 @@ export interface Finding {
   updated_at: string
 }
 
+export interface SecuritySnapshot {
+  id: string
+  scan_id: string
+  package_name: string
+  signer_digest: string | null
+  version_name: string | null
+  version_code: string | null
+  snapshot_hash: string
+  payload: Record<string, unknown>
+  created_at: string
+}
+
+export interface VersionDiff {
+  id: string
+  baseline_scan_id: string
+  target_scan_id: string
+  status: string
+  summary: Record<string, unknown>
+  entry_mapping: Array<Record<string, unknown>>
+  deltas: Array<Record<string, unknown>>
+  replay_candidates: Array<Record<string, unknown>>
+  created_at: string
+}
+
+export interface PatternMatch {
+  id: string
+  pattern_id: string
+  scan_id: string
+  entry_point_id: string
+  status: string
+  score: number
+  reasons: string[]
+  metadata_json: Record<string, unknown>
+  created_at: string
+}
+
 export interface CoverageItem {
   id: string
   control_id: string

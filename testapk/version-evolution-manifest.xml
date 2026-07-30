@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.apkscanner.vulntest"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="28" />
+
+    <permission
+        android:name="io.apkscanner.vulntest.SIGNATURE_ONLY"
+        android:protectionLevel="signature" />
+
+    <application
+        android:allowBackup="false"
+        android:debuggable="false"
+        android:usesCleartextTraffic="false"
+        android:label="APKScanner Version Evolution Test">
+        <provider
+            android:name=".SecretProvider"
+            android:authorities="io.apkscanner.vulntest.secrets"
+            android:exported="true"
+            android:grantUriPermissions="false" />
+    </application>
+</manifest>

@@ -34,9 +34,13 @@ from .models import (
     Evidence,
     Finding,
     InvestigationTask,
+    PatternMatch,
     Scan,
     ScanEvent,
     SecurityHypothesis,
+    SecuritySnapshot,
+    VersionDiff,
+    VulnerabilityPattern,
 )
 from .orchestrator import ScanOrchestrator
 from .reports import ReportBuilder
@@ -55,14 +59,18 @@ from .schemas import (
     FindingReview,
     HealthResponse,
     InvestigationTaskOut,
+    PatternMatchOut,
     ScanAgentControl,
     ScanDeleteResult,
     ScanDetail,
     ScanRerunResult,
     ScanSummary,
     SecurityHypothesisOut,
+    SecuritySnapshotOut,
     TaskAgentControl,
     TaskDeleteResult,
+    VersionDiffOut,
+    VulnerabilityPatternOut,
 )
 
 router = APIRouter(prefix="/api/v1")
@@ -347,6 +355,87 @@ def list_entries(scan_id: str, session: Session = Depends(get_session)) -> list[
             .order_by(EntryPoint.kind, EntryPoint.name)
         )
     )
+
+
+@router.get(
+    "/scans/{scan_id}/security-snapshot",
+    response_model=SecuritySnapshotOut,
+)
+def get_security_snapshot(
+    scan_id: str,
+    session: Session = Depends(get_session),
+) -> SecuritySnapshot:
+    require_scan(session, scan_id)
+    snapshot = session.scalar(
+        select(SecuritySnapshot).where(SecuritySnapshot.scan_id == scan_id)
+    )
+    if snapshot is None:
+        raise HTTPException(404, "Security snapshot is not available")
+    return snapshot
+
+
+@router.get(
+    "/scans/{scan_id}/version-diff",
+    response_model=VersionDiffOut,
+)
+def get_version_diff(
+    scan_id: str,
+    session: Session = Depends(get_session),
+) -> VersionDiff:
+    require_scan(session, scan_id)
+    diff = session.scalar(
+        select(VersionDiff)
+        .where(VersionDiff.target_scan_id == scan_id)
+        .order_by(desc(VersionDiff.created_at))
+    )
+    if diff is None:
+        raise HTTPException(404, "No same-signer baseline version is available")
+    return diff
+
+
+@router.get(
+    "/scans/{scan_id}/pattern-matches",
+    response_model=list[PatternMatchOut],
+)
+def list_pattern_matches(
+    scan_id: str,
+    session: Session = Depends(get_session),
+) -> list[PatternMatch]:
+    require_scan(session, scan_id)
+    return list(
+        session.scalars(
+            select(PatternMatch)
+            .where(PatternMatch.scan_id == scan_id)
+            .order_by(PatternMatch.score.desc(), PatternMatch.created_at)
+        )
+    )
+
+
+@router.get("/patterns", response_model=list[VulnerabilityPatternOut])
+def list_vulnerability_patterns(
+    session: Session = Depends(get_session),
+) -> list[VulnerabilityPattern]:
+    return list(
+        session.scalars(
+            select(VulnerabilityPattern).order_by(
+                VulnerabilityPattern.updated_at.desc()
+            )
+        )
+    )
+
+
+@router.get(
+    "/patterns/{pattern_id}",
+    response_model=VulnerabilityPatternOut,
+)
+def get_vulnerability_pattern(
+    pattern_id: str,
+    session: Session = Depends(get_session),
+) -> VulnerabilityPattern:
+    pattern = session.get(VulnerabilityPattern, pattern_id)
+    if pattern is None:
+        raise HTTPException(404, "Vulnerability pattern not found")
+    return pattern
 
 
 @router.get("/scans/{scan_id}/findings", response_model=list[FindingOut])

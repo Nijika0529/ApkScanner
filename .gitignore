@@ -21,6 +21,8 @@ opencode-worker/bin/
 testapk/*
 !testapk/README.md
 !testapk/build-vulntest.sh
+!testapk/build-version-evolution-fixtures.sh
+!testapk/version-evolution-manifest.xml
 !testapk/vulntest.apk
 !testapk/vulntest-ground-truth.json
 !testapk/vulntest-test-signing.jks

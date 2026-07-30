@@ -58,6 +58,9 @@ class Scan(Base):
     benchmark_evaluations: Mapped[list[BenchmarkEvaluation]] = relationship(
         back_populates="scan", cascade="all, delete"
     )
+    security_snapshot: Mapped[SecuritySnapshot | None] = relationship(
+        back_populates="scan", cascade="all, delete", uselist=False
+    )
 
 
 class EntryPoint(Base):
@@ -253,6 +256,113 @@ class ProofAttempt(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     hypothesis: Mapped[SecurityHypothesis] = relationship(back_populates="proof_attempts")
+
+
+class SecuritySnapshot(Base):
+    """Content-addressed security facts for one application version."""
+
+    __tablename__ = "security_snapshots"
+    __table_args__ = (UniqueConstraint("scan_id", name="uq_security_snapshot_scan"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scan_id: Mapped[str] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
+    schema_version: Mapped[str] = mapped_column(String(16), default="1.0")
+    package_name: Mapped[str] = mapped_column(String(512), index=True)
+    signer_digest: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    version_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    version_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    snapshot_hash: Mapped[str] = mapped_column(String(64), index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    scan: Mapped[Scan] = relationship(back_populates="security_snapshot")
+
+
+class VersionDiff(Base):
+    """Semantic security delta between two same-identity application scans."""
+
+    __tablename__ = "version_diffs"
+    __table_args__ = (
+        UniqueConstraint(
+            "baseline_scan_id",
+            "target_scan_id",
+            name="uq_version_diff_scan_pair",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    baseline_scan_id: Mapped[str] = mapped_column(
+        ForeignKey("scans.id", ondelete="CASCADE"), index=True
+    )
+    target_scan_id: Mapped[str] = mapped_column(
+        ForeignKey("scans.id", ondelete="CASCADE"), index=True
+    )
+    schema_version: Mapped[str] = mapped_column(String(16), default="1.0")
+    status: Mapped[str] = mapped_column(String(32), default="completed", index=True)
+    summary: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    entry_mapping: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    deltas: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    replay_candidates: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class VulnerabilityPattern(Base):
+    """Reusable, package-independent pattern distilled from a proven finding."""
+
+    __tablename__ = "vulnerability_patterns"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    schema_version: Mapped[str] = mapped_column(String(16), default="1.0")
+    fingerprint: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="validated", index=True)
+    source_finding_id: Mapped[str | None] = mapped_column(
+        ForeignKey("findings.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    source_scan_id: Mapped[str | None] = mapped_column(
+        ForeignKey("scans.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    vulnerability_class: Mapped[str] = mapped_column(String(256), index=True)
+    title: Mapped[str] = mapped_column(String(1024))
+    attacker_model: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    entry_signature: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    code_signature: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    missing_guards: Mapped[list[str]] = mapped_column(JSON, default=list)
+    exclusion_conditions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    proof_recipe: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class PatternMatch(Base):
+    """A non-finding candidate produced by deterministic pattern search."""
+
+    __tablename__ = "pattern_matches"
+    __table_args__ = (
+        UniqueConstraint(
+            "pattern_id",
+            "scan_id",
+            "entry_point_id",
+            name="uq_pattern_match_target",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    schema_version: Mapped[str] = mapped_column(String(16), default="1.0")
+    pattern_id: Mapped[str] = mapped_column(
+        ForeignKey("vulnerability_patterns.id", ondelete="CASCADE"), index=True
+    )
+    scan_id: Mapped[str] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
+    entry_point_id: Mapped[str] = mapped_column(
+        ForeignKey("entry_points.id", ondelete="CASCADE"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(32), default="candidate_match", index=True)
+    score: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class BenchmarkEvaluation(Base):

@@ -56,16 +56,24 @@ stop_existing() {
 }
 
 detect_adb_serial() {
-  local -a devices
-  mapfile -t devices < <(
-    adb devices 2>/dev/null |
-      awk 'NR > 1 && $2 == "device" { print $1 }'
-  )
-  if [ "${#devices[@]}" -eq 1 ]; then
-    printf '%s\n' "${devices[0]}"
-  elif [ "${#devices[@]}" -gt 1 ]; then
-    echo "multiple ADB devices are online; set APKSCANNER_ADB_SERIAL explicitly" >&2
-  fi
+  local -a devices=()
+  local attempt
+  for attempt in $(seq 1 5); do
+    mapfile -t devices < <(
+      adb devices 2>/dev/null |
+        awk 'NR > 1 && $2 == "device" { print $1 }'
+    )
+    if [ "${#devices[@]}" -eq 1 ]; then
+      printf '%s\n' "${devices[0]}"
+      return
+    fi
+    if [ "${#devices[@]}" -gt 1 ]; then
+      echo "multiple ADB devices are online; set APKSCANNER_ADB_SERIAL explicitly" >&2
+      return
+    fi
+    sleep 1
+  done
+  echo "no ADB device became ready during startup; device tasks will use static-only mode" >&2
 }
 
 # Build before stopping the running service. A failed frontend build therefore

@@ -7,12 +7,15 @@ import type {
   Health,
   InvestigationTask,
   InvestigatorChoice,
+  PatternMatch,
   Scan,
   ScanDeleteResult,
   ScanRerunResult,
   ScanEvent,
   SecurityHypothesis,
+  SecuritySnapshot,
   TaskDeleteResult,
+  VersionDiff,
 } from "./types"
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -32,6 +35,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
+async function optionalRequest<T>(path: string, signal?: AbortSignal): Promise<T | null> {
+  const response = await fetch(path, {
+    signal,
+    headers: { "X-APKScanner-Request": "console" },
+  })
+  if (response.status === 404) return null
+  if (!response.ok) throw new Error(`Request failed: ${response.status}`)
+  return response.json() as Promise<T>
+}
+
 export const api = {
   health: () => request<Health>("/api/v1/health"),
   scans: () => request<Scan[]>("/api/v1/scans"),
@@ -39,6 +52,12 @@ export const api = {
     request<Scan>(`/api/v1/scans/${id}`, { signal }),
   entries: (id: string, signal?: AbortSignal) =>
     request<EntryPoint[]>(`/api/v1/scans/${id}/entries`, { signal }),
+  securitySnapshot: (id: string, signal?: AbortSignal) =>
+    optionalRequest<SecuritySnapshot>(`/api/v1/scans/${id}/security-snapshot`, signal),
+  versionDiff: (id: string, signal?: AbortSignal) =>
+    optionalRequest<VersionDiff>(`/api/v1/scans/${id}/version-diff`, signal),
+  patternMatches: (id: string, signal?: AbortSignal) =>
+    request<PatternMatch[]>(`/api/v1/scans/${id}/pattern-matches`, { signal }),
   findings: (id: string, signal?: AbortSignal) =>
     request<Finding[]>(`/api/v1/scans/${id}/findings`, { signal }),
   signals: (id: string, signal?: AbortSignal) =>
