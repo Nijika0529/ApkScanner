@@ -32,8 +32,10 @@ import {
 } from "lucide-react"
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import { api } from "./api"
+import { MarkdownContent } from "./components/MarkdownContent"
 import { Badge, Button, Card, Dialog, DialogContent, DialogDescription, DialogTitle, Progress, Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui"
 import { cn, formatDate, shortHash, statusLabel } from "./lib"
+import { markdownToPlainText } from "./markdown"
 import type { AgentAudit, BenchmarkEvaluation, CoverageItem, EntryPoint, Finding, Health, InvestigationTask, InvestigatorChoice, Scan, ScanEvent, SecurityHypothesis } from "./types"
 
 const severityTone = {
@@ -481,7 +483,64 @@ function isVerificationCandidate(signal: Finding) {
 function FindingCard({ finding, onRefresh }: { finding: Finding; onRefresh: () => Promise<void> }) {
   const [open, setOpen] = useState(false)
   const [reviewOpen, setReviewOpen] = useState(false)
-  return <article className="rounded-xl border border-slate-200 bg-slate-50/70"><button onClick={() => setOpen(!open)} className="flex w-full items-start gap-4 p-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-700 sm:p-5" aria-expanded={open}><Badge tone={severityTone[finding.severity]} className="mt-0.5 min-w-16 justify-center uppercase">{finding.severity}</Badge><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h3 className="font-semibold text-slate-900">{finding.title}</h3><Badge tone={statusTone(finding.status)}>{statusLabel(finding.status)}</Badge></div><p className="mt-1.5 line-clamp-2 text-sm leading-relaxed text-slate-500">{finding.description}</p><div className="mt-3 flex flex-wrap gap-3 text-[11px] text-slate-600"><span>{finding.masvs}</span>{finding.cwe && <span>{finding.cwe}</span>}<span>置信度 {finding.confidence}</span><span>{finding.source}</span></div></div><ChevronRight className={cn("mt-1 h-4 w-4 shrink-0 text-slate-600 transition-transform", open && "rotate-90")} /></button>{open && <div className="border-t border-slate-200 px-4 py-5 sm:px-5"><div className="grid gap-5 lg:grid-cols-2"><div><p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">风险说明</p><p className="text-sm leading-7 text-slate-700">{finding.description}</p></div><div><p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">修复建议</p><p className="text-sm leading-7 text-slate-700">{finding.remediation}</p></div></div>{finding.evidence_ids.length > 0 && <div className="mt-5"><p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">可核验证据</p><div className="flex flex-wrap gap-2">{finding.evidence_ids.map((evidenceId) => <a key={evidenceId} href={`/api/v1/evidence/${evidenceId}/download`} className="rounded-lg border border-cyan-200 bg-cyan-50 px-2.5 py-1.5 font-mono text-[11px] text-cyan-900 hover:border-cyan-400 hover:underline">{evidenceId}</a>)}</div></div>}<div className="mt-5 flex flex-wrap items-center justify-between gap-3"><p className="font-mono text-xs text-slate-600">rule · {finding.rule_id} · evidence {finding.evidence_ids.length}</p><Button variant="secondary" size="sm" onClick={() => setReviewOpen(true)}>人工审核</Button></div></div>}<ReviewDialog finding={finding} open={reviewOpen} onOpenChange={setReviewOpen} onReviewed={onRefresh} /></article>
+  return (
+    <article className="rounded-xl border border-slate-200 bg-slate-50/70">
+      <button
+        onClick={() => setOpen(!open)}
+        className="flex w-full items-start gap-4 p-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-700 sm:p-5"
+        aria-expanded={open}
+      >
+        <Badge tone={severityTone[finding.severity]} className="mt-0.5 min-w-16 justify-center uppercase">{finding.severity}</Badge>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="font-semibold text-slate-900">{finding.title}</h3>
+            <Badge tone={statusTone(finding.status)}>{statusLabel(finding.status)}</Badge>
+          </div>
+          <p className="mt-1.5 line-clamp-2 text-sm leading-relaxed text-slate-500">
+            {markdownToPlainText(finding.description)}
+          </p>
+          <div className="mt-3 flex flex-wrap gap-3 text-[11px] text-slate-600">
+            <span>{finding.masvs}</span>
+            {finding.cwe && <span>{finding.cwe}</span>}
+            <span>置信度 {finding.confidence}</span>
+            <span>{finding.source}</span>
+          </div>
+        </div>
+        <ChevronRight className={cn("mt-1 h-4 w-4 shrink-0 text-slate-600 transition-transform", open && "rotate-90")} />
+      </button>
+      {open && (
+        <div className="border-t border-slate-200 px-4 py-5 sm:px-5">
+          <div className="grid gap-6 xl:grid-cols-[minmax(0,1.4fr)_minmax(18rem,0.6fr)]">
+            <div className="min-w-0">
+              <p className="mb-3 text-xs font-semibold uppercase tracking-wider text-slate-500">风险说明</p>
+              <MarkdownContent>{finding.description}</MarkdownContent>
+            </div>
+            <div className="min-w-0 rounded-xl border border-slate-200 bg-white p-4">
+              <p className="mb-3 text-xs font-semibold uppercase tracking-wider text-slate-500">修复建议</p>
+              <MarkdownContent>{finding.remediation}</MarkdownContent>
+            </div>
+          </div>
+          {finding.evidence_ids.length > 0 && (
+            <div className="mt-5">
+              <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">可核验证据</p>
+              <div className="flex flex-wrap gap-2">
+                {finding.evidence_ids.map((evidenceId) => (
+                  <a key={evidenceId} href={`/api/v1/evidence/${evidenceId}/download`} className="rounded-lg border border-cyan-200 bg-cyan-50 px-2.5 py-1.5 font-mono text-[11px] text-cyan-900 hover:border-cyan-400 hover:underline">
+                    {evidenceId}
+                  </a>
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
+            <p className="font-mono text-xs text-slate-600">rule · {finding.rule_id} · evidence {finding.evidence_ids.length}</p>
+            <Button variant="secondary" size="sm" onClick={() => setReviewOpen(true)}>人工审核</Button>
+          </div>
+        </div>
+      )}
+      <ReviewDialog finding={finding} open={reviewOpen} onOpenChange={setReviewOpen} onReviewed={onRefresh} />
+    </article>
+  )
 }
 
 function ReviewDialog({ finding, open, onOpenChange, onReviewed }: { finding: Finding; open: boolean; onOpenChange: (open: boolean) => void; onReviewed: () => Promise<void> }) {
@@ -554,7 +613,7 @@ function HypothesisPipeline({ scanId, scanStatus, hypotheses, evaluations, entri
     </div>}
     <div className="space-y-3">{hypotheses.map((hypothesis) => {
       const latestArgument = hypothesis.arguments.at(-1)
-      const latestSummary = textValue(latestArgument?.payload.summary)
+      const latestSummary = markdownToPlainText(textValue(latestArgument?.payload.summary) ?? "") || undefined
       return <article key={hypothesis.id} className={cn("rounded-xl border bg-white p-4", hypothesis.status === "proven" ? "border-emerald-200" : "border-slate-200")}>
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between"><div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><Badge tone={statusTone(hypothesis.status)}>{statusLabel(hypothesis.status)}</Badge><Badge>{hypothesis.category}</Badge><span className="font-mono text-[11px] text-slate-400">{hypothesis.id}</span></div><h3 className="mt-3 font-semibold text-slate-950">{hypothesis.claim}</h3><p className="mt-2 break-all font-mono text-xs text-slate-500">{hypothesis.entry_point_ids.map((id) => names.get(id) ?? id).join(" · ")}</p></div><div className="text-right"><p className="text-2xl font-black text-slate-800">{hypothesis.confidence_score}</p><p className="text-[11px] text-slate-500">平台置信分</p></div></div>
         <div className="mt-4 grid gap-3 lg:grid-cols-2"><div className="rounded-lg border border-slate-200 bg-slate-50 p-3"><p className="text-xs font-bold text-slate-700">辩论记录 · {hypothesis.arguments.length}</p><p className="mt-2 text-xs leading-5 text-slate-600">{latestArgument ? `${latestArgument.role} / ${latestArgument.phase}${latestSummary ? `：${latestSummary}` : ""}` : "等待 Hunter 产生第一项结构化论证"}</p></div><div className="rounded-lg border border-slate-200 bg-slate-50 p-3"><p className="text-xs font-bold text-slate-700">Proof Attempt · {hypothesis.proof_attempts.length}</p><div className="mt-2 flex flex-wrap gap-2">{hypothesis.proof_attempts.length ? hypothesis.proof_attempts.map((proof) => <Badge key={proof.id} tone={proof.harm_demonstrated ? "good" : statusTone(proof.status)}>{proof.test_case_id} · {proof.harm_demonstrated ? "危害已证明" : statusLabel(proof.status)}</Badge>) : <span className="text-xs text-slate-600">尚未进入设备证明队列</span>}</div></div></div>
@@ -978,7 +1037,7 @@ function AuditConclusion({ audit, current, taskResult }: { audit: AgentAudit; cu
           <div className="min-w-0">
             <p className={cn("text-[11px] font-bold uppercase tracking-[0.16em]", presentation.eyebrow)}>{current ? "任务当前最终结论" : validation ? "历史平台校验记录" : "中间模型输出"}</p>
             <h4 id={headingId} className="mt-1 text-lg font-bold text-slate-950">{presentation.label}</h4>
-            <p className="mt-2 text-sm leading-6 text-slate-700">{summary}</p>
+            <MarkdownContent className="mt-3">{summary}</MarkdownContent>
           </div>
         </div>
         <div className="grid shrink-0 grid-cols-3 gap-2 sm:min-w-72">
