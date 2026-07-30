@@ -95,7 +95,8 @@ exploration and Agent-built dedicated PoCs remain available; the platform report
 a requested ordinary-app test actually lacks either execution route. An `adb shell` success is
 retained as a separate identity and is never treated as equivalent to an ordinary third-party app.
 
-When `APKSCANNER_ANDROID_SDK_ROOT` points to an SDK containing platform API 36 and build-tools,
+When `APKSCANNER_ANDROID_SDK_ROOT` points to an SDK containing the configured compile platform and
+build-tools,
 an OpenCode Agent may create a source-only PoC or build its own signed APK under the isolated
 `poc/` directory. The control plane validates paths, size, signature, package and launch metadata,
 records source/APK SHA-256 values, enters the same ADB queue, installs and launches the PoC as an
@@ -266,10 +267,14 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_ADB_SERIAL` | unset | Remote cloud-device ADB serial |
 | `APKSCANNER_PROBE_APK` | unset | Built Probe APK path |
 | `APKSCANNER_ANDROID_SDK_ROOT` | Android SDK env/unset | SDK used for platform-managed Agent PoC builds |
+| `APKSCANNER_ANDROID_BUILD_TOOLS_VERSION` | newest installed/unset | Pin one coherent SDK `build-tools/<version>` directory; when unset, compatible aapt2 resource-table failures may retry other installed versions |
 | `APKSCANNER_POC_ENABLED` | `true` | Permit validated source or Agent-built prebuilt PoC APKs |
 | `APKSCANNER_POC_BUILD_TIMEOUT` | 180 s | Per-command PoC build timeout (30–600 s) |
 | `APKSCANNER_POC_MAX_SOURCE_BYTES` | 512 KiB | Platform-managed PoC source-project limit (64 KiB–16 MiB) |
 | `APKSCANNER_POC_MAX_APK_BYTES` | 128 MiB | Agent-built prebuilt PoC APK limit |
+| `APKSCANNER_POC_COMPILE_API` | `APKSCANNER_ANDROID_API` | Installed SDK platform used to compile PoC Java sources |
+| `APKSCANNER_POC_MIN_API` | `21` | Requested PoC minimum API; legacy `dx` raises the effective minimum to 26 |
+| `APKSCANNER_POC_TARGET_API` | `APKSCANNER_ANDROID_API` | PoC target SDK used to reproduce the selected Android platform behavior |
 | `APKSCANNER_INVESTIGATOR_BACKEND` | `codex` | Default: `codex`, `opencode`, or `none` |
 | `APKSCANNER_AGENT_PERMISSION_PROFILE` | `personal_lab` | `personal_lab` enables full decompiler access and writable tool analysis; `strict` keeps schema-only analysis |
 | `APKSCANNER_CODEX_ENABLED` | `false` | Dispatch Codex investigations |
@@ -290,7 +295,7 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `DEEPSEEK_API_KEY` | unset | DeepSeek credential delivered to the selected worker over its one-shot stdin request |
 | `APKSCANNER_MOBSF_URL` / `APKSCANNER_MOBSF_API_KEY` | unset | Optional MobSF API |
 | `APKSCANNER_ANDROID_VERSION` | `16` | Reported dynamic baseline |
-| `APKSCANNER_ANDROID_API` | `36` | Android SDK API used for platform-managed PoC builds |
+| `APKSCANNER_ANDROID_API` | `36` | Expected audit-device API and default PoC compile/target API |
 | `APKSCANNER_DEVICE_MIN_API` / `APKSCANNER_DEVICE_MAX_API` | `21` / `99` | Compatible cloud-device API range |
 | `APKSCANNER_DEVICE_INSTALL_POLICY` | `install_or_reuse` | `replace`, `install_or_reuse`, or `reuse_installed` target policy |
 | `APKSCANNER_DEVICE_RESET_POLICY` | `per_round` | `per_test`, `per_round`, or `never`; each requested test may override it |

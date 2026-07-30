@@ -80,7 +80,7 @@ Web 健康检查使用真正的非阻塞锁；设备繁忙时读取最近一次�
 | Codex host worker | 当前任务 attempt workspace 与模型网络 | 仅作为显式 `host` 降级模式；developer instructions 禁止 ADB/目标网络请求，设备动作仍走平台 |
 | OpenCode + DeepSeek Docker worker | 独立 task workspace、完整只读反编译根、`/tmp`、DeepSeek API | workspace 可写、rootfs 只读、临时 HOME；Analyzer 允许 read/glob/grep/bash 和本地构建，独立 Finalizer 只允许 StructuredOutput；容器无设备挂载 |
 | OpenCode + DeepSeek host worker | 独立 task workspace、完整反编译根、主机工具/网络、可选 ADB | personal-lab 模式可自由分析和构建；每次调用使用临时 HOME/XDG 与带随机 Basic Auth 的 loopback server；仅适合个人受控环境 |
-| 云真机 | 目标 APK、可选 Probe APK、Agent PoC、测试账号 | 固定 Android 16/API 36；串行 lease；任务前后 `pm clear`；不声称完整快照复位 |
+| 云真机 | 目标 APK、可选 Probe APK、Agent PoC、测试账号 | 配置声明目标 Android/API；串行 lease；任务前后 `pm clear`；不声称完整快照复位 |
 | Probe APK | 可选的普通 App UID 通用入口快速执行器 | 只接受最初发送者为 shell/root 的调度；复杂 Binder/AIDL/漏洞链改用 Agent 专用 PoC；仍只允许安装在专用测试设备 |
 | MobSF | 上传 APK并返回广度扫描报告 | 可选、显式 URL/API Key；失败不阻断内置基线，但标为 tool gap |
 

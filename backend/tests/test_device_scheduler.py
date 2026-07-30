@@ -558,6 +558,45 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
     )
 
 
+def test_poc_log_evidence_waits_for_delayed_correlated_result(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    class DelayedLogRunner:
+        attempts = 0
+
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @classmethod
+        def run(cls, argv, **_kwargs):  # noqa: ANN001, ANN206
+            cls.attempts += 1
+            stdout = (
+                'I/APKSCANNER_POC: {"request_id":"request-1","success":true}'
+                if cls.attempts == 2
+                else ""
+            )
+            return CommandResult(argv, 0, stdout, "")
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        DelayedLogRunner(),  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr("apkscanner.device.time.sleep", lambda _seconds: None)
+
+    result, matching, attempts, _elapsed = adapter._poll_poc_logcat(
+        log_tag="APKSCANNER_POC",
+        request_id="request-1",
+        timeout_seconds=5,
+        budget=None,
+    )
+
+    assert result.exit_code == 0
+    assert len(matching) == 1
+    assert attempts == 2
+
+
 def test_poc_owned_ui_cannot_forge_a_target_security_impact() -> None:
     oracle = AgentOracleSpec(
         kind="ui_text",

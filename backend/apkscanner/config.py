@@ -51,12 +51,16 @@ class Settings:
     adb_serial: str | None = None
     probe_apk_path: Path | None = None
     android_sdk_root: Path | None = None
+    android_build_tools_version: str | None = None
     poc_enabled: bool = True
     poc_build_timeout_seconds: int = 180
     poc_max_source_bytes: int = 512 * 1024
     poc_max_apk_bytes: int = 128 * 1024 * 1024
     device_android_version: str = "16"
     device_android_api: int = 36
+    poc_compile_api: int | None = None
+    poc_min_api: int = 21
+    poc_target_api: int | None = None
     device_min_api: int = 21
     device_max_api: int = 99
     device_install_policy: str = "install_or_reuse"
@@ -156,6 +160,9 @@ class Settings:
                 )
                 else None
             ),
+            android_build_tools_version=(
+                os.getenv("APKSCANNER_ANDROID_BUILD_TOOLS_VERSION") or None
+            ),
             poc_enabled=_env_bool("APKSCANNER_POC_ENABLED", True),
             poc_build_timeout_seconds=max(
                 30, min(600, int(os.getenv("APKSCANNER_POC_BUILD_TIMEOUT", 180)))
@@ -176,6 +183,19 @@ class Settings:
             ),
             device_android_version=os.getenv("APKSCANNER_ANDROID_VERSION", "16"),
             device_android_api=int(os.getenv("APKSCANNER_ANDROID_API", 36)),
+            poc_compile_api=(
+                int(os.environ["APKSCANNER_POC_COMPILE_API"])
+                if os.getenv("APKSCANNER_POC_COMPILE_API")
+                else None
+            ),
+            poc_min_api=max(
+                1, int(os.getenv("APKSCANNER_POC_MIN_API", 21))
+            ),
+            poc_target_api=(
+                int(os.environ["APKSCANNER_POC_TARGET_API"])
+                if os.getenv("APKSCANNER_POC_TARGET_API")
+                else None
+            ),
             device_min_api=max(1, int(os.getenv("APKSCANNER_DEVICE_MIN_API", 21))),
             device_max_api=max(1, int(os.getenv("APKSCANNER_DEVICE_MAX_API", 99))),
             device_install_policy=os.getenv(

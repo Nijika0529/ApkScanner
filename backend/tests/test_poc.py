@@ -4,6 +4,7 @@ import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from xml.etree import ElementTree
 
 from apkscanner.artifacts import ArtifactStore
 from apkscanner.db import Database
@@ -248,11 +249,46 @@ package="io.apkscanner.poc.providerprobe">
     output = tmp_path / "build"
     output.mkdir()
 
-    normalized = PocBuilder._build_manifest(source, output)
+    normalized = PocBuilder._build_manifest(source, output, compile_api=23)
 
     text = normalized.read_text(encoding="utf-8")
     assert "<queries>" not in text
     assert "MainActivity" in text
+
+
+def test_source_build_keeps_queries_and_exports_launcher_on_modern_android(
+    tmp_path,
+) -> None:
+    source = tmp_path / "source.xml"
+    source.write_text(
+        """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+package="io.apkscanner.poc.providerprobe">
+<queries><package android:name="io.apkscanner.vulntest" /></queries>
+<application><activity android:name=".MainActivity" android:exported="false" /></application>
+</manifest>""",
+        encoding="utf-8",
+    )
+    output = tmp_path / "build"
+    output.mkdir()
+
+    normalized = PocBuilder._build_manifest(
+        source,
+        output,
+        compile_api=36,
+        package_name="io.apkscanner.poc.providerprobe",
+        launch_component=".MainActivity",
+    )
+
+    root = ElementTree.parse(normalized).getroot()
+    activity = root.find("application/activity")
+    assert root.find("queries") is not None
+    assert activity is not None
+    assert (
+        activity.get(
+            "{http://schemas.android.com/apk/res/android}exported"
+        )
+        == "true"
+    )
 
 
 def test_source_build_drops_override_annotations_for_legacy_android_jar(
@@ -324,6 +360,120 @@ def test_poc_builder_uses_legacy_dx_when_d8_is_unavailable(
     builder = PocBuilder(configured, ToolRunner(), ArtifactStore(configured))
 
     assert builder._dex_tool() == ("dx", dx)
+
+
+def test_poc_builder_sorts_build_tools_as_versions_and_honors_pin(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    sdk = tmp_path / "android-sdk"
+    for version in ("9.0.0", "34.0.0"):
+        tool = sdk / "build-tools" / version / "aapt2"
+        tool.parent.mkdir(parents=True)
+        tool.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    configured = replace(settings, android_sdk_root=sdk)
+    builder = PocBuilder(configured, ToolRunner(), ArtifactStore(configured))
+    assert builder._tool_candidates("aapt2")[0].parent.name == "34.0.0"
+
+    pinned = replace(configured, android_build_tools_version="9.0.0")
+    pinned_builder = PocBuilder(pinned, ToolRunner(), ArtifactStore(pinned))
+    assert pinned_builder._tool_candidates("aapt2") == [
+        sdk / "build-tools" / "9.0.0" / "aapt2"
+    ]
+
+
+def test_poc_sdk_roles_are_separate_and_legacy_dx_raises_minimum(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    sdk = tmp_path / "android-sdk"
+    tool_dir = sdk / "build-tools" / "34.0.0"
+    platform = sdk / "platforms" / "android-36"
+    tool_dir.mkdir(parents=True)
+    platform.mkdir(parents=True)
+    for name in ("aapt2", "apksigner", "zipalign", "dx"):
+        (tool_dir / name).write_text("#!/bin/sh\n", encoding="utf-8")
+    (platform / "android.jar").write_bytes(b"android")
+    configured = replace(
+        settings,
+        android_sdk_root=sdk,
+        device_android_api=36,
+        poc_compile_api=36,
+        poc_min_api=21,
+        poc_target_api=35,
+    )
+
+    builder = PocBuilder(configured, ToolRunner(), ArtifactStore(configured))
+
+    assert builder._compile_api() == 36
+    assert builder._target_api() == 35
+    assert builder._effective_min_api() == 26
+
+
+def test_poc_builder_retries_only_aapt2_resource_table_compatibility_errors(
+    settings,
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    write_poc_project(workspace)
+    android_jar = tmp_path / "android.jar"
+    android_jar.write_bytes(b"android")
+    first = tmp_path / "aapt2-36"
+    second = tmp_path / "aapt2-34"
+    dx = tmp_path / "dx"
+    for tool in (first, second, dx):
+        tool.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    class RetryRunner:
+        calls: list[list[str]] = []
+
+        def run(self, argv, **_kwargs):  # noqa: ANN001
+            self.calls.append(argv)
+            if argv[0] == str(first):
+                return CommandResult(
+                    argv,
+                    1,
+                    "",
+                    "LoadedArsc.cpp:94 RES_TABLE_TYPE_TYPE entry offsets "
+                    "overlap actual entry data",
+                )
+            if argv[0] == str(second):
+                return CommandResult(argv, 0, "", "")
+            return CommandResult(argv, 1, "", "javac source error")
+
+    runner = RetryRunner()
+    builder = PocBuilder(settings, runner, ArtifactStore(settings))  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        builder,
+        "capability",
+        lambda: {"available": True, "source_build_available": True},
+    )
+    monkeypatch.setattr(builder, "_android_jar", lambda: android_jar)
+    monkeypatch.setattr(builder, "_compile_api", lambda: 36)
+    monkeypatch.setattr(builder, "_dex_tool", lambda: ("dx", dx))
+    original_candidates = builder._tool_candidates
+    monkeypatch.setattr(
+        builder,
+        "_tool_candidates",
+        lambda name: [first, second] if name == "aapt2" else original_candidates(name),
+    )
+    monkeypatch.setattr(builder, "_required_tool", lambda name: name)
+
+    result = builder.build(workspace, poc_spec())
+
+    assert result.ok is False
+    assert [kind for kind, _result, _metadata in result.commands[:2]] == [
+        "poc.build.aapt2",
+        "poc.build.aapt2",
+    ]
+    assert result.commands[0][2]["tool_path"] == str(first)
+    assert result.commands[1][2]["tool_path"] == str(second)
+    assert result.commands[1][2]["compile_api"] == 36
+    assert result.error is not None and "poc.build.javac" in result.error
 
 
 def test_personal_lab_ingests_an_agent_built_prebuilt_apk(

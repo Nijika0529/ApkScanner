@@ -763,6 +763,7 @@ class AdbDeviceAdapter:
         extras: dict[str, str | int | bool] | None = None,
         oracle: AgentOracleSpec | None = None,
         test_case_id: str | None = None,
+        build_metadata: dict[str, Any] | None = None,
     ) -> DeviceProbeResult:
         """Install and launch a dedicated PoC as an ordinary application UID."""
         if not self.configured:
@@ -789,15 +790,36 @@ class AdbDeviceAdapter:
                 separators=(",", ":"),
             ).encode()
         ).decode()
+        built_target_api = (
+            (build_metadata or {}).get("target_api")
+            or self.settings.poc_target_api
+            or self.settings.device_android_api
+        )
         common = {
             "caller_identity": "agent_poc_app",
             "poc_package": spec.package_name,
+            "poc_compile_api": (build_metadata or {}).get("compile_api"),
+            "poc_min_api": (build_metadata or {}).get("min_api"),
+            "poc_target_api": built_target_api,
             "request_id": request_id,
             "session_state": state,
             "test_case_id": test_case_id,
         }
         commands: list[tuple[str, CommandResult, dict[str, Any]]] = []
         with self._lease:
+            device_api = self._adb_budget(
+                ["shell", "getprop", "ro.build.version.sdk"],
+                budget,
+                30,
+            )
+            actual_api = device_api.stdout.strip()
+            common["device_api"] = actual_api or None
+            common["device_api_matches_poc_target"] = (
+                actual_api == str(built_target_api)
+            )
+            commands.append(
+                ("blackbox.device_profile", device_api, dict(common))
+            )
             install = self._adb_budget(
                 ["install", "-r", "-t", str(apk_path)],
                 budget,
@@ -853,14 +875,16 @@ class AdbDeviceAdapter:
                     spec.timeout_seconds,
                 )
                 commands.append(("blackbox.poc_launch", launch, dict(common)))
-                log_result = self._adb_budget(
-                    ["logcat", "-d", "-t", "500", "-s", f"{spec.log_tag}:I"],
-                    budget,
-                    60,
+                log_result, matching, poll_attempts, observation_seconds = (
+                    self._poll_poc_logcat(
+                        log_tag=spec.log_tag,
+                        request_id=request_id,
+                        timeout_seconds=(
+                            spec.timeout_seconds if launch.exit_code == 0 else 1
+                        ),
+                        budget=budget,
+                    )
                 )
-                matching = [
-                    line for line in log_result.stdout.splitlines() if request_id in line
-                ]
                 normalized = [line.lower().replace(" ", "") for line in matching]
                 poc_success = any('"success":true' in line for line in normalized)
                 poc_payload = self._last_json_payload(matching)
@@ -882,6 +906,8 @@ class AdbDeviceAdapter:
                                 for line in normalized
                             ),
                             "matching_line_count": len(matching),
+                            "poll_attempts": poll_attempts,
+                            "observation_window_seconds": observation_seconds,
                             **poc_oracle,
                         },
                     )
@@ -955,6 +981,37 @@ class AdbDeviceAdapter:
                 "command_count": len(commands),
             },
         )
+
+    def _poll_poc_logcat(
+        self,
+        *,
+        log_tag: str,
+        request_id: str,
+        timeout_seconds: int,
+        budget: TimeBudget | None,
+    ) -> tuple[CommandResult, list[str], int, float]:
+        started = time.monotonic()
+        deadline = started + max(timeout_seconds, 1)
+        attempts = 0
+        last = self._budget_exhausted(
+            ["adb", "-s", self.serial or "", "logcat"]
+        )
+        while True:
+            attempts += 1
+            remaining = max(1, int(deadline - time.monotonic()))
+            last = self._adb_budget(
+                ["logcat", "-d", "-t", "500", "-s", f"{log_tag}:I"],
+                budget,
+                min(15, remaining),
+            )
+            matching = [
+                line for line in last.stdout.splitlines() if request_id in line
+            ]
+            if matching or last.exit_code != 0:
+                return last, matching, attempts, time.monotonic() - started
+            if time.monotonic() >= deadline or (budget is not None and budget.expired):
+                return last, [], attempts, time.monotonic() - started
+            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
 
     def _direct_probe_args(self, entry: EntryPoint, package_name: str) -> list[str] | None:
         if entry.kind in {"activity", "activity_alias"}:

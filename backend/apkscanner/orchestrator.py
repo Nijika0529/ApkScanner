@@ -3010,6 +3010,7 @@ class ScanOrchestrator:
                             extras=dict(request.extras),
                             oracle=request.oracle,
                             test_case_id=test_case_id,
+                            build_metadata=artifact.metadata,
                         )
                         for index, (kind, result, metadata) in enumerate(probe.commands):
                             probe.commands[index] = (

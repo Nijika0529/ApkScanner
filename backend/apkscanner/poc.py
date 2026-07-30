@@ -19,6 +19,12 @@ from .tools import CommandResult, ToolRunner
 
 ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android"
 ALLOWED_SOURCE_SUFFIXES = {".java", ".xml"}
+AAPT2_RESOURCE_TABLE_COMPATIBILITY_ERRORS = (
+    "entry offsets overlap actual entry data",
+    "loadedarsc.cpp",
+    "resources.arsc is corrupt",
+    "invalid resource table",
+)
 
 
 @dataclass(slots=True)
@@ -61,7 +67,7 @@ class PocBuilder:
                 "Android SDK platform android.jar": android_jar,
                 "d8 or dx": dex_tool,
                 "java compiler": shutil.which("javac"),
-                "zipalign": shutil.which("zipalign") or self._build_tool("zipalign"),
+                "zipalign": self._tool_candidate("zipalign"),
                 "keytool": shutil.which("keytool"),
             }.items()
             if value is None
@@ -69,8 +75,8 @@ class PocBuilder:
         ingest_missing = [
             name
             for name, value in {
-                "aapt2": shutil.which("aapt2") or self._build_tool("aapt2"),
-                "apksigner": shutil.which("apksigner") or self._build_tool("apksigner"),
+                "aapt2": self._tool_candidate("aapt2"),
+                "apksigner": self._tool_candidate("apksigner"),
             }.items()
             if value is None
         ]
@@ -79,12 +85,62 @@ class PocBuilder:
                 "available": False,
                 "detail": f"PoC APK ingestion is missing: {', '.join(ingest_missing)}",
             }
+        compile_api = self._compile_api()
+        min_api = self._effective_min_api()
+        target_api = self._target_api()
+        toolchain = {
+            name: str(value) if value is not None else None
+            for name, value in {
+                "aapt2": self._tool_candidate(name="aapt2"),
+                "d8_or_dx": (
+                    self._dex_tool()[1] if self._dex_tool() is not None else None
+                ),
+                "zipalign": self._tool_candidate(name="zipalign"),
+                "apksigner": self._tool_candidate(name="apksigner"),
+            }.items()
+        }
         return {
             "available": True,
             "android_api": self.settings.device_android_api,
+            "compile_api": compile_api,
+            "min_api": min_api,
+            "target_api": target_api,
+            "build_tools_version": self.settings.android_build_tools_version,
+            "toolchain": toolchain,
+            "aapt2_fallbacks": [
+                str(item) for item in self._tool_candidates("aapt2")[1:]
+            ],
             "source_contract": "manifest_and_java_or_prebuilt_apk",
-            "source_build_available": not source_missing,
-            "source_build_missing": source_missing,
+            "source_build_available": not source_missing and compile_api is not None,
+            "source_build_missing": [
+                *source_missing,
+                *(
+                    [
+                        "Android SDK platform android.jar for compile API "
+                        f"{self._requested_compile_api()}"
+                    ]
+                    if compile_api is None
+                    else []
+                ),
+            ],
+            "configuration_warnings": [
+                *(
+                    [
+                        f"compile API {compile_api} is below target API "
+                        f"{target_api}; PoC sources cannot reference newer APIs"
+                    ]
+                    if compile_api is not None and target_api > compile_api
+                    else []
+                ),
+                *(
+                    [
+                        f"compile API {compile_api} cannot encode Android 11+ "
+                        "package-visibility queries; <queries> will be omitted"
+                    ]
+                    if compile_api is not None and compile_api < 30
+                    else []
+                ),
+            ],
             "max_source_bytes": self.settings.poc_max_source_bytes,
             "max_prebuilt_apk_bytes": self.settings.poc_max_apk_bytes,
             "max_source_files": 64,
@@ -145,35 +201,81 @@ class PocBuilder:
             unsigned_apk = output / "unsigned.apk"
             aligned_apk = output / "aligned.apk"
             signed_apk = output / "poc.apk"
-            build_manifest = self._build_manifest(manifest, output)
-            build_sources = self._build_sources(sources, output)
             android_jar = self._android_jar()
             dex_tool = self._dex_tool()
             assert android_jar is not None and dex_tool is not None
             dex_tool_name, dex_tool_path = dex_tool
+            compile_api = self._compile_api()
+            min_api = self._effective_min_api()
+            target_api = self._target_api()
+            assert compile_api is not None
+            build_manifest = self._build_manifest(
+                manifest,
+                output,
+                compile_api=compile_api,
+                package_name=effective_spec.package_name,
+                launch_component=effective_spec.launch_component,
+            )
+            build_sources = self._build_sources(sources, output)
+
+            aapt2_suffix = [
+                "link",
+                "-o",
+                str(unsigned_apk),
+                "-I",
+                str(android_jar),
+                "--manifest",
+                str(build_manifest),
+                "--min-sdk-version",
+                str(min_api),
+                "--target-sdk-version",
+                str(target_api),
+                "--version-code",
+                "1",
+                "--version-name",
+                "1.0",
+            ]
+            aapt2_ok = False
+            aapt2_candidates = self._tool_candidates("aapt2")
+            for attempt, aapt2 in enumerate(aapt2_candidates, start=1):
+                result = self.runner.run(
+                    [str(aapt2), *aapt2_suffix],
+                    cwd=project,
+                    timeout=self.settings.poc_build_timeout_seconds,
+                    cancel_event=cancel_event,
+                )
+                commands.append(
+                    (
+                        "poc.build.aapt2",
+                        result,
+                        {
+                            **self._command_metadata(
+                                effective_spec,
+                                source_sha256,
+                                compile_api=compile_api,
+                                min_api=min_api,
+                                target_api=target_api,
+                            ),
+                            "tool_path": str(aapt2),
+                            "tool_attempt": attempt,
+                        },
+                    )
+                )
+                if result.exit_code == 0:
+                    aapt2_ok = True
+                    break
+                if not self._is_aapt2_resource_table_compatibility_error(result):
+                    break
+            if not aapt2_ok:
+                return PocBuildResult(
+                    ok=False,
+                    commands=commands,
+                    error=self._command_failure("poc.build.aapt2", commands[-1][1]),
+                    source_sha256=source_sha256,
+                    source_path=source_path,
+                )
 
             steps = [
-                (
-                    "poc.build.aapt2",
-                    [
-                        self._required_tool("aapt2"),
-                        "link",
-                        "-o",
-                        str(unsigned_apk),
-                        "-I",
-                        str(android_jar),
-                        "--manifest",
-                        str(build_manifest),
-                        "--min-sdk-version",
-                        str(self.settings.device_android_api),
-                        "--target-sdk-version",
-                        str(self.settings.device_android_api),
-                        "--version-code",
-                        "1",
-                        "--version-name",
-                        "1.0",
-                    ],
-                ),
                 (
                     "poc.build.javac",
                     [
@@ -203,7 +305,13 @@ class PocBuilder:
                     (
                         kind,
                         result,
-                        self._command_metadata(effective_spec, source_sha256),
+                        self._command_metadata(
+                            effective_spec,
+                            source_sha256,
+                            compile_api=compile_api,
+                            min_api=min_api,
+                            target_api=target_api,
+                        ),
                     )
                 )
                 if result.exit_code != 0:
@@ -243,7 +351,7 @@ class PocBuilder:
                     # Legacy dx does not desugar Java 8 lambdas. Allow its
                     # invoke-custom output on the modern audit devices where
                     # Agent-authored PoCs execute.
-                    "--min-sdk-version=26",
+                    f"--min-sdk-version={min_api}",
                     f"--output={classes_dex}",
                     *[str(item.relative_to(classes)) for item in class_files],
                 ]
@@ -259,7 +367,13 @@ class PocBuilder:
                 (
                     f"poc.build.{dex_tool_name}",
                     dex_result,
-                    self._command_metadata(effective_spec, source_sha256),
+                    self._command_metadata(
+                        effective_spec,
+                        source_sha256,
+                        compile_api=compile_api,
+                        min_api=min_api,
+                        target_api=target_api,
+                    ),
                 )
             )
             if dex_result.exit_code != 0:
@@ -345,7 +459,13 @@ class PocBuilder:
                     (
                         kind,
                         result,
-                        self._command_metadata(effective_spec, source_sha256),
+                        self._command_metadata(
+                            effective_spec,
+                            source_sha256,
+                            compile_api=compile_api,
+                            min_api=min_api,
+                            target_api=target_api,
+                        ),
                     )
                 )
                 if result.exit_code != 0:
@@ -367,7 +487,13 @@ class PocBuilder:
             source_sha256=source_sha256,
             source_path=source_path,
             metadata={
-                **self._command_metadata(effective_spec, source_sha256),
+                **self._command_metadata(
+                    effective_spec,
+                    source_sha256,
+                    compile_api=compile_api,
+                    min_api=min_api,
+                    target_api=target_api,
+                ),
                 "apk_sha256": apk_sha256,
                 "apk_path": str(apk_path),
                 "source_path": str(source_path),
@@ -376,12 +502,41 @@ class PocBuilder:
         )
 
     @staticmethod
-    def _build_manifest(source: Path, output: Path) -> Path:
+    def _build_manifest(
+        source: Path,
+        output: Path,
+        *,
+        compile_api: int | None = None,
+        package_name: str | None = None,
+        launch_component: str | None = None,
+    ) -> Path:
         tree = ElementTree.parse(source)
         root = tree.getroot()
-        for child in list(root):
-            if child.tag == "queries":
-                root.remove(child)
+        if compile_api is not None and compile_api < 30:
+            for child in list(root):
+                if child.tag == "queries":
+                    root.remove(child)
+        if package_name and launch_component:
+            component = (
+                f"{package_name}{launch_component}"
+                if launch_component.startswith(".")
+                else launch_component
+            )
+            application = root.find("application")
+            if application is not None:
+                for activity in application.findall("activity"):
+                    name = activity.get(f"{{{ANDROID_NAMESPACE}}}name")
+                    normalized = (
+                        f"{package_name}{name}"
+                        if name and name.startswith(".")
+                        else name
+                    )
+                    if normalized == component:
+                        activity.set(
+                            f"{{{ANDROID_NAMESPACE}}}exported",
+                            "true",
+                        )
+                        break
         target = output / "AndroidManifest.xml"
         tree.write(target, encoding="utf-8", xml_declaration=True)
         return target
@@ -462,10 +617,6 @@ class PocBuilder:
                 "poc.prebuilt.verify_signature",
                 [self._required_tool("apksigner"), "verify", "--verbose", str(candidate)],
             ),
-            (
-                "poc.prebuilt.inspect_manifest",
-                [self._required_tool("aapt2"), "dump", "badging", str(candidate)],
-            ),
         ]
         inspection: CommandResult | None = None
         for kind, argv in checks:
@@ -484,6 +635,38 @@ class PocBuilder:
                 )
             if kind == "poc.prebuilt.inspect_manifest":
                 inspection = result
+        for attempt, aapt2 in enumerate(self._tool_candidates("aapt2"), start=1):
+            kind = "poc.prebuilt.inspect_manifest"
+            result = self.runner.run(
+                [str(aapt2), "dump", "badging", str(candidate)],
+                cwd=poc_root,
+                timeout=self.settings.poc_build_timeout_seconds,
+                cancel_event=cancel_event,
+            )
+            commands.append(
+                (
+                    kind,
+                    result,
+                    {
+                        **metadata,
+                        "tool_path": str(aapt2),
+                        "tool_attempt": attempt,
+                    },
+                )
+            )
+            if result.exit_code == 0:
+                inspection = result
+                break
+            if not self._is_aapt2_resource_table_compatibility_error(result):
+                break
+        if inspection is None:
+            return PocBuildResult(
+                ok=False,
+                commands=commands,
+                error=self._command_failure(
+                    "poc.prebuilt.inspect_manifest", commands[-1][1]
+                ),
+            )
         assert inspection is not None
         package_match = re.search(r"package: name='([^']+)'", inspection.stdout)
         if package_match is None or package_match.group(1) != spec.package_name:
@@ -725,29 +908,95 @@ class PocBuilder:
                 )
         return stream.getvalue()
 
+    def _requested_compile_api(self) -> int:
+        return self.settings.poc_compile_api or self.settings.device_android_api
+
+    def _compile_api(self) -> int | None:
+        android_jar = self._android_jar()
+        if android_jar is None:
+            return None
+        match = re.fullmatch(r"android-(\d+)", android_jar.parent.name)
+        return int(match.group(1)) if match is not None else None
+
+    def _effective_min_api(self) -> int:
+        requested = min(
+            self.settings.poc_min_api,
+            self._requested_target_api(),
+        )
+        # Debian/legacy dx does not desugar Java 8 lambdas and emits
+        # invoke-custom bytecode, which Android only supports from API 26.
+        dex_tool = self._dex_tool()
+        return max(requested, 26) if dex_tool and dex_tool[0] == "dx" else requested
+
+    def _requested_target_api(self) -> int:
+        return self.settings.poc_target_api or self.settings.device_android_api
+
+    def _target_api(self) -> int:
+        return max(self._requested_target_api(), self._effective_min_api())
+
     def _android_jar(self) -> Path | None:
         if self.settings.android_sdk_root is None:
             return None
         candidate = (
             self.settings.android_sdk_root
             / "platforms"
-            / f"android-{self.settings.device_android_api}"
+            / f"android-{self._requested_compile_api()}"
             / "android.jar"
         )
         return candidate if candidate.is_file() else None
 
-    def _build_tool(self, name: str) -> Path | None:
+    @staticmethod
+    def _version_key(
+        value: str,
+    ) -> tuple[int, tuple[tuple[int, object], ...]]:
+        return (
+            1 if re.match(r"^\d", value) else 0,
+            tuple(
+                (1, int(part)) if part.isdigit() else (0, part.lower())
+                for part in re.findall(r"\d+|[A-Za-z]+", value)
+            ),
+        )
+
+    def _build_tools_directories(self) -> list[Path]:
         if self.settings.android_sdk_root is None:
-            return None
+            return []
         root = self.settings.android_sdk_root / "build-tools"
         if not root.is_dir():
-            return None
+            return []
+        if self.settings.android_build_tools_version:
+            pinned = root / self.settings.android_build_tools_version
+            return [pinned] if pinned.is_dir() else []
+        return sorted(
+            (item for item in root.iterdir() if item.is_dir()),
+            key=lambda item: self._version_key(item.name),
+            reverse=True,
+        )
+
+    def _tool_candidates(self, name: str) -> list[Path]:
         candidates = [
             directory / name
-            for directory in root.iterdir()
-            if directory.is_dir() and (directory / name).is_file()
+            for directory in self._build_tools_directories()
+            if (directory / name).is_file()
         ]
-        return sorted(candidates)[-1] if candidates else None
+        if not self.settings.android_build_tools_version:
+            path_tool = shutil.which(name)
+            if path_tool:
+                candidates.append(Path(path_tool))
+        unique: list[Path] = []
+        seen: set[Path] = set()
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                unique.append(candidate)
+        return unique
+
+    def _tool_candidate(self, name: str) -> Path | None:
+        candidates = self._tool_candidates(name)
+        return candidates[0] if candidates else None
+
+    def _build_tool(self, name: str) -> Path | None:
+        return self._tool_candidate(name)
 
     def _dex_tool(self) -> tuple[str, Path] | None:
         for name in ("d8", "dx"):
@@ -772,10 +1021,23 @@ class PocBuilder:
         return None
 
     def _required_tool(self, name: str) -> str:
-        value = shutil.which(name) or self._build_tool(name)
+        value = self._tool_candidate(name)
+        if value is None and name in {"javac", "keytool"}:
+            path_tool = shutil.which(name)
+            value = Path(path_tool) if path_tool else None
         if value is None:
             raise ValueError(f"required PoC build tool is unavailable: {name}")
         return str(value)
+
+    @staticmethod
+    def _is_aapt2_resource_table_compatibility_error(
+        result: CommandResult,
+    ) -> bool:
+        diagnostic = f"{result.stderr}\n{result.stdout}".lower()
+        return any(
+            marker in diagnostic
+            for marker in AAPT2_RESOURCE_TABLE_COMPATIBILITY_ERRORS
+        )
 
     @staticmethod
     def _command_failure(kind: str, result: CommandResult) -> str:
@@ -827,10 +1089,21 @@ class PocBuilder:
     def _command_metadata(
         spec: AgentPocSpec,
         source_sha256: str,
+        *,
+        compile_api: int | None = None,
+        min_api: int | None = None,
+        target_api: int | None = None,
     ) -> dict[str, object]:
-        return {
+        metadata: dict[str, object] = {
             "poc_package": spec.package_name,
             "poc_project_path": spec.project_path,
             "poc_source_sha256": source_sha256,
             "platform_managed_build": True,
         }
+        if compile_api is not None:
+            metadata["compile_api"] = compile_api
+        if min_api is not None:
+            metadata["min_api"] = min_api
+        if target_api is not None:
+            metadata["target_api"] = target_api
+        return metadata
