@@ -433,7 +433,7 @@ def test_provider_poc_claim_without_row_count_is_not_platform_proof() -> None:
     assert metadata["oracle"]["matched"] is False
 
 
-def test_correlated_poc_log_oracle_can_report_structured_impact() -> None:
+def test_correlated_poc_log_oracle_is_not_independent_platform_impact() -> None:
     oracle = AgentOracleSpec(
         kind="log_contains",
         expected_text="demo-password=hunter2",
@@ -455,7 +455,7 @@ def test_correlated_poc_log_oracle_can_report_structured_impact() -> None:
         ),
     )
 
-    assert metadata["security_impact_observed"] is True
+    assert metadata["security_impact_observed"] is False
     assert metadata["oracle"]["matched"] is True
 
 
@@ -483,11 +483,11 @@ def test_poc_log_oracle_uses_all_correlated_json_lines() -> None:
         ),
     )
 
-    assert metadata["security_impact_observed"] is True
+    assert metadata["security_impact_observed"] is False
     assert metadata["oracle"]["matched"] is True
 
 
-def test_process_correlated_plain_poc_log_can_report_impact() -> None:
+def test_process_correlated_plain_poc_log_is_not_platform_impact() -> None:
     oracle = AgentOracleSpec(
         kind="log_contains",
         expected_text="vault_secret=rescue-chain-secret",
@@ -503,7 +503,7 @@ def test_process_correlated_plain_poc_log_can_report_impact() -> None:
         ),
     )
 
-    assert metadata["security_impact_observed"] is True
+    assert metadata["security_impact_observed"] is False
     assert metadata["oracle"]["matched"] is True
 
 
@@ -527,6 +527,38 @@ def test_poc_log_claim_without_expected_observation_is_not_proof() -> None:
 
     assert metadata["security_impact_observed"] is False
     assert metadata["oracle"]["matched"] is False
+
+
+def test_target_uid_log_oracle_proves_command_execution_under_target_uid() -> None:
+    oracle = AgentOracleSpec(
+        kind="target_uid_log_contains",
+        expected_text="APKSCANNER_TARGET_COMMAND_MARKER",
+        impact="privileged_action",
+    )
+    output = (
+        "07-30 22:11:02.460 10413 2423 2968 I APKSCANNER_TARGET: "
+        "APKSCANNER_TARGET_COMMAND_MARKER\n"
+        "07-30 22:11:03.000 10414 2500 2500 I APKSCANNER_POC: "
+        "APKSCANNER_TARGET_COMMAND_MARKER"
+    )
+
+    matched = AdbDeviceAdapter._evaluate_target_log_oracle(
+        oracle,
+        output,
+        "io.apkscanner.specialcases",
+        target_uid=10413,
+    )
+    wrong_uid = AdbDeviceAdapter._evaluate_target_log_oracle(
+        oracle,
+        output,
+        "io.apkscanner.specialcases",
+        target_uid=99999,
+    )
+
+    assert matched["oracle"]["matched"] is True
+    assert matched["security_impact_observed"] is True
+    assert wrong_uid["oracle"]["matched"] is False
+    assert wrong_uid["security_impact_observed"] is False
 
 
 def test_missing_optional_probe_does_not_emit_a_failed_probe_broadcast(settings) -> None:  # noqa: ANN001

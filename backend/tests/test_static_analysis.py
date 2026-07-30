@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import stat
 import zipfile
+from pathlib import Path
 
 import pytest
 from apkscanner.manifest import parse_manifest
@@ -27,6 +28,100 @@ def test_inspector_falls_back_to_plaintext_manifest(settings, fixture_apk) -> No
         assert stat.S_IMODE(result.workspace.stat().st_mode) == 0o700
 
 
+def test_inspector_keeps_smali_and_uses_aapt2_manifest_when_oem_resources_fail(
+    settings,
+    fixture_apk,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+
+    class OemFallbackRunner:
+        def available(self, tool: str) -> bool:
+            return tool in {"apktool", "aapt2"}
+
+        def version(self, tool: str) -> str:
+            return f"{tool} test"
+
+        def run(self, argv, **_kwargs):  # noqa: ANN001
+            if argv[:2] == ["apktool", "d"] and "--no-res" not in argv:
+                return CommandResult(
+                    argv=argv,
+                    exit_code=1,
+                    stdout="",
+                    stderr="Can't find framework resources for package of id: 3",
+                )
+            if argv[:2] == ["apktool", "d"] and "--no-res" in argv:
+                output = argv[argv.index("--output") + 1]
+                smali = (
+                    __import__("pathlib").Path(output)
+                    / "smali"
+                    / "com"
+                    / "example"
+                    / "OemService.smali"
+                )
+                smali.parent.mkdir(parents=True)
+                smali.write_text(
+                    ".class public Lcom/example/OemService;\n.super Landroid/app/Service;\n",
+                    encoding="utf-8",
+                )
+                return CommandResult(argv=argv, exit_code=0, stdout="", stderr="")
+            if argv[:5] == [
+                "aapt2",
+                "dump",
+                "xmltree",
+                "--file",
+                "AndroidManifest.xml",
+            ]:
+                return CommandResult(
+                    argv=argv,
+                    exit_code=0,
+                    stdout=(
+                        "N: android=http://schemas.android.com/apk/res/android (line=1)\n"
+                        "  E: manifest (line=1)\n"
+                        '    A: package="com.example" (Raw: "com.example")\n'
+                        "      E: uses-sdk (line=2)\n"
+                        "        A: http://schemas.android.com/apk/res/android:"
+                        "minSdkVersion(0x0101020c)=26\n"
+                        "        A: http://schemas.android.com/apk/res/android:"
+                        "targetSdkVersion(0x01010270)=36\n"
+                        "      E: application (line=3)\n"
+                        "          E: service (line=4)\n"
+                        "            A: http://schemas.android.com/apk/res/android:"
+                        'name(0x01010003)="com.example.OemService" '
+                        '(Raw: "com.example.OemService")\n'
+                        "            A: http://schemas.android.com/apk/res/android:"
+                        "exported(0x01010010)=true\n"
+                    ),
+                    stderr="",
+                )
+            if argv[:3] == ["aapt2", "dump", "badging"]:
+                return CommandResult(
+                    argv=argv,
+                    exit_code=0,
+                    stdout=(
+                        "package: name='com.example' versionCode='1' versionName='1.0'\n"
+                        "sdkVersion:'26'\ntargetSdkVersion:'36'\n"
+                    ),
+                    stderr="",
+                )
+            raise AssertionError(argv)
+
+    inspector = ApkInspector(settings, runner=OemFallbackRunner())
+    monkeypatch.setattr(
+        "apkscanner.static_analysis.discover_tools",
+        lambda _runner: {"apktool": "test", "aapt2": "test"},
+    )
+    result = inspector.inspect(fixture_apk, "scan-oem-fallback")
+
+    assert result.manifest.package_name == "com.example"
+    assert result.manifest.target_sdk == 36
+    assert result.manifest.entries[0].name == "com.example.OemService"
+    assert result.code_index["com.example.OemService"]["status"] == "smali_fallback"
+    assert result.tool_results["apktool"]["exit_code"] == 1
+    assert result.tool_results["apktool_no_resources"]["exit_code"] == 0
+    assert result.tool_results["aapt2_manifest"]["exit_code"] == 0
+
+
 def test_builtin_rules_emit_candidates_and_coverage(settings, fixture_apk) -> None:  # noqa: ANN001
     settings.ensure_directories()
     result = ApkInspector(settings).inspect(fixture_apk, "scan-rules")
@@ -46,6 +141,122 @@ def test_builtin_rules_emit_candidates_and_coverage(settings, fixture_apk) -> No
         "MASVS-RESILIENCE",
         "MASVS-PRIVACY",
     }
+
+
+def test_high_value_code_signals_create_bounded_static_review_surfaces(
+    tmp_path,
+) -> None:
+    manifest = parse_manifest(
+        """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+        package="com.example.agent">
+          <uses-sdk android:targetSdkVersion="35" />
+          <application />
+        </manifest>"""
+    )
+    root = tmp_path / "apktool"
+    sources = {
+        "smali_classes2/com/example/agent/HtmlPreviewActivity.smali": (
+            "invoke-virtual {v0, v1, v2}, "
+            "Landroid/webkit/WebView;->addJavascriptInterface"
+            "(Ljava/lang/Object;Ljava/lang/String;)V\n"
+            "invoke-virtual {v3, v4}, "
+            "Landroid/webkit/WebSettings;->setAllowFileAccess(Z)V\n"
+        ),
+        "smali_classes2/com/example/agent/cli/CliImpl.smali": (
+            ".class public Lcom/example/agent/cli/CliImpl;\n"
+            "invoke-static {v1}, "
+            "Lcom/example/agent/cli/ShellRiskAssessor;->isRisky(Ljava/lang/String;)Z\n"
+            "invoke-virtual {v0, v1}, "
+            "Ljava/lang/Runtime;->exec(Ljava/lang/String;)Ljava/lang/Process;\n"
+        ),
+        "smali_classes2/com/example/agent/cli/ShellRiskAssessor.smali": (
+            'const-string v0, "pm clear"\n'
+        ),
+        "smali_classes2/com/example/agent/AgentBinder.smali": (
+            ".class public Lcom/example/agent/AgentBinder;\n"
+            ".super Landroid/os/Binder;\n"
+            "invoke-virtual {v0, p1}, "
+            "Lcom/example/agent/cli/CliImpl;->execute(Ljava/lang/String;)V\n"
+        ),
+        "smali_classes2/com/example/agent/AgentService.smali": (
+            ".class public Lcom/example/agent/AgentService;\n"
+            "new-instance v0, Lcom/example/agent/AgentBinder;\n"
+        ),
+        "smali_classes2/com/example/agent/AgentApp.smali": (
+            '.field private static final APP_SECRET:Ljava/lang/String; = '
+            '"0123456789ABCDEF0123456789ABCDEF"\n'
+            'const-string v0, "https://gateway-pre.example.test"\n'
+        ),
+        "smali_classes2/okhttp3/OkHttpClient.smali": (
+            "Ljava/lang/Runtime;->exec(Ljava/lang/String;)Ljava/lang/Process;\n"
+        ),
+    }
+    for relative, content in sources.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    result = StaticAnalysisResult(
+        manifest=manifest,
+        workspace=tmp_path,
+        tool_versions={},
+        tool_results={},
+        signing={},
+        file_inventory={},
+        searchable_roots=[root],
+        decompilation={"status": "not_available"},
+        code_index={},
+    )
+
+    engine = BuiltinRuleEngine()
+    findings, _coverage = engine.evaluate(result)
+    surfaces = engine.static_review_surfaces(manifest, findings)
+
+    assert {surface.family for surface in surfaces} == {
+        "web_content_boundary",
+        "shell_execution_boundary",
+        "release_configuration_boundary",
+    }
+    shell = next(
+        item for item in surfaces if item.family == "shell_execution_boundary"
+    )
+    assert all("okhttp3" not in item["path"] for item in shell.locations)
+    release = next(
+        item for item in surfaces if item.family == "release_configuration_boundary"
+    )
+    assert set(release.rule_ids) == {
+        "CODE-HARDCODED-SECRET",
+        "CODE-NONPRODUCTION-ENDPOINT",
+    }
+
+    for surface in surfaces:
+        ApkInspector.add_static_surface_to_code_index(
+            result,
+            surface_name=surface.name,
+            locations=surface.locations,
+        )
+        anchors = result.code_index[surface.name]["anchors"]
+        assert anchors
+        assert all(
+            anchor["line_start"] <= anchor["signal_line"] <= anchor["line_end"]
+            for anchor in anchors
+            if anchor["relationship"] == "signal_source"
+        )
+    shell_anchors = result.code_index[shell.name]["anchors"]
+    assert any(
+        Path(anchor["path"]).name == "ShellRiskAssessor.smali"
+        and anchor["relationship"] == "outbound_reference"
+        for anchor in shell_anchors
+    )
+    assert any(
+        Path(anchor["path"]).name == "AgentBinder.smali"
+        and anchor["relationship"] == "inbound_reference"
+        for anchor in shell_anchors
+    )
+    assert any(
+        Path(anchor["path"]).name == "AgentService.smali"
+        and anchor["relationship"] == "inbound_reference"
+        for anchor in shell_anchors
+    )
 
 
 def test_inspector_rejects_zip_path_traversal(settings, tmp_path) -> None:  # noqa: ANN001

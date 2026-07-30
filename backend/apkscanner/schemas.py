@@ -310,6 +310,7 @@ class AgentOracleSpec(BaseModel):
         "provider_rows",
         "ui_text",
         "log_contains",
+        "target_uid_log_contains",
         "process_crash",
     ] = "reachability"
     expected_text: str | None = Field(default=None, min_length=1, max_length=500)
@@ -325,7 +326,11 @@ class AgentOracleSpec(BaseModel):
 
     @model_validator(mode="after")
     def validate_predicate(self) -> Self:
-        if self.kind in {"ui_text", "log_contains"} and not self.expected_text:
+        if self.kind in {
+            "ui_text",
+            "log_contains",
+            "target_uid_log_contains",
+        } and not self.expected_text:
             raise ValueError(f"{self.kind} requires expected_text")
         if self.kind == "provider_rows" and self.minimum_rows is None:
             self.minimum_rows = 1
@@ -339,6 +344,7 @@ class AgentOracleSpec(BaseModel):
                 "unauthorized_state_change",
                 "privileged_action",
             },
+            "target_uid_log_contains": {"none", "privileged_action"},
             "process_crash": {"none", "denial_of_service"},
         }
         if self.impact not in allowed_impacts[self.kind]:

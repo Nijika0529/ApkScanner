@@ -77,6 +77,44 @@ def test_planner_statically_closes_signature_guarded_component() -> None:
     )
 
 
+def test_planner_dispatches_internal_static_surface_without_device_side_effects() -> None:
+    entry = EntryPoint(
+        id="00000000-0000-0000-0000-000000000019",
+        scan_id="scan",
+        kind="static_surface",
+        name="static://shell_execution_boundary",
+        owner_component="static://shell_execution_boundary",
+        exported=False,
+        exported_reason="static_semantic_seed",
+        metadata_json={
+            "effective_enabled": True,
+            "static_review_family": "shell_execution_boundary",
+            "static_review_priority": 96,
+            "static_review_rule_ids": ["CODE-COMMAND-EXEC"],
+            "static_review_hypotheses": [
+                "Untrusted tool input reaches the shell execution sink."
+            ],
+        },
+    )
+
+    plan = InvestigationPlanner(
+        android_version="16",
+        adb_configured=True,
+    ).plan_with_decisions("scan", [entry])
+
+    assert plan.static_closures == []
+    assert len(plan.tasks) == 1
+    task = plan.tasks[0]
+    assert task.task_type == "static_review"
+    assert task.priority == 96
+    assert task.target_entry_ids == [entry.id]
+    assert task.hypotheses == [
+        "Untrusted tool input reaches the shell execution sink."
+    ]
+    assert task.allowed_side_effects == []
+    assert task.device_profile["static_review"] is True
+
+
 def test_planner_groups_deep_links_with_their_owner_activity() -> None:
     activity = EntryPoint(
         id="00000000-0000-0000-0000-000000000017",
@@ -103,7 +141,8 @@ def test_planner_groups_deep_links_with_their_owner_activity() -> None:
     assert len(tasks) == 1
     assert tasks[0].task_type == "component"
     assert tasks[0].target_entry_ids == [activity.id, deep_link.id]
-    assert any("Deep links handled by" in item for item in tasks[0].hypotheses)
+    assert any("callback provenance" in item for item in tasks[0].hypotheses)
+    assert not any("Deep links handled by" in item for item in tasks[0].hypotheses)
 
 
 def test_planner_resolves_framework_signature_binding_permission() -> None:

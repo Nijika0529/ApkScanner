@@ -962,6 +962,24 @@ class PocBuilder:
         log_tags: set[str] = set()
         for source in sources:
             text = source.read_text(encoding="utf-8", errors="replace")
+            if "bindService(" in text and re.search(r"\.\s*wait\s*\(", text):
+                raise ValueError(
+                    "Binder PoC must not block the Activity main thread after bindService; "
+                    "run the transaction from onServiceConnected"
+                )
+            dex_tool = self._dex_tool()
+            if (
+                dex_tool is not None
+                and dex_tool[0] == "dx"
+                and re.search(
+                    r"(?:\([^)]*\)|[A-Za-z_$][A-Za-z0-9_$]*)\s*->",
+                    text,
+                )
+            ):
+                raise ValueError(
+                    "the available dx toolchain does not support Java lambdas; "
+                    "use an anonymous Runnable or callback class"
+                )
             package_match = re.search(
                 r"(?m)^\s*package\s+([A-Za-z][A-Za-z0-9_.]*)\s*;",
                 text,

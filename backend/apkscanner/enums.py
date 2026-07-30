@@ -21,6 +21,7 @@ class EntryPointKind(StrEnum):
     RECEIVER = "receiver"
     PROVIDER = "provider"
     DEEP_LINK = "deep_link"
+    STATIC_SURFACE = "static_surface"
 
 
 class TaskStatus(StrEnum):

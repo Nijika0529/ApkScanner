@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 from .agent_events import AgentCancelledError, AgentEventCallback, emit_agent_event
 from .agent_prompt import developer_instructions, investigation_prompt
 from .config import Settings
+from .enums import TaskType
 from .models import EntryPoint, InvestigationTask, Scan
 from .schemas import AGENT_RESULT_JSON_SCHEMA, AgentInvestigationResult
 from .worker_protocol import (
@@ -365,6 +366,7 @@ class OpenCodeInvestigator:
         event_callback: AgentEventCallback | None = None,
         cancel_event: threading.Event | None = None,
         proof_replay_token: str | None = None,
+        proof_replay_url: str | None = None,
     ) -> OpenCodeRunResult:
         if not workspace.is_dir():
             raise ValueError("scan workspace is unavailable")
@@ -393,6 +395,7 @@ class OpenCodeInvestigator:
             enable_thinking_explorer=self.settings.opencode_thinking_explorer,
             enable_workspace_analyzer=(
                 self.settings.agent_permission_profile == "personal_lab"
+                and task.task_type != TaskType.STATIC_REVIEW.value
             ),
             default_model=self.settings.opencode_model,
             critic_model=self.settings.opencode_critic_model,
@@ -430,10 +433,11 @@ class OpenCodeInvestigator:
             response_contract="structured_result",
         )
         scan_workspace = (self.settings.data_dir / "workspaces" / scan.id).resolve()
+        expose_shared_workspace = task.task_type != TaskType.STATIC_REVIEW.value
         shared_names = [
             name
             for name in ("jadx", "apktool", "archive")
-            if (scan_workspace / name).is_dir()
+            if expose_shared_workspace and (scan_workspace / name).is_dir()
         ]
         if self.settings.opencode_isolation == "docker":
             external_read_roots = [f"/scan-workspace/{name}" for name in shared_names]
@@ -522,7 +526,9 @@ class OpenCodeInvestigator:
         if proof_replay_token and self.settings.opencode_isolation == "host":
             payload["_proof_replay_token"] = proof_replay_token
             payload["_proof_task_id"] = task.id
-            payload["_proof_replay_url"] = self.settings.proof_replay_base_url
+            payload["_proof_replay_url"] = (
+                proof_replay_url or self.settings.proof_replay_base_url
+            )
         analysis_stage = next(
             (
                 stage

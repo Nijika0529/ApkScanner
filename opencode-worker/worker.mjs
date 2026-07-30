@@ -1075,7 +1075,32 @@ function buildConfig(payload) {
     ...(workspaceTools.includes("bash")
       ? {
           bash: payload.allow_adb
-            ? { "*": "allow" }
+            ? {
+                "*": "allow",
+                "su *": "deny",
+                "adb root": "deny",
+                "adb * root": "deny",
+                "adb remount": "deny",
+                "adb * remount": "deny",
+                "adb usb": "deny",
+                "adb * usb": "deny",
+                "adb tcpip *": "deny",
+                "adb * tcpip *": "deny",
+                "adb forward *": "deny",
+                "adb * forward *": "deny",
+                "adb reverse *": "deny",
+                "adb * reverse *": "deny",
+                "adb shell su *": "deny",
+                "adb * shell su *": "deny",
+                "adb shell run-as *": "deny",
+                "adb * shell run-as *": "deny",
+                "adb shell stop adbd": "deny",
+                "adb * shell stop adbd": "deny",
+                "adb shell start adbd": "deny",
+                "adb * shell start adbd": "deny",
+                "adb shell setprop service.adb.tcp.port *": "deny",
+                "adb * shell setprop service.adb.tcp.port *": "deny",
+              }
             : {
                 "*": "allow",
                 adb: "deny",

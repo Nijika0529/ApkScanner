@@ -7,6 +7,8 @@ import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
 import pytest
@@ -47,6 +49,44 @@ def test_live_proof_replay_requires_an_explicit_hypothesis() -> None:
                 "poc": poc_spec().model_dump(mode="json"),
             }
         )
+
+
+def test_embedded_live_proof_endpoint_rejects_an_unregistered_task(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    orchestrator = ScanOrchestrator(
+        settings,
+        database,
+        ArtifactStore(settings),
+    )
+    replay = AgentProofReplay(
+        hypothesis_id="11111111-2222-4333-8444-555555555555",
+        oracle=AgentOracleSpec(),
+        rationale="Exercise the CLI-local proof transport.",
+        poc=poc_spec(),
+    )
+    request = Request(
+        (
+            f"{orchestrator._ensure_live_proof_endpoint()}"
+            "/api/v1/internal/tasks/"
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/proof-replay"
+        ),
+        data=replay.model_dump_json().encode(),
+        headers={
+            "Content-Type": "application/json",
+            "X-APKScanner-Proof-Token": "not-registered",
+        },
+        method="POST",
+    )
+
+    try:
+        with pytest.raises(HTTPError) as error:
+            urlopen(request, timeout=2)
+        assert error.value.code == 403
+        assert "not active" in error.value.read().decode()
+    finally:
+        orchestrator.shutdown()
 
 
 def write_poc_project(workspace: Path) -> Path:
@@ -116,6 +156,53 @@ def test_poc_builder_accepts_only_source_projects_under_workspace(
     assert manifest.name == "AndroidManifest.xml"
     assert [item.name for item in sources] == ["MainActivity.java"]
     assert effective == poc_spec()
+
+
+def test_poc_builder_rejects_main_thread_wait_after_bind_service(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = write_poc_project(workspace)
+    source = next((project / "src").rglob("MainActivity.java"))
+    source.write_text(
+        """package io.apkscanner.poc.providerprobe;
+public final class MainActivity extends android.app.Activity {
+  void test(android.content.Intent intent) throws Exception {
+    bindService(intent, null, 0);
+    this.wait(5000);
+  }
+}""",
+        encoding="utf-8",
+    )
+    builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
+
+    with pytest.raises(ValueError, match="must not block"):
+        builder._validate_project(workspace, poc_spec())
+
+
+def test_poc_builder_rejects_lambdas_for_dx_toolchain(
+    settings,
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = write_poc_project(workspace)
+    source = next((project / "src").rglob("MainActivity.java"))
+    source.write_text(
+        """package io.apkscanner.poc.providerprobe;
+public final class MainActivity extends android.app.Activity {
+  void test() { new Thread(() -> {}).start(); }
+}""",
+        encoding="utf-8",
+    )
+    builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
+    monkeypatch.setattr(builder, "_dex_tool", lambda: ("dx", Path("/sdk/dx")))
+
+    with pytest.raises(ValueError, match="does not support Java lambdas"):
+        builder._validate_project(workspace, poc_spec())
 
 
 def test_poc_builder_recovers_a_unique_project_path_by_package(

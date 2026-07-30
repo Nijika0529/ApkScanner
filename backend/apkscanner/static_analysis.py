@@ -9,7 +9,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .config import Settings
-from .manifest import ManifestDocument, parse_manifest
+from .manifest import ManifestDocument, aapt2_xmltree_to_xml, parse_manifest
 from .permissions import ensure_private_directory
 from .tools import CommandResult, TimeBudget, ToolRunner, discover_tools
 
@@ -72,6 +72,23 @@ class ApkInspector:
             ):
                 manifest_path = candidate
                 searchable_roots.append(decoded_dir)
+            elif self.runner.available("apktool"):
+                fallback = self._run(
+                    [
+                        "apktool",
+                        "d",
+                        "--force",
+                        "--no-res",
+                        "--output",
+                        str(decoded_dir),
+                        str(apk_path),
+                    ],
+                    budget,
+                    self.settings.tool_timeout_seconds,
+                )
+                tool_results["apktool_no_resources"] = self._serialize_result(fallback)
+                if fallback.exit_code == 0 and decoded_dir.is_dir():
+                    searchable_roots.append(decoded_dir)
 
         if manifest_path is None and self.runner.available("apkanalyzer"):
             result = self._run(
@@ -81,14 +98,36 @@ class ApkInspector:
             if result.exit_code == 0 and result.stdout.lstrip().startswith("<"):
                 manifest_path = workspace / "AndroidManifest.xml"
                 manifest_path.write_text(result.stdout, encoding="utf-8")
-                searchable_roots.append(workspace)
+
+        if manifest_path is None and self.runner.available("aapt2"):
+            result = self._run(
+                [
+                    "aapt2",
+                    "dump",
+                    "xmltree",
+                    "--file",
+                    "AndroidManifest.xml",
+                    str(apk_path),
+                ],
+                budget,
+                120,
+            )
+            tool_results["aapt2_manifest"] = self._serialize_result(result)
+            if result.exit_code == 0:
+                try:
+                    decoded_manifest = aapt2_xmltree_to_xml(result.stdout)
+                    parse_manifest(decoded_manifest)
+                except (ValueError, TypeError):
+                    pass
+                else:
+                    manifest_path = workspace / "AndroidManifest.xml"
+                    manifest_path.write_text(decoded_manifest, encoding="utf-8")
 
         if manifest_path is None:
             plaintext = self._plaintext_manifest(apk_path)
             if plaintext is not None:
                 manifest_path = workspace / "AndroidManifest.xml"
                 manifest_path.write_text(plaintext, encoding="utf-8")
-                searchable_roots.append(workspace)
 
         if manifest_path is None:
             raise InvalidApkError(
@@ -426,16 +465,24 @@ class ApkInspector:
         *,
         include_content: bool,
         max_chars: int = 24_000,
+        focus_line: int | None = None,
     ) -> dict[str, Any]:
         raw = path.read_bytes()
         text = raw.decode("utf-8", errors="replace")
-        excerpt = text[:max_chars]
+        line_start = 1
+        if focus_line is not None and focus_line > 1:
+            lines = text.splitlines(keepends=True)
+            start_index = max(0, min(focus_line - 1, len(lines)) - 80)
+            excerpt = "".join(lines[start_index:])[:max_chars]
+            line_start = start_index + 1
+        else:
+            excerpt = text[:max_chars]
         anchor: dict[str, Any] = {
             "path": str(path.relative_to(workspace)),
             "language": "java" if path.suffix == ".java" else "smali",
             "sha256": hashlib.sha256(raw).hexdigest(),
-            "line_start": 1,
-            "line_end": excerpt.count("\n") + 1,
+            "line_start": line_start,
+            "line_end": line_start + excerpt.count("\n"),
             "truncated": len(text) > len(excerpt),
             "source_bytes": len(raw),
             "decompiler_error_markers": [
@@ -451,6 +498,236 @@ class ApkInspector:
         if include_content:
             anchor["content"] = excerpt
         return anchor
+
+    @classmethod
+    def add_static_surface_to_code_index(
+        cls,
+        result: StaticAnalysisResult,
+        *,
+        surface_name: str,
+        locations: list[dict[str, Any]],
+    ) -> None:
+        anchors: list[dict[str, Any]] = []
+        seen: set[Path] = set()
+        seed_sources: list[Path] = []
+        allowed_roots = {
+            path.name: path.resolve()
+            for path in result.searchable_roots
+            if path.is_dir()
+        }
+        for location in locations:
+            root = allowed_roots.get(str(location.get("root") or ""))
+            if root is None:
+                continue
+            candidate = (root / str(location.get("path") or "")).resolve()
+            if (
+                candidate in seen
+                or not candidate.is_relative_to(root)
+                or not candidate.is_file()
+            ):
+                continue
+            seen.add(candidate)
+            seed_sources.append(candidate)
+            anchor = cls._source_anchor(
+                candidate,
+                result.workspace,
+                include_content=True,
+                focus_line=int(location.get("line") or 0) or None,
+            )
+            anchor["signal_line"] = int(location.get("line") or 0)
+            anchor["relationship"] = "signal_source"
+            anchors.append(anchor)
+            if len(anchors) >= 8:
+                break
+        package_path = result.manifest.package_name.replace(".", "/")
+        for candidate, relationship in cls._one_hop_app_references(
+            seed_sources,
+            list(allowed_roots.values()),
+            package_path=package_path,
+        ):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            anchor = cls._source_anchor(
+                candidate,
+                result.workspace,
+                include_content=True,
+            )
+            anchor["signal_line"] = 0
+            anchor["relationship"] = relationship
+            anchors.append(anchor)
+            if len(anchors) >= 20:
+                break
+        result.code_index[surface_name] = {
+            "component": surface_name,
+            "status": "static_signal_source_available" if anchors else "source_not_found",
+            "target_in_jadx_failure_list": False,
+            "target_source_has_decompiler_errors": False,
+            "global_decompilation_status": result.decompilation.get("status"),
+            "anchors": anchors,
+        }
+
+    @staticmethod
+    def _one_hop_app_references(
+        seed_sources: list[Path],
+        searchable_roots: list[Path],
+        *,
+        package_path: str,
+    ) -> list[tuple[Path, str]]:
+        """Resolve exact app-owned class references without exposing the whole APK."""
+
+        descriptors: list[str] = []
+        seen_descriptors: set[str] = set()
+        seed_descriptors: set[str] = set()
+        for source in seed_sources:
+            try:
+                text = source.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            class_match = re.search(r"(?m)^\.class[^\n]* L([^;]+);", text)
+            if class_match:
+                seed_descriptors.add(class_match.group(1))
+            for descriptor in re.findall(r"L([A-Za-z0-9_/$]+);", text):
+                if (
+                    not descriptor.startswith(f"{package_path}/")
+                    or descriptor in seed_descriptors
+                    or descriptor in seen_descriptors
+                ):
+                    continue
+                seen_descriptors.add(descriptor)
+                descriptors.append(descriptor)
+
+        resolved: list[tuple[Path, str]] = []
+        seen_paths: set[Path] = set()
+        frontier = descriptors
+        for depth, depth_limit in enumerate((6, 4, 4)):
+            next_frontier: list[str] = []
+            added_this_depth = 0
+            for descriptor in sorted(
+                frontier,
+                key=ApkInspector._reference_priority,
+                reverse=True,
+            ):
+                outer_class = descriptor.split("$", 1)[0]
+                candidates: list[Path] = []
+                for root in searchable_roots:
+                    for smali_root in sorted(root.glob("smali*")):
+                        candidates.append(smali_root / f"{outer_class}.smali")
+                    candidates.append(root / "sources" / f"{outer_class}.java")
+                for candidate in candidates:
+                    candidate = candidate.resolve()
+                    if candidate in seen_paths or not candidate.is_file():
+                        continue
+                    seen_paths.add(candidate)
+                    resolved.append((candidate, "outbound_reference"))
+                    added_this_depth += 1
+                    if depth < 2:
+                        try:
+                            linked_text = candidate.read_text(
+                                encoding="utf-8",
+                                errors="replace",
+                            )
+                        except OSError:
+                            linked_text = ""
+                        for linked in re.findall(
+                            r"L([A-Za-z0-9_/$]+);",
+                            linked_text,
+                        ):
+                            if (
+                                linked.startswith(f"{package_path}/")
+                                and linked not in seed_descriptors
+                                and linked not in seen_descriptors
+                            ):
+                                seen_descriptors.add(linked)
+                                next_frontier.append(linked)
+                    break
+                if added_this_depth >= depth_limit:
+                    break
+            frontier = next_frontier
+
+        inbound_frontier = set(seed_descriptors)
+        for inbound_limit in (4, 2):
+            if not inbound_frontier:
+                break
+            needles = tuple(
+                f"L{descriptor};" for descriptor in sorted(inbound_frontier)
+            )
+            next_inbound_frontier: set[str] = set()
+            added_this_depth = 0
+            for root in searchable_roots:
+                for smali_root in sorted(root.glob("smali*")):
+                    package_root = smali_root / package_path
+                    if not package_root.is_dir():
+                        continue
+                    for candidate in package_root.rglob("*.smali"):
+                        candidate = candidate.resolve()
+                        if candidate in seen_paths or candidate in seed_sources:
+                            continue
+                        try:
+                            text = candidate.read_text(
+                                encoding="utf-8",
+                                errors="replace",
+                            )
+                        except OSError:
+                            continue
+                        if not any(needle in text for needle in needles):
+                            continue
+                        seen_paths.add(candidate)
+                        resolved.append((candidate, "inbound_reference"))
+                        added_this_depth += 1
+                        class_match = re.search(
+                            r"(?m)^\.class[^\n]* L([^;]+);",
+                            text,
+                        )
+                        if class_match:
+                            next_inbound_frontier.add(class_match.group(1))
+                        if added_this_depth >= inbound_limit:
+                            break
+                    if added_this_depth >= inbound_limit:
+                        break
+                if added_this_depth >= inbound_limit:
+                    break
+            inbound_frontier = next_inbound_frontier
+        return resolved
+
+    @staticmethod
+    def _reference_priority(descriptor: str) -> tuple[int, int, str]:
+        lowered = descriptor.lower()
+        security_terms = (
+            "risk",
+            "assess",
+            "policy",
+            "permission",
+            "auth",
+            "bridge",
+            "web",
+            "shell",
+            "command",
+            "path",
+            "binder",
+            "service",
+            "receiver",
+            "activity",
+            "config",
+            "source",
+        )
+        score = sum(term in lowered for term in security_terms)
+        return score, -lowered.count("$"), descriptor
+
+    @staticmethod
+    def persist_code_index(result: StaticAnalysisResult) -> None:
+        (result.workspace / "code_index.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "decompilation": result.decompilation,
+                    "components": result.code_index,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
     @staticmethod
     def _merge_badging(manifest: ManifestDocument, text: str) -> None:

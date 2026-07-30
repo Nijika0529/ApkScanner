@@ -1198,6 +1198,11 @@ def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # no
     )
     source.parent.mkdir(parents=True, exist_ok=True)
     source.write_text("class ExportedProvider {}", encoding="utf-8")
+    manifest = source.parents[3] / "AndroidManifest.xml"
+    manifest.write_text(
+        "<manifest package=\"example\"><application /></manifest>",
+        encoding="utf-8",
+    )
 
     def context() -> dict[str, object]:
         return {
@@ -1255,6 +1260,37 @@ def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # no
         == materialized
     )
 
+    static_context = context()
+    static_context["entry_scope"] = {
+        "catalog": [{"kind": "static_surface"}],
+    }
+    bounded = orchestrator._materialize_agent_evidence(
+        scan_id,
+        "00000000-0000-0000-0000-000000000073",
+        1,
+        [dict(evidence_summary)],
+        platform_context=static_context,
+    )
+    bounded_context = json.loads(
+        (bounded / "context.json").read_text(encoding="utf-8")
+    )
+    assert bounded.is_relative_to(settings.data_dir / "agent_context" / scan_id)
+    assert not bounded.is_relative_to(settings.data_dir / "workspaces" / scan_id)
+    assert bounded_context["workspace_policy"]["shared_scan_workspace_exposed"] is False
+    assert bounded_context["workspace_policy"]["decompiled_roots"] == {
+        "host": [],
+        "container": [],
+    }
+    assert (bounded / materialized).is_file()
+    assert (
+        bounded_context["platform_context"]["bounded_manifest_path"]
+        == "target_source/AndroidManifest.xml"
+    )
+    assert bounded_context["platform_context"]["bounded_manifest"]["package_name"] == (
+        "example"
+    )
+    assert (bounded / "target_source/AndroidManifest.xml").is_file()
+
 
 def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(settings, fixture_apk) -> None:  # noqa: ANN001
     settings.ensure_directories()
@@ -1292,7 +1328,13 @@ def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(setting
         assert seal is not None
         assert seal.kind == "scan.seal"
         assert seal.sha256 == scan.stats["seal"]["sha256"]
-        assert len(list(session.scalars(select(EntryPoint).where(EntryPoint.scan_id == scan_id)))) == 8
+        entries = list(
+            session.scalars(
+                select(EntryPoint).where(EntryPoint.scan_id == scan_id)
+            )
+        )
+        assert len(entries) == 9
+        assert sum(entry.kind == "static_surface" for entry in entries) == 1
         findings = list(
             session.scalars(select(Finding).where(Finding.scan_id == scan_id))
         )
@@ -1302,6 +1344,7 @@ def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(setting
         )
         tasks = list(session.scalars(select(InvestigationTask).where(InvestigationTask.scan_id == scan_id)))
         assert tasks
+        assert sum(task.task_type == "static_review" for task in tasks) == 1
         assert {task.status for task in tasks} == {"blocked_device"}
         assert len(list(session.scalars(select(CoverageItem).where(CoverageItem.scan_id == scan_id)))) >= 16
         report = ReportBuilder().build(session, scan)

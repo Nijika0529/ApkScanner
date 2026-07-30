@@ -1,0 +1,54 @@
+{
+  "schema_version": "1.0",
+  "package_name": "io.apkscanner.specialcases",
+  "expected_findings": [
+    {
+      "id": "SC-01",
+      "title": "Exported Binder service trusts caller-supplied identity and command",
+      "severity": "critical",
+      "entry": "io.apkscanner.specialcases.AgentService"
+    },
+    {
+      "id": "SC-02",
+      "title": "Shell risk assessor is bypassable by real shell semantics",
+      "severity": "critical",
+      "entry": "static://shell_execution_boundary"
+    },
+    {
+      "id": "SC-03",
+      "title": "Attacker URL reaches internal WebView with sensitive JavaScript bridge",
+      "severity": "high",
+      "entry": "static://web_content_boundary"
+    },
+    {
+      "id": "SC-04",
+      "title": "Release configuration selects a cleartext pre-production endpoint",
+      "severity": "high",
+      "entry": "static://release_configuration_boundary"
+    },
+    {
+      "id": "SC-05",
+      "title": "Client-side emergency signing secret is embedded in the APK",
+      "severity": "high",
+      "entry": "static://release_configuration_boundary"
+    },
+    {
+      "id": "SC-06",
+      "title": "Unauthenticated broadcast persistently replaces policy state",
+      "severity": "high",
+      "entry": "io.apkscanner.specialcases.PolicyUpdateReceiver"
+    },
+    {
+      "id": "SC-07",
+      "title": "Browsable authorization callback accepts success without state binding",
+      "severity": "medium",
+      "entry": "io.apkscanner.specialcases.CallbackActivity"
+    },
+    {
+      "id": "SC-08",
+      "title": "Exported activity switches the active session from an untrusted extra",
+      "severity": "low",
+      "entry": "io.apkscanner.specialcases.SessionActivity"
+    }
+  ]
+}

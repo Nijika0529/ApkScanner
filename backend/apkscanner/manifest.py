@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import itertools
+import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
+from xml.etree import ElementTree as StdElementTree
 
 from defusedxml import ElementTree
 
 from .enums import EntryPointKind
 
 ANDROID_NS = "http://schemas.android.com/apk/res/android"
+
+_AAPT2_ELEMENT = re.compile(r"^(?P<indent>\s*)E:\s+(?P<tag>[^\s]+)(?:\s+\(line=\d+\))?$")
+_AAPT2_ATTRIBUTE = re.compile(
+    r"^(?P<indent>\s*)A:\s+(?P<name>.+?)(?:\(0x[0-9a-fA-F]+\))?=(?P<value>.*)$"
+)
+_AAPT2_RAW_VALUE = re.compile(r'\s+\(Raw:\s+"(?P<value>(?:[^"\\]|\\.)*)"\)\s*$')
 
 
 def android_attr(element: ElementTree.Element, name: str) -> str | None:
@@ -32,6 +41,103 @@ def normalize_class_name(package_name: str, name: str) -> str:
     if "." not in name:
         return f"{package_name}.{name}"
     return name
+
+
+def _decode_aapt2_quoted(value: str) -> str:
+    try:
+        return str(json.loads(f'"{value}"'))
+    except (json.JSONDecodeError, TypeError):
+        return value.replace(r"\"", '"').replace(r"\\", "\\")
+
+
+def _decode_aapt2_protection_level(value: str) -> str:
+    try:
+        numeric = int(value, 0)
+    except ValueError:
+        return value
+    base = {
+        0: "normal",
+        1: "dangerous",
+        2: "signature",
+        3: "signatureOrSystem",
+    }.get(numeric & 0xF, str(numeric & 0xF))
+    flags = [
+        name
+        for bit, name in (
+            (0x10, "privileged"),
+            (0x20, "development"),
+            (0x40, "appop"),
+            (0x80, "pre23"),
+            (0x100, "installer"),
+            (0x200, "verifier"),
+            (0x400, "preinstalled"),
+            (0x800, "setup"),
+            (0x1000, "instant"),
+            (0x2000, "runtime"),
+            (0x4000, "oem"),
+            (0x8000, "vendorPrivileged"),
+        )
+        if numeric & bit
+    ]
+    return "|".join([base, *flags])
+
+
+def _decode_aapt2_attribute_value(name: str, value: str) -> str:
+    raw_match = _AAPT2_RAW_VALUE.search(value)
+    if raw_match:
+        return _decode_aapt2_quoted(raw_match.group("value"))
+    normalized = value.strip()
+    if len(normalized) >= 2 and normalized[0] == normalized[-1] == '"':
+        return _decode_aapt2_quoted(normalized[1:-1])
+    local_name = name.rsplit("}", 1)[-1].rsplit(":", 1)[-1]
+    if local_name == "protectionLevel":
+        return _decode_aapt2_protection_level(normalized)
+    return normalized
+
+
+def aapt2_xmltree_to_xml(text: str) -> str:
+    """Convert ``aapt2 dump xmltree`` output into parseable manifest XML.
+
+    This is intentionally limited to the element/attribute records needed by
+    AndroidManifest parsing. It provides a framework-independent fallback for
+    OEM APKs whose resources require vendor framework packages that Apktool
+    does not have installed.
+    """
+
+    root: StdElementTree.Element | None = None
+    stack: list[tuple[int, StdElementTree.Element]] = []
+    for raw_line in text.splitlines():
+        element_match = _AAPT2_ELEMENT.match(raw_line)
+        if element_match:
+            indent = len(element_match.group("indent"))
+            element = StdElementTree.Element(element_match.group("tag"))
+            while stack and stack[-1][0] >= indent:
+                stack.pop()
+            if stack:
+                stack[-1][1].append(element)
+            elif root is None:
+                root = element
+            else:
+                raise ValueError("aapt2 xmltree contains multiple root elements")
+            stack.append((indent, element))
+            continue
+
+        attribute_match = _AAPT2_ATTRIBUTE.match(raw_line)
+        if attribute_match is None or not stack:
+            continue
+        name = attribute_match.group("name")
+        if name.startswith(f"{ANDROID_NS}:"):
+            name = f"{{{ANDROID_NS}}}{name[len(ANDROID_NS) + 1:]}"
+        value = _decode_aapt2_attribute_value(
+            name,
+            attribute_match.group("value"),
+        )
+        stack[-1][1].set(name, value)
+
+    if root is None or root.tag != "manifest":
+        raise ValueError("aapt2 xmltree output does not contain a manifest root")
+    StdElementTree.register_namespace("android", ANDROID_NS)
+    return StdElementTree.tostring(root, encoding="unicode")
 
 
 @dataclass(slots=True)

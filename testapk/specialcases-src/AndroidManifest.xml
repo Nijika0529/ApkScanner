@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.apkscanner.specialcases"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="36" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:name=".AgentApp"
+        android:allowBackup="false"
+        android:debuggable="false"
+        android:label="APKScanner Special Cases"
+        android:theme="@android:style/Theme.Material.Light"
+        android:usesCleartextTraffic="true">
+
+        <activity
+            android:name=".SessionActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".CallbackActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="specialagent"
+                    android:host="auth"
+                    android:path="/callback" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".HtmlPreviewActivity"
+            android:exported="false" />
+
+        <service
+            android:name=".AgentService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.apkscanner.specialcases.AGENT_START" />
+            </intent-filter>
+        </service>
+
+        <receiver
+            android:name=".PolicyUpdateReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.apkscanner.specialcases.POLICY_UPDATE" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

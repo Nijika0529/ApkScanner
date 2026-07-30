@@ -836,6 +836,32 @@ class AdbDeviceAdapter:
             commands.append(
                 ("blackbox.device_profile", device_api, dict(common))
             )
+            target_uid_result = self._adb_budget(
+                [
+                    "shell",
+                    "cmd",
+                    "package",
+                    "list",
+                    "packages",
+                    "-U",
+                    target_package_name,
+                ],
+                budget,
+                30,
+            )
+            target_uid_match = re.search(
+                rf"package:{re.escape(target_package_name)}\s+uid:(\d+)",
+                target_uid_result.stdout,
+            )
+            target_uid = (
+                int(target_uid_match.group(1))
+                if target_uid_match is not None
+                else None
+            )
+            common["target_uid"] = target_uid
+            commands.append(
+                ("blackbox.target_uid", target_uid_result, dict(common))
+            )
             # A prior worker may have been interrupted before its cleanup, or a
             # fresh data directory may use a different signing key. Removing
             # only the validated io.apkscanner.poc.* package makes the next
@@ -861,6 +887,14 @@ class AdbDeviceAdapter:
                     60,
                 )
                 commands.append(("blackbox.poc_clear", clear, dict(common)))
+                log_clear = self._adb_budget(
+                    ["logcat", "-c"],
+                    budget,
+                    30,
+                )
+                commands.append(
+                    ("blackbox.poc_logcat_clear", log_clear, dict(common))
+                )
                 ui_baseline: CommandResult | None = None
                 if oracle is not None and oracle.kind == "ui_text":
                     ui_baseline = self._adb_budget(
@@ -1014,10 +1048,15 @@ class AdbDeviceAdapter:
                     )
                 if oracle is not None and oracle.kind in {
                     "log_contains",
+                    "target_uid_log_contains",
                     "process_crash",
                 }:
                     target_log = self._adb_budget(
-                        ["logcat", "-d", "-t", "800"],
+                        (
+                            ["logcat", "-d", "-v", "uid", "-t", "800"]
+                            if oracle.kind == "target_uid_log_contains"
+                            else ["logcat", "-d", "-t", "800"]
+                        ),
                         budget,
                         60,
                     )
@@ -1031,6 +1070,7 @@ class AdbDeviceAdapter:
                                     oracle,
                                     target_log.stdout,
                                     target_package_name,
+                                    target_uid=target_uid,
                                 ),
                             },
                         )
@@ -1329,13 +1369,7 @@ class AdbDeviceAdapter:
                     "expected_text": oracle.expected_text,
                     "structured_poc_result": bool(payload),
                 },
-                impact_observed=bool(
-                    matched
-                    and (
-                        payload.get("security_impact_observed") is True
-                        or plain_impact_claim
-                    )
-                ),
+                impact_observed=False,
                 refutation_observed=bool(payload) or plain_impact_claim,
             )
         return {}
@@ -1436,11 +1470,30 @@ class AdbDeviceAdapter:
         oracle: AgentOracleSpec,
         output: str,
         package_name: str,
+        *,
+        target_uid: int | None = None,
     ) -> dict[str, Any]:
         if oracle.kind == "log_contains" and oracle.expected_text:
             matched = oracle.expected_text in output
             observation = {"expected_text": oracle.expected_text}
             impact_observed = False
+        elif oracle.kind == "target_uid_log_contains":
+            matching_lines = [
+                line
+                for line in output.splitlines()
+                if oracle.expected_text
+                and oracle.expected_text in line
+                and cls._logcat_line_uid(line) == target_uid
+            ]
+            matched = bool(target_uid is not None and matching_lines)
+            observation = {
+                "expected_text": oracle.expected_text,
+                "target_uid": target_uid,
+                "matching_target_uid_lines": len(matching_lines),
+            }
+            impact_observed = bool(
+                matched and oracle.impact == "privileged_action"
+            )
         elif oracle.kind == "process_crash":
             matched = cls._target_process_crashed(output, package_name)
             observation = {
@@ -1458,6 +1511,14 @@ class AdbDeviceAdapter:
             observation=observation,
             impact_observed=impact_observed,
         )
+
+    @staticmethod
+    def _logcat_line_uid(line: str) -> int | None:
+        match = re.match(
+            r"^\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+\s+(\d+)\s+\d+\s+\d+\s+",
+            line,
+        )
+        return int(match.group(1)) if match is not None else None
 
     @staticmethod
     def _target_process_crashed(output: str, package_name: str) -> bool:

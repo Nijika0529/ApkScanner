@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .enums import Confidence, CoverageStatus, EntryPointKind, Severity
@@ -40,6 +40,18 @@ class CoverageDraft:
     status: str
     stages: dict[str, Any]
     gap_reason: str | None = None
+
+
+@dataclass(slots=True)
+class StaticReviewSurfaceDraft:
+    name: str
+    family: str
+    title: str
+    severity: str
+    priority: int
+    rule_ids: list[str]
+    hypotheses: list[str]
+    locations: list[dict[str, Any]]
 
 
 CODE_RULES = (
@@ -106,7 +118,109 @@ CODE_RULES = (
         Severity.LOW,
         "CWE-926",
     ),
+    (
+        "CODE-NONPRODUCTION-ENDPOINT",
+        re.compile(
+            r"(?i)(?:https?|wss?)://[^\s\"']*(?:pre|test|staging|dev)[^\s\"']*"
+        ),
+        "Release code references a non-production service endpoint",
+        "Use environment-bound release configuration and reject pre, test, staging, or development endpoints in production artifacts.",
+        "MASVS-NETWORK",
+        Severity.HIGH,
+        "CWE-16",
+    ),
+    (
+        "CODE-HARDCODED-SECRET",
+        re.compile(
+            r'\.field[^\n]*(?:app[_-]?secret|app[_-]?key|client[_-]?secret|'
+            r'api[_-]?key)[^\n]*=\s*"[A-Za-z0-9+/=_-]{12,}"|'
+            r'(?:app[_-]?secret|app[_-]?key|client[_-]?secret|api[_-]?key)'
+            r'\s*[=:]\s*["\'][A-Za-z0-9+/=_-]{12,}["\']',
+            re.IGNORECASE,
+        ),
+        "Potential client-side hardcoded service credential",
+        "Remove privileged shared secrets from the APK, rotate exposed credentials, and perform signing or privileged authorization on a trusted service.",
+        "MASVS-AUTH",
+        Severity.HIGH,
+        "CWE-798",
+    ),
 )
+
+
+STATIC_REVIEW_FAMILIES: dict[str, dict[str, Any]] = {
+    "web_content_boundary": {
+        "rule_ids": {
+            "CODE-WEBVIEW-JS-BRIDGE",
+            "CODE-WEBVIEW-FILE-ACCESS",
+        },
+        "title": "WebView content and native bridge trust boundary",
+        "severity": Severity.HIGH.value,
+        "priority": 94,
+        "path_hints": ("htmlpreview", "webview", "html"),
+        "preferred_only": True,
+        "hypotheses": [
+            (
+                "Attacker-controlled URL or generated HTML can reach this WebView through a "
+                "concrete report, card, message, deep-link, or IPC path."
+            ),
+            (
+                "JavaScript, file-origin, or navigation privileges expose sensitive native data "
+                "or actions without strict origin authorization."
+            ),
+            (
+                "The source-to-WebView-to-bridge chain crosses an application trust boundary and "
+                "has concrete confidentiality, integrity, or privileged-action impact."
+            ),
+        ],
+    },
+    "shell_execution_boundary": {
+        "rule_ids": {"CODE-COMMAND-EXEC"},
+        "title": "Shell execution and command-risk policy boundary",
+        "severity": Severity.HIGH.value,
+        "priority": 96,
+        "path_hints": ("/cli/", "cliexecutor", "shell", "command"),
+        "preferred_only": True,
+        "hypotheses": [
+            (
+                "Untrusted user, model, tool, file, or IPC input can reach a shell execution sink "
+                "under the application's privileges."
+            ),
+            (
+                "The command-risk policy disagrees with real shell semantics for substitution, "
+                "pipelines, xargs, glob expansion, relative paths, wrappers, or multi-step flows."
+            ),
+            (
+                "A policy bypass can read protected data, alter another package or persistent "
+                "security state, or execute attacker-controlled script content."
+            ),
+        ],
+    },
+    "release_configuration_boundary": {
+        "rule_ids": {
+            "CODE-NONPRODUCTION-ENDPOINT",
+            "CODE-HARDCODED-SECRET",
+        },
+        "title": "Release endpoint and embedded credential boundary",
+        "severity": Severity.HIGH.value,
+        "priority": 92,
+        "path_hints": ("application", "app.smali", "uploader", "remote", "provider"),
+        "preferred_only": True,
+        "hypotheses": [
+            (
+                "Production startup or request code can select a pre, test, staging, development, "
+                "or cleartext endpoint for user content, credentials, traces, or model traffic."
+            ),
+            (
+                "A credential embedded in the APK is used for privileged request authentication, "
+                "security-policy signing, or access to a reusable backend capability."
+            ),
+            (
+                "The active release configuration creates a concrete interception, data exposure, "
+                "environment-confusion, or server-impersonation impact."
+            ),
+        ],
+    },
+}
 
 
 class BuiltinRuleEngine:
@@ -118,6 +232,85 @@ class BuiltinRuleEngine:
         findings.extend(self._code_rules(result.searchable_roots))
         coverage = self._coverage(result, findings)
         return findings, coverage
+
+    def static_review_surfaces(
+        self,
+        manifest: ManifestDocument,
+        findings: list[FindingDraft],
+    ) -> list[StaticReviewSurfaceDraft]:
+        package_prefix = manifest.package_name.replace(".", "/") + "/"
+        by_rule = {finding.rule_id: finding for finding in findings}
+        surfaces: list[StaticReviewSurfaceDraft] = []
+        for family, config in STATIC_REVIEW_FAMILIES.items():
+            locations: list[dict[str, Any]] = []
+            present_rule_ids: list[str] = []
+            for rule_id in sorted(config["rule_ids"]):
+                finding = by_rule.get(rule_id)
+                if finding is None:
+                    continue
+                accepted = [
+                    location
+                    for location in finding.locations
+                    if self._location_belongs_to_package(location, package_prefix)
+                ]
+                if not accepted:
+                    continue
+                present_rule_ids.append(rule_id)
+                locations.extend(accepted)
+            if not locations:
+                continue
+            unique_locations = list(
+                {
+                    (
+                        str(item.get("root") or ""),
+                        str(item.get("path") or ""),
+                        int(item.get("line") or 0),
+                    ): item
+                    for item in locations
+                }.values()
+            )
+            hints = tuple(str(value).lower() for value in config["path_hints"])
+            preferred = [
+                item
+                for item in unique_locations
+                if any(
+                    hint in str(item.get("path") or "").lower()
+                    for hint in hints
+                )
+            ]
+            if config.get("preferred_only") and preferred:
+                unique_locations = preferred
+            unique_locations.sort(
+                key=lambda item: (
+                    0
+                    if any(hint in str(item.get("path") or "").lower() for hint in hints)
+                    else 1,
+                    str(item.get("path") or ""),
+                    int(item.get("line") or 0),
+                )
+            )
+            surfaces.append(
+                StaticReviewSurfaceDraft(
+                    name=f"static://{family}",
+                    family=family,
+                    title=str(config["title"]),
+                    severity=str(config["severity"]),
+                    priority=int(config["priority"]),
+                    rule_ids=present_rule_ids,
+                    hypotheses=list(config["hypotheses"]),
+                    locations=unique_locations[:12],
+                )
+            )
+        return surfaces
+
+    @staticmethod
+    def _location_belongs_to_package(
+        location: dict[str, Any],
+        package_prefix: str,
+    ) -> bool:
+        path = PurePosixPath(str(location.get("path") or ""))
+        normalized = "/".join(path.parts)
+        return package_prefix in f"{normalized}/"
 
     def _manifest_rules(self, manifest: ManifestDocument) -> list[FindingDraft]:
         findings: list[FindingDraft] = []
@@ -322,14 +515,30 @@ class BuiltinRuleEngine:
                 except OSError:
                     continue
                 for rule_id, pattern, *_rest in CODE_RULES:
-                    if len(matches[rule_id]) >= 25:
+                    match_limit = (
+                        100
+                        if rule_id == "CODE-NONPRODUCTION-ENDPOINT"
+                        else 50
+                        if rule_id == "CODE-HARDCODED-SECRET"
+                        else 25
+                    )
+                    if len(matches[rule_id]) >= match_limit:
                         continue
-                    for match in pattern.finditer(text):
+                    for accepted_for_file, match in enumerate(
+                        pattern.finditer(text),
+                        start=1,
+                    ):
                         line = text.count("\n", 0, match.start()) + 1
                         matches[rule_id].append(
-                            {"path": str(path.relative_to(root)), "line": line, "root": root.name}
+                            {
+                                "path": str(path.relative_to(root)),
+                                "line": line,
+                                "root": root.name,
+                            }
                         )
-                        if len(matches[rule_id]) >= 25:
+                        if len(matches[rule_id]) >= match_limit:
+                            break
+                        if accepted_for_file >= 3:
                             break
         findings: list[FindingDraft] = []
         for rule_id, _pattern, title, remediation, masvs, severity, cwe in CODE_RULES:

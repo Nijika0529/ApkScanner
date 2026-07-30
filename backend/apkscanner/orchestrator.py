@@ -15,6 +15,7 @@ from contextlib import contextmanager, suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -28,9 +29,17 @@ from .codex_runner import CodexInvestigator
 from .config import Settings
 from .db import Database
 from .device import AdbDeviceAdapter, DeviceLeaseCancelledError
-from .enums import CoverageStatus, FindingStatus, ScanStatus, TaskStatus
+from .enums import (
+    CoverageStatus,
+    EntryPointKind,
+    FindingStatus,
+    ScanStatus,
+    TaskStatus,
+    TaskType,
+)
 from .evidence import EvidenceRecorder
 from .finding_policy import partition_findings
+from .manifest import parse_manifest
 from .mobsf import MobSFAdapter
 from .models import (
     CoverageItem,
@@ -139,6 +148,9 @@ class ScanOrchestrator:
         self._task_cancellations: dict[str, threading.Event] = {}
         self._live_proof_contexts: dict[str, _LiveProofContext] = {}
         self._live_proof_lock = threading.Lock()
+        self._live_proof_server: ThreadingHTTPServer | None = None
+        self._live_proof_server_thread: threading.Thread | None = None
+        self._live_proof_base_url: str | None = None
         self._task_cancellations_lock = threading.Lock()
         self._shutting_down = threading.Event()
         # Bound task workers across all scans handled by this control-plane
@@ -165,6 +177,80 @@ class ScanOrchestrator:
             current = self._live_proof_contexts.get(task_id)
             if current is not None and secrets.compare_digest(current.token, token):
                 self._live_proof_contexts.pop(task_id, None)
+
+    def _ensure_live_proof_endpoint(self) -> str:
+        with self._live_proof_lock:
+            if self._live_proof_base_url is not None:
+                return self._live_proof_base_url
+            orchestrator = self
+
+            class ProofReplayHandler(BaseHTTPRequestHandler):
+                def do_POST(self) -> None:  # noqa: N802
+                    match = re.fullmatch(
+                        r"/api/v1/internal/tasks/([a-f0-9-]{36})/proof-replay",
+                        self.path,
+                    )
+                    if match is None:
+                        self._respond(404, {"detail": "not found"})
+                        return
+                    try:
+                        length = int(self.headers.get("Content-Length", "0"))
+                    except ValueError:
+                        self._respond(400, {"detail": "invalid Content-Length"})
+                        return
+                    if length <= 0 or length > 2_000_000:
+                        self._respond(413, {"detail": "invalid proof replay size"})
+                        return
+                    try:
+                        replay = AgentProofReplay.model_validate_json(
+                            self.rfile.read(length)
+                        )
+                        response = orchestrator.execute_live_proof_replay(
+                            match.group(1),
+                            self.headers.get("X-APKScanner-Proof-Token", ""),
+                            replay,
+                        )
+                    except PermissionError as exc:
+                        self._respond(403, {"detail": str(exc)})
+                        return
+                    except (TimeoutError, ValueError) as exc:
+                        self._respond(409, {"detail": str(exc)})
+                        return
+                    except Exception as exc:  # local task boundary
+                        self._respond(500, {"detail": str(exc)})
+                        return
+                    self._respond(200, response)
+
+                def _respond(self, status: int, payload: dict[str, Any]) -> None:
+                    body = json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode()
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, _format: str, *args: Any) -> None:
+                    return
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), ProofReplayHandler)
+            server.daemon_threads = True
+            thread = threading.Thread(
+                target=server.serve_forever,
+                kwargs={"poll_interval": 0.1},
+                name="apkscanner-proof-replay",
+                daemon=True,
+            )
+            thread.start()
+            self._live_proof_server = server
+            self._live_proof_server_thread = thread
+            self._live_proof_base_url = (
+                f"http://127.0.0.1:{server.server_address[1]}"
+            )
+            return self._live_proof_base_url
 
     def execute_live_proof_replay(
         self,
@@ -592,6 +678,10 @@ class ScanOrchestrator:
             cancellations = list(self._task_cancellations.values())
         for cancellation in cancellations:
             cancellation.set()
+        proof_server = self._live_proof_server
+        if proof_server is not None:
+            proof_server.shutdown()
+            proof_server.server_close()
         self.runner.shutdown()
         self.opencode.shutdown()
 
@@ -832,6 +922,24 @@ class ScanOrchestrator:
                         findings.extend(mobsf_result.findings)
                     except Exception as exc:  # optional external scanner surface
                         mobsf_error = str(exc)
+            static_review_surfaces = self.rules.static_review_surfaces(
+                result.manifest,
+                findings,
+            )
+            for surface in static_review_surfaces:
+                self.inspector.add_static_surface_to_code_index(
+                    result,
+                    surface_name=surface.name,
+                    locations=surface.locations,
+                )
+                for finding in findings:
+                    if (
+                        finding.rule_id in surface.rule_ids
+                        and surface.name not in finding.entry_names
+                    ):
+                        finding.entry_names.append(surface.name)
+            if static_review_surfaces:
+                self.inspector.persist_code_index(result)
             scan.package_name = result.manifest.package_name
             scan.version_name = result.manifest.version_name
             scan.version_code = result.manifest.version_code
@@ -892,6 +1000,53 @@ class ScanOrchestrator:
                                 code_context.get(
                                     "target_source_has_decompiler_errors"
                                 )
+                            ),
+                            "global_status": code_context.get(
+                                "global_decompilation_status",
+                                result.decompilation.get("status"),
+                            ),
+                        },
+                    },
+                )
+                session.add(entry)
+                entries.append(entry)
+            for surface in static_review_surfaces:
+                code_context = result.code_index.get(surface.name, {})
+                public_anchors = [
+                    {
+                        key: value
+                        for key, value in anchor.items()
+                        if key != "content"
+                    }
+                    for anchor in code_context.get("anchors", [])
+                    if isinstance(anchor, dict)
+                ]
+                entry = EntryPoint(
+                    scan_id=scan.id,
+                    kind=EntryPointKind.STATIC_SURFACE.value,
+                    name=surface.name,
+                    owner_component=surface.name,
+                    exported=False,
+                    exported_reason="static_semantic_seed",
+                    permission=None,
+                    permission_protection=None,
+                    intent_filters=[],
+                    deep_links=[],
+                    code_anchors=public_anchors,
+                    metadata_json={
+                        "effective_enabled": True,
+                        "direct_invocation_applicable": False,
+                        "static_review_family": surface.family,
+                        "static_review_title": surface.title,
+                        "static_review_severity": surface.severity,
+                        "static_review_priority": surface.priority,
+                        "static_review_rule_ids": surface.rule_ids,
+                        "static_review_hypotheses": surface.hypotheses,
+                        "static_review_locations": surface.locations,
+                        "decompilation": {
+                            "status": code_context.get(
+                                "status",
+                                "source_not_found",
                             ),
                             "global_status": code_context.get(
                                 "global_decompilation_status",
@@ -1737,6 +1892,7 @@ class ScanOrchestrator:
             entry
             for entry in scan_entries
             if entry.id not in statically_closed_entry_ids
+            and entry.kind != EntryPointKind.STATIC_SURFACE.value
         ]
         seed_entry_ids = set(task.target_entry_ids)
         direct_test_entry_ids = {
@@ -1759,7 +1915,9 @@ class ScanOrchestrator:
                     "permission_protection": entry.permission_protection,
                     "direct_test_allowed": entry.id in direct_test_entry_ids,
                     "direct_reachability": (
-                        "blocked"
+                        "not_applicable"
+                        if entry.kind == EntryPointKind.STATIC_SURFACE.value
+                        else "blocked"
                         if entry.id in statically_closed_entry_ids
                         else "testable"
                     ),
@@ -2128,6 +2286,10 @@ class ScanOrchestrator:
                 }
                 if agent_backend == "opencode":
                     investigation_kwargs["proof_replay_token"] = proof_token
+                    if proof_token is not None:
+                        investigation_kwargs["proof_replay_url"] = (
+                            self._ensure_live_proof_endpoint()
+                        )
                 try:
                     result = investigator.investigate(**investigation_kwargs)
                 finally:
@@ -2507,7 +2669,8 @@ class ScanOrchestrator:
         # A busy non-blocking snapshot remains eligible for the device queue, but
         # an explicit unavailable result should degrade directly to static AI.
         device_ready = bool(
-            self.device.configured
+            task.task_type != TaskType.STATIC_REVIEW.value
+            and self.device.configured
             and package_name
             and self.device.package_safe(package_name)
             and (
@@ -5041,14 +5204,13 @@ class ScanOrchestrator:
         *,
         platform_context: dict[str, Any] | None = None,
     ) -> Path:
-        task_root = (
-            self.settings.data_dir
-            / "workspaces"
-            / scan_id
-            / "agent_context"
-            / task_id
-            / f"attempt-{attempt}"
+        static_review = self._is_static_review_context(platform_context)
+        context_root = (
+            self.settings.data_dir / "agent_context" / scan_id
+            if static_review
+            else self.settings.data_dir / "workspaces" / scan_id / "agent_context"
         )
+        task_root = context_root / task_id / f"attempt-{attempt}"
         task_root.mkdir(parents=True, exist_ok=True)
         self._materialize_target_sources(
             scan_id,
@@ -5058,6 +5220,10 @@ class ScanOrchestrator:
         scan_workspace = (
             self.settings.data_dir / "workspaces" / scan_id
         ).resolve()
+        expose_shared_workspace = (
+            self.settings.agent_permission_profile == "personal_lab"
+            and not static_review
+        )
         shared_names = [
             name
             for name in ("jadx", "apktool", "archive")
@@ -5065,9 +5231,7 @@ class ScanOrchestrator:
         ]
         workspace_policy = {
             "writable_root": ".",
-            "shared_scan_workspace_exposed": (
-                self.settings.agent_permission_profile == "personal_lab"
-            ),
+            "shared_scan_workspace_exposed": expose_shared_workspace,
             "context_file": "context.json",
             "decompiled_roots": (
                 {
@@ -5079,14 +5243,20 @@ class ScanOrchestrator:
                         f"/scan-workspace/{name}" for name in shared_names
                     ],
                 }
-                if self.settings.agent_permission_profile == "personal_lab"
+                if expose_shared_workspace
                 else {"host": [], "container": []}
             ),
             "reason": (
+                "This bounded static semantic task receives the exact signal sources and "
+                "deterministically resolved one-hop application references under target_source. "
+                "The full decompiler workspace is intentionally omitted to prevent unrelated "
+                "package inventory."
+                if static_review
+                else
                 "The task root is independently writable. Complete decompiler outputs are exposed "
                 "read-only; relevant target sources and immutable evidence are also materialized "
                 "locally."
-                if self.settings.agent_permission_profile == "personal_lab"
+                if expose_shared_workspace
                 else (
                     "Concurrent agents receive isolated writable roots; relevant target code "
                     "and immutable evidence are materialized in this context."
@@ -5109,6 +5279,22 @@ class ScanOrchestrator:
             json.dumps(context, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         return task_root
+
+    @staticmethod
+    def _is_static_review_context(
+        platform_context: dict[str, Any] | None,
+    ) -> bool:
+        if not isinstance(platform_context, dict):
+            return False
+        entry_scope = platform_context.get("entry_scope")
+        if not isinstance(entry_scope, dict):
+            return False
+        catalog = entry_scope.get("catalog")
+        return isinstance(catalog, list) and any(
+            isinstance(item, dict)
+            and item.get("kind") == EntryPointKind.STATIC_SURFACE.value
+            for item in catalog
+        )
 
     def _copy_evidence_artifacts(
         self,
@@ -5187,6 +5373,74 @@ class ScanOrchestrator:
         ).resolve()
         source_root = (task_root / "target_source").resolve()
         copied_bytes = 0
+        if self._is_static_review_context(platform_context):
+            manifest_source = next(
+                (
+                    candidate
+                    for candidate in (
+                        scan_workspace / "AndroidManifest.xml",
+                        scan_workspace / "apktool" / "AndroidManifest.xml",
+                    )
+                    if candidate.is_file()
+                ),
+                None,
+            )
+            if manifest_source is not None:
+                manifest_target = source_root / "AndroidManifest.xml"
+                manifest_target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(manifest_source, manifest_target)
+                copied_bytes += manifest_source.stat().st_size
+                platform_context["bounded_manifest_path"] = str(
+                    manifest_target.relative_to(task_root)
+                )
+                try:
+                    manifest_document = parse_manifest(
+                        manifest_source.read_text(
+                            encoding="utf-8",
+                            errors="replace",
+                        )
+                    )
+                except (OSError, ValueError):
+                    manifest_document = None
+                if manifest_document is not None:
+                    referenced_classes: set[str] = set()
+                    for component in components:
+                        if not isinstance(component, dict):
+                            continue
+                        for anchor in component.get("anchors") or []:
+                            if not isinstance(anchor, dict):
+                                continue
+                            content = anchor.get("content")
+                            if not isinstance(content, str):
+                                continue
+                            referenced_classes.update(
+                                descriptor.replace("/", ".")
+                                for descriptor in re.findall(
+                                    r"L([A-Za-z0-9_/$]+);",
+                                    content,
+                                )
+                            )
+                    platform_context["bounded_manifest"] = {
+                        "package_name": manifest_document.package_name,
+                        "min_sdk": manifest_document.min_sdk,
+                        "target_sdk": manifest_document.target_sdk,
+                        "application": manifest_document.application,
+                        "matching_components": [
+                            {
+                                "kind": entry.kind,
+                                "name": entry.name,
+                                "owner_component": entry.owner_component,
+                                "exported": entry.exported,
+                                "permission": entry.permission,
+                                "permission_protection": entry.permission_protection,
+                                "intent_filters": entry.intent_filters,
+                                "deep_links": entry.deep_links,
+                            }
+                            for entry in manifest_document.entries
+                            if entry.name in referenced_classes
+                            or entry.owner_component in referenced_classes
+                        ],
+                    }
         for component in components:
             if not isinstance(component, dict):
                 continue

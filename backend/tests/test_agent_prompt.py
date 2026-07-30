@@ -108,7 +108,8 @@ def _phase_prompt(phase: str, *, response_contract: str = "structured_result") -
 def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     planning = _phase_prompt("test_planning")
     continuation = _phase_prompt("exploration_round")
-    assert "A log_contains Oracle attached to a structured PoC may use" in planning
+    assert "A PoC log_contains Oracle records only the PoC's claim" in planning
+    assert "target_uid_log_contains may use" in planning
     critic = _phase_prompt("adversarial_review")
     rescue_review = _phase_prompt("rescue_review")
     rescue_exploration = _phase_prompt("rescue_exploration")

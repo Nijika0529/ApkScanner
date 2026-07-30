@@ -88,6 +88,9 @@ class InvestigationPlanner:
         deep_links_by_owner: dict[str, list[EntryPoint]] = defaultdict(list)
         component_tasks_by_name: dict[str, InvestigationTask] = {}
         for entry in entries:
+            if entry.kind == EntryPointKind.STATIC_SURFACE.value:
+                plan.tasks.append(self._static_review_task(scan_id, entry))
+                continue
             closure = self._static_closure(entry)
             if closure is not None:
                 plan.static_closures.append(closure)
@@ -109,13 +112,15 @@ class InvestigationPlanner:
             ]
             owner_task.hypotheses = [
                 *owner_task.hypotheses,
-                *self._deep_link_hypotheses(owner),
+                *self._deep_link_hypotheses(owner)[1:],
             ]
             owner_task.priority = max(owner_task.priority, 98)
         return plan
 
     @classmethod
     def _static_closure(cls, entry: EntryPoint) -> StaticEntryClosure | None:
+        if entry.kind == EntryPointKind.STATIC_SURFACE.value:
+            return None
         if (entry.metadata_json or {}).get("effective_enabled") is False:
             return StaticEntryClosure(
                 entry_point_id=entry.id,
@@ -267,8 +272,14 @@ class InvestigationPlanner:
             *{
             EntryPointKind.ACTIVITY.value: [
                 "A third-party application can launch the activity.",
-                "External extras or data can bypass authentication or reach a sensitive screen.",
-                "Nested intents, URI grants, or WebView navigation can cross a trust boundary.",
+                (
+                    "External extras, URI data, or callback results can bypass authentication, "
+                    "caller binding, transaction state, or reach a sensitive screen."
+                ),
+                (
+                    "Nested intents, URI grants, internal component redirects, or WebView "
+                    "navigation can cross a trust boundary and reach a sensitive sink."
+                ),
             ],
             EntryPointKind.ACTIVITY_ALIAS.value: [
                 "The alias exposes its target activity under weaker authorization controls.",
@@ -277,10 +288,18 @@ class InvestigationPlanner:
             EntryPointKind.SERVICE.value: [
                 "A third-party application can start or bind to the service.",
                 "The service performs or returns sensitive behavior without caller authorization.",
+                (
+                    "Every Binder transaction binds the real calling UID to an authorized package "
+                    "and does not trust caller-supplied identity fields."
+                ),
             ],
             EntryPointKind.RECEIVER.value: [
                 "An untrusted application can deliver a broadcast to the receiver.",
                 "Attacker-controlled extras trigger a sensitive or persistent side effect.",
+                (
+                    "Payload authentication cannot be forged with APK-embedded material and "
+                    "freshness or version checks prevent replay and update lockout."
+                ),
             ],
             EntryPointKind.PROVIDER.value: [
                 "An untrusted application can query or open provider data.",
@@ -309,6 +328,44 @@ class InvestigationPlanner:
             **self._base(),
         )
 
+    def _static_review_task(
+        self,
+        scan_id: str,
+        entry: EntryPoint,
+    ) -> InvestigationTask:
+        metadata = entry.metadata_json or {}
+        hypotheses = [
+            str(value)
+            for value in metadata.get("static_review_hypotheses", [])
+            if isinstance(value, str)
+        ]
+        if not hypotheses:
+            hypotheses = [
+                "The assigned static code signal participates in a reachable security boundary.",
+                "The signal has concrete unauthorized confidentiality, integrity, or privilege impact.",
+            ]
+        return InvestigationTask(
+            scan_id=scan_id,
+            task_type=TaskType.STATIC_REVIEW.value,
+            priority=int(metadata.get("static_review_priority") or 85),
+            target_entry_ids=[entry.id],
+            hypotheses=hypotheses,
+            preconditions={
+                "ordinary_app_caller": True,
+                "static_semantic_seed": True,
+                "family": metadata.get("static_review_family"),
+                "rule_ids": list(metadata.get("static_review_rule_ids") or []),
+            },
+            allowed_side_effects=[],
+            device_profile={
+                "android_version": self.android_version,
+                "root_capable": False,
+                "reset_capability": "not_applicable",
+                "configured": self.adb_configured,
+                "static_review": True,
+            },
+        )
+
     def _deep_link_task(
         self, scan_id: str, owner: str, deep_links: list[EntryPoint]
     ) -> InvestigationTask:
@@ -325,8 +382,12 @@ class InvestigationPlanner:
     def _deep_link_hypotheses(owner: str) -> list[str]:
         return [
             f"Deep links handled by {owner} are reachable from an untrusted application.",
-            "URI path, query, fragment, encoding, and duplicate parameters are not strictly validated.",
-            "Different URI forms or caller-controlled parameters expose privileged behavior.",
-            "App Link verification, redirects, or custom schemes allow link interception.",
-            "A link can reach nested intents, file access, WebView script, or an open redirect.",
+            (
+                "URI parameters, callback provenance, transaction state or nonce, encoding, and "
+                "duplicate values are not strictly bound to the initiating trusted flow."
+            ),
+            (
+                "A link can reach privileged behavior, nested intents, file access, WebView "
+                "script, an internal component, or an open redirect."
+            ),
         ]
