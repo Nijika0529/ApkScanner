@@ -221,6 +221,27 @@ def test_provider_key_is_sent_in_one_shot_payload_not_worker_environment(
     assert "DEEPSEEK_API_KEY" not in worker_environment
 
 
+def test_live_proof_bridge_is_exposed_only_with_an_active_task(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    investigator = OpenCodeInvestigator(settings)
+
+    inactive = investigator._worker_environment(tmp_path / "inactive")
+    active = investigator._worker_environment(
+        tmp_path / "active",
+        allow_adb=True,
+        proof_replay_token="proof-secret",
+        proof_task_id="task-id",
+        proof_replay_url="http://127.0.0.1:8000",
+    )
+
+    assert "APKSCANNER_PROOF_TOKEN" not in inactive
+    assert active["APKSCANNER_PROOF_TOKEN"] == "proof-secret"
+    assert active["APKSCANNER_PROOF_TASK_ID"] == "task-id"
+    assert "platform-bin" in active["PATH"]
+
+
 @pytest.mark.skipif(not hasattr(os, "chown"), reason="requires POSIX ownership")
 def test_root_docker_workspace_is_prepared_for_image_node_user(
     settings,

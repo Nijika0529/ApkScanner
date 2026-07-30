@@ -9,9 +9,14 @@ from xml.etree import ElementTree
 from apkscanner.artifacts import ArtifactStore
 from apkscanner.db import Database
 from apkscanner.models import EntryPoint, InvestigationTask, ProofAttempt, Scan
-from apkscanner.orchestrator import ScanOrchestrator
+from apkscanner.orchestrator import ScanOrchestrator, _LiveProofContext
 from apkscanner.poc import PocBuilder, PocBuildResult
-from apkscanner.schemas import AgentPocSpec, AgentRequestedTest
+from apkscanner.schemas import (
+    AgentOracleSpec,
+    AgentPocSpec,
+    AgentProofReplay,
+    AgentRequestedTest,
+)
 from apkscanner.tools import CommandResult, TimeBudget, ToolRunner
 
 
@@ -154,6 +159,45 @@ package="io.apkscanner.poc.providerprobe">
     assert (
         effective.launch_component
         == "io.apkscanner.poc.providerprobe.MainActivity"
+    )
+
+
+def test_poc_builder_repairs_manifest_launcher_to_match_java_activity(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = write_poc_project(workspace)
+    source = next((project / "src").rglob("MainActivity.java"))
+    source.write_text(
+        """package io.apkscanner.poc.actual;
+public final class MainActivity extends android.app.Activity {}""",
+        encoding="utf-8",
+    )
+    builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
+
+    _project, _sources, manifest, effective = builder._validate_project(
+        workspace,
+        poc_spec(),
+    )
+    output = tmp_path / "output"
+    output.mkdir()
+    built_manifest = builder._build_manifest(
+        manifest,
+        output,
+        package_name=effective.package_name,
+        launch_component=effective.launch_component,
+    )
+    activity = ElementTree.parse(built_manifest).getroot().find(
+        "application/activity"
+    )
+
+    assert effective.launch_component == "io.apkscanner.poc.actual.MainActivity"
+    assert activity is not None
+    assert (
+        activity.get("{http://schemas.android.com/apk/res/android}name")
+        == "io.apkscanner.poc.actual.MainActivity"
     )
 
 
@@ -609,6 +653,125 @@ def test_platform_builds_poc_before_device_queue_and_records_artifact(
     assert not gaps
     assert artifacts[orchestrator._poc_request_key(request)].apk_sha256 == "b" * 64
     assert any(item["kind"] == "poc.build_artifact" for item in evidence)
+
+
+def test_live_proof_replay_auto_associates_current_task_and_deduplicates(
+    settings,
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    store = ArtifactStore(settings)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    write_poc_project(workspace)
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="target.apk",
+            package_name="com.example.target",
+            artifact_sha256="1" * 64,
+            artifact_path=str(tmp_path / "target.apk"),
+        )
+        entry = EntryPoint(
+            scan=scan,
+            kind="activity",
+            name="com.example.target.MainActivity",
+            exported=True,
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="running",
+            target_entry_ids=[],
+            hypotheses=["An ordinary app can trigger unauthorized behavior."],
+        )
+        session.add_all([scan, entry, task])
+        session.flush()
+        task.target_entry_ids = [entry.id]
+        session.commit()
+        scan_id, task_id, entry_id = scan.id, task.id, entry.id
+
+    orchestrator = ScanOrchestrator(settings, database, store)
+    hypothesis = orchestrator.hypothesis_ledger.ensure_task_hypotheses(task)[0]
+    built_apk = tmp_path / "poc.apk"
+    built_apk.write_bytes(b"APK")
+    artifact = PocBuildResult(
+        ok=True,
+        apk_sha256="2" * 64,
+        apk_path=built_apk,
+        source_sha256="3" * 64,
+        source_path=tmp_path / "source.zip",
+        metadata={},
+    )
+    captured: list[AgentRequestedTest] = []
+
+    def build(*, requests, **_kwargs):  # noqa: ANN001
+        captured.extend(requests)
+        return requests, {
+            orchestrator._poc_request_key(requests[0]): artifact
+        }, []
+
+    def execute(**kwargs):  # noqa: ANN003, ANN202
+        kwargs["evidence_summaries"].append(
+            {"id": "evidence-live", "kind": "blackbox.poc_logcat"}
+        )
+        return [{"test_case_id": "agent-r1-1"}], []
+
+    monkeypatch.setattr(orchestrator, "_build_requested_pocs", build)
+    monkeypatch.setattr(orchestrator, "_execute_requested_tests", execute)
+    monkeypatch.setattr(
+        orchestrator.hypothesis_ledger,
+        "task_proof_result",
+        lambda _task_id: ("reproduced_blackbox", ["evidence-live"]),
+    )
+    evidence: list[dict] = []
+    context = _LiveProofContext(
+        token="secret-token",
+        scan_id=scan_id,
+        task_id=task_id,
+        package_name="com.example.target",
+        workspace=workspace,
+        entries=[entry],
+        default_entry_id=entry.id,
+        hypotheses=[
+            {
+                "id": hypothesis.id,
+                "impact": hypothesis.impact,
+            }
+        ],
+        budget=TimeBudget.from_seconds(30),
+        evidence_summaries=evidence,
+        cancel_event=threading.Event(),
+        round_index=0,
+    )
+    orchestrator._register_live_proof_context(context)
+    replay = AgentProofReplay(
+        poc=poc_spec(),
+        oracle=AgentOracleSpec(
+            kind="log_contains",
+            expected_text="security_impact_observed",
+            impact="unauthorized_state_change",
+        ),
+        rationale="Replay the final working ordinary-app PoC.",
+    )
+
+    first = orchestrator.execute_live_proof_replay(
+        task_id, "secret-token", replay
+    )
+    second = orchestrator.execute_live_proof_replay(
+        task_id, "secret-token", replay
+    )
+
+    assert captured[0].hypothesis_id == hypothesis.id
+    assert captured[0].entry_point_id == entry_id
+    assert first["result"] == "reproduced_blackbox"
+    assert first["evidence_ids"] == ["evidence-live"]
+    assert first["deduplicated"] is False
+    assert second["deduplicated"] is True
+    assert len(captured) == 1
 
 
 def test_poc_execution_is_correlated_into_the_hypothesis_proof(

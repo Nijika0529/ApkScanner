@@ -55,6 +55,19 @@ stop_existing() {
   rm -f "$PID_FILE"
 }
 
+detect_adb_serial() {
+  local -a devices
+  mapfile -t devices < <(
+    adb devices 2>/dev/null |
+      awk 'NR > 1 && $2 == "device" { print $1 }'
+  )
+  if [ "${#devices[@]}" -eq 1 ]; then
+    printf '%s\n' "${devices[0]}"
+  elif [ "${#devices[@]}" -gt 1 ]; then
+    echo "multiple ADB devices are online; set APKSCANNER_ADB_SERIAL explicitly" >&2
+  fi
+}
+
 # Build before stopping the running service. A failed frontend build therefore
 # cannot replace a working process or silently leave FastAPI serving an old bundle.
 build_frontend
@@ -67,7 +80,7 @@ export APKSCANNER_OPENCODE_ISOLATION="host"
 export APKSCANNER_OPENCODE_MODEL="deepseek-v4-flash"
 export APKSCANNER_OPENCODE_THINKING_EXPLORER="false"
 export APKSCANNER_AGENT_PERMISSION_PROFILE="personal_lab"
-export APKSCANNER_ADB_SERIAL="${APKSCANNER_ADB_SERIAL:-$(adb devices 2>/dev/null | grep -oP '10\.170\.\d+\.\d+:\d+' | head -1 || echo '')}"
+export APKSCANNER_ADB_SERIAL="${APKSCANNER_ADB_SERIAL:-$(detect_adb_serial)}"
 export APKSCANNER_DEVICE_INSTALL_POLICY="install_or_reuse"
 export APKSCANNER_DEVICE_RESET_POLICY="per_round"
 export APKSCANNER_FRONTEND_DIST="$PROJECT_DIR/frontend/dist"

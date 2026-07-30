@@ -160,8 +160,12 @@ scanctl capabilities --deep
 Host Worker 为每次调用创建私有的临时 HOME/XDG 目录树以及认证过的 loopback OpenCode
 服务器。默认 `personal_lab` 路径先运行关闭思考的工具分析器，开放 `read`、`glob`、
 `grep`、`bash`、完整只读反编译目录和按 `task_id + attempt` 隔离的可写 workspace；
-随后由新的无工具 StructuredOutput 会话定稿。host 模式可用原始 ADB 和授权网络做探索，
-但要计入证明的 Android 动作仍由 Python 控制面验证并执行。设置
+随后由新的无工具 StructuredOutput 会话定稿。host 模式可用原始 ADB 和授权网络做探索。
+Agent 得到可工作的普通应用 PoC 后，在任务工作区写入回放 JSON，并运行
+`apkscanner-proof <文件>`；这个带任务临时令牌的命令会在当前 Agent 会话尚未结束时，
+立即交给 Python 控制面完成构建、独占设备执行、Oracle 判断、Evidence 落库和 Hypothesis
+关联。`requested_tests` 仅保留为 Docker 或实时回放不可用时的兼容后备，同一测试不得在
+两条路径重复提交。设置
 `APKSCANNER_AGENT_PERMISSION_PROFILE=strict` 可回到单次无工具定稿。
 Host 模式不提供 PID/同 UID 进程隔离；同机 Agent 可能读取控制面进程可见的信息，因此
 它只适合个人受控调试，不能作为凭据隔离边界。生产或处理不受信任 APK 时使用默认 Docker

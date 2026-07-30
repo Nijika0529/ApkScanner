@@ -334,6 +334,29 @@ class AgentRequestedTest(BaseModel):
         return self
 
 
+class AgentProofReplay(BaseModel):
+    """One final platform-attested replay after free Agent exploration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hypothesis_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9-]{36}$",
+    )
+    entry_point_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9-]{36}$",
+    )
+    extras: dict[str, StrictStr | StrictInt | StrictBool] = Field(
+        default_factory=dict,
+        max_length=16,
+    )
+    reset: Literal["inherit", "clean", "preserve"] = "clean"
+    oracle: AgentOracleSpec
+    rationale: str = Field(min_length=1, max_length=1000)
+    poc: AgentPocSpec
+
+
 class AgentHypothesisAssessment(BaseModel):
     """A hypothesis-specific closure receipt instead of a task-wide blanket verdict."""
 

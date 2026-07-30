@@ -214,9 +214,14 @@ The host worker creates a private temporary HOME/XDG tree and an authenticated l
 server for each invocation. The default `personal_lab` path runs a non-thinking analyzer with
 `read`, `glob`, `grep`, and `bash`, complete read-only decompiler roots, and a writable
 per-task/attempt workspace; an isolated tool-disabled StructuredOutput turn finalizes its memo.
-Host mode may use raw ADB and authorized network access for exploration. Android actions that must
-count as proof are still requested as typed data, validated, and executed by the Python control
-plane. Set `APKSCANNER_AGENT_PERMISSION_PROFILE=strict` for a single tool-disabled finalizer.
+Host mode may use raw ADB and authorized network access for exploration. Once the Agent has a
+working ordinary-app PoC, it writes a replay JSON file and runs
+`apkscanner-proof <file>`. The task-scoped helper immediately hands that PoC to the Python control
+plane for build, serialized device execution, Oracle evaluation, Evidence recording, and
+Hypothesis correlation while the Agent session is still active. The structured
+`requested_tests` field remains only as a compatibility fallback for Docker/no-live-replay runs;
+the Agent must not submit the same test through both paths. Set
+`APKSCANNER_AGENT_PERMISSION_PROFILE=strict` for a single tool-disabled finalizer.
 Host mode does not isolate same-UID processes or their `/proc` metadata, so it is suitable only for
 controlled personal debugging and is not a credential-security boundary. Use the default Docker
 mode for production or untrusted APKs.

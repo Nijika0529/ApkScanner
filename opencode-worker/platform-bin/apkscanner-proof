@@ -1,0 +1,2 @@
+#!/usr/bin/env sh
+exec python -m apkscanner.proof_client "$@"

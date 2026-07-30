@@ -180,6 +180,47 @@ def test_health_capability_does_not_enter_an_active_device_session(settings) -> 
     assert not worker.is_alive()
 
 
+def test_active_task_allows_live_replay_thread_to_take_command_lock(settings) -> None:  # noqa: ANN001
+    class NoAdbRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        NoAdbRunner(),  # type: ignore[arg-type]
+    )
+    task_acquired = threading.Event()
+    replay_completed = threading.Event()
+    release_task = threading.Event()
+
+    def hold_task() -> None:
+        with adapter.task_lease(
+            "active",
+            priority=90,
+            cancel_event=threading.Event(),
+            on_acquired=lambda _waited: task_acquired.set(),
+        ):
+            assert release_task.wait(timeout=5)
+
+    def replay_command() -> None:
+        with adapter.lease():
+            replay_completed.set()
+
+    task_thread = threading.Thread(target=hold_task)
+    task_thread.start()
+    assert task_acquired.wait(timeout=5)
+    replay_thread = threading.Thread(target=replay_command)
+    replay_thread.start()
+    assert replay_completed.wait(timeout=5)
+    replay_thread.join(timeout=5)
+    assert not replay_thread.is_alive()
+    assert adapter.scheduler.snapshot()["active_task_id"] == "active"
+    release_task.set()
+    task_thread.join(timeout=5)
+    assert not task_thread.is_alive()
+
+
 def test_non_blocking_health_probe_does_not_wait_behind_an_adb_command(settings) -> None:  # noqa: ANN001
     class NoAdbRunner:
         @staticmethod

@@ -30,6 +30,7 @@ dev = [
 [project.scripts]
 apk-scanner = "apkscanner.cli:main"
 scanctl = "apkscanner.cli:main"
+apkscanner-proof = "apkscanner.proof_client:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["backend/apkscanner"]

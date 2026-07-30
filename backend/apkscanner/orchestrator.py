@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import re
+import secrets
 import shutil
 import threading
 import uuid
@@ -11,6 +12,7 @@ from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager, suppress
 from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -51,13 +53,36 @@ from .planner import InvestigationPlanner
 from .poc import PocBuilder, PocBuildResult
 from .repository import add_event, now
 from .rules import BuiltinRuleEngine
-from .schemas import AGENT_RESULT_JSON_SCHEMA, AgentOracleSpec, AgentRequestedTest
+from .schemas import (
+    AGENT_RESULT_JSON_SCHEMA,
+    AgentOracleSpec,
+    AgentProofReplay,
+    AgentRequestedTest,
+)
 from .security_design import build_android_threat_model, finding_identity
 from .security_pipeline import HypothesisLedger
 from .static_analysis import ApkInspector
 from .tools import CommandResult, TimeBudget, ToolRunner
 
 AGENT_MIN_OPTIONAL_PHASE_SECONDS = 30
+
+
+@dataclass(slots=True)
+class _LiveProofContext:
+    token: str
+    scan_id: str
+    task_id: str
+    package_name: str
+    workspace: Path
+    entries: list[EntryPoint]
+    default_entry_id: str
+    hypotheses: list[dict[str, Any]]
+    budget: TimeBudget
+    evidence_summaries: list[dict[str, Any]]
+    cancel_event: threading.Event
+    round_index: int
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    responses: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def _critic_timeout_seconds(remaining_task_seconds: int) -> int:
@@ -88,12 +113,160 @@ class ScanOrchestrator:
         self._resubmit_requested: set[str] = set()
         self._running_lock = asyncio.Lock()
         self._task_cancellations: dict[str, threading.Event] = {}
+        self._live_proof_contexts: dict[str, _LiveProofContext] = {}
+        self._live_proof_lock = threading.Lock()
         self._task_cancellations_lock = threading.Lock()
         self._shutting_down = threading.Event()
         # Bound task workers across all scans handled by this control-plane
         # process. Per-scan executors may queue work, but model/device orchestration
         # cannot exceed this shared limit.
         self._agent_slots = threading.BoundedSemaphore(settings.agent_concurrency)
+
+    def _register_live_proof_context(
+        self,
+        context: _LiveProofContext,
+    ) -> None:
+        with self._live_proof_lock:
+            self._live_proof_contexts[context.task_id] = context
+
+    def _unregister_live_proof_context(
+        self,
+        task_id: str,
+        token: str,
+    ) -> None:
+        with self._live_proof_lock:
+            current = self._live_proof_contexts.get(task_id)
+            if current is not None and secrets.compare_digest(current.token, token):
+                self._live_proof_contexts.pop(task_id, None)
+
+    def execute_live_proof_replay(
+        self,
+        task_id: str,
+        token: str,
+        replay: AgentProofReplay,
+    ) -> dict[str, Any]:
+        with self._live_proof_lock:
+            context = self._live_proof_contexts.get(task_id)
+        if context is None or not secrets.compare_digest(context.token, token):
+            raise PermissionError("proof replay is not active for this task")
+        signature = hashlib.sha256(
+            json.dumps(
+                replay.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        with context.lock:
+            cached = context.responses.get(signature)
+            if cached is not None:
+                return {**cached, "deduplicated": True}
+            self._raise_if_cancelled(context.cancel_event)
+            if context.budget.expired:
+                raise TimeoutError("task budget expired before proof replay")
+            hypothesis_ids = [str(item["id"]) for item in context.hypotheses]
+            hypothesis_id = replay.hypothesis_id
+            if hypothesis_id is None:
+                candidates = context.hypotheses
+                if replay.oracle.impact != "none":
+                    impactful = [
+                        item
+                        for item in candidates
+                        if str(item.get("impact") or "").strip()
+                        and str(item.get("impact") or "").strip().lower()
+                        not in {"none", "n/a", "unknown"}
+                    ]
+                    candidates = impactful or candidates
+                hypothesis_id = str(candidates[0]["id"])
+            if hypothesis_id not in hypothesis_ids:
+                raise ValueError("proof replay hypothesis is outside this task")
+            entry_id = replay.entry_point_id
+            if entry_id is None:
+                entry_id = context.default_entry_id
+            if entry_id not in {entry.id for entry in context.entries}:
+                raise ValueError("proof replay entry point is outside this task")
+            request = AgentRequestedTest(
+                hypothesis_id=hypothesis_id,
+                entry_point_id=entry_id,
+                state="guest",
+                uri=None,
+                extras=dict(replay.extras),
+                operation="auto",
+                reset=replay.reset,
+                oracle=replay.oracle,
+                rationale=replay.rationale,
+                poc=replay.poc,
+            )
+            accepted, validation_gaps = self._validate_requested_tests(
+                [request],
+                context.entries,
+                limit=1,
+                hypothesis_ids=set(hypothesis_ids),
+                permission_profile=self.settings.agent_permission_profile,
+            )
+            before = len(context.evidence_summaries)
+            artifacts: dict[str, PocBuildResult] = {}
+            build_gaps: list[str] = []
+            if accepted:
+                accepted, artifacts, build_gaps = self._build_requested_pocs(
+                    scan_id=context.scan_id,
+                    task_id=context.task_id,
+                    workspace=context.workspace,
+                    requests=accepted,
+                    evidence_summaries=context.evidence_summaries,
+                    cancel_event=context.cancel_event,
+                )
+            executed: list[dict[str, Any]] = []
+            execution_gaps: list[str] = []
+            if accepted:
+                context.round_index += 1
+                executed, execution_gaps = self._execute_requested_tests(
+                    scan_id=context.scan_id,
+                    task_id=context.task_id,
+                    package_name=context.package_name,
+                    entries=context.entries,
+                    requests=accepted,
+                    budget=context.budget,
+                    evidence_summaries=context.evidence_summaries,
+                    round_index=context.round_index,
+                    poc_artifacts=artifacts,
+                )
+            new_evidence = context.evidence_summaries[before:]
+            proof = self.hypothesis_ledger.task_proof_result(context.task_id)
+            response = {
+                "schema_version": "1.0",
+                "accepted": bool(accepted),
+                "executed": bool(executed),
+                "hypothesis_id": hypothesis_id,
+                "entry_point_id": entry_id,
+                "result": proof[0] if proof is not None else "inconclusive",
+                "evidence_ids": [
+                    str(item["id"])
+                    for item in new_evidence
+                    if isinstance(item.get("id"), str)
+                ],
+                "gaps": [
+                    *validation_gaps,
+                    *build_gaps,
+                    *execution_gaps,
+                ],
+                "deduplicated": False,
+            }
+            context.responses[signature] = response
+            self._record_exploration_event(
+                context.scan_id,
+                context.task_id,
+                "proof_replay.completed",
+                "Agent 调通的 PoC 已由平台实时重放并完成证据判定",
+                {
+                    "source": "platform",
+                    "hypothesis_id": hypothesis_id,
+                    "entry_point_id": entry_id,
+                    "result": response["result"],
+                    "evidence_ids": response["evidence_ids"],
+                    "gaps": response["gaps"],
+                },
+            )
+            return response
 
     def resolve_investigator(self, requested: str = "configured") -> str:
         backend = (
@@ -1338,6 +1511,7 @@ class ScanOrchestrator:
         device_capability = self.device.capability(non_blocking=True)
         device_lease_owned = False
         device_lease_acquired = False
+        device_prepared = False
 
         def current_device_capability() -> dict[str, Any]:
             capability = dict(device_capability)
@@ -1458,6 +1632,15 @@ class ScanOrchestrator:
                     "security_hypotheses": hypothesis_context,
                     "candidate_under_review": candidate_under_review,
                     "debate": debate_context or None,
+                    "proof_replay": {
+                        "available": bool(
+                            device_prepared
+                            and agent_backend == "opencode"
+                            and self.settings.opencode_isolation == "host"
+                        ),
+                        "command": "apkscanner-proof <proof-replay.json>",
+                        "mode": "single_final_platform_attestation",
+                    },
                 }
                 agent_workspace = self._materialize_agent_evidence(
                     scan_id,
@@ -1494,6 +1677,29 @@ class ScanOrchestrator:
                     phase=phase,
                     capability=capability,
                 )
+                proof_token: str | None = None
+                if (
+                    device_prepared
+                    and agent_backend == "opencode"
+                    and self.settings.opencode_isolation == "host"
+                ):
+                    proof_token = secrets.token_urlsafe(32)
+                    self._register_live_proof_context(
+                        _LiveProofContext(
+                            token=proof_token,
+                            scan_id=scan_id,
+                            task_id=task_id,
+                            package_name=package_name,
+                            workspace=agent_workspace,
+                            entries=testable_entries,
+                            default_entry_id=entries[0].id,
+                            hypotheses=hypothesis_context,
+                            budget=budget,
+                            evidence_summaries=evidence_summaries,
+                            cancel_event=cancel_event,
+                            round_index=round_index,
+                        )
+                    )
 
                 def on_runtime_event(event: AgentRuntimeEvent) -> None:
                     record = {
@@ -1535,17 +1741,24 @@ class ScanOrchestrator:
                     raise TimeoutError(
                         "task time budget exhausted while preparing the AI audit context"
                     )
-                result = investigator.investigate(
-                    scan=scan,
-                    task=task,
-                    entries=entries,
-                    workspace=agent_workspace,
-                    evidence=evidence_summaries,
-                    platform_context=platform_context,
-                    timeout_seconds=remaining,
-                    event_callback=on_runtime_event,
-                    cancel_event=cancel_event,
-                )
+                investigation_kwargs = {
+                    "scan": scan,
+                    "task": task,
+                    "entries": entries,
+                    "workspace": agent_workspace,
+                    "evidence": evidence_summaries,
+                    "platform_context": platform_context,
+                    "timeout_seconds": remaining,
+                    "event_callback": on_runtime_event,
+                    "cancel_event": cancel_event,
+                }
+                if agent_backend == "opencode":
+                    investigation_kwargs["proof_replay_token"] = proof_token
+                try:
+                    result = investigator.investigate(**investigation_kwargs)
+                finally:
+                    if proof_token is not None:
+                        self._unregister_live_proof_context(task_id, proof_token)
                 self._raise_if_cancelled(cancel_event)
                 self._record_agent_response(
                     scan_id=scan_id,
@@ -1789,6 +2002,7 @@ class ScanOrchestrator:
                         coverage_gaps.append(f"Device preparation failed: {failures}")
                     else:
                         prepared = True
+                        device_prepared = True
 
                         for entry in entries:
                             if budget.expired:
@@ -1812,6 +2026,7 @@ class ScanOrchestrator:
                         agent_result is not None
                         and self._needs_adversarial_review(agent_result.result)
                         and not self._has_requested_test_work(agent_result.result)
+                        and self.hypothesis_ledger.task_proof_result(task_id) is None
                         and not budget.expired
                         and critic_budget >= AGENT_MIN_OPTIONAL_PHASE_SECONDS
                     ):
@@ -1880,6 +2095,7 @@ class ScanOrchestrator:
                         agent_result is not None
                         and self._needs_adversarial_review(agent_result.result)
                         and not self._has_requested_test_work(agent_result.result)
+                        and self.hypothesis_ledger.task_proof_result(task_id) is None
                         and (
                             budget.expired
                             or critic_budget < AGENT_MIN_OPTIONAL_PHASE_SECONDS
@@ -1893,6 +2109,7 @@ class ScanOrchestrator:
                     while (
                         agent_result
                         and self._has_requested_test_work(agent_result.result)
+                        and self.hypothesis_ledger.task_proof_result(task_id) is None
                         and prepared
                         and not budget.expired
                     ):

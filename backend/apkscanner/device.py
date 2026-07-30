@@ -183,27 +183,26 @@ class AdbDeviceAdapter:
             cancel_event=cancel_event,
             on_queued=on_queued,
         ) as metadata:
-            command_lock_wait_started = time.monotonic()
-            held_seconds = 0.0
+            acquired_at = time.monotonic()
             session_started = False
             try:
-                with self._lease:
-                    self._active_cancel_event = cancel_event
-                    held_at = time.monotonic()
-                    metadata["wait_seconds"] += held_at - command_lock_wait_started
-                    try:
-                        if cancel_event.is_set():
-                            raise DeviceLeaseCancelledError(
-                                "device lease was cancelled before the command session"
-                            )
-                        session_started = True
-                        if on_acquired is not None:
-                            on_acquired(metadata["wait_seconds"])
-                        yield metadata
-                    finally:
-                        held_seconds = max(0.0, time.monotonic() - held_at)
-                        self._active_cancel_event = None
+                if cancel_event.is_set():
+                    raise DeviceLeaseCancelledError(
+                        "device lease was cancelled before the command session"
+                    )
+                # The scheduler owns the device for the complete task. Do not hold
+                # the command RLock here: live proof replay enters through the API
+                # thread while the Agent thread waits for its response. Individual
+                # device operations take `_lease`, so commands remain serialized
+                # without deadlocking a replay submitted by the owning task.
+                self._active_cancel_event = cancel_event
+                session_started = True
+                if on_acquired is not None:
+                    on_acquired(metadata["wait_seconds"])
+                yield metadata
             finally:
+                held_seconds = max(0.0, time.monotonic() - acquired_at)
+                self._active_cancel_event = None
                 if session_started and on_released is not None:
                     on_released(held_seconds)
 

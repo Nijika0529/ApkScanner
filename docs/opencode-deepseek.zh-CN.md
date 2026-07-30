@@ -134,7 +134,8 @@ OpenCode 返回后还要经过本地 Ajv 8.20.0 和业务语义校验：
 - `supported_static`、`refuted_static`、`reproduced_blackbox`、
   `not_reproduced` 必须至少引用一个平台 Evidence ID；
 - `final_evaluation`、`recovery_evaluation` 不允许再产生 `requested_tests`；
-- `requested_tests[].hypothesis_id` 必填，且 Hypothesis/EntryPoint ID 必须属于当前任务；
+- 实时 Proof Replay 可用时，`requested_tests` 只作为兼容字段且不得重复提交同一测试；
+- 兼容路径的 `requested_tests[].hypothesis_id` 必填，且 Hypothesis/EntryPoint ID 必须属于当前任务；
 - 数组数量和文本长度均有上限；
 - 纠正最多两次，每次使用全新 session，并把精确校验错误交给定稿器。
 
@@ -153,7 +154,9 @@ Agent 不再允许返回通用的 `inconclusive`。JADX、动态插桩或登录�
   创建分析产物。
 - MCP、task/subagent 禁用；Agent 可用 shell 创建脚本、Android 工程和预编译 PoC APK。
 - `strict` 或 Docker 无设备模式仍阻断 ADB；`personal_lab + host + ADB_SERIAL` 允许原始
-  ADB 探索，但能计入复现证明的动作仍通过 `requested_tests` 由平台关联 Probe/PoC 证据。
+  ADB 探索。Agent 完成 PoC 后运行 `apkscanner-proof <回放 JSON>`，由任务内实时通道
+  调用平台的构建、串行设备执行、Oracle 和 Evidence 关联；只有实时通道不可用时才回退
+  `requested_tests`。
 - 每次调用使用临时 HOME/XDG、全新 OpenCode server 和随机 Basic Auth。
 - `OPENCODE_PURE=1`，并关闭项目配置、Claude 配置、模型目录刷新和自动升级。
 - API Key 通过 Worker 的一次性 stdin 请求传递，不进入 Worker 初始环境。Worker 在

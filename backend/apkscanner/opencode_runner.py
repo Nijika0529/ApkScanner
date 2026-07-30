@@ -318,6 +318,7 @@ class OpenCodeInvestigator:
         timeout_seconds: int | None = None,
         event_callback: AgentEventCallback | None = None,
         cancel_event: threading.Event | None = None,
+        proof_replay_token: str | None = None,
     ) -> OpenCodeRunResult:
         if not workspace.is_dir():
             raise ValueError("scan workspace is unavailable")
@@ -449,6 +450,10 @@ class OpenCodeInvestigator:
                 if isinstance(item, dict) and isinstance(item.get("id"), str)
             ),
         }
+        if proof_replay_token and self.settings.opencode_isolation == "host":
+            payload["_proof_replay_token"] = proof_replay_token
+            payload["_proof_task_id"] = task.id
+            payload["_proof_replay_url"] = self.settings.proof_replay_base_url
         if workspace_tools_enabled:
             payload["explorer_prompt"] = investigation_prompt(
                 scan,
@@ -887,6 +892,9 @@ class OpenCodeInvestigator:
         cancel_event: threading.Event | None,
     ) -> dict[str, Any]:
         payload.pop("_readonly_mounts", None)
+        proof_replay_token = payload.pop("_proof_replay_token", None)
+        proof_task_id = payload.pop("_proof_task_id", None)
+        proof_replay_url = payload.pop("_proof_replay_url", None)
         node = self.settings.opencode_node_bin or shutil.which("node")
         if node is None:
             raise RuntimeError("Node.js is not installed")
@@ -896,6 +904,9 @@ class OpenCodeInvestigator:
             env = self._worker_environment(
                 root,
                 allow_adb=bool(payload.get("allow_adb")),
+                proof_replay_token=proof_replay_token,
+                proof_task_id=proof_task_id,
+                proof_replay_url=proof_replay_url,
             )
             cwd = workspace.resolve() if workspace is not None else root
             if workspace is not None and not cwd.is_dir():
@@ -940,7 +951,15 @@ class OpenCodeInvestigator:
                 self._unregister_process(process)
         return response
 
-    def _worker_environment(self, root: Path, *, allow_adb: bool = False) -> dict[str, str]:
+    def _worker_environment(
+        self,
+        root: Path,
+        *,
+        allow_adb: bool = False,
+        proof_replay_token: str | None = None,
+        proof_task_id: str | None = None,
+        proof_replay_url: str | None = None,
+    ) -> dict[str, str]:
         allowed = {
             "HTTP_PROXY",
             "HTTPS_PROXY",
@@ -959,9 +978,11 @@ class OpenCodeInvestigator:
         env = {key: value for key, value in os.environ.items() if key in allowed}
         bin_dir = self.worker_dir / "node_modules" / ".bin"
         blocker_dir = self.worker_dir / "bin"
+        platform_bin_dir = self.worker_dir / "platform-bin"
         env["PATH"] = os.pathsep.join(
             value
             for value in (
+                str(platform_bin_dir),
                 None if allow_adb else str(blocker_dir),
                 str(bin_dir),
                 os.environ.get("PATH"),
@@ -982,6 +1003,14 @@ class OpenCodeInvestigator:
                 "OPENCODE_PURE": "1",
             }
         )
+        if proof_replay_token and proof_task_id and proof_replay_url:
+            env.update(
+                {
+                    "APKSCANNER_PROOF_TOKEN": proof_replay_token,
+                    "APKSCANNER_PROOF_TASK_ID": proof_task_id,
+                    "APKSCANNER_PROOF_REPLAY_URL": proof_replay_url,
+                }
+            )
         return env
 
     def _invoke_docker(

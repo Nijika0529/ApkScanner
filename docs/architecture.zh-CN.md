@@ -145,8 +145,15 @@ ADB、Probe、Agent 请求/响应和平台校验 Evidence 一并装载给新一�
 - Critic 独立寻找权限检查、调用者校验、不可达路径、认证/配置前置和无实际危害的反例；
 - Arbiter 是平台 Evidence 校验后的决定，不直接采用任一模型的自评。
 
-通过边界校验的 `requested_tests` 必须关联当前任务的 Hypothesis，并形成
-`ProofAttempt`。第一版 `android_entry_probe` Prover 复用现有 ADB/Probe 能力；
+host `personal_lab` 模式的主验证路径是实时 Proof Replay：Agent 自由使用 Bash/ADB
+探索并构建 PoC，确认最终方案后运行 `apkscanner-proof <回放 JSON>`。控制面使用仅在
+当前任务有效的随机令牌接收请求，自动关联当前种子入口和最匹配的 Hypothesis，再执行
+PoC 构建、全局串行 ADB、Oracle 和 Evidence 记录，并把结果同步返回给仍在运行的 Agent，
+从而允许其基于失败结果修正 PoC 后继续下一轮。相同回放按内容去重。
+
+`requested_tests` 仅作为实时通道不可用时的兼容后备；通过边界校验的请求同样必须关联
+当前任务的 Hypothesis，并形成 `ProofAttempt`。`android_entry_probe` Prover 复用现有
+ADB/Probe 能力；
 Oracle 将“入口执行成功”和“实际危害”分开：普通应用 UID Probe 回执只能设置
 `execution_demonstrated=true`；只有领域 Prover 同时给出平台可校验的
 `security_impact_observed=true`（例如敏感数据实际返回、未授权状态确实变化或认证边界被

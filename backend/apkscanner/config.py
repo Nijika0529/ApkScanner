@@ -61,6 +61,7 @@ class Settings:
     poc_compile_api: int | None = None
     poc_min_api: int = 21
     poc_target_api: int | None = None
+    proof_replay_base_url: str = "http://127.0.0.1:8000"
     device_min_api: int = 21
     device_max_api: int = 99
     device_install_policy: str = "install_or_reuse"
@@ -196,6 +197,10 @@ class Settings:
                 if os.getenv("APKSCANNER_POC_TARGET_API")
                 else None
             ),
+            proof_replay_base_url=os.getenv(
+                "APKSCANNER_PROOF_REPLAY_BASE_URL",
+                "http://127.0.0.1:8000",
+            ).rstrip("/"),
             device_min_api=max(1, int(os.getenv("APKSCANNER_DEVICE_MIN_API", 21))),
             device_max_api=max(1, int(os.getenv("APKSCANNER_DEVICE_MAX_API", 99))),
             device_install_policy=os.getenv(

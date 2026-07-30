@@ -5,7 +5,17 @@ import json
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from sqlalchemy import case, desc, select, update
 from sqlalchemy.orm import Session, selectinload
@@ -33,6 +43,7 @@ from .reports import ReportBuilder
 from .repository import add_event, now
 from .schemas import (
     AgentAuditOut,
+    AgentProofReplay,
     BenchmarkEvaluationOut,
     BenchmarkSpec,
     Capability,
@@ -68,6 +79,25 @@ def get_store(request: Request) -> ArtifactStore:
 
 def get_orchestrator(request: Request) -> ScanOrchestrator:
     return request.app.state.orchestrator
+
+
+@router.post("/internal/tasks/{task_id}/proof-replay")
+def execute_live_proof_replay(
+    task_id: str,
+    replay: AgentProofReplay,
+    x_apkscanner_proof_token: str = Header(default=""),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> dict[str, Any]:
+    try:
+        return orchestrator.execute_live_proof_replay(
+            task_id,
+            x_apkscanner_proof_token,
+            replay,
+        )
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except (TimeoutError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 def get_session(database: Database = Depends(get_database)):

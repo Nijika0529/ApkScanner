@@ -53,7 +53,8 @@ def test_agent_adb_policy_keeps_full_access_with_hard_safety_boundary() -> None:
     assert "adb forward/reverse" in instructions
     assert "adb root" in instructions
     assert "uninstall temporary PoC APKs" in instructions
-    assert "platform requested_test" in instructions
+    assert "apkscanner-proof <proof-replay.json>" in instructions
+    assert "Do not submit the same action again through requested_tests" in instructions
     assert "assigned coverage seed is a hard workflow scope" in instructions
     assert "Do not use a broad glob" in instructions
     assert "A zero-result search ends that proposed branch" in instructions
@@ -61,8 +62,8 @@ def test_agent_adb_policy_keeps_full_access_with_hard_safety_boundary() -> None:
     assert "If two ordinary-app PoC executions have already answered" in instructions
     assert "never reconstruct a task UUID" in instructions
     assert "One existence/path check for each PoC source is sufficient" in instructions
-    assert "move directly to one platform-managed PoC" in instructions
-    assert "return the requested test rather than continuing raw ADB" in instructions
+    assert "move directly to one dedicated PoC" in instructions
+    assert "submit exactly one live proof replay" in instructions
     assert "without discovering or invoking an Android SDK toolchain" in instructions
     assert "poc_builder.source_build_available=true" in instructions
 
@@ -131,7 +132,8 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     assert "Do not assign the final platform verdict" in memo
     assert "Make an explicit evidence-weighted decision" not in memo
     assert "Unless the result is reproduced_blackbox" not in memo
-    assert "optional platform-replay action channel" in planning
+    assert "requested_tests is a deprecated compatibility field" in planning
+    assert "apkscanner-proof" in planning
 
 
 def test_requested_tests_can_be_omitted_when_no_platform_replay_is_needed() -> None:

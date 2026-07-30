@@ -55,6 +55,8 @@ class PocBuilder:
         self.runner = runner
         self.store = store
         self._keystore_lock = threading.Lock()
+        self._aapt2_flag_cache: dict[tuple[Path, str], bool] = {}
+        self._aapt2_flag_lock = threading.Lock()
 
     def capability(self) -> dict[str, object]:
         if not self.settings.poc_enabled:
@@ -230,7 +232,6 @@ class PocBuilder:
                 str(min_api),
                 "--target-sdk-version",
                 str(target_api),
-                "--no-resource-remapping",
                 "--version-code",
                 "1",
                 "--version-name",
@@ -239,8 +240,22 @@ class PocBuilder:
             aapt2_ok = False
             aapt2_candidates = self._tool_candidates("aapt2")
             for attempt, aapt2 in enumerate(aapt2_candidates, start=1):
+                compatibility_flags = (
+                    ["--no-resource-remapping"]
+                    if self._aapt2_supports_flag(
+                        aapt2,
+                        "--no-resource-remapping",
+                        cancel_event=cancel_event,
+                    )
+                    else []
+                )
                 result = self.runner.run(
-                    [str(aapt2), *aapt2_suffix],
+                    [
+                        str(aapt2),
+                        aapt2_suffix[0],
+                        *compatibility_flags,
+                        *aapt2_suffix[1:],
+                    ],
                     cwd=project,
                     timeout=self.settings.poc_build_timeout_seconds,
                     cancel_event=cancel_event,
@@ -259,6 +274,7 @@ class PocBuilder:
                             ),
                             "tool_path": str(aapt2),
                             "tool_attempt": attempt,
+                            "compatibility_flags": compatibility_flags,
                         },
                     )
                 )
@@ -525,6 +541,7 @@ class PocBuilder:
             )
             application = root.find("application")
             if application is not None:
+                matched = False
                 for activity in application.findall("activity"):
                     name = activity.get(f"{{{ANDROID_NAMESPACE}}}name")
                     normalized = (
@@ -537,7 +554,30 @@ class PocBuilder:
                             f"{{{ANDROID_NAMESPACE}}}exported",
                             "true",
                         )
+                        matched = True
                         break
+                if not matched:
+                    activities = application.findall("activity")
+                    launchers = [
+                        activity
+                        for activity in activities
+                        if any(
+                            action.get(f"{{{ANDROID_NAMESPACE}}}name")
+                            == "android.intent.action.MAIN"
+                            for intent_filter in activity.findall("intent-filter")
+                            for action in intent_filter.findall("action")
+                        )
+                    ]
+                    candidates = launchers if len(launchers) == 1 else activities
+                    if len(candidates) == 1:
+                        candidates[0].set(
+                            f"{{{ANDROID_NAMESPACE}}}name",
+                            component,
+                        )
+                        candidates[0].set(
+                            f"{{{ANDROID_NAMESPACE}}}exported",
+                            "true",
+                        )
         target = output / "AndroidManifest.xml"
         tree.write(target, encoding="utf-8", xml_declaration=True)
         return target
@@ -835,14 +875,45 @@ class PocBuilder:
                     "launch_component": candidates[0],
                 }
             )
+            component = candidates[0]
+        java_activities: set[str] = set()
         log_tags: set[str] = set()
         for source in sources:
             text = source.read_text(encoding="utf-8", errors="replace")
+            package_match = re.search(
+                r"(?m)^\s*package\s+([A-Za-z][A-Za-z0-9_.]*)\s*;",
+                text,
+            )
+            activity_match = re.search(
+                r"\bclass\s+([A-Za-z][A-Za-z0-9_]*)\s+extends\s+"
+                r"(?:android\.app\.)?Activity\b",
+                text,
+            )
+            if package_match and activity_match:
+                java_activities.add(
+                    f"{package_match.group(1)}.{activity_match.group(1)}"
+                )
             log_tags.update(
                 re.findall(
                     r'\b(?:TAG|LOG_TAG)\s*=\s*"([A-Z][A-Z0-9_]{2,31})"',
                     text,
                 )
+            )
+        if component not in java_activities:
+            candidates = [
+                item
+                for item in java_activities
+                if item.startswith("io.apkscanner.poc.")
+            ]
+            if len(candidates) != 1:
+                raise ValueError(
+                    "PoC launcher activity must match exactly one Java Activity class"
+                )
+            effective_spec = AgentPocSpec.model_validate(
+                {
+                    **effective_spec.model_dump(mode="python"),
+                    "launch_component": candidates[0],
+                }
             )
         if len(log_tags) == 1:
             effective_spec = AgentPocSpec.model_validate(
@@ -1029,6 +1100,28 @@ class PocBuilder:
         if value is None:
             raise ValueError(f"required PoC build tool is unavailable: {name}")
         return str(value)
+
+    def _aapt2_supports_flag(
+        self,
+        tool: Path,
+        flag: str,
+        *,
+        cancel_event: threading.Event | None,
+    ) -> bool:
+        key = (tool.resolve(), flag)
+        with self._aapt2_flag_lock:
+            cached = self._aapt2_flag_cache.get(key)
+        if cached is not None:
+            return cached
+        help_result = self.runner.run(
+            [str(tool), "link", "-h"],
+            timeout=15,
+            cancel_event=cancel_event,
+        )
+        supported = flag in f"{help_result.stdout}\n{help_result.stderr}"
+        with self._aapt2_flag_lock:
+            self._aapt2_flag_cache[key] = supported
+        return supported
 
     @staticmethod
     def _is_aapt2_resource_table_compatibility_error(
