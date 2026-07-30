@@ -816,8 +816,37 @@ class AdbDeviceAdapter:
             common["device_api_matches_poc_target"] = (
                 actual_api == str(built_target_api)
             )
+            try:
+                device_api_number = int(actual_api)
+                minimum_api_number = int(common["poc_min_api"])
+            except (TypeError, ValueError):
+                common["device_api_satisfies_poc_min"] = None
+                common["poc_runtime_compatible"] = None
+            else:
+                common["device_api_satisfies_poc_min"] = (
+                    device_api_number >= minimum_api_number
+                )
+                # compileSdk/targetSdk do not need to equal the device API.
+                # The install/launch results remain the authoritative runtime
+                # compatibility checks; this flag only captures the hard
+                # minSdk boundary.
+                common["poc_runtime_compatible"] = (
+                    device_api_number >= minimum_api_number
+                )
             commands.append(
                 ("blackbox.device_profile", device_api, dict(common))
+            )
+            # A prior worker may have been interrupted before its cleanup, or a
+            # fresh data directory may use a different signing key. Removing
+            # only the validated io.apkscanner.poc.* package makes the next
+            # install deterministic without touching the target application.
+            stale_uninstall = self._adb_budget(
+                ["uninstall", spec.package_name],
+                budget,
+                90,
+            )
+            commands.append(
+                ("blackbox.poc_pre_uninstall", stale_uninstall, dict(common))
             )
             install = self._adb_budget(
                 ["install", "-r", "-t", str(apk_path)],
@@ -1043,7 +1072,7 @@ class AdbDeviceAdapter:
             attempts += 1
             remaining = max(1, int(deadline - time.monotonic()))
             last = self._adb_budget(
-                ["logcat", "-d", "-t", "500", "-s", f"{log_tag}:I"],
+                ["logcat", "-d", "-t", "500", "-s", f"{log_tag}:V"],
                 budget,
                 min(15, remaining),
             )
@@ -1279,9 +1308,15 @@ class AdbDeviceAdapter:
             )
         if oracle.kind == "log_contains" and oracle.expected_text:
             normalized_output = output.lower().replace(" ", "")
-            structured_success = payload.get("success") is True
+            structured_success = bool(
+                payload.get("success") is True
+                or '"success":true' in normalized_output
+                or "success=true" in normalized_output
+            )
             plain_impact_claim = (
-                "security_impact_observed=true" in normalized_output
+                '"security_impact_observed":true' in normalized_output
+                or "'security_impact_observed':true" in normalized_output
+                or "security_impact_observed=true" in normalized_output
             )
             matched = bool(
                 (structured_success or plain_impact_claim)

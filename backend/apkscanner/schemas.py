@@ -493,7 +493,7 @@ class AgentInvestigationResult(BaseModel):
     )
     review_objections: list[AgentReviewObjection] = Field(
         default_factory=list,
-        max_length=100,
+        max_length=2,
     )
     objection_resolutions: list[AgentObjectionResolution] = Field(
         default_factory=list,

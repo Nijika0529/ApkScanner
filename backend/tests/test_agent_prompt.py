@@ -59,7 +59,8 @@ def test_agent_adb_policy_keeps_full_access_with_hard_safety_boundary() -> None:
     assert "Do not use a broad glob" in instructions
     assert "A zero-result search ends that proposed branch" in instructions
     assert "Treat raw ADB as a hypothesis probe, not an exploration loop" in instructions
-    assert "If two ordinary-app PoC executions have already answered" in instructions
+    assert "After one ordinary-app replay answers a hypothesis" in instructions
+    assert "A reproduced_blackbox receipt ends that hypothesis" in instructions
     assert "never reconstruct a task UUID" in instructions
     assert "One existence/path check for each PoC source is sufficient" in instructions
     assert "move directly to one dedicated PoC" in instructions
@@ -131,6 +132,8 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     assert "return requested_tests=[], and do not reopen" in critic
     assert "does not need to regenerate hypothesis assessment receipts" in critic
     assert "OBJ-1" in critic
+    assert "at most two objections" in critic
+    assert "not a new APK audit" in critic
     assert "review_objections" in critic
     assert "platform_proven_hypotheses" in critic
     assert "Never object to, refute, or downgrade" in critic
@@ -168,6 +171,24 @@ def test_requested_tests_can_be_omitted_when_no_platform_replay_is_needed() -> N
     )
 
     assert result.requested_tests == []
+
+
+def test_critic_cannot_expand_beyond_two_objections() -> None:
+    payload = _result(
+        "Critic 只应保留可能改变最终结论的实质异议。"
+    ).model_dump(mode="json")
+    payload["review_objections"] = [
+        {
+            "objection_id": f"OBJ-{index}",
+            "claim": f"异议 {index}",
+            "basis": "候选证据不足。",
+            "evidence_ids": [],
+        }
+        for index in range(1, 4)
+    ]
+
+    with pytest.raises(ValidationError, match="too_long"):
+        AgentInvestigationResult.model_validate(payload)
 
 
 def test_poc_base_package_remains_inside_the_controlled_namespace() -> None:

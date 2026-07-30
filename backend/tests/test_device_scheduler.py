@@ -459,6 +459,34 @@ def test_correlated_poc_log_oracle_can_report_structured_impact() -> None:
     assert metadata["oracle"]["matched"] is True
 
 
+def test_poc_log_oracle_uses_all_correlated_json_lines() -> None:
+    oracle = AgentOracleSpec(
+        kind="log_contains",
+        expected_text="security_impact_observed",
+        impact="unauthorized_data_access",
+    )
+
+    metadata = AdbDeviceAdapter._evaluate_poc_oracle(
+        oracle,
+        # The parser returns the final JSON object. A PoC may emit the concrete
+        # successful step first and a summary without a success field last.
+        poc_payload={
+            "request_id": "request-1",
+            "test": "summary",
+            "security_impact_observed": True,
+        },
+        output=(
+            '{"request_id":"request-1","test":"redirect",'
+            '"success":true,"security_impact_observed":true}\n'
+            '{"request_id":"request-1","test":"summary",'
+            '"security_impact_observed":true}'
+        ),
+    )
+
+    assert metadata["security_impact_observed"] is True
+    assert metadata["oracle"]["matched"] is True
+
+
 def test_process_correlated_plain_poc_log_can_report_impact() -> None:
     oracle = AgentOracleSpec(
         kind="log_contains",
@@ -552,7 +580,9 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
         def run(cls, argv, **_kwargs):  # noqa: ANN001, ANN206
             if "apkscanner_request_id" in argv:
                 cls.request_id = argv[argv.index("apkscanner_request_id") + 1]
-            if "APKSCANNER_POC:I" in argv:
+            if "getprop" in argv:
+                stdout = "33\n"
+            elif "APKSCANNER_POC:V" in argv:
                 stdout = (
                     f'I/APKSCANNER_POC: {{"request_id":"{cls.request_id}",'
                     '"success":true,"security_impact_observed":true}'
@@ -597,6 +627,7 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
         state="guest",
         oracle=oracle,
         test_case_id="agent-r1-1",
+        build_metadata={"compile_api": 23, "min_api": 26, "target_api": 36},
     )
     by_kind = {
         kind: metadata for kind, _command_result, metadata in result.commands
@@ -604,6 +635,17 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
 
     assert by_kind["blackbox.poc_logcat"]["poc_success"] is True
     assert by_kind["blackbox.poc_logcat"]["poc_claimed_security_impact"] is True
+    assert by_kind["blackbox.device_profile"]["device_api"] == "33"
+    assert (
+        by_kind["blackbox.device_profile"]["device_api_matches_poc_target"]
+        is False
+    )
+    assert (
+        by_kind["blackbox.device_profile"]["device_api_satisfies_poc_min"]
+        is True
+    )
+    assert by_kind["blackbox.device_profile"]["poc_runtime_compatible"] is True
+    assert "blackbox.poc_pre_uninstall" in by_kind
     assert "security_impact_observed" not in by_kind["blackbox.poc_logcat"]
     assert (
         by_kind["blackbox.poc_ui_baseline"]["target_text_present"]
@@ -617,6 +659,42 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
         ]
         is True
     )
+
+
+def test_poc_log_collection_accepts_debug_priority(settings) -> None:  # noqa: ANN001
+    class DebugLogRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @staticmethod
+        def run(argv, **_kwargs):  # noqa: ANN001, ANN205
+            assert "APKSCANNER_POC:V" in argv
+            return CommandResult(
+                argv,
+                0,
+                (
+                    "07-30 19:54:14.790 13786 13786 D APKSCANNER_POC: "
+                    '{"apkscanner_request_id":"request-debug",'
+                    '"success":true,"security_impact_observed":true}'
+                ),
+                "",
+            )
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        DebugLogRunner(),  # type: ignore[arg-type]
+    )
+
+    _result, matching, attempts, _elapsed = adapter._poll_poc_logcat(
+        log_tag="APKSCANNER_POC",
+        request_id="request-debug",
+        timeout_seconds=5,
+        budget=None,
+    )
+
+    assert len(matching) == 1
+    assert attempts == 1
 
 
 def test_poc_log_evidence_waits_for_delayed_correlated_result(

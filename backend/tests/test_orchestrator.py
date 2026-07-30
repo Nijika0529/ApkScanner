@@ -841,8 +841,6 @@ def test_blind_rescue_reopens_a_model_negative_before_closure(
         "static_only",
         "rescue_review",
         "rescue_exploration",
-        "adversarial_review",
-        "final_evaluation",
     ]
     with database.session_factory() as session:
         completed = session.get(InvestigationTask, task_id)
@@ -861,7 +859,282 @@ def test_blind_rescue_reopens_a_model_negative_before_closure(
             )
         )
         assert any(argument.role == "rescuer" for argument in arguments)
-        assert any(argument.role == "critic" for argument in arguments)
+        assert not any(argument.role == "critic" for argument in arguments)
+        assert completed.result["debate_policy"]["phase_counts"] == {
+            "rescue_exploration": 1,
+            "rescue_review": 1,
+            "static_only": 1,
+        }
+
+
+@pytest.mark.parametrize("critic_objects", [False, True])
+def test_positive_debate_is_single_pass_and_arbitrates_only_real_objections(
+    settings,
+    monkeypatch,
+    critic_objects,
+) -> None:  # noqa: ANN001
+    configured = replace(
+        settings,
+        adb_serial="single-pass-device:5555",
+        codex_enabled=True,
+    )
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    store = ArtifactStore(configured)
+    cited_sha, cited_path = store.put_json(
+        "evidence",
+        {"kind": "static.manifest", "exported": True},
+    )
+    unused_sha, unused_path = store.put_json(
+        "evidence",
+        {"kind": "static.code", "unrelated": True},
+    )
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="single-pass.apk",
+            package_name="com.example.singlepass",
+            artifact_sha256="7" * 64,
+            artifact_path=str(configured.data_dir / "single-pass.apk"),
+            stats={"investigator": "codex"},
+        )
+        entry = EntryPoint(
+            scan=scan,
+            kind="activity",
+            name="com.example.singlepass.EntryActivity",
+            owner_component="com.example.singlepass.EntryActivity",
+            exported=True,
+        )
+        session.add_all([scan, entry])
+        session.flush()
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="queued",
+            target_entry_ids=[entry.id],
+            hypotheses=["The exported entry reaches a privileged internal action."],
+        )
+        cited = Evidence(
+            scan_id=scan.id,
+            kind="static.manifest",
+            sha256=cited_sha,
+            path=str(cited_path),
+            summary="Exported entry without a permission",
+        )
+        unused = Evidence(
+            scan_id=scan.id,
+            kind="static.code",
+            sha256=unused_sha,
+            path=str(unused_path),
+            summary="Unrelated component evidence",
+        )
+        session.add_all([task, cited, unused])
+        session.commit()
+        scan_id, task_id, cited_id = scan.id, task.id, cited.id
+
+    orchestrator = ScanOrchestrator(configured, database, store)
+    monkeypatch.setattr(
+        orchestrator.device.runner,
+        "available",
+        lambda executable: executable == "adb",
+    )
+    monkeypatch.setattr(
+        orchestrator.device,
+        "capability",
+        lambda *, non_blocking=False: {"available": True},
+    )
+    monkeypatch.setattr(
+        orchestrator.device,
+        "prepare",
+        lambda *_args, **_kwargs: [
+            (
+                "device.install",
+                CommandResult(["adb", "install"], 0, "", ""),
+                {},
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        orchestrator.device,
+        "probe",
+        lambda *_args, **_kwargs: SimpleNamespace(commands=[]),
+    )
+    monkeypatch.setattr(orchestrator.device, "cleanup", lambda _package: [])
+    phases: list[str] = []
+
+    class SinglePassInvestigator:
+        @staticmethod
+        def capability(*, deep=False):  # noqa: ANN001, ANN205
+            return {"available": True, "version": "fake-sdk", "deep": deep}
+
+        @staticmethod
+        def investigate(**kwargs):  # noqa: ANN003, ANN205
+            context = kwargs["platform_context"]
+            phase = context["phase"]
+            phases.append(phase)
+            hypothesis_id = context["security_hypotheses"][0]["id"]
+            if phase == "adversarial_review":
+                assert [item["id"] for item in kwargs["evidence"]] == [cited_id]
+                assert context["agent_round_history"] == []
+                assert context["executed_agent_tests"] == []
+                assert context["target_code_context"] == {
+                    "status": "candidate_evidence_only",
+                    "components": [],
+                }
+                assert context["critic_scope"] == {
+                    "mode": "candidate_and_cited_evidence_only",
+                    "evidence_ids": [cited_id],
+                    "maximum_objections": 2,
+                }
+                objections = (
+                    [
+                        {
+                            "objection_id": "OBJ-1",
+                            "hypothesis_id": hypothesis_id,
+                            "claim": "The candidate did not establish the sensitive sink.",
+                            "basis": "The cited manifest proves export only.",
+                            "evidence_ids": [cited_id],
+                        }
+                    ]
+                    if critic_objects
+                    else []
+                )
+                return SimpleNamespace(
+                    thread_id="thread-critic",
+                    turn_id="turn-critic",
+                    usage={"input_tokens": 1, "output_tokens": 1},
+                    result=AgentInvestigationResult(
+                        summary="Critic 已完成一次证据审查。",
+                        result=(
+                            "refuted_static"
+                            if critic_objects
+                            else "supported_static"
+                        ),
+                        hypotheses_tested=[],
+                        hypothesis_assessments=[],
+                        review_objections=objections,
+                        objection_resolutions=[],
+                        test_cases=[],
+                        evidence_ids=[cited_id],
+                        severity_proposal=(
+                            "info" if critic_objects else "high"
+                        ),
+                        confidence="high",
+                        coverage_gaps=[],
+                        followups=[],
+                        requested_tests=[],
+                    ),
+                )
+            if phase == "final_evaluation":
+                assert critic_objects
+                assert context["debate"]["critic"]["review_objections"][0][
+                    "objection_id"
+                ] == "OBJ-1"
+                return SimpleNamespace(
+                    thread_id="thread-final",
+                    turn_id="turn-final",
+                    usage={"input_tokens": 1, "output_tokens": 1},
+                    result=AgentInvestigationResult(
+                        summary="最终裁决采纳了 Critic 的实质异议。",
+                        result="refuted_static",
+                        hypotheses_tested=[hypothesis_id],
+                        hypothesis_assessments=[
+                            {
+                                "hypothesis_id": hypothesis_id,
+                                "verdict": "refuted_static",
+                                "source": "Exported manifest entry",
+                                "control": "Explicit Intent",
+                                "sink": "",
+                                "reachable_path": "Caller -> EntryActivity",
+                                "boundary": "android_component_export_boundary",
+                                "counterevidence": [
+                                    "No sensitive sink is present in cited evidence"
+                                ],
+                                "proof_gaps": [],
+                                "evidence_ids": [cited_id],
+                                "confidence": "high",
+                            }
+                        ],
+                        review_objections=[],
+                        objection_resolutions=[
+                            {
+                                "objection_id": "OBJ-1",
+                                "disposition": "sustained",
+                                "rationale": "现有证据只证明入口可达。",
+                                "evidence_ids": [cited_id],
+                            }
+                        ],
+                        test_cases=[],
+                        evidence_ids=[cited_id],
+                        severity_proposal="info",
+                        confidence="high",
+                        coverage_gaps=[],
+                        followups=[],
+                        requested_tests=[],
+                    ),
+                )
+            return SimpleNamespace(
+                thread_id="thread-hunter",
+                turn_id="turn-hunter",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                result=AgentInvestigationResult(
+                    summary="Hunter 发现了一个需要独立审查的高风险候选。",
+                    result="supported_static",
+                    hypotheses_tested=[hypothesis_id],
+                    hypothesis_assessments=[
+                        {
+                            "hypothesis_id": hypothesis_id,
+                            "verdict": "supported_static",
+                            "source": "EntryActivity",
+                            "control": "Attacker Intent",
+                            "sink": "PrivilegedAction",
+                            "reachable_path": "EntryActivity -> PrivilegedAction",
+                            "boundary": "android_component_export_boundary",
+                            "counterevidence": [],
+                            "proof_gaps": [],
+                            "evidence_ids": [cited_id],
+                            "confidence": "high",
+                        }
+                    ],
+                    review_objections=[],
+                    objection_resolutions=[],
+                    test_cases=[],
+                    evidence_ids=[cited_id],
+                    severity_proposal="high",
+                    confidence="high",
+                    coverage_gaps=[],
+                    followups=[],
+                    requested_tests=[],
+                ),
+            )
+
+    orchestrator.investigators["codex"] = SinglePassInvestigator()
+    orchestrator._run_task(scan_id, task_id, 120)
+
+    assert phases == (
+        ["test_planning", "adversarial_review", "final_evaluation"]
+        if critic_objects
+        else ["test_planning", "adversarial_review"]
+    )
+    with database.session_factory() as session:
+        completed = session.get(InvestigationTask, task_id)
+        assert completed is not None
+        assert completed.status == "completed"
+        assert completed.result["result"] == (
+            "refuted_static" if critic_objects else "supported_static"
+        )
+        policy = completed.result["debate_policy"]
+        assert policy["phase_counts"]["adversarial_review"] == 1
+        assert policy["phase_counts"].get("rescue_review", 0) == 0
+        assert policy["phase_counts"].get("final_evaluation", 0) == int(
+            critic_objects
+        )
+        assert policy["outcome"] == (
+            "arbiter_completed"
+            if critic_objects
+            else "candidate_kept_without_arbiter"
+        )
 
 
 def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # noqa: ANN001

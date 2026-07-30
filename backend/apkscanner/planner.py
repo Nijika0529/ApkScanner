@@ -86,6 +86,7 @@ class InvestigationPlanner:
     ) -> InvestigationPlan:
         plan = InvestigationPlan()
         deep_links_by_owner: dict[str, list[EntryPoint]] = defaultdict(list)
+        component_tasks_by_name: dict[str, InvestigationTask] = {}
         for entry in entries:
             closure = self._static_closure(entry)
             if closure is not None:
@@ -94,9 +95,23 @@ class InvestigationPlanner:
             if entry.kind == EntryPointKind.DEEP_LINK.value:
                 deep_links_by_owner[entry.owner_component or entry.name].append(entry)
                 continue
-            plan.tasks.append(self._component_task(scan_id, entry))
+            task = self._component_task(scan_id, entry)
+            plan.tasks.append(task)
+            component_tasks_by_name[entry.name] = task
         for owner, deep_links in deep_links_by_owner.items():
-            plan.tasks.append(self._deep_link_task(scan_id, owner, deep_links))
+            owner_task = component_tasks_by_name.get(owner)
+            if owner_task is None:
+                plan.tasks.append(self._deep_link_task(scan_id, owner, deep_links))
+                continue
+            owner_task.target_entry_ids = [
+                *owner_task.target_entry_ids,
+                *(entry.id for entry in deep_links),
+            ]
+            owner_task.hypotheses = [
+                *owner_task.hypotheses,
+                *self._deep_link_hypotheses(owner),
+            ]
+            owner_task.priority = max(owner_task.priority, 98)
         return plan
 
     @classmethod
@@ -302,12 +317,16 @@ class InvestigationPlanner:
             task_type=TaskType.DEEP_LINK.value,
             priority=98,
             target_entry_ids=[entry.id for entry in deep_links],
-            hypotheses=[
-                f"Deep links handled by {owner} are reachable from an untrusted application.",
-                "URI path, query, fragment, encoding, and duplicate parameters are not strictly validated.",
-                "Different URI forms or caller-controlled parameters expose privileged behavior.",
-                "App Link verification, redirects, or custom schemes allow link interception.",
-                "A link can reach nested intents, file access, WebView script, or an open redirect.",
-            ],
+            hypotheses=self._deep_link_hypotheses(owner),
             **self._base(),
         )
+
+    @staticmethod
+    def _deep_link_hypotheses(owner: str) -> list[str]:
+        return [
+            f"Deep links handled by {owner} are reachable from an untrusted application.",
+            "URI path, query, fragment, encoding, and duplicate parameters are not strictly validated.",
+            "Different URI forms or caller-controlled parameters expose privileged behavior.",
+            "App Link verification, redirects, or custom schemes allow link interception.",
+            "A link can reach nested intents, file access, WebView script, or an open redirect.",
+        ]

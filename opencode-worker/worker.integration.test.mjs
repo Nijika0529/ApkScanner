@@ -53,6 +53,7 @@ test("non-thinking finalizer unwraps StructuredOutput value envelopes", async ()
     assert.equal(result.output_transport.model_calls[0].wire_tool_choice, "required")
     assert.equal(requests.length, 1)
     assert.equal(requests[0].body.thinking.type, "disabled")
+    assert.equal(requests[0].body.temperature, 0)
     assert.equal(requests[0].body.reasoning_effort, undefined)
     assert.equal(requests[0].body.tool_choice, "required")
     assert.deepEqual(toolNames(requests[0].body), ["StructuredOutput"])
@@ -144,6 +145,7 @@ test("stable analyzer uses non-thinking tools, then an isolated finalizer", asyn
     assert.match(result.output_transport.explorer_memo, /exported provider evidence/)
     assert.equal(requests.length, 3)
     assert.equal(requests[0].body.thinking.type, "disabled")
+    assert.equal(requests[0].body.temperature, 0)
     assert.equal(requests[0].body.tool_choice, "auto")
     assert.deepEqual(toolNames(requests[0].body), [
       "bash",

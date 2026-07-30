@@ -73,6 +73,22 @@ REACHABILITY_ONLY_HYPOTHESIS_CLAIMS = frozenset(
         "An untrusted application can deliver a broadcast to the receiver.",
     }
 )
+REACHABILITY_ONLY_CLAIM_FRAGMENTS = (
+    " are reachable from an untrusted application",
+    " is reachable from an untrusted application",
+    " are not strictly validated",
+    " is not strictly validated",
+)
+
+
+def _is_reachability_only_claim(claim: object) -> bool:
+    if not isinstance(claim, str):
+        return False
+    normalized = " ".join(claim.strip().lower().split())
+    return (
+        claim in REACHABILITY_ONLY_HYPOTHESIS_CLAIMS
+        or any(fragment in normalized for fragment in REACHABILITY_ONLY_CLAIM_FRAGMENTS)
+    )
 
 
 @dataclass(slots=True)
@@ -91,6 +107,10 @@ class _LiveProofContext:
     round_index: int
     lock: threading.Lock = field(default_factory=threading.Lock)
     responses: dict[str, dict[str, Any]] = field(default_factory=dict)
+    proof_strategies: dict[str, dict[str, Any]] = field(default_factory=dict)
+    proven_semantic_strategies: dict[str, dict[str, Any]] = field(
+        default_factory=dict
+    )
 
 
 class ScanOrchestrator:
@@ -197,8 +217,9 @@ class ScanOrchestrator:
             )
             if (
                 replay.oracle.impact != "none"
-                and selected_hypothesis.get("claim")
-                in REACHABILITY_ONLY_HYPOTHESIS_CLAIMS
+                and _is_reachability_only_claim(
+                    selected_hypothesis.get("claim")
+                )
             ):
                 raise ValueError(
                     "an impactful proof replay must target the concrete harm or "
@@ -221,6 +242,78 @@ class ScanOrchestrator:
                 rationale=replay.rationale,
                 poc=replay.poc,
             )
+            semantic_strategy_signature = hashlib.sha256(
+                json.dumps(
+                    {
+                        "entry_point_id": entry_id,
+                        "poc_package": replay.poc.package_name,
+                        "extras": replay.extras,
+                        "oracle": replay.oracle.model_dump(mode="json"),
+                        "rationale": " ".join(
+                            replay.rationale.lower().split()
+                        ),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            prior_proven_strategy = context.proven_semantic_strategies.get(
+                semantic_strategy_signature
+            )
+            if prior_proven_strategy is not None:
+                response = {
+                    "schema_version": "1.0",
+                    "accepted": True,
+                    "executed": False,
+                    "hypothesis_id": hypothesis_id,
+                    "entry_point_id": entry_id,
+                    "result": "inconclusive",
+                    "evidence_ids": [],
+                    "evidence": [],
+                    "gaps": [
+                        "This PoC package, entry, Oracle, and exploit rationale "
+                        "already produced a proven platform replay for hypothesis "
+                        f"{prior_proven_strategy['hypothesis_id']}. Do not rewrite "
+                        "the same PoC merely to attach it to another hypothesis."
+                    ],
+                    "deduplicated": False,
+                    "deduplicated_strategy": True,
+                    "prior_hypothesis_id": prior_proven_strategy[
+                        "hypothesis_id"
+                    ],
+                    "prior_evidence_ids": prior_proven_strategy[
+                        "evidence_ids"
+                    ],
+                }
+                receipt_payload = json.dumps(
+                    response,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                response["receipt_signature"] = hmac.new(
+                    token.encode(),
+                    receipt_payload,
+                    hashlib.sha256,
+                ).hexdigest()
+                context.responses[signature] = response
+                self._record_exploration_event(
+                    context.scan_id,
+                    context.task_id,
+                    "proof_replay.semantic_deduplicated",
+                    "已成功的同语义 PoC 不再因换假设或改写源码而重复执行",
+                    {
+                        "source": "platform",
+                        "hypothesis_id": hypothesis_id,
+                        "prior_hypothesis_id": prior_proven_strategy[
+                            "hypothesis_id"
+                        ],
+                        "entry_point_id": entry_id,
+                        "semantic_strategy_signature": (
+                            semantic_strategy_signature
+                        ),
+                    },
+                )
+                return response
             accepted, validation_gaps = self._validate_requested_tests(
                 [request],
                 context.entries,
@@ -240,6 +333,89 @@ class ScanOrchestrator:
                     evidence_summaries=context.evidence_summaries,
                     cancel_event=context.cancel_event,
                 )
+            strategy_signature: str | None = None
+            if accepted:
+                artifact = artifacts.get(
+                    self._poc_request_key(accepted[0])
+                )
+                if artifact is not None and artifact.ok:
+                    strategy_signature = hashlib.sha256(
+                        json.dumps(
+                            {
+                                "entry_point_id": entry_id,
+                                "source_sha256": artifact.source_sha256,
+                                "apk_sha256": artifact.apk_sha256,
+                                "extras": replay.extras,
+                                "reset": replay.reset,
+                                "oracle": replay.oracle.model_dump(mode="json"),
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest()
+                    prior_strategy = context.proof_strategies.get(
+                        strategy_signature
+                    )
+                    if prior_strategy is not None:
+                        new_evidence = context.evidence_summaries[before:]
+                        self._materialize_live_evidence(context, new_evidence)
+                        response = {
+                            "schema_version": "1.0",
+                            "accepted": True,
+                            "executed": False,
+                            "hypothesis_id": hypothesis_id,
+                            "entry_point_id": entry_id,
+                            "result": "inconclusive",
+                            "evidence_ids": [
+                                str(item["id"])
+                                for item in new_evidence
+                                if isinstance(item.get("id"), str)
+                            ],
+                            "evidence": new_evidence,
+                            "gaps": [
+                                "This exact PoC source, entry, input, and Oracle "
+                                "strategy already ran for hypothesis "
+                                f"{prior_strategy['hypothesis_id']}. Dynamic proof "
+                                "ownership is not transferred to a different claim. "
+                                "Use the existing evidence for static support or "
+                                "submit a materially different claim-specific strategy."
+                            ],
+                            "deduplicated": False,
+                            "deduplicated_strategy": True,
+                            "prior_hypothesis_id": prior_strategy[
+                                "hypothesis_id"
+                            ],
+                            "prior_evidence_ids": prior_strategy[
+                                "evidence_ids"
+                            ],
+                        }
+                        receipt_payload = json.dumps(
+                            response,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode()
+                        response["receipt_signature"] = hmac.new(
+                            token.encode(),
+                            receipt_payload,
+                            hashlib.sha256,
+                        ).hexdigest()
+                        context.responses[signature] = response
+                        self._record_exploration_event(
+                            context.scan_id,
+                            context.task_id,
+                            "proof_replay.strategy_deduplicated",
+                            "相同 PoC 策略已执行，平台拒绝跨假设重复重放",
+                            {
+                                "source": "platform",
+                                "hypothesis_id": hypothesis_id,
+                                "prior_hypothesis_id": prior_strategy[
+                                    "hypothesis_id"
+                                ],
+                                "entry_point_id": entry_id,
+                                "strategy_signature": strategy_signature,
+                            },
+                        )
+                        return response
             executed: list[dict[str, Any]] = []
             execution_gaps: list[str] = []
             if accepted:
@@ -256,10 +432,27 @@ class ScanOrchestrator:
                     poc_artifacts=artifacts,
                 )
             new_evidence = context.evidence_summaries[before:]
+            self._materialize_live_evidence(context, new_evidence)
             proven_hypotheses = (
                 self.hypothesis_ledger.task_proven_hypotheses(context.task_id)
             )
             proof_evidence_ids = proven_hypotheses.get(hypothesis_id)
+            result = (
+                FindingStatus.REPRODUCED_BLACKBOX.value
+                if proof_evidence_ids
+                else "inconclusive"
+            )
+            replay_gaps = [
+                *validation_gaps,
+                *build_gaps,
+                *execution_gaps,
+            ]
+            if result == "inconclusive" and executed and not replay_gaps:
+                replay_gaps.append(
+                    "The platform replay executed, but the correlated Oracle did not "
+                    "demonstrate the requested security impact. Inspect the attached "
+                    "evidence metadata before changing the PoC or Oracle."
+                )
             response = {
                 "schema_version": "1.0",
                 "accepted": bool(accepted),
@@ -270,21 +463,14 @@ class ScanOrchestrator:
                 # never make this replay look proven. The task-level aggregate
                 # remains useful for terminating exploration, but live receipts
                 # are claim-specific security evidence.
-                "result": (
-                    FindingStatus.REPRODUCED_BLACKBOX.value
-                    if proof_evidence_ids
-                    else "inconclusive"
-                ),
+                "result": result,
                 "evidence_ids": [
                     str(item["id"])
                     for item in new_evidence
                     if isinstance(item.get("id"), str)
                 ],
-                "gaps": [
-                    *validation_gaps,
-                    *build_gaps,
-                    *execution_gaps,
-                ],
+                "evidence": new_evidence,
+                "gaps": replay_gaps,
                 "deduplicated": False,
             }
             receipt_payload = json.dumps(
@@ -298,6 +484,18 @@ class ScanOrchestrator:
                 hashlib.sha256,
             ).hexdigest()
             context.responses[signature] = response
+            if strategy_signature is not None and executed:
+                context.proof_strategies[strategy_signature] = {
+                    "hypothesis_id": hypothesis_id,
+                    "evidence_ids": list(response["evidence_ids"]),
+                }
+            if result == FindingStatus.REPRODUCED_BLACKBOX.value:
+                context.proven_semantic_strategies[
+                    semantic_strategy_signature
+                ] = {
+                    "hypothesis_id": hypothesis_id,
+                    "evidence_ids": list(response["evidence_ids"]),
+                }
             self._record_exploration_event(
                 context.scan_id,
                 context.task_id,
@@ -1622,6 +1820,22 @@ class ScanOrchestrator:
         debate_context: dict[str, Any] = {}
         rescue_context: dict[str, Any] = {}
         rescue_gate: dict[str, Any] = {}
+        phase_counts: dict[str, int] = {}
+        single_pass_phases = {
+            "adversarial_review",
+            "rescue_review",
+            "rescue_exploration",
+            "final_evaluation",
+        }
+        debate_policy: dict[str, Any] = {
+            "mode": "single_pass",
+            "max_critic_rounds": 1,
+            "max_rescue_reviews": 1,
+            "max_rescue_explorations": 1,
+            "max_final_evaluations": 1,
+            "critic_max_objections": 2,
+            "critic_and_rescue_are_mutually_exclusive": True,
+        }
         package_name = scan.package_name
         investigator = self.investigators.get(agent_backend)
         agent_enabled = self.settings.investigator_enabled(agent_backend)
@@ -1638,6 +1852,24 @@ class ScanOrchestrator:
             audit_id: str | None = None
             runtime_events: list[dict[str, Any]] = []
             self._raise_if_cancelled(cancel_event)
+            if (
+                phase in single_pass_phases
+                and phase_counts.get(phase, 0) >= 1
+            ):
+                self._record_exploration_event(
+                    scan_id,
+                    task_id,
+                    "debate.phase.skipped",
+                    "单向辩论策略阻止了重复阶段",
+                    {
+                        "source": "platform",
+                        "phase": phase,
+                        "round_index": round_index,
+                        "maximum_runs": 1,
+                    },
+                )
+                return None, f"{phase} is limited to one run per task"
+            phase_counts[phase] = phase_counts.get(phase, 0) + 1
             if investigator is None:
                 return None, "AI investigation is disabled for this scan"
             if not agent_enabled:
@@ -1686,18 +1918,47 @@ class ScanOrchestrator:
                                 if isinstance(item, dict)
                                 and item.get("name") in seed_names
                             ]
+                critic_turn = phase == "adversarial_review"
+                critic_evidence_ids = (
+                    self._candidate_evidence_ids(candidate_under_review)
+                    if critic_turn
+                    else set()
+                )
+                dispatch_evidence = (
+                    [
+                        item
+                        for item in evidence_summaries
+                        if str(item.get("id")) in critic_evidence_ids
+                    ]
+                    if critic_turn
+                    else evidence_summaries
+                )
+                dispatch_code_context = (
+                    {
+                        "status": "candidate_evidence_only",
+                        "components": [],
+                    }
+                    if critic_turn
+                    else target_code_context
+                )
                 platform_context = {
                     "phase": phase,
                     "round_index": round_index,
                     "output_language": "zh-CN",
                     "device": current_device_capability(),
                     "poc_builder": self.poc_builder.capability(),
-                    "coverage_gaps": [] if blind_rescue else coverage_gaps,
-                    "target_code_context": target_code_context,
+                    "coverage_gaps": (
+                        [] if blind_rescue or critic_turn else coverage_gaps
+                    ),
+                    "target_code_context": dispatch_code_context,
                     "entry_scope": entry_scope,
-                    "executed_agent_tests": executed_tests or [],
+                    "executed_agent_tests": (
+                        [] if critic_turn else executed_tests or []
+                    ),
                     "agent_round_history": (
-                        [] if blind_rescue else deepcopy(agent_round_history)
+                        []
+                        if blind_rescue or critic_turn
+                        else deepcopy(agent_round_history)
                     ),
                     "further_test_rounds_available": (
                         phase != "final_evaluation"
@@ -1715,8 +1976,21 @@ class ScanOrchestrator:
                     "candidate_under_review": (
                         None if blind_rescue else candidate_under_review
                     ),
+                    "critic_scope": (
+                        {
+                            "mode": "candidate_and_cited_evidence_only",
+                            "evidence_ids": sorted(critic_evidence_ids),
+                            "maximum_objections": 2,
+                        }
+                        if critic_turn
+                        else None
+                    ),
                     "debate": None if blind_rescue else debate_context or None,
                     "rescue": None if blind_rescue else rescue_context or None,
+                    "debate_policy": {
+                        **debate_policy,
+                        "phase_counts": dict(phase_counts),
+                    },
                     "blind_rescue": (
                         {
                             "mode": "independent_negative_closure_review",
@@ -1745,7 +2019,7 @@ class ScanOrchestrator:
                     scan_id,
                     task_id,
                     task.attempts,
-                    evidence_summaries,
+                    dispatch_evidence,
                     platform_context=platform_context,
                 )
                 self._record_exploration_event(
@@ -1770,7 +2044,7 @@ class ScanOrchestrator:
                     scan=scan,
                     task=task,
                     entries=entries,
-                    evidence=evidence_summaries,
+                    evidence=dispatch_evidence,
                     platform_context=platform_context,
                     backend=agent_backend,
                     phase=phase,
@@ -1846,7 +2120,7 @@ class ScanOrchestrator:
                     "task": task,
                     "entries": entries,
                     "workspace": agent_workspace,
-                    "evidence": evidence_summaries,
+                    "evidence": dispatch_evidence,
                     "platform_context": platform_context,
                     "timeout_seconds": remaining,
                     "event_callback": on_runtime_event,
@@ -2054,11 +2328,12 @@ class ScanOrchestrator:
         def run_negative_rescue(current_result, *, round_index: int):  # noqa: ANN202
             """Require an independent blind review before accepting a model negative."""
 
-            nonlocal debate_context, rescue_context
+            nonlocal rescue_context
             if (
                 current_result is None
                 or not self._needs_rescue_review(current_result.result)
                 or self.hypothesis_ledger.task_proof_result(task_id) is not None
+                or phase_counts.get("adversarial_review", 0) > 0
             ):
                 return current_result
 
@@ -2071,6 +2346,7 @@ class ScanOrchestrator:
                     "mode": "blind_independent_review",
                 }
             )
+            debate_policy["outcome"] = "rescue_started"
             self._record_exploration_event(
                 scan_id,
                 task_id,
@@ -2097,6 +2373,7 @@ class ScanOrchestrator:
                         "error": review_error,
                     }
                 )
+                debate_policy["outcome"] = rescue_gate["outcome"]
                 coverage_gaps.append(
                     "Blind rescue review was unavailable; the model negative was not accepted: "
                     f"{review_error}"
@@ -2128,6 +2405,7 @@ class ScanOrchestrator:
                         "outcome": "independent_closure_confirmed",
                     }
                 )
+                debate_policy["outcome"] = rescue_gate["outcome"]
                 self._record_exploration_event(
                     scan_id,
                     task_id,
@@ -2171,6 +2449,7 @@ class ScanOrchestrator:
                         "error": exploration_error,
                     }
                 )
+                debate_policy["outcome"] = rescue_gate["outcome"]
                 coverage_gaps.append(
                     "Rescue found an alternate exploit lead, but tool verification was unavailable; "
                     f"the prior negative was not accepted: {exploration_error}"
@@ -2202,6 +2481,7 @@ class ScanOrchestrator:
                     ),
                 }
             )
+            debate_policy["outcome"] = rescue_gate["outcome"]
             self._record_exploration_event(
                 scan_id,
                 task_id,
@@ -2222,43 +2502,6 @@ class ScanOrchestrator:
                 },
             )
 
-            if (
-                self._needs_adversarial_review(current_result.result)
-                and not self._has_requested_test_work(current_result.result)
-                and self.hypothesis_ledger.task_proof_result(task_id) is None
-            ):
-                candidate_payload = current_result.result.model_dump(mode="json")
-                critic_result, critic_error = invoke_agent(
-                    phase="adversarial_review",
-                    candidate_under_review=candidate_payload,
-                    round_index=round_index + 1,
-                )
-                if critic_result is not None:
-                    critic_payload = critic_result.result.model_dump(mode="json")
-                    debate_context = {
-                        "candidate": candidate_payload,
-                        "critic": critic_payload,
-                        "critic_thread_id": critic_result.thread_id,
-                        "critic_turn_id": critic_result.turn_id,
-                        "origin": "negative_closure_rescue",
-                    }
-                    final_result, final_error = invoke_agent(
-                        phase="final_evaluation",
-                        executed_tests=executed_agent_tests,
-                        round_index=round_index + 1,
-                    )
-                    if final_result is not None:
-                        current_result = final_result
-                    else:
-                        coverage_gaps.append(
-                            "Final evaluation of the rescued candidate failed; retained the "
-                            f"tool-verified rescue result: {final_error}"
-                        )
-                elif critic_error:
-                    coverage_gaps.append(
-                        "Adversarial review of the rescued candidate was unavailable; retained "
-                        f"the tool-verified rescue result: {critic_error}"
-                    )
             return current_result
 
         # A busy non-blocking snapshot remains eligible for the device queue, but
@@ -2355,6 +2598,7 @@ class ScanOrchestrator:
                     replay_proof_terminal = (
                         self.hypothesis_ledger.task_proof_result(task_id) is not None
                     )
+                    initial_executed_test_count = len(executed_agent_tests)
                     agent_result, agent_error = invoke_agent(
                         phase=(
                             "final_evaluation"
@@ -2382,12 +2626,9 @@ class ScanOrchestrator:
                         )
                         if critic_result is not None and proof_after_critic is None:
                             critic_payload = critic_result.result.model_dump(mode="json")
-                            debate_context = {
-                                "candidate": candidate_payload,
-                                "critic": critic_payload,
-                                "critic_thread_id": critic_result.thread_id,
-                                "critic_turn_id": critic_result.turn_id,
-                            }
+                            material_objections = list(
+                                critic_payload.get("review_objections", [])
+                            )
                             critic_requested_test_count = len(
                                 critic_result.result.requested_tests
                             ) + len(
@@ -2400,37 +2641,73 @@ class ScanOrchestrator:
                                     "Critic proposed device tests, but Critic is evidence-only; "
                                     "the proposals were not scheduled."
                                 )
-                            merged_result = agent_result.result.model_copy(
-                                update={
-                                    "coverage_gaps": list(
-                                        dict.fromkeys(
-                                            [
-                                                *agent_result.result.coverage_gaps,
-                                                *critic_result.result.coverage_gaps,
-                                            ]
-                                        )
-                                    ),
+                            if material_objections:
+                                debate_context = {
+                                    "candidate": candidate_payload,
+                                    "critic": critic_payload,
+                                    "critic_thread_id": critic_result.thread_id,
+                                    "critic_turn_id": critic_result.turn_id,
                                 }
-                            )
-                            agent_result.result = merged_result
-                            self._record_exploration_event(
-                                scan_id,
-                                task_id,
-                                "debate.completed",
-                                "Hunter 候选已完成独立 Critic 质疑",
-                                {
-                                    "source": "platform",
-                                    "candidate_result": candidate_payload.get("result"),
-                                    "critic_result": critic_payload.get("result"),
-                                    "critic_objection_count": len(
-                                        critic_payload.get("review_objections", [])
-                                    ),
-                                    "critic_test_proposals_ignored": (
-                                        critic_requested_test_count
-                                    ),
-                                },
-                            )
+                                debate_policy["outcome"] = (
+                                    "critic_objections_require_one_arbiter"
+                                )
+                                merged_result = agent_result.result.model_copy(
+                                    update={
+                                        "coverage_gaps": list(
+                                            dict.fromkeys(
+                                                [
+                                                    *agent_result.result.coverage_gaps,
+                                                    *critic_result.result.coverage_gaps,
+                                                ]
+                                            )
+                                        ),
+                                    }
+                                )
+                                agent_result.result = merged_result
+                                self._record_exploration_event(
+                                    scan_id,
+                                    task_id,
+                                    "debate.objections_recorded",
+                                    "Critic 提出实质异议，任务仅进入一次最终裁决",
+                                    {
+                                        "source": "platform",
+                                        "candidate_result": candidate_payload.get(
+                                            "result"
+                                        ),
+                                        "critic_result": critic_payload.get("result"),
+                                        "critic_objection_count": len(
+                                            material_objections
+                                        ),
+                                        "critic_test_proposals_ignored": (
+                                            critic_requested_test_count
+                                        ),
+                                    },
+                                )
+                            else:
+                                debate_policy["outcome"] = (
+                                    "candidate_kept_without_arbiter"
+                                )
+                                self._record_exploration_event(
+                                    scan_id,
+                                    task_id,
+                                    "debate.closed_no_objection",
+                                    "Critic 未提出实质异议，保留候选结论并停止辩论",
+                                    {
+                                        "source": "platform",
+                                        "candidate_result": candidate_payload.get(
+                                            "result"
+                                        ),
+                                        "critic_result": critic_payload.get("result"),
+                                        "critic_objection_count": 0,
+                                        "critic_test_proposals_ignored": (
+                                            critic_requested_test_count
+                                        ),
+                                    },
+                                )
                         elif critic_result is not None:
+                            debate_policy["outcome"] = (
+                                "platform_proof_stopped_debate"
+                            )
                             self._record_exploration_event(
                                 scan_id,
                                 task_id,
@@ -2445,6 +2722,7 @@ class ScanOrchestrator:
                                 },
                             )
                         elif critic_error:
+                            debate_policy["outcome"] = "critic_unavailable"
                             coverage_gaps.append(
                                 f"Adversarial review was unavailable: {critic_error}"
                             )
@@ -2629,7 +2907,11 @@ class ScanOrchestrator:
                         agent_error = None
 
                     if (
-                        (executed_agent_tests or debate_context)
+                        (
+                            len(executed_agent_tests)
+                            > initial_executed_test_count
+                            or debate_context
+                        )
                         and not replay_proof_terminal
                         and self.hypothesis_ledger.task_proof_result(task_id) is None
                         and not budget.expired
@@ -2642,17 +2924,24 @@ class ScanOrchestrator:
                         if final_result is not None:
                             agent_result = final_result
                             agent_error = None
+                            if debate_context:
+                                debate_policy["outcome"] = "arbiter_completed"
                             if self._has_requested_test_work(final_result.result):
                                 coverage_gaps.append(
                                     "Final evaluation requested additional tests, but final turns "
                                     "cannot schedule new device actions."
                                 )
                         else:
+                            if debate_context:
+                                debate_policy["outcome"] = "arbiter_unavailable"
                             coverage_gaps.append(
                                 "Final AI evaluation failed; retained the latest exploration result: "
                                 f"{final_error}"
                             )
-                    elif (executed_agent_tests or debate_context) and budget.expired:
+                    elif (
+                        len(executed_agent_tests) > initial_executed_test_count
+                        or debate_context
+                    ) and budget.expired:
                         coverage_gaps.append(
                             "Final AI evaluation could not start because the parent task "
                             "lifecycle had already ended; retained the latest validated result."
@@ -2693,6 +2982,7 @@ class ScanOrchestrator:
             agent_result = None
         validated_payload: dict[str, Any] | None = None
         validated_result_value: str | None = None
+        debate_policy["phase_counts"] = dict(phase_counts)
         if agent_result:
             raw_payload = agent_result.result.model_dump(mode="json")
             validated_payload, validated_result_value = self._validated_agent_payload(
@@ -2714,6 +3004,7 @@ class ScanOrchestrator:
                 validated_payload["negative_closure_rescue"] = deepcopy(
                     rescue_gate
                 )
+            validated_payload["debate_policy"] = deepcopy(debate_policy)
             proven_hypotheses = (
                 self.hypothesis_ledger.task_proven_hypotheses(task_id)
             )
@@ -2795,6 +3086,7 @@ class ScanOrchestrator:
                             "coverage_gaps": coverage_gaps,
                             "agent_backend": agent_backend,
                             "negative_closure_rescue": deepcopy(rescue_gate),
+                            "debate_policy": deepcopy(debate_policy),
                         },
                     },
                 )
@@ -2814,7 +3106,8 @@ class ScanOrchestrator:
                                 ),
                             ],
                             "agent_backend": agent_backend,
-                            "negative_closure_rescue": deepcopy(rescue_gate),
+                                "negative_closure_rescue": deepcopy(rescue_gate),
+                                "debate_policy": deepcopy(debate_policy),
                         },
                     },
                 )
@@ -2829,6 +3122,7 @@ class ScanOrchestrator:
                             "static_agent_attempted": agent_enabled,
                             "agent_backend": agent_backend,
                             "negative_closure_rescue": deepcopy(rescue_gate),
+                            "debate_policy": deepcopy(debate_policy),
                         },
                     },
                 )
@@ -3134,6 +3428,38 @@ class ScanOrchestrator:
             FindingStatus.REFUTED_STATIC.value,
             FindingStatus.NOT_REPRODUCED.value,
         }
+
+    @staticmethod
+    def _candidate_evidence_ids(
+        candidate: dict[str, Any] | None,
+    ) -> set[str]:
+        """Limit Critic input to evidence the candidate actually relied on."""
+
+        if not isinstance(candidate, dict):
+            return set()
+        evidence_ids: set[str] = set()
+
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key == "evidence_ids" and isinstance(item, list):
+                        evidence_ids.update(
+                            evidence_id
+                            for evidence_id in item
+                            if isinstance(evidence_id, str)
+                        )
+                    elif key in {
+                        "hypothesis_assessments",
+                        "test_cases",
+                        "platform_proof_overrides",
+                    }:
+                        collect(item)
+            elif isinstance(value, list):
+                for item in value:
+                    collect(item)
+
+        collect(candidate)
+        return evidence_ids
 
     @staticmethod
     def _requested_test_signature(request: AgentRequestedTest) -> str:
@@ -3509,6 +3835,20 @@ class ScanOrchestrator:
         accepted: list[AgentRequestedTest] = []
         artifacts: dict[str, PocBuildResult] = {}
         gaps: list[str] = []
+        with self.database.session_factory() as session:
+            scan = session.get(Scan, scan_id)
+            target_package = scan.package_name if scan is not None else None
+            requested_entry_ids = {
+                request.entry_point_id for request in requests
+            }
+            requested_entries = {
+                entry.id: entry
+                for entry in session.scalars(
+                    select(EntryPoint).where(
+                        EntryPoint.id.in_(requested_entry_ids)
+                    )
+                )
+            }
         for request in requests:
             if request.poc is None:
                 accepted.append(request)
@@ -3516,6 +3856,11 @@ class ScanOrchestrator:
             key = self._poc_request_key(request)
             outcome = artifacts.get(key)
             if outcome is None:
+                request_entry = requested_entries.get(request.entry_point_id)
+                provider_request = (
+                    request_entry is not None
+                    and request_entry.kind == "provider"
+                )
                 self._record_exploration_event(
                     scan_id,
                     task_id,
@@ -3533,6 +3878,23 @@ class ScanOrchestrator:
                     workspace,
                     request.poc,
                     cancel_event=cancel_event,
+                    visible_packages=(
+                        (target_package,)
+                        if provider_request and target_package
+                        else ()
+                    ),
+                    visible_provider_authorities=tuple(
+                        authority.strip()
+                        for authority in str(
+                            (
+                                request_entry.metadata_json
+                                if provider_request and request_entry
+                                else {}
+                            ).get("authorities")
+                            or ""
+                        ).split(";")
+                        if authority.strip()
+                    ),
                 )
                 artifacts[key] = outcome
                 if outcome.commands:
@@ -4679,7 +5041,6 @@ class ScanOrchestrator:
         *,
         platform_context: dict[str, Any] | None = None,
     ) -> Path:
-        identifiers = [item["id"] for item in summaries if isinstance(item.get("id"), str)]
         task_root = (
             self.settings.data_dir
             / "workspaces"
@@ -4688,8 +5049,7 @@ class ScanOrchestrator:
             / task_id
             / f"attempt-{attempt}"
         )
-        evidence_root = task_root / "evidence"
-        evidence_root.mkdir(parents=True, exist_ok=True)
+        task_root.mkdir(parents=True, exist_ok=True)
         self._materialize_target_sources(
             scan_id,
             task_root,
@@ -4735,6 +5095,35 @@ class ScanOrchestrator:
         }
         if platform_context is not None:
             platform_context["workspace"] = workspace_policy
+        self._copy_evidence_artifacts(task_root, summaries)
+        context = {
+            "schema_version": "1.0",
+            "scan_id": scan_id,
+            "task_id": task_id,
+            "attempt": attempt,
+            "evidence": summaries,
+            "platform_context": platform_context or {},
+            "workspace_policy": workspace_policy,
+        }
+        (task_root / "context.json").write_text(
+            json.dumps(context, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return task_root
+
+    def _copy_evidence_artifacts(
+        self,
+        task_root: Path,
+        summaries: list[dict[str, Any]],
+    ) -> None:
+        """Copy immutable evidence records into an active Agent workspace."""
+
+        identifiers = [
+            item["id"] for item in summaries if isinstance(item.get("id"), str)
+        ]
+        if not identifiers:
+            return
+        evidence_root = task_root / "evidence"
+        evidence_root.mkdir(parents=True, exist_ok=True)
         with self.database.session_factory() as session:
             records = list(
                 session.scalars(select(Evidence).where(Evidence.id.in_(identifiers)))
@@ -4752,19 +5141,31 @@ class ScanOrchestrator:
             target = evidence_root / f"{record.id}{suffix}"
             shutil.copyfile(source, target)
             summary["artifact"] = str(target.relative_to(task_root))
-        context = {
-            "schema_version": "1.0",
-            "scan_id": scan_id,
-            "task_id": task_id,
-            "attempt": attempt,
-            "evidence": summaries,
-            "platform_context": platform_context or {},
-            "workspace_policy": workspace_policy,
-        }
-        (task_root / "context.json").write_text(
-            json.dumps(context, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        return task_root
+
+    def _materialize_live_evidence(
+        self,
+        context: _LiveProofContext,
+        summaries: list[dict[str, Any]],
+    ) -> None:
+        """Expose proof evidence before returning the live replay receipt."""
+
+        self._copy_evidence_artifacts(context.workspace, summaries)
+        context_path = context.workspace / "context.json"
+        try:
+            payload = json.loads(context_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        payload["evidence"] = context.evidence_summaries
+        temporary = context_path.with_suffix(".json.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(context_path)
+        except OSError:
+            with suppress(OSError):
+                temporary.unlink()
 
     def _materialize_target_sources(
         self,
@@ -5136,6 +5537,8 @@ class ScanOrchestrator:
             in {
                 FindingStatus.SUPPORTED_STATIC.value,
                 FindingStatus.REFUTED_STATIC.value,
+                FindingStatus.REPRODUCED_BLACKBOX.value,
+                FindingStatus.NOT_REPRODUCED.value,
             }
             and not any(
                 evidence_by_id[evidence_id]["kind"].startswith("static.")

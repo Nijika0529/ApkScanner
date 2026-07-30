@@ -113,6 +113,19 @@ class PocBuilder:
                 str(item) for item in self._tool_candidates("aapt2")[1:]
             ],
             "source_contract": "manifest_and_java_or_prebuilt_apk",
+            "agent_source_build_contract": {
+                "required_inputs": ["AndroidManifest.xml", "src/**/*.java"],
+                "agent_must_compile": False,
+                "platform_manages": [
+                    "target_sdk_compatibility",
+                    "target_package_visibility",
+                    "compilation",
+                    "signing",
+                    "installation",
+                    "evidence_capture",
+                    "cleanup",
+                ],
+            },
             "source_build_available": not source_missing and compile_api is not None,
             "source_build_missing": [
                 *source_missing,
@@ -136,10 +149,16 @@ class PocBuilder:
                 ),
                 *(
                     [
-                        f"compile API {compile_api} cannot encode Android 11+ "
-                        "package-visibility queries; <queries> will be omitted"
+                        "target API was lowered below 30 because the available "
+                        "compile platform cannot encode Android package-visibility "
+                        "queries"
                     ]
-                    if compile_api is not None and compile_api < 30
+                    if (
+                        compile_api is not None
+                        and compile_api < 30
+                        and self._requested_target_api() >= 30
+                        and target_api < 30
+                    )
                     else []
                 ),
             ],
@@ -154,6 +173,8 @@ class PocBuilder:
         spec: AgentPocSpec,
         *,
         cancel_event: threading.Event | None = None,
+        visible_packages: tuple[str, ...] = (),
+        visible_provider_authorities: tuple[str, ...] = (),
     ) -> PocBuildResult:
         capability = self.capability()
         if not capability.get("available"):
@@ -211,12 +232,22 @@ class PocBuilder:
             min_api = self._effective_min_api()
             target_api = self._target_api()
             assert compile_api is not None
+            supports_package_visibility = compile_api >= 30 and target_api >= 30
             build_manifest = self._build_manifest(
                 manifest,
                 output,
-                compile_api=compile_api,
                 package_name=effective_spec.package_name,
                 launch_component=effective_spec.launch_component,
+                min_api=min_api,
+                target_api=target_api,
+                visible_packages=(
+                    visible_packages if supports_package_visibility else ()
+                ),
+                visible_provider_authorities=(
+                    visible_provider_authorities
+                    if supports_package_visibility
+                    else ()
+                ),
             )
             build_sources = self._build_sources(sources, output)
 
@@ -523,16 +554,67 @@ class PocBuilder:
         source: Path,
         output: Path,
         *,
-        compile_api: int | None = None,
         package_name: str | None = None,
         launch_component: str | None = None,
+        min_api: int | None = None,
+        target_api: int | None = None,
+        visible_packages: tuple[str, ...] = (),
+        visible_provider_authorities: tuple[str, ...] = (),
     ) -> Path:
         tree = ElementTree.parse(source)
         root = tree.getroot()
-        if compile_api is not None and compile_api < 30:
-            for child in list(root):
-                if child.tag == "queries":
-                    root.remove(child)
+        if min_api is not None or target_api is not None:
+            uses_sdk = root.find("uses-sdk")
+            if uses_sdk is None:
+                uses_sdk = ElementTree.Element("uses-sdk")
+                root.insert(0, uses_sdk)
+            if min_api is not None:
+                uses_sdk.set(
+                    f"{{{ANDROID_NAMESPACE}}}minSdkVersion",
+                    str(min_api),
+                )
+            if target_api is not None:
+                uses_sdk.set(
+                    f"{{{ANDROID_NAMESPACE}}}targetSdkVersion",
+                    str(target_api),
+                )
+        queries = root.find("queries")
+        if queries is None and (visible_packages or visible_provider_authorities):
+            queries = ElementTree.Element("queries")
+            application = root.find("application")
+            insert_at = (
+                list(root).index(application)
+                if application is not None
+                else len(list(root))
+            )
+            root.insert(insert_at, queries)
+        if queries is not None:
+            declared_packages = {
+                node.get(f"{{{ANDROID_NAMESPACE}}}name")
+                for node in queries.findall("package")
+            }
+            for visible_package in visible_packages:
+                if visible_package and visible_package not in declared_packages:
+                    node = ElementTree.SubElement(queries, "package")
+                    node.set(
+                        f"{{{ANDROID_NAMESPACE}}}name",
+                        visible_package,
+                    )
+            declared_authorities = {
+                authority.strip()
+                for node in queries.findall("provider")
+                for authority in (
+                    node.get(f"{{{ANDROID_NAMESPACE}}}authorities") or ""
+                ).split(";")
+                if authority.strip()
+            }
+            for authority in visible_provider_authorities:
+                if authority and authority not in declared_authorities:
+                    node = ElementTree.SubElement(queries, "provider")
+                    node.set(
+                        f"{{{ANDROID_NAMESPACE}}}authorities",
+                        authority,
+                    )
         if package_name and launch_component:
             component = (
                 f"{package_name}{launch_component}"
@@ -1004,7 +1086,19 @@ class PocBuilder:
         return self.settings.poc_target_api or self.settings.device_android_api
 
     def _target_api(self) -> int:
-        return max(self._requested_target_api(), self._effective_min_api())
+        requested = max(self._requested_target_api(), self._effective_min_api())
+        compile_api = self._compile_api()
+        if (
+            compile_api is not None
+            and compile_api < 30
+            and requested >= 30
+            and self._effective_min_api() <= 29
+        ):
+            # <queries> was introduced in API 30. A legacy android.jar rejects
+            # that element, while a target SDK below 30 is exempt from package
+            # visibility filtering and therefore does not need it.
+            return 29
+        return requested
 
     def _android_jar(self) -> Path | None:
         sdk_root = self._sdk_root()

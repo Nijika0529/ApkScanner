@@ -77,6 +77,35 @@ def test_planner_statically_closes_signature_guarded_component() -> None:
     )
 
 
+def test_planner_groups_deep_links_with_their_owner_activity() -> None:
+    activity = EntryPoint(
+        id="00000000-0000-0000-0000-000000000017",
+        scan_id="scan",
+        kind="activity",
+        name="com.example.DeepLinkActivity",
+        owner_component="com.example.DeepLinkActivity",
+        exported=True,
+    )
+    deep_link = EntryPoint(
+        id="00000000-0000-0000-0000-000000000018",
+        scan_id="scan",
+        kind="deep_link",
+        name="demo://example.test/open",
+        owner_component=activity.name,
+        exported=True,
+    )
+
+    tasks = InvestigationPlanner(
+        android_version="16",
+        adb_configured=True,
+    ).plan("scan", [activity, deep_link])
+
+    assert len(tasks) == 1
+    assert tasks[0].task_type == "component"
+    assert tasks[0].target_entry_ids == [activity.id, deep_link.id]
+    assert any("Deep links handled by" in item for item in tasks[0].hypotheses)
+
+
 def test_planner_resolves_framework_signature_binding_permission() -> None:
     entry = EntryPoint(
         id="00000000-0000-0000-0000-000000000011",

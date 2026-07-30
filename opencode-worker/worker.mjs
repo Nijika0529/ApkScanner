@@ -1114,6 +1114,7 @@ function buildConfig(payload) {
       "apkscanner-analyzer": {
         mode: "primary",
         model: analysisModel,
+        temperature: 0,
         prompt: payload.explorer_instructions ?? payload.developer_instructions,
         options: thinkingOptions("disabled", null),
         permission: workspacePermission,
@@ -1121,6 +1122,7 @@ function buildConfig(payload) {
       "apkscanner-explorer": {
         mode: "primary",
         model,
+        temperature: 0,
         prompt: payload.explorer_instructions ?? payload.developer_instructions,
         options: thinkingOptions(
           "enabled",
@@ -1131,6 +1133,7 @@ function buildConfig(payload) {
       "apkscanner-memo-writer": {
         mode: "primary",
         model: finalizerModel,
+        temperature: 0,
         prompt:
           "用简体中文将已完成的调查总结为简洁的纯文本证据备忘录。保留 Evidence ID、" +
           "包名、类名、代码符号、路径、命令和 URI 原文。" +
@@ -1143,6 +1146,7 @@ function buildConfig(payload) {
       "apkscanner-finalizer": {
         mode: "primary",
         model: finalizerModel,
+        temperature: 0,
         prompt: payload.developer_instructions,
         options: thinkingOptions("disabled", null),
         permission: finalizerPermission,

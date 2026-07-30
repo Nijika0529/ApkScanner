@@ -203,6 +203,60 @@ def test_each_hypothesis_assessment_is_validated_at_its_own_evidence_strength() 
     assert any("static-evidence strength" in gap for gap in assessment["proof_gaps"])
 
 
+def test_invalid_negative_assessment_degrades_without_failing_proven_task() -> None:
+    hypothesis_id = "00000000-0000-0000-0000-000000000001"
+    payload = _payload("reproduced_blackbox", ["poc-launch", "poc-log"])
+    payload["hypothesis_assessments"] = [
+        {
+            "hypothesis_id": hypothesis_id,
+            "verdict": "not_reproduced",
+            "evidence_ids": [],
+            "proof_gaps": [],
+        }
+    ]
+    evidence = [
+        {
+            "id": "static",
+            "kind": "static.apktool",
+            "exit_code": 0,
+            "metadata": {},
+        },
+        {
+            "id": "poc-launch",
+            "kind": "blackbox.poc_launch",
+            "exit_code": 0,
+            "metadata": {
+                "caller_identity": "agent_poc_app",
+                "request_id": "request-1",
+                "test_case_id": "agent-r1-1",
+            },
+        },
+        {
+            "id": "poc-log",
+            "kind": "blackbox.poc_logcat",
+            "exit_code": 0,
+            "metadata": {
+                "request_id": "request-1",
+                "request_observed": True,
+                "poc_success": True,
+                "security_impact_observed": True,
+                "test_case_id": "agent-r1-1",
+            },
+        },
+    ]
+
+    validated, result = ScanOrchestrator._validated_agent_payload(
+        payload,
+        evidence,
+    )
+
+    assert result == "reproduced_blackbox"
+    assessment = validated["hypothesis_assessments"][0]
+    assert assessment["verdict"] == "refuted_static"
+    assert assessment["evidence_ids"] == ["static"]
+    assert any("static-evidence strength" in gap for gap in assessment["proof_gaps"])
+
+
 def test_not_reproduced_requires_correlated_explicit_negative_oracle() -> None:
     evidence = [
         {

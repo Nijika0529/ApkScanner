@@ -315,7 +315,7 @@ def test_poc_build_failure_includes_tool_diagnostic() -> None:
     )
 
 
-def test_source_build_drops_package_visibility_queries_from_legacy_manifest(
+def test_source_build_preserves_package_visibility_queries_with_legacy_android_jar(
     tmp_path,
 ) -> None:
     source = tmp_path / "source.xml"
@@ -330,10 +330,11 @@ package="io.apkscanner.poc.providerprobe">
     output = tmp_path / "build"
     output.mkdir()
 
-    normalized = PocBuilder._build_manifest(source, output, compile_api=23)
+    normalized = PocBuilder._build_manifest(source, output)
 
     text = normalized.read_text(encoding="utf-8")
-    assert "<queries>" not in text
+    assert "<queries>" in text
+    assert "io.apkscanner.vulntest" in text
     assert "MainActivity" in text
 
 
@@ -355,7 +356,6 @@ package="io.apkscanner.poc.providerprobe">
     normalized = PocBuilder._build_manifest(
         source,
         output,
-        compile_api=36,
         package_name="io.apkscanner.poc.providerprobe",
         launch_component=".MainActivity",
     )
@@ -370,6 +370,68 @@ package="io.apkscanner.poc.providerprobe">
         )
         == "true"
     )
+
+
+def test_source_build_adds_target_visibility_without_overwriting_agent_queries(
+    tmp_path,
+) -> None:
+    source = tmp_path / "source.xml"
+    source.write_text(
+        """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+package="io.apkscanner.poc.providerprobe">
+<queries><package android:name="io.existing.visible" /></queries>
+<application><activity android:name=".MainActivity" /></application>
+</manifest>""",
+        encoding="utf-8",
+    )
+    output = tmp_path / "build"
+    output.mkdir()
+
+    normalized = PocBuilder._build_manifest(
+        source,
+        output,
+        visible_packages=("io.apkscanner.vulntest",),
+        visible_provider_authorities=("io.apkscanner.vulntest.secrets",),
+    )
+
+    root = ElementTree.parse(normalized).getroot()
+    namespace = "{http://schemas.android.com/apk/res/android}"
+    queries = root.find("queries")
+    assert queries is not None
+    assert {
+        node.get(f"{namespace}name") for node in queries.findall("package")
+    } == {"io.existing.visible", "io.apkscanner.vulntest"}
+    assert {
+        node.get(f"{namespace}authorities")
+        for node in queries.findall("provider")
+    } == {"io.apkscanner.vulntest.secrets"}
+
+
+def test_source_build_normalizes_manifest_sdk_values(tmp_path) -> None:
+    source = tmp_path / "source.xml"
+    source.write_text(
+        """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+package="io.apkscanner.poc.providerprobe">
+<uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+<application><activity android:name=".MainActivity" /></application>
+</manifest>""",
+        encoding="utf-8",
+    )
+    output = tmp_path / "build"
+    output.mkdir()
+
+    normalized = PocBuilder._build_manifest(
+        source,
+        output,
+        min_api=26,
+        target_api=29,
+    )
+
+    uses_sdk = ElementTree.parse(normalized).getroot().find("uses-sdk")
+    namespace = "{http://schemas.android.com/apk/res/android}"
+    assert uses_sdk is not None
+    assert uses_sdk.get(f"{namespace}minSdkVersion") == "26"
+    assert uses_sdk.get(f"{namespace}targetSdkVersion") == "29"
 
 
 def test_source_build_drops_override_annotations_for_legacy_android_jar(
@@ -490,6 +552,37 @@ def test_poc_sdk_roles_are_separate_and_legacy_dx_raises_minimum(
     assert builder._compile_api() == 36
     assert builder._target_api() == 35
     assert builder._effective_min_api() == 26
+
+
+def test_legacy_compile_platform_lowers_target_to_avoid_queries_visibility(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    sdk = tmp_path / "android-sdk"
+    tool_dir = sdk / "build-tools" / "29.0.3"
+    platform = sdk / "platforms" / "android-23"
+    tool_dir.mkdir(parents=True)
+    platform.mkdir(parents=True)
+    for name in ("aapt2", "apksigner", "zipalign", "dx"):
+        (tool_dir / name).write_text("#!/bin/sh\n", encoding="utf-8")
+    (platform / "android.jar").write_bytes(b"android")
+    configured = replace(
+        settings,
+        android_sdk_root=sdk,
+        device_android_api=36,
+        poc_compile_api=36,
+        poc_min_api=21,
+    )
+
+    builder = PocBuilder(configured, ToolRunner(), ArtifactStore(configured))
+
+    assert builder._compile_api() == 23
+    assert builder._effective_min_api() == 26
+    assert builder._target_api() == 29
+    assert any(
+        "package-visibility" in warning
+        for warning in builder.capability()["configuration_warnings"]
+    )
 
 
 def test_poc_builder_retries_only_aapt2_resource_table_compatibility_errors(
@@ -806,6 +899,16 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
             "secret-token",
             replay,
         )
+    context.hypotheses[0]["claim"] = (
+        "Deep links handled by com.example.target.MainActivity are reachable "
+        "from an untrusted application."
+    )
+    with pytest.raises(ValueError, match="reachability-only"):
+        orchestrator.execute_live_proof_replay(
+            task_id,
+            "secret-token",
+            replay,
+        )
     context.hypotheses[0]["claim"] = hypothesis.claim
     first = orchestrator.execute_live_proof_replay(
         task_id, "secret-token", replay
@@ -850,7 +953,96 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
     ).hexdigest()
     assert second["deduplicated"] is True
     assert unrelated["result"] == "inconclusive"
-    assert len(captured) == 2
+    assert unrelated["executed"] is False
+    assert unrelated["deduplicated_strategy"] is True
+    assert unrelated["prior_hypothesis_id"] == hypothesis.id
+    assert len(captured) == 1
+
+
+def test_live_proof_evidence_is_immediately_materialized(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    store = ArtifactStore(settings)
+    orchestrator = ScanOrchestrator(settings, database, store)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "context.json").write_text(
+        json.dumps({"schema_version": "1.0", "evidence": []}),
+        encoding="utf-8",
+    )
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="target.apk",
+            package_name="com.example.target",
+            artifact_sha256="4" * 64,
+            artifact_path=str(tmp_path / "target.apk"),
+        )
+        entry = EntryPoint(
+            scan=scan,
+            kind="activity",
+            name="com.example.target.MainActivity",
+            exported=True,
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="running",
+            target_entry_ids=[],
+        )
+        session.add_all([scan, entry, task])
+        session.flush()
+        task.target_entry_ids = [entry.id]
+        evidence = orchestrator.evidence.command(
+            session,
+            scan_id=scan.id,
+            task_id=task.id,
+            kind="blackbox.poc_logcat",
+            result=CommandResult(["adb", "logcat"], 0, "proof output", ""),
+            metadata={
+                "oracle": {"matched": False},
+                "test_case_id": "agent-r1-1",
+            },
+        )
+        session.commit()
+        summary = orchestrator._evidence_summary(evidence)
+        scan_id, task_id, entry_id, evidence_id = (
+            scan.id,
+            task.id,
+            entry.id,
+            evidence.id,
+        )
+
+    summaries = [summary]
+    context = _LiveProofContext(
+        token="secret-token",
+        scan_id=scan_id,
+        task_id=task_id,
+        package_name="com.example.target",
+        workspace=workspace,
+        entries=[entry],
+        default_entry_id=entry_id,
+        hypotheses=[],
+        budget=TimeBudget.from_seconds(30),
+        evidence_summaries=summaries,
+        cancel_event=threading.Event(),
+        round_index=0,
+    )
+
+    orchestrator._materialize_live_evidence(context, summaries)
+
+    artifact = workspace / summary["artifact"]
+    assert artifact.is_file()
+    assert "proof output" in artifact.read_text(encoding="utf-8")
+    materialized = json.loads(
+        (workspace / "context.json").read_text(encoding="utf-8")
+    )
+    assert materialized["evidence"][0]["id"] == evidence_id
+    assert materialized["evidence"][0]["artifact"] == summary["artifact"]
 
 
 def test_poc_execution_is_correlated_into_the_hypothesis_proof(
