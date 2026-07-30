@@ -65,8 +65,6 @@ from .static_analysis import ApkInspector
 from .tools import CommandResult, TimeBudget, ToolRunner
 from .versioning import SecurityEvolutionService
 
-AGENT_MIN_OPTIONAL_PHASE_SECONDS = 30
-
 
 @dataclass(slots=True)
 class _LiveProofContext:
@@ -84,11 +82,6 @@ class _LiveProofContext:
     round_index: int
     lock: threading.Lock = field(default_factory=threading.Lock)
     responses: dict[str, dict[str, Any]] = field(default_factory=dict)
-
-
-def _critic_timeout_seconds(remaining_task_seconds: int) -> int:
-    """Do not impose a Critic-specific timeout below the task lifecycle."""
-    return max(0, remaining_task_seconds)
 
 
 class ScanOrchestrator:
@@ -1826,7 +1819,11 @@ class ScanOrchestrator:
                     model=(
                         self.settings.codex_worker_model
                         if agent_backend == "codex"
-                        else self.settings.opencode_model
+                        else (
+                            self.settings.opencode_critic_model
+                            if phase == "adversarial_review"
+                            else self.settings.opencode_model
+                        )
                     ),
                     payload=argument_payload,
                 )
@@ -2081,21 +2078,16 @@ class ScanOrchestrator:
                         executed_tests=executed_agent_tests,
                         round_index=0,
                     )
-                    critic_budget = _critic_timeout_seconds(
-                        budget.remaining()
-                    )
                     if (
                         agent_result is not None
                         and self._needs_adversarial_review(agent_result.result)
                         and not self._has_requested_test_work(agent_result.result)
                         and self.hypothesis_ledger.task_proof_result(task_id) is None
                         and not budget.expired
-                        and critic_budget >= AGENT_MIN_OPTIONAL_PHASE_SECONDS
                     ):
                         candidate_payload = agent_result.result.model_dump(mode="json")
                         critic_result, critic_error = invoke_agent(
                             phase="adversarial_review",
-                            timeout_cap=critic_budget,
                             candidate_under_review=candidate_payload,
                             round_index=0,
                         )
@@ -2142,7 +2134,7 @@ class ScanOrchestrator:
                                     "candidate_result": candidate_payload.get("result"),
                                     "critic_result": critic_payload.get("result"),
                                     "critic_objection_count": len(
-                                        critic_payload.get("coverage_gaps", [])
+                                        critic_payload.get("review_objections", [])
                                     ),
                                     "critic_test_proposals_ignored": (
                                         critic_requested_test_count
@@ -2158,14 +2150,11 @@ class ScanOrchestrator:
                         and self._needs_adversarial_review(agent_result.result)
                         and not self._has_requested_test_work(agent_result.result)
                         and self.hypothesis_ledger.task_proof_result(task_id) is None
-                        and (
-                            budget.expired
-                            or critic_budget < AGENT_MIN_OPTIONAL_PHASE_SECONDS
-                        )
+                        and budget.expired
                     ):
                         coverage_gaps.append(
-                            "Adversarial review was skipped to preserve the final-evaluation "
-                            "budget."
+                            "Adversarial review could not start because the parent task "
+                            "lifecycle had already ended."
                         )
                     completed_rounds = 0
                     while (
@@ -2322,16 +2311,8 @@ class ScanOrchestrator:
                             break
                         if budget.expired:
                             break
-                        exploration_budget = budget.remaining()
-                        if exploration_budget < AGENT_MIN_OPTIONAL_PHASE_SECONDS:
-                            coverage_gaps.append(
-                                "Adaptive AI exploration was skipped to preserve the "
-                                "final-evaluation budget."
-                            )
-                            break
                         next_result, next_error = invoke_agent(
                             phase="exploration_round",
-                            timeout_cap=exploration_budget,
                             executed_tests=executed_agent_tests,
                             round_index=completed_rounds,
                         )
@@ -2344,15 +2325,13 @@ class ScanOrchestrator:
                         agent_result = next_result
                         agent_error = None
 
-                    final_budget = budget.remaining()
                     if (
                         (executed_agent_tests or debate_context)
                         and not replay_proof_terminal
-                        and final_budget >= AGENT_MIN_OPTIONAL_PHASE_SECONDS
+                        and not budget.expired
                     ):
                         final_result, final_error = invoke_agent(
                             phase="final_evaluation",
-                            timeout_cap=final_budget,
                             executed_tests=executed_agent_tests,
                             round_index=completed_rounds,
                         )
@@ -2369,11 +2348,10 @@ class ScanOrchestrator:
                                 "Final AI evaluation failed; retained the latest exploration result: "
                                 f"{final_error}"
                             )
-                    elif (executed_agent_tests or debate_context) and not budget.expired:
+                    elif (executed_agent_tests or debate_context) and budget.expired:
                         coverage_gaps.append(
-                            "Final AI evaluation was skipped because less than "
-                            f"{AGENT_MIN_OPTIONAL_PHASE_SECONDS} seconds remained; retained "
-                            "the latest validated planning result."
+                            "Final AI evaluation could not start because the parent task "
+                            "lifecycle had already ended; retained the latest validated result."
                         )
                 except AgentCancelledError:
                     raise
@@ -3590,7 +3568,11 @@ class ScanOrchestrator:
         model = (
             self.settings.codex_worker_model
             if backend == "codex"
-            else self.settings.opencode_model
+            else (
+                self.settings.opencode_critic_model
+                if phase == "adversarial_review"
+                else self.settings.opencode_model
+            )
         )
         execution_profile = (
             opencode_execution_profile(
@@ -3600,6 +3582,8 @@ class ScanOrchestrator:
                 enable_workspace_analyzer=(
                     self.settings.agent_permission_profile == "personal_lab"
                 ),
+                default_model=self.settings.opencode_model,
+                critic_model=self.settings.opencode_critic_model,
             )
             if backend == "opencode"
             else None
@@ -3607,6 +3591,14 @@ class ScanOrchestrator:
         opencode_workspace_tools = bool(
             execution_profile
             and any(stage.workspace_tools for stage in execution_profile.stages)
+        )
+        opencode_analysis_stage = next(
+            (
+                stage
+                for stage in (execution_profile.stages if execution_profile else ())
+                if stage.output_mode == "text"
+            ),
+            None,
         )
         direct_tool_access = backend == "codex" or opencode_workspace_tools
         shell_access = backend == "codex" or opencode_workspace_tools
@@ -3638,6 +3630,14 @@ class ScanOrchestrator:
             "backend": backend,
             "provider": provider,
             "model": model,
+            "stage_models": (
+                {
+                    stage.name: stage.model
+                    for stage in execution_profile.stages
+                }
+                if execution_profile is not None
+                else None
+            ),
             "isolation": isolation,
             "phase": phase,
             "attempt": task.attempts,
@@ -3679,16 +3679,32 @@ class ScanOrchestrator:
             "prompt": prompt,
             "explorer_instructions": (
                 developer_instructions(
-                    direct_tool_access=True,
-                    shell_access=True,
-                    workspace_write=True,
-                    adb_access=adb_access,
-                    network_access=network_access,
+                    direct_tool_access=bool(
+                        opencode_analysis_stage
+                        and opencode_analysis_stage.workspace_tools
+                    ),
+                    shell_access=bool(
+                        opencode_analysis_stage
+                        and opencode_analysis_stage.workspace_tools
+                    ),
+                    workspace_write=bool(
+                        opencode_analysis_stage
+                        and opencode_analysis_stage.workspace_tools
+                    ),
+                    adb_access=bool(
+                        adb_access
+                        and opencode_analysis_stage
+                        and opencode_analysis_stage.workspace_tools
+                    ),
+                    network_access=bool(
+                        network_access
+                        and opencode_analysis_stage
+                        and opencode_analysis_stage.workspace_tools
+                    ),
                     response_contract="analysis_memo",
                 )
                 if backend == "opencode"
-                and execution_profile is not None
-                and any(stage.output_mode == "text" for stage in execution_profile.stages)
+                and opencode_analysis_stage is not None
                 else None
             ),
             "explorer_prompt": (
@@ -3698,16 +3714,19 @@ class ScanOrchestrator:
                     entries,
                     evidence,
                     platform_context,
-                    direct_tool_access=True,
-                    shell_access=True,
-                    workspace_write=True,
-                    adb_access=adb_access,
-                    network_access=network_access,
+                    direct_tool_access=opencode_analysis_stage.workspace_tools,
+                    shell_access=opencode_analysis_stage.workspace_tools,
+                    workspace_write=opencode_analysis_stage.workspace_tools,
+                    adb_access=bool(
+                        adb_access and opencode_analysis_stage.workspace_tools
+                    ),
+                    network_access=bool(
+                        network_access and opencode_analysis_stage.workspace_tools
+                    ),
                     response_contract="analysis_memo",
                 )
                 if backend == "opencode"
-                and execution_profile is not None
-                and any(stage.output_mode == "text" for stage in execution_profile.stages)
+                and opencode_analysis_stage is not None
                 else None
             ),
             "output_schema": AGENT_RESULT_JSON_SCHEMA,
@@ -3828,7 +3847,11 @@ class ScanOrchestrator:
             "model": (
                 self.settings.codex_worker_model
                 if backend == "codex"
-                else self.settings.opencode_model
+                else (
+                    self.settings.opencode_critic_model
+                    if phase == "adversarial_review"
+                    else self.settings.opencode_model
+                )
             ),
             "isolation": (
                 self.settings.codex_isolation
@@ -3883,7 +3906,11 @@ class ScanOrchestrator:
             "model": (
                 self.settings.codex_worker_model
                 if backend == "codex"
-                else self.settings.opencode_model
+                else (
+                    self.settings.opencode_critic_model
+                    if phase == "adversarial_review"
+                    else self.settings.opencode_model
+                )
             ),
             "isolation": (
                 self.settings.codex_isolation
@@ -4592,6 +4619,12 @@ class ScanOrchestrator:
                 continue
             assessment["evidence_ids"] = resolve_ids(assessment.get("evidence_ids", []))
             nested_ids.extend(assessment["evidence_ids"])
+        for objection_field in ("review_objections", "objection_resolutions"):
+            for item in payload.get(objection_field, []):
+                if not isinstance(item, dict):
+                    continue
+                item["evidence_ids"] = resolve_ids(item.get("evidence_ids", []))
+                nested_ids.extend(item["evidence_ids"])
         valid_ids = list(dict.fromkeys(resolved_claims))
         valid_ids = list(dict.fromkeys([*valid_ids, *nested_ids]))
         unknown = sorted(set(unknown))

@@ -254,7 +254,9 @@ def investigation_prompt(
         "to falsify it. Identify permission checks, caller validation, unreachable paths, required "
         "authentication or configuration, harmless behavior, and missing impact. Use only supplied "
         "evidence, return requested_tests=[], and do not reopen workspace or device exploration. "
-        "Do not restate the candidate as fact. "
+        "Do not restate the candidate as fact. Give each material objection a stable ID OBJ-1, "
+        "OBJ-2, and so on, and return it in review_objections with its exact evidence basis. "
+        "If no material objection survives the supplied evidence, return review_objections=[]. "
         if phase == "adversarial_review"
         else ""
     )
@@ -293,11 +295,16 @@ def investigation_prompt(
         ),
         "adversarial_review": (
             "This is a bounded evidence critique. Do not use tools, ADB, or request new tests. State "
-            "only concrete objections supported by the supplied candidate and evidence."
+            "only concrete objections supported by the supplied candidate and evidence. The text "
+            "analysis pass is an argument memo, not the structured verdict; enumerate objections "
+            "as OBJ-1, OBJ-2, ... so the non-thinking finalizer can preserve them exactly."
         ),
         "final_evaluation": (
             "This is the terminal decision turn. Do not inspect files, use ADB, build a PoC, or "
-            "request tests. Reconcile existing evidence into the final structured result."
+            "request tests. Reconcile existing evidence into the final structured result. Read "
+            "platform_context.debate. For every Critic review_objection, return exactly one "
+            "objection_resolutions item with the same objection_id and a sustained, overruled, "
+            "or partially_sustained disposition grounded in existing evidence."
         ),
         "recovery_evaluation": (
             "This is a bounded recovery decision. Do not start new exploration or request tests; "
@@ -340,7 +347,7 @@ def investigation_prompt(
     )
     receipt_instruction = (
         "The Critic does not need to regenerate hypothesis assessment receipts; record only "
-        "specific objections and counterevidence for the final evaluator."
+        "specific objections and counterevidence for the final evaluator in review_objections."
         if phase == "adversarial_review"
         else (
             "The final result must provide one hypothesis assessment receipt for every "

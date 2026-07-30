@@ -240,9 +240,10 @@ can rebuild the worker once within the original task budget without changing mod
 memo-writer exists only inside the opt-in experimental explorer profile and is not part of normal
 scans.
 
-Use the default `deepseek-v4-flash` model. The text-only `deepseek-v4-pro` is rejected early because
-it cannot satisfy the scanner's mandatory StructuredOutput contract; no failure silently switches
-models. `scanctl capabilities --deep`
+Use `deepseek-v4-flash` as the default analyzer/finalizer. The text-only `deepseek-v4-pro` is
+rejected as the primary model, but may be configured as the evidence-only Critic analyzer through
+`APKSCANNER_OPENCODE_CRITIC_MODEL`; Flash converts its memo into the mandatory StructuredOutput
+contract. No failure silently switches models. `scanctl capabilities --deep`
 performs a small real, billable non-thinking StructuredOutput call rather than only checking a
 catalog. An enterprise DeepSeek-compatible gateway can be selected with
 `APKSCANNER_DEEPSEEK_BASE_URL`; remote gateways must use HTTPS, while plain HTTP is accepted only on
@@ -288,7 +289,8 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_CODEX_AUTH_FILE` | unset | Auth file mounted only into the worker |
 | `APKSCANNER_CODEX_BIN` | bundled SDK runtime | Explicit tested Codex binary override |
 | `APKSCANNER_OPENCODE_ENABLED` | `false` | Allow OpenCode + DeepSeek investigations |
-| `APKSCANNER_OPENCODE_MODEL` | `deepseek-v4-flash` | DeepSeek model ID; text-only V4 Pro is rejected |
+| `APKSCANNER_OPENCODE_MODEL` | `deepseek-v4-flash` | Structured analyzer/finalizer model; text-only V4 Pro is rejected in this primary role |
+| `APKSCANNER_OPENCODE_CRITIC_MODEL` | `deepseek-v4-pro` | Text analysis model for evidence-only adversarial review; Flash still performs structured finalization |
 | `APKSCANNER_OPENCODE_THINKING_EXPLORER` | `false` | Experimental legacy thinking/tool-loop profile |
 | `APKSCANNER_OPENCODE_REASONING_EFFORT` | `high` | Experimental explorer effort: `high` or `max` |
 | `APKSCANNER_OPENCODE_AGENT_STEPS` | ignored | Retained for compatibility; Agent model/tool steps are not capped |

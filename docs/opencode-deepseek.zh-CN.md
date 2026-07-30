@@ -55,9 +55,9 @@ adb-shell 输出不能冒充普通 App UID 证据，最终复现仍通过平台 
 
 | 扫描阶段 | 执行配置 | 思考与工具 | 输出 |
 | --- | --- | --- | --- |
-| 所有阶段（`personal_lab` 默认） | `stable_analyzer` | 关闭思考，开放任务 workspace 工具 | 文本 memo 后接隔离的 `StructuredOutput` |
-| 所有阶段（`strict`） | `structured_finalizer` | 关闭思考，不开放 workspace 工具 | 单次 `StructuredOutput` |
-| `test_planning`、`adversarial_review`、`exploration_round`（显式实验） | `thinking_explorer_then_finalizer` | Explorer 开启思考并允许受限 workspace 工具；定稿器关闭思考 | 文本 memo 后接隔离的 `StructuredOutput` |
+| `test_planning`、`exploration_round`（`personal_lab`） | `stable_analyzer` | V4 Flash 关闭思考，开放任务 workspace 工具 | 文本 memo 后接隔离的 `StructuredOutput` |
+| 静态阶段（`strict`） | `structured_finalizer` | V4 Flash 关闭思考，不开放 workspace 工具 | 单次 `StructuredOutput` |
+| `adversarial_review` | `critic_analyzer` | V4 Pro 关闭思考且无工具，只审查现有证据；V4 Flash 无工具定稿 | Pro 反驳 memo 后接 Flash `StructuredOutput` |
 | `final_evaluation`、`recovery_evaluation` | `structured_finalizer` | 始终关闭思考且不开放 workspace 工具 | 单次 `StructuredOutput` |
 
 实验性 Explorer 的思考强度通过
@@ -120,14 +120,19 @@ sequenceDiagram
 退避重试；整个 Worker 仍失败时，Python 只会在原任务剩余预算内重建一次，不延长总预算、
 不切换模型。会话事件流和会话删除都有 1 秒清理上限；终态 NDJSON 写入后 Worker 显式
 退出，Python 无论成功、超时还是取消都会终止并回收整个 Worker 进程组，避免遗留
-`opencode serve` 子进程。平台按阶段预留最终裁决预算，Critic 和额外探索预算不足时会
-跳过而不是发起注定超时的调用。
+`opencode serve` 子进程。Critic 不再设置独立的 120 秒预算，也不会为了“给最终裁决
+留时间”而提前跳过；只有父任务生命周期已经被外部终止时才不会再启动新阶段。
 
 ## 结构化结果与危害约束
 
 稳定 Finalizer 位于全新 session，关闭思考且只允许内部 `StructuredOutput`，避免工具
 标记、隐藏推理和旧会话状态污染定稿。实验性 Explorer 只生成证据备忘录，不负责最终
 JSON。
+
+V4 Pro 仅作为独立 Critic 的文本分析器，不直接承担 JSON Schema。它必须输出带
+`OBJ-1`、`OBJ-2` 等稳定编号的反驳备忘录；V4 Flash 将其转换为
+`review_objections`。后续最终裁决必须在 `objection_resolutions` 中逐条保留同一编号并
+给出 `sustained`、`overruled` 或 `partially_sustained`，缺项会被 Worker 语义校验拒绝。
 
 OpenCode 返回后还要经过本地 Ajv 8.20.0 和业务语义校验：
 
@@ -189,6 +194,7 @@ export APKSCANNER_INVESTIGATOR_BACKEND=opencode
 export APKSCANNER_OPENCODE_ENABLED=true
 export APKSCANNER_OPENCODE_ISOLATION=host
 export APKSCANNER_OPENCODE_MODEL=deepseek-v4-flash
+export APKSCANNER_OPENCODE_CRITIC_MODEL=deepseek-v4-pro
 
 scanctl capabilities --deep
 ```

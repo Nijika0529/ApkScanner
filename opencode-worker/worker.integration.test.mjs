@@ -183,6 +183,63 @@ test("stable analyzer uses non-thinking tools, then an isolated finalizer", asyn
   }
 })
 
+test("critic uses V4 Pro text with no tools then V4 Flash StructuredOutput", async () => {
+  const requests = []
+  const api = createServer(async (request, response) => {
+    const body = await readJSON(request)
+    requests.push(body)
+    if (requests.length === 1) {
+      sendCompletion(response, body, {
+        id: "critic-pro",
+        content:
+          "OBJ-1: 候选结论没有证明普通应用调用者能够绕过签名权限；现有证据支持反驳。",
+      })
+      return
+    }
+    sendCompletion(response, body, {
+      id: "critic-flash",
+      toolCalls: [structuredOutputCall(expected)],
+      finish: "tool_calls",
+    })
+  })
+  await listen(api)
+  const address = api.address()
+  assert(address && typeof address !== "string")
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-critic-test-"))
+  try {
+    const completed = await runWorker(
+      root,
+      investigationPayload({
+        baseURL: `http://127.0.0.1:${address.port}`,
+        profile: criticProfile(),
+        criticModel: "deepseek-v4-pro",
+        phase: "adversarial_review",
+      }),
+    )
+    assert.equal(completed.code, 0, completed.stderr)
+    const { result } = parseWorkerOutput(completed.stdout)
+    assert.deepEqual(result.result, expected)
+    assert.equal(result.output_transport.profile, "critic_analyzer")
+    assert.deepEqual(
+      result.output_transport.stages.map((stage) => stage.model),
+      ["deepseek-v4-pro", "deepseek-v4-flash"],
+    )
+    assert.equal(requests.length, 2)
+    assert.equal(requests[0].model, "deepseek-v4-pro")
+    assert.equal(requests[0].thinking.type, "disabled")
+    assert.deepEqual(toolNames(requests[0]), [])
+    assert.equal(requests[1].model, "deepseek-v4-flash")
+    assert.deepEqual(toolNames(requests[1]), ["StructuredOutput"])
+    assert.match(
+      JSON.stringify(requests[1].messages),
+      /OBJ-1/,
+    )
+  } finally {
+    api.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test("empty tool-loop completion is terminalized into a non-empty memo", async () => {
   const requests = []
   const api = createServer(async (request, response) => {
@@ -945,6 +1002,85 @@ test("semantic validation requires one receipt per platform hypothesis", async (
   }
 })
 
+test("final evaluation must resolve every Critic objection", async () => {
+  const objectionSchema = {
+    type: "object",
+    properties: {
+      answer: { type: "string" },
+      result: { type: "string" },
+      objection_resolutions: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            objection_id: { type: "string" },
+            disposition: { type: "string" },
+            rationale: { type: "string" },
+          },
+          required: ["objection_id", "disposition", "rationale"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["answer", "result", "objection_resolutions"],
+    additionalProperties: false,
+  }
+  const requests = []
+  const api = createServer(async (request, response) => {
+    const body = await readJSON(request)
+    requests.push(body)
+    const value =
+      requests.length === 1
+        ? {
+            answer: "missing",
+            result: "example",
+            objection_resolutions: [],
+          }
+        : {
+            answer: "resolved",
+            result: "example",
+            objection_resolutions: [
+              {
+                objection_id: "OBJ-1",
+                disposition: "overruled",
+                rationale: "平台证据已经直接证明该调用路径。",
+              },
+            ],
+          }
+    sendCompletion(response, body, {
+      id: `objection-${requests.length}`,
+      toolCalls: [structuredOutputCall(value)],
+      finish: "tool_calls",
+    })
+  })
+  await listen(api)
+  const address = api.address()
+  assert(address && typeof address !== "string")
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-objection-test-"))
+  try {
+    const completed = await runWorker(
+      root,
+      investigationPayload({
+        baseURL: `http://127.0.0.1:${address.port}`,
+        phase: "final_evaluation",
+        outputSchema: objectionSchema,
+        requiredObjectionIDs: ["OBJ-1"],
+      }),
+    )
+    assert.equal(completed.code, 0, completed.stderr)
+    const { result } = parseWorkerOutput(completed.stdout)
+    assert.equal(result.result.answer, "resolved")
+    assert.equal(requests.length, 2)
+    assert.equal(
+      result.output_transport.model_calls[0].validation_errors[0].instance_path,
+      "/objection_resolutions",
+    )
+  } finally {
+    api.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 function investigationPayload({
   baseURL,
   profile,
@@ -956,6 +1092,8 @@ function investigationPayload({
   allowedEntryPointIDs = [],
   allowedEvidenceIDs = [],
   requireHypothesisReceipts = false,
+  criticModel = "deepseek-v4-pro",
+  requiredObjectionIDs = [],
 }) {
   return {
     schema_version: "1.0",
@@ -965,6 +1103,7 @@ function investigationPayload({
     developer_instructions: "Return only through the required structured contract.",
     explorer_instructions: "Use workspace tools as needed and return only an analysis memo.",
     model: "deepseek-v4-flash",
+    critic_model: criticModel,
     base_url: baseURL,
     phase,
     tool_profile: "workspace_shell",
@@ -975,6 +1114,7 @@ function investigationPayload({
     allowed_entry_point_ids: allowedEntryPointIDs,
     allowed_evidence_ids: allowedEvidenceIDs,
     require_hypothesis_receipts: requireHypothesisReceipts,
+    required_objection_ids: requiredObjectionIDs,
   }
 }
 
@@ -998,6 +1138,33 @@ function stableProfile() {
         output_mode: "structured_output_tool",
         workspace_tools: false,
         wire_tool_choice: "required",
+      },
+    ],
+  }
+}
+
+function criticProfile() {
+  return {
+    name: "critic_analyzer",
+    output_mode: "analyze_then_finalize",
+    stages: [
+      {
+        name: "analyzer",
+        thinking_mode: "disabled",
+        reasoning_effort: null,
+        output_mode: "text",
+        workspace_tools: false,
+        wire_tool_choice: "auto",
+        model: "deepseek-v4-pro",
+      },
+      {
+        name: "finalizer",
+        thinking_mode: "disabled",
+        reasoning_effort: null,
+        output_mode: "structured_output_tool",
+        workspace_tools: false,
+        wire_tool_choice: "required",
+        model: "deepseek-v4-flash",
       },
     ],
   }

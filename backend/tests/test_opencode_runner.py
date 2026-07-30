@@ -15,6 +15,7 @@ from apkscanner.opencode_runner import (
     OPENCODE_CLI_VERSION,
     OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE,
     OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
+    OPENCODE_PROFILE_CRITIC_ANALYZER,
     OPENCODE_PROFILE_STABLE_ANALYZER,
     OPENCODE_PROFILE_STRUCTURED_FINALIZER,
     OPENCODE_PROVIDER_KEY_FIELD,
@@ -320,10 +321,21 @@ def test_structured_output_is_default_and_thinking_explorer_is_retired() -> None
         "adversarial_review",
         enable_thinking_explorer=True,
         enable_workspace_analyzer=True,
+        default_model="deepseek-v4-flash",
+        critic_model="deepseek-v4-pro",
     )
-    assert personal_lab_critic.name == OPENCODE_PROFILE_STRUCTURED_FINALIZER
-    assert len(personal_lab_critic.stages) == 1
-    assert personal_lab_critic.stages[0].workspace_tools is False
+    assert personal_lab_critic.name == OPENCODE_PROFILE_CRITIC_ANALYZER
+    assert len(personal_lab_critic.stages) == 2
+    assert [stage.model for stage in personal_lab_critic.stages] == [
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+    ]
+    assert all(stage.workspace_tools is False for stage in personal_lab_critic.stages)
+    assert personal_lab_critic.stages[0].output_mode == "text"
+    assert (
+        personal_lab_critic.stages[1].output_mode
+        == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
+    )
     personal_lab_finalizer = opencode_execution_profile(
         "final_evaluation",
         enable_workspace_analyzer=True,
@@ -393,6 +405,7 @@ def test_personal_lab_investigate_uses_workspace_analysis_then_validates_result(
         assert workspace == expected_workspace
         assert payload["action"] == "investigate"
         assert payload["model"] == "deepseek-v4-flash"
+        assert payload["critic_model"] == "deepseek-v4-pro"
         assert payload["phase"] == "static_only"
         assert "Inspect context.json first" in payload["prompt"]
         assert "mandatory root and scope boundary" in payload["prompt"]

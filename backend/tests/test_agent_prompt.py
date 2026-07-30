@@ -128,7 +128,10 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     assert "changed PoC, input, or Oracle" in continuation
     assert "return requested_tests=[], and do not reopen" in critic
     assert "does not need to regenerate hypothesis assessment receipts" in critic
+    assert "OBJ-1" in critic
+    assert "review_objections" in critic
     assert "terminal decision turn" in final
+    assert "objection_resolutions" in final
     assert "Do not assign the final platform verdict" in memo
     assert "Make an explicit evidence-weighted decision" not in memo
     assert "Unless the result is reproduced_blackbox" not in memo

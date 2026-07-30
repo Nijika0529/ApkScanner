@@ -30,13 +30,14 @@ from .worker_protocol import (
 OPENCODE_SDK_VERSION = "1.18.4"
 OPENCODE_CLI_VERSION = "1.18.4"
 AJV_VERSION = "8.20.0"
-OPENCODE_WORKER_PROTOCOL_VERSION = "7"
+OPENCODE_WORKER_PROTOCOL_VERSION = "8"
 OPENCODE_PROVIDER = "deepseek"
 OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL = "structured_output_tool"
 OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE = "analyze_then_finalize"
 OPENCODE_TOOL_PROFILE = "workspace_shell"
 OPENCODE_WORKSPACE_TOOLS = ("read", "glob", "grep", "bash", "write", "edit")
 OPENCODE_PROFILE_STABLE_ANALYZER = "stable_analyzer"
+OPENCODE_PROFILE_CRITIC_ANALYZER = "critic_analyzer"
 OPENCODE_PROFILE_STRUCTURED_FINALIZER = "structured_finalizer"
 OPENCODE_PROVIDER_KEY_FIELD = "_provider_api_key"
 OPENCODE_FINALIZER_PHASES = frozenset({"final_evaluation", "recovery_evaluation"})
@@ -52,6 +53,7 @@ class OpenCodeExecutionStage:
     output_mode: str
     workspace_tools: bool
     reasoning_effort: str | None = None
+    model: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +73,7 @@ class OpenCodeExecutionProfile:
                     "reasoning_effort": stage.reasoning_effort,
                     "output_mode": stage.output_mode,
                     "workspace_tools": stage.workspace_tools,
+                    "model": stage.model,
                     "wire_tool_choice": (
                         "required"
                         if stage.output_mode == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
@@ -92,12 +95,35 @@ def opencode_execution_profile(
     reasoning_effort: str = "high",
     enable_thinking_explorer: bool = False,
     enable_workspace_analyzer: bool = False,
+    default_model: str | None = None,
+    critic_model: str | None = None,
 ) -> OpenCodeExecutionProfile:
     normalized = (phase or "").strip().lower()
-    # Critic and final decision phases already receive the full evidence context
-    # produced by earlier exploration. Running another workspace analyzer here
-    # consumes their short reserve and can strand the required StructuredOutput
-    # finalizer at the worker deadline.
+    if normalized == "adversarial_review":
+        return OpenCodeExecutionProfile(
+            name=OPENCODE_PROFILE_CRITIC_ANALYZER,
+            output_mode=OPENCODE_OUTPUT_MODE_ANALYZE_THEN_FINALIZE,
+            stages=(
+                OpenCodeExecutionStage(
+                    name="analyzer",
+                    thinking_mode="disabled",
+                    reasoning_effort=None,
+                    output_mode="text",
+                    workspace_tools=False,
+                    model=critic_model or default_model,
+                ),
+                OpenCodeExecutionStage(
+                    name="finalizer",
+                    thinking_mode="disabled",
+                    reasoning_effort=None,
+                    output_mode=OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
+                    workspace_tools=False,
+                    model=default_model,
+                ),
+            ),
+        )
+    # Final decision phases already receive the full evidence context produced by
+    # earlier exploration. They need only the bounded StructuredOutput finalizer.
     if normalized in OPENCODE_BOUNDED_STRUCTURED_PHASES:
         return OpenCodeExecutionProfile(
             name=OPENCODE_PROFILE_STRUCTURED_FINALIZER,
@@ -109,6 +135,7 @@ def opencode_execution_profile(
                     reasoning_effort=None,
                     output_mode=OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
                     workspace_tools=False,
+                    model=default_model,
                 ),
             ),
         )
@@ -123,6 +150,7 @@ def opencode_execution_profile(
                     reasoning_effort=None,
                     output_mode="text",
                     workspace_tools=True,
+                    model=default_model,
                 ),
                 OpenCodeExecutionStage(
                     name="finalizer",
@@ -130,6 +158,7 @@ def opencode_execution_profile(
                     reasoning_effort=None,
                     output_mode=OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
                     workspace_tools=False,
+                    model=default_model,
                 ),
             ),
         )
@@ -147,6 +176,7 @@ def opencode_execution_profile(
                 reasoning_effort=None,
                 output_mode=OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
                 workspace_tools=False,
+                model=default_model,
             ),
         ),
     )
@@ -219,17 +249,21 @@ class OpenCodeInvestigator:
             reasoning_effort=self.settings.opencode_reasoning_effort,
             enable_thinking_explorer=self.settings.opencode_thinking_explorer,
             enable_workspace_analyzer=personal_lab,
+            default_model=self.settings.opencode_model,
+            critic_model=self.settings.opencode_critic_model,
         )
         capability: dict[str, Any] = {
             "available": True,
             "version": OPENCODE_SDK_VERSION,
             "provider": OPENCODE_PROVIDER,
             "model": self.settings.opencode_model,
+            "critic_model": self.settings.opencode_critic_model,
             "isolation": self.settings.opencode_isolation,
             "output_mode": default_profile.output_mode,
             "execution_profile": default_profile.as_payload(),
             "execution_profiles": [
                 OPENCODE_PROFILE_STABLE_ANALYZER,
+                OPENCODE_PROFILE_CRITIC_ANALYZER,
                 OPENCODE_PROFILE_STRUCTURED_FINALIZER,
             ],
             "thinking_explorer_retired": True,
@@ -299,6 +333,15 @@ class OpenCodeInvestigator:
                     capability["detail"] = (
                         f"DeepSeek model {self.settings.opencode_model!r} is not exposed by OpenCode"
                     )
+                if (
+                    capability.get("available")
+                    and self.settings.opencode_critic_model not in models
+                ):
+                    capability["available"] = False
+                    capability["detail"] = (
+                        "DeepSeek Critic model "
+                        f"{self.settings.opencode_critic_model!r} is not exposed by OpenCode"
+                    )
             except Exception as exc:
                 capability["available"] = False
                 capability["detail"] = f"OpenCode capability probe failed: {exc}"
@@ -348,6 +391,8 @@ class OpenCodeInvestigator:
             enable_workspace_analyzer=(
                 self.settings.agent_permission_profile == "personal_lab"
             ),
+            default_model=self.settings.opencode_model,
+            critic_model=self.settings.opencode_critic_model,
         )
         workspace_tools_enabled = any(
             stage.workspace_tools for stage in execution_profile.stages
@@ -399,6 +444,7 @@ class OpenCodeInvestigator:
             "prompt": prompt,
             "developer_instructions": instructions,
             "model": self.settings.opencode_model,
+            "critic_model": self.settings.opencode_critic_model,
             "base_url": self.settings.deepseek_base_url,
             "phase": phase,
             "output_schema": AGENT_RESULT_JSON_SCHEMA,
@@ -449,31 +495,60 @@ class OpenCodeInvestigator:
                 for item in evidence
                 if isinstance(item, dict) and isinstance(item.get("id"), str)
             ),
+            "required_objection_ids": sorted(
+                str(item["objection_id"])
+                for item in (
+                    ((context.get("debate") or {}).get("critic") or {}).get(
+                        "review_objections", []
+                    )
+                    if isinstance(context.get("debate"), dict)
+                    and isinstance((context.get("debate") or {}).get("critic"), dict)
+                    else []
+                )
+                if isinstance(item, dict)
+                and isinstance(item.get("objection_id"), str)
+            ),
         }
         if proof_replay_token and self.settings.opencode_isolation == "host":
             payload["_proof_replay_token"] = proof_replay_token
             payload["_proof_task_id"] = task.id
             payload["_proof_replay_url"] = self.settings.proof_replay_base_url
-        if workspace_tools_enabled:
+        analysis_stage = next(
+            (
+                stage
+                for stage in execution_profile.stages
+                if stage.output_mode == "text"
+            ),
+            None,
+        )
+        if analysis_stage is not None:
             payload["explorer_prompt"] = investigation_prompt(
                 scan,
                 task,
                 entries,
                 evidence,
                 context,
-                direct_tool_access=True,
-                shell_access=True,
-                workspace_write=True,
-                adb_access=bool(payload["allow_adb"]),
-                network_access=bool(payload["allow_network"]),
+                direct_tool_access=analysis_stage.workspace_tools,
+                shell_access=analysis_stage.workspace_tools,
+                workspace_write=analysis_stage.workspace_tools,
+                adb_access=(
+                    analysis_stage.workspace_tools and bool(payload["allow_adb"])
+                ),
+                network_access=(
+                    analysis_stage.workspace_tools and bool(payload["allow_network"])
+                ),
                 response_contract="analysis_memo",
             )
             payload["explorer_instructions"] = developer_instructions(
-                direct_tool_access=True,
-                shell_access=True,
-                workspace_write=True,
-                adb_access=bool(payload["allow_adb"]),
-                network_access=bool(payload["allow_network"]),
+                direct_tool_access=analysis_stage.workspace_tools,
+                shell_access=analysis_stage.workspace_tools,
+                workspace_write=analysis_stage.workspace_tools,
+                adb_access=(
+                    analysis_stage.workspace_tools and bool(payload["allow_adb"])
+                ),
+                network_access=(
+                    analysis_stage.workspace_tools and bool(payload["allow_network"])
+                ),
                 response_contract="analysis_memo",
             )
         response = self._invoke_investigation_with_retry(
@@ -647,6 +722,11 @@ class OpenCodeInvestigator:
             return "APKSCANNER_OPENCODE_ISOLATION must be host or docker"
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", self.settings.opencode_model):
             return "APKSCANNER_OPENCODE_MODEL contains unsupported characters"
+        if not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+            self.settings.opencode_critic_model,
+        ):
+            return "APKSCANNER_OPENCODE_CRITIC_MODEL contains unsupported characters"
         if self.settings.opencode_model.lower() in {
             "deepseek-chat",
             "deepseek-reasoner",
@@ -654,6 +734,14 @@ class OpenCodeInvestigator:
             return (
                 "deepseek-chat and deepseek-reasoner are retired; use "
                 "deepseek-v4-flash"
+            )
+        if self.settings.opencode_critic_model.lower() in {
+            "deepseek-chat",
+            "deepseek-reasoner",
+        }:
+            return (
+                "APKSCANNER_OPENCODE_CRITIC_MODEL cannot use retired "
+                "deepseek-chat or deepseek-reasoner aliases"
             )
         if self.settings.opencode_model.lower() == "deepseek-v4-pro":
             return (

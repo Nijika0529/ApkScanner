@@ -39,6 +39,7 @@ class Settings:
     codex_auth_file: Path | None = None
     opencode_enabled: bool = False
     opencode_model: str = "deepseek-v4-flash"
+    opencode_critic_model: str = "deepseek-v4-pro"
     opencode_node_bin: str | None = None
     opencode_worker_dir: Path | None = None
     opencode_isolation: str = "docker"
@@ -113,6 +114,9 @@ class Settings:
             opencode_enabled=_env_bool("APKSCANNER_OPENCODE_ENABLED"),
             opencode_model=os.getenv(
                 "APKSCANNER_OPENCODE_MODEL", "deepseek-v4-flash"
+            ),
+            opencode_critic_model=os.getenv(
+                "APKSCANNER_OPENCODE_CRITIC_MODEL", "deepseek-v4-pro"
             ),
             opencode_node_bin=os.getenv("APKSCANNER_OPENCODE_NODE_BIN"),
             opencode_worker_dir=(

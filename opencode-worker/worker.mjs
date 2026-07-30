@@ -17,6 +17,7 @@ const OUTPUT_MODE_STRUCTURED_TOOL = "structured_output_tool"
 const OUTPUT_MODE_ANALYZE_THEN_FINALIZE = "analyze_then_finalize"
 const OUTPUT_MODE_EXPLORE_THEN_FINALIZE = "explore_then_finalize"
 const PROFILE_STABLE_ANALYZER = "stable_analyzer"
+const PROFILE_CRITIC_ANALYZER = "critic_analyzer"
 const PROFILE_THINKING_EXPLORER = "thinking_explorer_then_finalizer"
 const PROFILE_STRUCTURED_FINALIZER = "structured_finalizer"
 const STRUCTURED_RETRY_COUNT = 2
@@ -140,6 +141,7 @@ async function runLiveProbe(client, payload) {
     output_mode: OUTPUT_MODE_STRUCTURED_TOOL,
     workspace_tools: false,
     wire_tool_choice: "required",
+    model: payload.model,
   }
   const outcome = await runStructuredStage(client, payload, {
     stage,
@@ -256,12 +258,15 @@ async function runTextStage(client, payload, { stage, promptText, title }) {
       thinking_mode: stage.thinking_mode,
       reasoning_effort: stage.reasoning_effort,
       wire_tool_choice: "omitted",
+      model: stage.model ?? payload.model,
     })
     response = await promptAsyncAndWait(
       client,
       payload,
       promptText,
-      workspaceToolFlags(payload),
+      stage.workspace_tools
+        ? workspaceToolFlags(payload)
+        : disabledWorkspaceToolFlags(),
       undefined,
       stage.name === "explorer" ? "apkscanner-explorer" : "apkscanner-analyzer",
       stage,
@@ -292,6 +297,7 @@ async function runTextStage(client, payload, { stage, promptText, title }) {
           reasoning_effort: null,
           workspace_tools: false,
           wire_tool_choice: "omitted",
+          model: payload.model,
         },
       )
       responses.push(terminalResponse)
@@ -332,7 +338,7 @@ async function runTextStage(client, payload, { stage, promptText, title }) {
     parseError,
     validationErrors: [],
     accepted: !providerError && !parseError,
-    tools: workspaceToolNames(payload),
+    tools: stage.workspace_tools ? workspaceToolNames(payload) : [],
   })
   call.terminalized = terminalized
   if (providerError) {
@@ -385,6 +391,7 @@ async function runStructuredStage(
         attempt: index + 1,
         thinking_mode: "disabled",
         wire_tool_choice: "required",
+        model: stage.model ?? payload.model,
       })
       emitRuntimeEvent(
         "model.transport.selected",
@@ -395,6 +402,7 @@ async function runStructuredStage(
           request_mode: "prompt_sync",
           thinking_mode: "disabled",
           wire_tool_choice: "required",
+          model: stage.model ?? payload.model,
         },
       )
       response = await promptSync(
@@ -405,6 +413,7 @@ async function runStructuredStage(
           type: "json_schema",
           schema,
         },
+        stage,
       )
     })
     responses.push(response)
@@ -510,7 +519,7 @@ async function runStructuredStage(
   }
 }
 
-async function promptSync(client, payload, promptText, format) {
+async function promptSync(client, payload, promptText, format, stage) {
   try {
     return unwrap(
       await client.session.prompt({
@@ -521,6 +530,7 @@ async function promptSync(client, payload, promptText, format) {
             promptText,
             disabledWorkspaceToolFlags(),
             "apkscanner-finalizer",
+            stage?.model ?? payload.model,
           ),
           format,
         },
@@ -592,13 +602,20 @@ async function promptAsyncAndWait(
       thinking_mode: stage.thinking_mode,
       reasoning_effort: stage.reasoning_effort,
       wire_tool_choice: stage.wire_tool_choice,
+      model: stage.model ?? payload.model,
     },
   )
   unwrap(
     await client.session.promptAsync({
       path: { id: sessionID },
       body: {
-        ...promptBody(payload, promptText, tools, agent),
+        ...promptBody(
+          payload,
+          promptText,
+          tools,
+          agent,
+          stage?.model ?? payload.model,
+        ),
         ...(format ? { format } : {}),
       },
     }),
@@ -719,7 +736,7 @@ async function rawSessionMessages(id) {
   }
 }
 
-function promptBody(payload, promptText, tools, agent) {
+function promptBody(payload, promptText, tools, agent, modelID) {
   const systemInstructions =
     agent === "apkscanner-finalizer"
       ? payload.developer_instructions
@@ -728,7 +745,7 @@ function promptBody(payload, promptText, tools, agent) {
     agent,
     model: {
       providerID: PROVIDER_ID,
-      modelID: payload.model,
+      modelID: modelID ?? payload.model,
     },
     system: systemInstructions,
     tools,
@@ -981,6 +998,7 @@ function outputTransport({ profile, calls, explorerSessionID, explorerMemo }) {
       output_mode: stage.output_mode,
       workspace_tools: stage.workspace_tools,
       wire_tool_choice: stage.wire_tool_choice,
+      model: stage.model ?? null,
     })),
     ...(explorerSessionID ? { explorer_thread_id: explorerSessionID } : {}),
     ...(explorerMemo ? { explorer_memo: explorerMemo } : {}),
@@ -995,6 +1013,15 @@ function outputTransport({ profile, calls, explorerSessionID, explorerMemo }) {
 
 function buildConfig(payload) {
   const model = `${PROVIDER_ID}/${payload.model}`
+  const analysisModel = `${PROVIDER_ID}/${
+    executionProfile(payload).stages.find((stage) => stage.output_mode === "text")
+      ?.model ?? payload.model
+  }`
+  const finalizerModel = `${PROVIDER_ID}/${
+    executionProfile(payload).stages.find(
+      (stage) => stage.output_mode === OUTPUT_MODE_STRUCTURED_TOOL,
+    )?.model ?? payload.model
+  }`
   const workspaceTools = workspaceToolNames(payload)
   const externalDirectoryPermission = {
     "*": "deny",
@@ -1055,7 +1082,7 @@ function buildConfig(payload) {
     agent: {
       "apkscanner-analyzer": {
         mode: "primary",
-        model,
+        model: analysisModel,
         prompt: payload.explorer_instructions ?? payload.developer_instructions,
         options: thinkingOptions("disabled", null),
         permission: workspacePermission,
@@ -1072,7 +1099,7 @@ function buildConfig(payload) {
       },
       "apkscanner-memo-writer": {
         mode: "primary",
-        model,
+        model: finalizerModel,
         prompt:
           "用简体中文将已完成的调查总结为简洁的纯文本证据备忘录。保留 Evidence ID、" +
           "包名、类名、代码符号、路径、命令和 URI 原文。" +
@@ -1084,7 +1111,7 @@ function buildConfig(payload) {
       },
       "apkscanner-finalizer": {
         mode: "primary",
-        model,
+        model: finalizerModel,
         prompt: payload.developer_instructions,
         options: thinkingOptions("disabled", null),
         permission: finalizerPermission,
@@ -1157,6 +1184,16 @@ function validatePayload(value) {
   ) {
     throw new Error("invalid DeepSeek model ID")
   }
+  if (
+    value.critic_model !== undefined &&
+    (
+      typeof value.critic_model !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.critic_model)
+    )
+  ) {
+    throw new Error("invalid DeepSeek critic model ID")
+  }
+  value.critic_model ??= value.model
   if (
     value.timeout_ms !== null &&
     (!Number.isInteger(value.timeout_ms) ||
@@ -1243,6 +1280,9 @@ function validatePayload(value) {
       value.allowed_evidence_ids,
       "allowed_evidence_ids",
     )
+    value.required_objection_ids = validateObjectionIdentifierList(
+      value.required_objection_ids,
+    )
   }
   return value
 }
@@ -1258,6 +1298,23 @@ function validateIdentifierList(value, label) {
     )
   ) {
     throw new Error(`${label} must contain only platform UUIDs`)
+  }
+  return [...new Set(value)]
+}
+
+function validateObjectionIdentifierList(value) {
+  if (value === undefined || value === null) return []
+  if (
+    !Array.isArray(value) ||
+    value.some(
+      (item) =>
+        typeof item !== "string" ||
+        !/^OBJ-[A-Za-z0-9_-]{1,32}$/.test(item),
+    )
+  ) {
+    throw new Error(
+      "required_objection_ids must contain only structured objection IDs",
+    )
   }
   return [...new Set(value)]
 }
@@ -1318,6 +1375,7 @@ function validateExecutionProfile(value) {
   if (
     ![
       PROFILE_STABLE_ANALYZER,
+      PROFILE_CRITIC_ANALYZER,
       PROFILE_THINKING_EXPLORER,
       PROFILE_STRUCTURED_FINALIZER,
     ].includes(value.name)
@@ -1336,6 +1394,11 @@ function validateExecutionProfile(value) {
         ]
       : value.name === PROFILE_STRUCTURED_FINALIZER
         ? [["finalizer", "disabled", OUTPUT_MODE_STRUCTURED_TOOL, false, "required"]]
+        : value.name === PROFILE_CRITIC_ANALYZER
+          ? [
+              ["analyzer", "disabled", "text", false, "auto"],
+              ["finalizer", "disabled", OUTPUT_MODE_STRUCTURED_TOOL, false, "required"],
+            ]
         : [
             ["analyzer", "disabled", "text", true, "auto"],
             ["finalizer", "disabled", OUTPUT_MODE_STRUCTURED_TOOL, false, "required"],
@@ -1358,6 +1421,8 @@ function validateExecutionProfile(value) {
       ? OUTPUT_MODE_EXPLORE_THEN_FINALIZE
       : value.name === PROFILE_STABLE_ANALYZER
         ? OUTPUT_MODE_ANALYZE_THEN_FINALIZE
+        : value.name === PROFILE_CRITIC_ANALYZER
+          ? OUTPUT_MODE_ANALYZE_THEN_FINALIZE
         : OUTPUT_MODE_STRUCTURED_TOOL
   if (value.output_mode !== outputMode) {
     throw new Error("execution_profile output_mode does not match the selected profile")
@@ -1390,6 +1455,16 @@ function validateExecutionStage(value) {
   if (!["auto", "omitted", "required"].includes(value.wire_tool_choice)) {
     throw new Error("invalid execution stage wire_tool_choice")
   }
+  if (
+    value.model !== null &&
+    value.model !== undefined &&
+    (
+      typeof value.model !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.model)
+    )
+  ) {
+    throw new Error("invalid execution stage model")
+  }
   return {
     name: value.name,
     thinking_mode: value.thinking_mode,
@@ -1397,6 +1472,7 @@ function validateExecutionStage(value) {
     output_mode: value.output_mode,
     workspace_tools: value.workspace_tools,
     wire_tool_choice: value.wire_tool_choice,
+    model: value.model ?? null,
   }
 }
 
@@ -1545,6 +1621,55 @@ function semanticValidationErrors(value, payload) {
       "/requested_tests",
       `${payload.phase} must not request additional tests`,
     )
+  }
+  const requiredObjections = new Set(payload.required_objection_ids ?? [])
+  for (const field of ["review_objections", "objection_resolutions"]) {
+    const ids = (Array.isArray(value[field]) ? value[field] : [])
+      .filter(
+        (item) =>
+          item &&
+          typeof item === "object" &&
+          !Array.isArray(item) &&
+          typeof item.objection_id === "string",
+      )
+      .map((item) => item.objection_id)
+    if (ids.length !== new Set(ids).size) {
+      add(`/${field}`, `${field} must use unique objection_id values`)
+    }
+  }
+  if (requiredObjections.size > 0) {
+    const resolutions = Array.isArray(value.objection_resolutions)
+      ? value.objection_resolutions
+      : []
+    const received = new Set(
+      resolutions
+        .filter(
+          (resolution) =>
+            resolution &&
+            typeof resolution === "object" &&
+            !Array.isArray(resolution) &&
+            typeof resolution.objection_id === "string",
+        )
+        .map((resolution) => resolution.objection_id),
+    )
+    const missing = [...requiredObjections].filter(
+      (objectionID) => !received.has(objectionID),
+    )
+    const unexpected = [...received].filter(
+      (objectionID) => !requiredObjections.has(objectionID),
+    )
+    if (missing.length > 0) {
+      add(
+        "/objection_resolutions",
+        `final evaluation must resolve every Critic objection; missing: ${missing.join(", ")}`,
+      )
+    }
+    if (unexpected.length > 0) {
+      add(
+        "/objection_resolutions",
+        `final evaluation referenced unknown Critic objections: ${unexpected.join(", ")}`,
+      )
+    }
   }
   if (Array.isArray(value.requested_tests)) {
     const allowedHypotheses = new Set(payload.allowed_hypothesis_ids ?? [])
@@ -1773,6 +1898,7 @@ function modelCallAudit({
     thinking_mode: stage.thinking_mode,
     reasoning_effort: stage.reasoning_effort,
     wire_tool_choice: stage.wire_tool_choice,
+    model: response.info?.modelID ?? stage.model ?? null,
     provider_error: response.info?.error
       ? normalizedProviderError(response.info.error)
       : null,

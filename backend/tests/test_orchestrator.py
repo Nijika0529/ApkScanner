@@ -26,18 +26,12 @@ from apkscanner.models import (
     ScanEvent,
     SecurityHypothesis,
 )
-from apkscanner.orchestrator import ScanOrchestrator, _critic_timeout_seconds
+from apkscanner.orchestrator import ScanOrchestrator
 from apkscanner.planner import StaticEntryClosure
 from apkscanner.reports import ReportBuilder
 from apkscanner.schemas import AgentInvestigationResult
 from apkscanner.tools import CommandResult
 from sqlalchemy import select
-
-
-def test_critic_has_no_phase_specific_timeout_cap() -> None:
-    assert _critic_timeout_seconds(3_000) == 3_000
-    assert _critic_timeout_seconds(181) == 181
-    assert _critic_timeout_seconds(60) == 60
 
 
 def test_blocked_direct_entry_does_not_turn_a_finding_into_false_positive() -> None:

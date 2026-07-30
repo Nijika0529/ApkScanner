@@ -439,6 +439,32 @@ class AgentHypothesisAssessment(BaseModel):
     confidence: Literal["high", "medium", "low"] = "medium"
 
 
+class AgentReviewObjection(BaseModel):
+    """A concrete Critic objection that the terminal evaluator must resolve."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    objection_id: str = Field(pattern=r"^OBJ-[A-Za-z0-9_-]{1,32}$")
+    hypothesis_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9-]{36}$",
+    )
+    claim: str = Field(min_length=1, max_length=2000)
+    basis: str = Field(min_length=1, max_length=4000)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
+
+
+class AgentObjectionResolution(BaseModel):
+    """The final evaluator's explicit disposition of one Critic objection."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    objection_id: str = Field(pattern=r"^OBJ-[A-Za-z0-9_-]{1,32}$")
+    disposition: Literal["sustained", "overruled", "partially_sustained"]
+    rationale: str = Field(min_length=1, max_length=4000)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
+
+
 class AgentInvestigationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -463,6 +489,14 @@ class AgentInvestigationResult(BaseModel):
     ]
     hypotheses_tested: list[str] = Field(max_length=100)
     hypothesis_assessments: list[AgentHypothesisAssessment] = Field(
+        default_factory=list,
+        max_length=100,
+    )
+    review_objections: list[AgentReviewObjection] = Field(
+        default_factory=list,
+        max_length=100,
+    )
+    objection_resolutions: list[AgentObjectionResolution] = Field(
         default_factory=list,
         max_length=100,
     )
@@ -579,6 +613,12 @@ class AgentInvestigationResult(BaseModel):
     def validate_explicit_verdict(self) -> Self:
         if self.result == "refuted_static" and self.severity_proposal != "info":
             raise ValueError("refuted_static must use info severity")
+        objection_ids = [item.objection_id for item in self.review_objections]
+        if len(objection_ids) != len(set(objection_ids)):
+            raise ValueError("review_objections must use unique objection_id values")
+        resolution_ids = [item.objection_id for item in self.objection_resolutions]
+        if len(resolution_ids) != len(set(resolution_ids)):
+            raise ValueError("objection_resolutions must use unique objection_id values")
         return self
 
 
