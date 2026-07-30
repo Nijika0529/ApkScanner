@@ -230,6 +230,7 @@ class PocBuilder:
                 str(min_api),
                 "--target-sdk-version",
                 str(target_api),
+                "--no-resource-remapping",
                 "--version-code",
                 "1",
                 "--version-name",

@@ -106,6 +106,7 @@ class ApkInspector:
                     "jadx",
                     "--no-res",
                     "--deobf",
+                    "--show-bad-code",
                     "--output-dir",
                     str(jadx_dir),
                     str(apk_path),
