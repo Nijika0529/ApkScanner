@@ -1656,6 +1656,9 @@ class ScanOrchestrator:
                     "continuation": continuation_context or None,
                     "threat_model": task_threat_model,
                     "security_hypotheses": hypothesis_context,
+                    "platform_proven_hypotheses": (
+                        self.hypothesis_ledger.task_proven_hypotheses(task_id)
+                    ),
                     "candidate_under_review": candidate_under_review,
                     "debate": debate_context or None,
                     "proof_replay": {
@@ -2091,7 +2094,10 @@ class ScanOrchestrator:
                             candidate_under_review=candidate_payload,
                             round_index=0,
                         )
-                        if critic_result is not None:
+                        proof_after_critic = (
+                            self.hypothesis_ledger.task_proof_result(task_id)
+                        )
+                        if critic_result is not None and proof_after_critic is None:
                             critic_payload = critic_result.result.model_dump(mode="json")
                             debate_context = {
                                 "candidate": candidate_payload,
@@ -2139,6 +2145,20 @@ class ScanOrchestrator:
                                     "critic_test_proposals_ignored": (
                                         critic_requested_test_count
                                     ),
+                                },
+                            )
+                        elif critic_result is not None:
+                            self._record_exploration_event(
+                                scan_id,
+                                task_id,
+                                "debate.discarded_platform_proven",
+                                "平台动态证明已形成，Critic 意见仅保留审计且不参与裁决",
+                                {
+                                    "source": "platform",
+                                    "critic_thread_id": critic_result.thread_id,
+                                    "critic_turn_id": critic_result.turn_id,
+                                    "proof_result": proof_after_critic[0],
+                                    "proof_evidence_ids": proof_after_critic[1],
                                 },
                             )
                         elif critic_error:
@@ -2328,6 +2348,7 @@ class ScanOrchestrator:
                     if (
                         (executed_agent_tests or debate_context)
                         and not replay_proof_terminal
+                        and self.hypothesis_ledger.task_proof_result(task_id) is None
                         and not budget.expired
                     ):
                         final_result, final_error = invoke_agent(
@@ -2391,9 +2412,11 @@ class ScanOrchestrator:
                     ]
                 )
             )
-            platform_proof = self.hypothesis_ledger.task_proof_result(task_id)
-            if platform_proof is not None:
-                proof_status, proof_evidence_ids = platform_proof
+            proven_hypotheses = (
+                self.hypothesis_ledger.task_proven_hypotheses(task_id)
+            )
+            if proven_hypotheses:
+                proof_status = FindingStatus.REPRODUCED_BLACKBOX.value
                 if validated_result_value != proof_status:
                     validated_payload["coverage_gaps"] = list(
                         dict.fromkeys(
@@ -2406,22 +2429,16 @@ class ScanOrchestrator:
                             ]
                         )
                     )
+                validated_payload = self._apply_platform_proof_overrides(
+                    validated_payload,
+                    proven_hypotheses=proven_hypotheses,
+                    proven_severity=self.hypothesis_ledger.task_proven_severity(
+                        task_id
+                    ),
+                    agent_round_history=agent_round_history,
+                    debate_context=debate_context,
+                )
                 validated_result_value = proof_status
-                validated_payload["result"] = proof_status
-                validated_payload["evidence_ids"] = list(
-                    dict.fromkeys(
-                        [
-                            *validated_payload.get("evidence_ids", []),
-                            *proof_evidence_ids,
-                        ]
-                    )
-                )
-                validated_payload["platform_severity"] = validated_payload.get(
-                    "severity_proposal"
-                )
-                validated_payload["severity_disposition"] = (
-                    "accepted_from_platform_harm_oracle"
-                )
             self._record_agent_validation(
                 task_id=task_id,
                 turn_id=agent_result.turn_id,
@@ -4582,6 +4599,172 @@ class ScanOrchestrator:
                     ]
                 )
             )
+        return payload
+
+    @staticmethod
+    def _apply_platform_proof_overrides(
+        payload: dict[str, Any],
+        *,
+        proven_hypotheses: dict[str, list[str]],
+        proven_severity: str | None,
+        agent_round_history: list[dict[str, Any]],
+        debate_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Make accepted platform harm receipts immutable in the final payload."""
+
+        if not proven_hypotheses:
+            return payload
+        assessments = [
+            dict(item)
+            for item in payload.get("hypothesis_assessments", [])
+            if isinstance(item, dict)
+        ]
+        by_hypothesis = {
+            str(item["hypothesis_id"]): item
+            for item in assessments
+            if isinstance(item.get("hypothesis_id"), str)
+        }
+        tested = [
+            value
+            for value in payload.get("hypotheses_tested", [])
+            if isinstance(value, str)
+        ]
+        all_proof_evidence_ids: list[str] = []
+        for hypothesis_id, proof_evidence_ids in proven_hypotheses.items():
+            all_proof_evidence_ids.extend(proof_evidence_ids)
+            assessment = by_hypothesis.get(hypothesis_id)
+            if assessment is None:
+                assessment = {
+                    "hypothesis_id": hypothesis_id,
+                    "source": "platform-correlated ordinary-app proof",
+                    "control": "",
+                    "sink": "Platform harm Oracle observed the declared security impact.",
+                    "reachable_path": "",
+                    "boundary": "",
+                }
+                assessments.append(assessment)
+                by_hypothesis[hypothesis_id] = assessment
+            assessment.update(
+                {
+                    "verdict": FindingStatus.REPRODUCED_BLACKBOX.value,
+                    "counterevidence": [],
+                    "proof_gaps": [],
+                    "evidence_ids": list(
+                        dict.fromkeys(
+                            [
+                                *[
+                                    value
+                                    for value in assessment.get("evidence_ids", [])
+                                    if isinstance(value, str)
+                                ],
+                                *proof_evidence_ids,
+                            ]
+                        )
+                    ),
+                    "confidence": "high",
+                }
+            )
+            tested.append(hypothesis_id)
+
+        severity_rank = {
+            "info": 0,
+            "low": 1,
+            "medium": 2,
+            "high": 3,
+            "critical": 4,
+        }
+        severity_candidates = [
+            str(payload.get("severity_proposal") or "info"),
+            str(proven_severity or "info"),
+        ]
+        severity_candidates.extend(
+            str(model_result.get("severity_proposal") or "info")
+            for round_item in agent_round_history
+            if isinstance((model_result := round_item.get("model_result")), dict)
+        )
+        valid_severities = [
+            value for value in severity_candidates if value in severity_rank
+        ]
+        severity = max(
+            valid_severities or ["info"],
+            key=severity_rank.__getitem__,
+        )
+        if severity == "info":
+            severity = "medium"
+
+        protected_objection_ids = {
+            str(objection["objection_id"])
+            for objection in (
+                ((debate_context.get("critic") or {}).get("review_objections", []))
+                if isinstance(debate_context.get("critic"), dict)
+                else []
+            )
+            if isinstance(objection, dict)
+            and objection.get("hypothesis_id") in proven_hypotheses
+            and isinstance(objection.get("objection_id"), str)
+        }
+        resolutions = [
+            dict(item)
+            for item in payload.get("objection_resolutions", [])
+            if isinstance(item, dict)
+        ]
+        for resolution in resolutions:
+            if resolution.get("objection_id") not in protected_objection_ids:
+                continue
+            resolution.update(
+                {
+                    "disposition": "overruled",
+                    "rationale": (
+                        "平台已通过关联普通应用身份、执行结果与危害 Oracle 的动态证据"
+                        "证明该假设；静态 Critic 无权推翻该证明。"
+                    ),
+                    "evidence_ids": list(
+                        dict.fromkeys(
+                            [
+                                *[
+                                    value
+                                    for value in resolution.get("evidence_ids", [])
+                                    if isinstance(value, str)
+                                ],
+                                *all_proof_evidence_ids,
+                            ]
+                        )
+                    ),
+                }
+            )
+
+        payload.update(
+            {
+                "result": FindingStatus.REPRODUCED_BLACKBOX.value,
+                "hypotheses_tested": list(dict.fromkeys(tested)),
+                "hypothesis_assessments": assessments,
+                "objection_resolutions": resolutions,
+                "evidence_ids": list(
+                    dict.fromkeys(
+                        [
+                            *[
+                                value
+                                for value in payload.get("evidence_ids", [])
+                                if isinstance(value, str)
+                            ],
+                            *all_proof_evidence_ids,
+                        ]
+                    )
+                ),
+                "severity_proposal": severity,
+                "platform_severity": severity,
+                "severity_disposition": "accepted_from_platform_harm_oracle",
+                "confidence": "high",
+                "platform_proof_overrides": {
+                    hypothesis_id: {
+                        "result": FindingStatus.REPRODUCED_BLACKBOX.value,
+                        "evidence_ids": evidence_ids,
+                        "immutable": True,
+                    }
+                    for hypothesis_id, evidence_ids in proven_hypotheses.items()
+                },
+            }
+        )
         return payload
 
     @staticmethod

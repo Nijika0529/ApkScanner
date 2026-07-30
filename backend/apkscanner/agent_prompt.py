@@ -257,6 +257,9 @@ def investigation_prompt(
         "Do not restate the candidate as fact. Give each material objection a stable ID OBJ-1, "
         "OBJ-2, and so on, and return it in review_objections with its exact evidence basis. "
         "If no material objection survives the supplied evidence, return review_objections=[]. "
+        "platform_context.platform_proven_hypotheses contains immutable platform harm receipts. "
+        "Never object to, refute, or downgrade those hypothesis IDs; a static disagreement may "
+        "only be noted as a non-dispositive model limitation. "
         if phase == "adversarial_review"
         else ""
     )
@@ -304,7 +307,9 @@ def investigation_prompt(
             "request tests. Reconcile existing evidence into the final structured result. Read "
             "platform_context.debate. For every Critic review_objection, return exactly one "
             "objection_resolutions item with the same objection_id and a sustained, overruled, "
-            "or partially_sustained disposition grounded in existing evidence."
+            "or partially_sustained disposition grounded in existing evidence. Any hypothesis in "
+            "platform_context.platform_proven_hypotheses must remain reproduced_blackbox with its "
+            "platform proof Evidence IDs; neither Critic nor Arbiter may downgrade it."
         ),
         "recovery_evaluation": (
             "This is a bounded recovery decision. Do not start new exploration or request tests; "

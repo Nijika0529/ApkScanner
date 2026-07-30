@@ -1895,3 +1895,76 @@ def test_refuted_static_agent_result_has_no_platform_risk_severity() -> None:
     assert validated["severity_proposal"] == "info"
     assert validated["platform_severity"] is None
     assert validated["severity_disposition"] == "not_applicable_refuted"
+
+
+def test_platform_proof_overrides_refuting_arbiter_payload() -> None:
+    hypothesis_id = "00000000-0000-0000-0000-000000000091"
+    payload = {
+        "result": "refuted_static",
+        "severity_proposal": "info",
+        "platform_severity": None,
+        "confidence": "low",
+        "hypotheses_tested": [hypothesis_id],
+        "hypothesis_assessments": [
+            {
+                "hypothesis_id": hypothesis_id,
+                "verdict": "refuted_static",
+                "source": "",
+                "control": "",
+                "sink": "",
+                "reachable_path": "",
+                "boundary": "",
+                "counterevidence": ["Static Critic disagreement."],
+                "proof_gaps": ["Critic did not inspect the device replay."],
+                "evidence_ids": ["static-only"],
+                "confidence": "high",
+            }
+        ],
+        "objection_resolutions": [
+            {
+                "objection_id": "OBJ-1",
+                "disposition": "sustained",
+                "rationale": "The Arbiter accepted the static objection.",
+                "evidence_ids": [],
+            }
+        ],
+        "evidence_ids": ["static-only"],
+    }
+
+    overridden = ScanOrchestrator._apply_platform_proof_overrides(
+        payload,
+        proven_hypotheses={
+            hypothesis_id: ["poc-logcat", "impact-observed"],
+        },
+        proven_severity="high",
+        agent_round_history=[
+            {
+                "model_result": {
+                    "result": "reproduced_blackbox",
+                    "severity_proposal": "low",
+                }
+            }
+        ],
+        debate_context={
+            "critic": {
+                "review_objections": [
+                    {
+                        "objection_id": "OBJ-1",
+                        "hypothesis_id": hypothesis_id,
+                    }
+                ]
+            }
+        },
+    )
+
+    assert overridden["result"] == "reproduced_blackbox"
+    assert overridden["severity_proposal"] == "high"
+    assert overridden["platform_severity"] == "high"
+    assert overridden["confidence"] == "high"
+    assert overridden["hypothesis_assessments"][0]["verdict"] == (
+        "reproduced_blackbox"
+    )
+    assert overridden["hypothesis_assessments"][0]["counterevidence"] == []
+    assert overridden["hypothesis_assessments"][0]["proof_gaps"] == []
+    assert overridden["objection_resolutions"][0]["disposition"] == "overruled"
+    assert overridden["platform_proof_overrides"][hypothesis_id]["immutable"] is True

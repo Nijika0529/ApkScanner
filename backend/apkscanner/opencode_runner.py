@@ -508,6 +508,13 @@ class OpenCodeInvestigator:
                 if isinstance(item, dict)
                 and isinstance(item.get("objection_id"), str)
             ),
+            "protected_hypothesis_ids": sorted(
+                str(hypothesis_id)
+                for hypothesis_id in (
+                    context.get("platform_proven_hypotheses") or {}
+                )
+                if isinstance(hypothesis_id, str)
+            ),
         }
         if proof_replay_token and self.settings.opencode_isolation == "host":
             payload["_proof_replay_token"] = proof_replay_token

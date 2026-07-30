@@ -130,8 +130,11 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     assert "does not need to regenerate hypothesis assessment receipts" in critic
     assert "OBJ-1" in critic
     assert "review_objections" in critic
+    assert "platform_proven_hypotheses" in critic
+    assert "Never object to, refute, or downgrade" in critic
     assert "terminal decision turn" in final
     assert "objection_resolutions" in final
+    assert "must remain reproduced_blackbox" in final
     assert "Do not assign the final platform verdict" in memo
     assert "Make an explicit evidence-weighted decision" not in memo
     assert "Unless the result is reproduced_blackbox" not in memo

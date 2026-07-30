@@ -11,6 +11,7 @@ from .db import Database
 from .enums import FindingStatus, HypothesisStatus, ProofAttemptStatus
 from .models import (
     EntryPoint,
+    Finding,
     HypothesisArgument,
     InvestigationTask,
     ProofAttempt,
@@ -152,6 +153,14 @@ class HypothesisLedger:
                     select(SecurityHypothesis).where(SecurityHypothesis.task_id == task_id)
                 )
             )
+            proven_hypothesis_ids = set(
+                session.scalars(
+                    select(ProofAttempt.hypothesis_id).where(
+                        ProofAttempt.task_id == task_id,
+                        ProofAttempt.harm_demonstrated.is_(True),
+                    )
+                )
+            )
             hypothesis_ids = {hypothesis.id for hypothesis in hypotheses}
             scoped_ids = {
                 value
@@ -162,6 +171,12 @@ class HypothesisLedger:
                 if not isinstance(assessment, dict):
                     continue
                 hypothesis_id = assessment.get("hypothesis_id")
+                if isinstance(hypothesis_id, str) and hypothesis_id in hypothesis_ids:
+                    scoped_ids.add(hypothesis_id)
+            for objection in payload.get("review_objections", []):
+                if not isinstance(objection, dict):
+                    continue
+                hypothesis_id = objection.get("hypothesis_id")
                 if isinstance(hypothesis_id, str) and hypothesis_id in hypothesis_ids:
                     scoped_ids.add(hypothesis_id)
             selected = (
@@ -189,11 +204,18 @@ class HypothesisLedger:
                     )
                 )
                 if role == "critic":
-                    hypothesis.status = HypothesisStatus.CHALLENGED.value
-                    hypothesis.refute_evidence_ids = self._merge_ids(
-                        hypothesis.refute_evidence_ids,
-                        evidence_ids,
-                    )
+                    # A Critic is an advisory model argument. It may challenge
+                    # model reasoning, but it can never downgrade a platform
+                    # harm proof or relabel its evidence as refutation.
+                    if (
+                        hypothesis.id not in proven_hypothesis_ids
+                        and hypothesis.status != HypothesisStatus.PROVEN.value
+                    ):
+                        hypothesis.status = HypothesisStatus.CHALLENGED.value
+                        hypothesis.refute_evidence_ids = self._merge_ids(
+                            hypothesis.refute_evidence_ids,
+                            evidence_ids,
+                        )
                 elif role in {"hunter", "advocate"}:
                     hypothesis.support_evidence_ids = self._merge_ids(
                         hypothesis.support_evidence_ids,
@@ -479,7 +501,7 @@ class HypothesisLedger:
                 if legacy_blanket or hypothesis.id in tested_ids
                 else ""
             )
-            status = HypothesisLedger._status_for_verdict(assessment_result)
+            model_status = HypothesisLedger._status_for_verdict(assessment_result)
             confidence_value = (
                 assessment.get("confidence")
                 if assessment is not None
@@ -500,7 +522,7 @@ class HypothesisLedger:
                 if legacy_blanket or hypothesis.id in tested_ids
                 else []
             )
-            disposition = (
+            model_disposition = (
                 "assessed"
                 if assessment is not None
                 else "legacy_task_verdict"
@@ -509,21 +531,73 @@ class HypothesisLedger:
                 if hypothesis.id in tested_ids
                 else "not_assessed_by_agent"
             )
+            proven_attempts = list(
+                session.scalars(
+                    select(ProofAttempt).where(
+                        ProofAttempt.hypothesis_id == hypothesis.id,
+                        ProofAttempt.harm_demonstrated.is_(True),
+                    )
+                )
+            )
+            proof_evidence_ids = list(
+                dict.fromkeys(
+                    evidence_id
+                    for attempt in proven_attempts
+                    for evidence_id in attempt.evidence_ids
+                )
+            )
+            platform_proven = bool(proven_attempts)
+            effective_status = (
+                HypothesisStatus.PROVEN.value
+                if platform_proven
+                else model_status
+            )
+            effective_verdict = (
+                FindingStatus.REPRODUCED_BLACKBOX.value
+                if platform_proven
+                else assessment_result or None
+            )
+            effective_evidence_ids = HypothesisLedger._merge_ids(
+                evidence_ids,
+                proof_evidence_ids,
+            )
+            disposition = (
+                "platform_proven" if platform_proven else model_disposition
+            )
+            effective_assessment = (
+                {
+                    **dict(assessment or {}),
+                    "hypothesis_id": hypothesis.id,
+                    "verdict": FindingStatus.REPRODUCED_BLACKBOX.value,
+                    "evidence_ids": effective_evidence_ids,
+                    "confidence": "high",
+                }
+                if platform_proven
+                else assessment
+            )
             closure_receipt = {
                 "schema_version": "1.0",
                 "hypothesis_id": hypothesis.id,
                 "disposition": disposition,
-                "verdict": assessment_result or None,
-                "evidence_ids": evidence_ids,
+                "verdict": effective_verdict,
+                "evidence_ids": effective_evidence_ids,
                 "proof_gaps": (
-                    list(assessment.get("proof_gaps", []))
+                    []
+                    if platform_proven
+                    else list(assessment.get("proof_gaps", []))
                     if assessment is not None
                     else []
                 ),
             }
             argument_payload = {
-                "platform_result": result_value,
-                "assessment": assessment,
+                "platform_result": (
+                    FindingStatus.REPRODUCED_BLACKBOX.value
+                    if platform_proven
+                    else result_value
+                ),
+                "assessment": effective_assessment,
+                "model_assessment": assessment,
+                "platform_proof_override": platform_proven,
                 "closure_receipt": closure_receipt,
             }
             session.add(
@@ -537,58 +611,42 @@ class HypothesisLedger:
                     backend=backend,
                     model=model,
                     payload=argument_payload,
-                    evidence_ids=evidence_ids,
+                    evidence_ids=effective_evidence_ids,
                 )
             )
-            harm_demonstrated = session.scalar(
-                select(ProofAttempt.id)
-                .where(
-                    ProofAttempt.hypothesis_id == hypothesis.id,
-                    ProofAttempt.harm_demonstrated.is_(True),
+            hypothesis.status = effective_status
+            hypothesis.confidence_score = 100 if platform_proven else confidence
+            if not platform_proven or not hypothesis.impact:
+                hypothesis.impact = str(
+                    (
+                        assessment.get("sink")
+                        or assessment.get("reachable_path")
+                        if assessment is not None
+                        else None
+                    )
+                    or payload.get("summary")
+                    or "No concrete security impact was established."
                 )
-                .limit(1)
-            )
-            hypothesis.status = (
-                HypothesisStatus.PROVEN.value
-                if harm_demonstrated is not None
-                else status
-            )
-            hypothesis.confidence_score = confidence
-            hypothesis.impact = str(
-                (
-                    assessment.get("sink")
-                    or assessment.get("reachable_path")
-                    if assessment is not None
-                    else None
-                )
-                or payload.get("summary")
-                or "No concrete security impact was established."
-            )
-            if status in {
+            if effective_status in {
                 HypothesisStatus.PROVEN.value,
                 HypothesisStatus.ACCEPTED_FOR_PROOF.value,
             }:
                 hypothesis.support_evidence_ids = HypothesisLedger._merge_ids(
                     hypothesis.support_evidence_ids,
-                    evidence_ids,
+                    effective_evidence_ids,
                 )
-            elif status == HypothesisStatus.REFUTED.value:
+            elif effective_status == HypothesisStatus.REFUTED.value:
                 hypothesis.refute_evidence_ids = HypothesisLedger._merge_ids(
                     hypothesis.refute_evidence_ids,
-                    evidence_ids,
+                    effective_evidence_ids,
                 )
             hypothesis.metadata_json = {
                 **dict(hypothesis.metadata_json or {}),
-                "platform_result": result_value,
-                "assessment": assessment,
-                "closure_receipt": {
-                    **closure_receipt,
-                    "disposition": (
-                        "platform_proven"
-                        if harm_demonstrated is not None
-                        else disposition
-                    ),
-                },
+                "platform_result": argument_payload["platform_result"],
+                "assessment": effective_assessment,
+                "model_assessment": assessment,
+                "platform_proof_override": platform_proven,
+                "closure_receipt": closure_receipt,
                 "severity_proposal": payload.get("severity_proposal"),
                 "platform_severity": payload.get("platform_severity"),
             }
@@ -630,6 +688,62 @@ class HypothesisLedger:
                 )
             )
             return FindingStatus.REPRODUCED_BLACKBOX.value, evidence_ids
+
+    def task_proven_hypotheses(self, task_id: str) -> dict[str, list[str]]:
+        """Return immutable platform harm receipts grouped by hypothesis."""
+
+        with self.database.session_factory() as session:
+            attempts = list(
+                session.scalars(
+                    select(ProofAttempt)
+                    .where(
+                        ProofAttempt.task_id == task_id,
+                        ProofAttempt.harm_demonstrated.is_(True),
+                    )
+                    .order_by(ProofAttempt.created_at)
+                )
+            )
+            receipts: dict[str, list[str]] = {}
+            for attempt in attempts:
+                receipts[attempt.hypothesis_id] = self._merge_ids(
+                    receipts.get(attempt.hypothesis_id, []),
+                    attempt.evidence_ids,
+                )
+            return receipts
+
+    def task_proven_severity(self, task_id: str) -> str | None:
+        """Return the strongest persisted severity backed by a platform proof."""
+
+        severity_rank = {
+            "info": 0,
+            "low": 1,
+            "medium": 2,
+            "high": 3,
+            "critical": 4,
+        }
+        with self.database.session_factory() as session:
+            severities = list(
+                session.scalars(
+                    select(Finding.severity)
+                    .join(
+                        SecurityHypothesis,
+                        SecurityHypothesis.final_finding_id == Finding.id,
+                    )
+                    .join(
+                        ProofAttempt,
+                        ProofAttempt.hypothesis_id == SecurityHypothesis.id,
+                    )
+                    .where(
+                        SecurityHypothesis.task_id == task_id,
+                        ProofAttempt.task_id == task_id,
+                        ProofAttempt.harm_demonstrated.is_(True),
+                    )
+                )
+            )
+        valid = [value for value in severities if value in severity_rank]
+        if not valid:
+            return None
+        return max(valid, key=severity_rank.__getitem__)
 
     @staticmethod
     def _fingerprint(

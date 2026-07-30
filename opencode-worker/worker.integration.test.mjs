@@ -1081,6 +1081,99 @@ test("final evaluation must resolve every Critic objection", async () => {
   }
 })
 
+test("finalizer rejects model downgrade of platform-proven hypothesis", async () => {
+  const hypothesisID = "00000000-0000-0000-0000-000000000101"
+  const evidenceID = "00000000-0000-0000-0000-000000000102"
+  const proofSchema = {
+    type: "object",
+    properties: {
+      result: { type: "string" },
+      severity_proposal: { type: "string" },
+      evidence_ids: { type: "array", items: { type: "string" } },
+      hypothesis_assessments: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            hypothesis_id: { type: "string" },
+            verdict: { type: "string" },
+          },
+          required: ["hypothesis_id", "verdict"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: [
+      "result",
+      "severity_proposal",
+      "evidence_ids",
+      "hypothesis_assessments",
+    ],
+    additionalProperties: false,
+  }
+  const requests = []
+  const api = createServer(async (request, response) => {
+    const body = await readJSON(request)
+    requests.push(body)
+    const proven = requests.length > 1
+    sendCompletion(response, body, {
+      id: `protected-proof-${requests.length}`,
+      toolCalls: [
+        structuredOutputCall({
+          result: proven ? "reproduced_blackbox" : "refuted_static",
+          severity_proposal: proven ? "high" : "info",
+          evidence_ids: [evidenceID],
+          hypothesis_assessments: [
+            {
+              hypothesis_id: hypothesisID,
+              verdict: proven ? "reproduced_blackbox" : "refuted_static",
+            },
+          ],
+        }),
+      ],
+      finish: "tool_calls",
+    })
+  })
+  await listen(api)
+  const address = api.address()
+  assert(address && typeof address !== "string")
+  const root = await mkdtemp(join(tmpdir(), "apkscanner-protected-proof-test-"))
+  try {
+    const completed = await runWorker(
+      root,
+      investigationPayload({
+        baseURL: `http://127.0.0.1:${address.port}`,
+        phase: "final_evaluation",
+        outputSchema: proofSchema,
+        allowedEvidenceIDs: [evidenceID],
+        protectedHypothesisIDs: [hypothesisID],
+      }),
+    )
+    assert.equal(completed.code, 0, completed.stderr)
+    const { result } = parseWorkerOutput(completed.stdout)
+    assert.equal(result.result.result, "reproduced_blackbox")
+    assert.equal(requests.length, 2)
+    const errors =
+      result.output_transport.model_calls[0].validation_errors
+    assert.ok(
+      errors.some(
+        (error) =>
+          error.instance_path === "/result" &&
+          /immutable/.test(error.message),
+      ),
+    )
+    assert.ok(
+      errors.some(
+        (error) =>
+          error.instance_path === "/hypothesis_assessments/0/verdict",
+      ),
+    )
+  } finally {
+    api.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 function investigationPayload({
   baseURL,
   profile,
@@ -1094,6 +1187,7 @@ function investigationPayload({
   requireHypothesisReceipts = false,
   criticModel = "deepseek-v4-pro",
   requiredObjectionIDs = [],
+  protectedHypothesisIDs = [],
 }) {
   return {
     schema_version: "1.0",
@@ -1115,6 +1209,7 @@ function investigationPayload({
     allowed_evidence_ids: allowedEvidenceIDs,
     require_hypothesis_receipts: requireHypothesisReceipts,
     required_objection_ids: requiredObjectionIDs,
+    protected_hypothesis_ids: protectedHypothesisIDs,
   }
 }
 

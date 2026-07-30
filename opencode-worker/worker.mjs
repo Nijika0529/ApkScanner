@@ -1283,6 +1283,10 @@ function validatePayload(value) {
     value.required_objection_ids = validateObjectionIdentifierList(
       value.required_objection_ids,
     )
+    value.protected_hypothesis_ids = validateIdentifierList(
+      value.protected_hypothesis_ids,
+      "protected_hypothesis_ids",
+    )
   }
   return value
 }
@@ -1623,6 +1627,52 @@ function semanticValidationErrors(value, payload) {
     )
   }
   const requiredObjections = new Set(payload.required_objection_ids ?? [])
+  const protectedHypotheses = new Set(payload.protected_hypothesis_ids ?? [])
+  if (
+    protectedHypotheses.size > 0 &&
+    ["final_evaluation", "recovery_evaluation"].includes(payload.phase) &&
+    value.result !== "reproduced_blackbox"
+  ) {
+    add(
+      "/result",
+      "platform-proven harm is immutable; final result must remain reproduced_blackbox",
+    )
+  }
+  for (const [index, assessment] of (
+    Array.isArray(value.hypothesis_assessments)
+      ? value.hypothesis_assessments
+      : []
+  ).entries()) {
+    if (
+      assessment &&
+      typeof assessment === "object" &&
+      !Array.isArray(assessment) &&
+      protectedHypotheses.has(assessment.hypothesis_id) &&
+      assessment.verdict !== "reproduced_blackbox"
+    ) {
+      add(
+        `/hypothesis_assessments/${index}/verdict`,
+        "platform-proven hypothesis cannot be downgraded by a model assessment",
+      )
+    }
+  }
+  if (payload.phase === "adversarial_review") {
+    for (const [index, objection] of (
+      Array.isArray(value.review_objections) ? value.review_objections : []
+    ).entries()) {
+      if (
+        objection &&
+        typeof objection === "object" &&
+        !Array.isArray(objection) &&
+        protectedHypotheses.has(objection.hypothesis_id)
+      ) {
+        add(
+          `/review_objections/${index}/hypothesis_id`,
+          "Critic cannot object to an immutable platform-proven hypothesis",
+        )
+      }
+    }
+  }
   for (const field of ["review_objections", "objection_resolutions"]) {
     const ids = (Array.isArray(value[field]) ? value[field] : [])
       .filter(

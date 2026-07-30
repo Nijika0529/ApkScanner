@@ -3,6 +3,7 @@ from __future__ import annotations
 from apkscanner.db import Database
 from apkscanner.models import (
     EntryPoint,
+    Finding,
     HypothesisArgument,
     InvestigationTask,
     ProofAttempt,
@@ -140,6 +141,162 @@ def test_hypothesis_ledger_tracks_arguments_and_concrete_proof(settings) -> None
             )
         )
         assert [argument.role for argument in arguments] == ["hunter", "critic"]
+
+
+def test_critic_and_arbiter_cannot_downgrade_platform_proven_hypothesis(
+    settings,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    entry_id = "00000000-0000-0000-0000-000000000081"
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="immutable-proof.apk",
+            artifact_sha256="8" * 64,
+            artifact_path=str(settings.data_dir / "immutable-proof.apk"),
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="deep_link",
+            target_entry_ids=[entry_id],
+            hypotheses=["A deep link executes attacker-controlled WebView JavaScript."],
+        )
+        session.add_all([scan, task])
+        session.commit()
+        scan_id = scan.id
+
+    ledger = HypothesisLedger(database)
+    hypothesis = ledger.ensure_task_hypotheses(task)[0]
+    request = AgentRequestedTest(
+        hypothesis_id=hypothesis.id,
+        entry_point_id=entry_id,
+        state="guest",
+        uri="demo://example.test/web",
+        extras={},
+        rationale="Reproduce JavaScript execution from an ordinary app.",
+    )
+    proof_id = ledger.plan_proof(
+        task_id=task.id,
+        test_case_id="webview-proof",
+        request=request,
+    )
+    assert proof_id is not None
+    ledger.start_proof(proof_id)
+    ledger.complete_proof(
+        proof_id,
+        [
+            {
+                "id": "probe-webview",
+                "kind": "blackbox.probe_app",
+                "exit_code": 0,
+                "metadata": {
+                    "caller_identity": "probe_app",
+                    "request_id": "request-webview",
+                },
+            },
+            {
+                "id": "log-webview",
+                "kind": "blackbox.logcat",
+                "exit_code": 0,
+                "metadata": {
+                    "request_id": "request-webview",
+                    "request_observed": True,
+                    "probe_success": True,
+                    "security_impact_observed": True,
+                },
+            },
+        ],
+    )
+
+    refuting_payload = {
+        "summary": "Critic claims the static path is blocked.",
+        "result": "refuted_static",
+        "confidence": "high",
+        "severity_proposal": "info",
+        "hypotheses_tested": [hypothesis.id],
+        "hypothesis_assessments": [
+            {
+                "hypothesis_id": hypothesis.id,
+                "verdict": "refuted_static",
+                "evidence_ids": [],
+                "confidence": "high",
+            }
+        ],
+        "review_objections": [
+            {
+                "objection_id": "OBJ-1",
+                "hypothesis_id": hypothesis.id,
+                "claim": "Static code does not show execution.",
+                "basis": "Static-only review.",
+                "evidence_ids": [],
+            }
+        ],
+        "evidence_ids": [],
+    }
+    ledger.record_argument(
+        task_id=task.id,
+        role="critic",
+        phase="adversarial_review",
+        backend="opencode",
+        model="deepseek-v4-pro",
+        payload=refuting_payload,
+    )
+    ledger.finalize(
+        task_id=task.id,
+        payload=refuting_payload,
+        result_value="refuted_static",
+        backend="opencode",
+        model="deepseek-v4-flash",
+    )
+
+    with database.session_factory() as session:
+        persisted = session.get(SecurityHypothesis, hypothesis.id)
+        assert persisted is not None
+        finding = Finding(
+            scan_id=scan_id,
+            dedupe_key="immutable-proof-webview",
+            rule_id="agent.webview.javascript",
+            source="opencode",
+            title="WebView JavaScript execution",
+            description="Platform-reproduced WebView JavaScript execution.",
+            remediation="Restrict untrusted WebView input.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            confidence="high",
+            status="reproduced_blackbox",
+            entry_point_ids=[entry_id],
+            evidence_ids=["probe-webview", "log-webview"],
+        )
+        session.add(finding)
+        session.flush()
+        persisted.final_finding_id = finding.id
+        session.commit()
+
+    assert ledger.task_proven_severity(task.id) == "high"
+    with database.session_factory() as session:
+        persisted = session.get(SecurityHypothesis, hypothesis.id)
+        assert persisted is not None
+        assert persisted.status == "proven"
+        assert persisted.confidence_score == 100
+        assert persisted.refute_evidence_ids == []
+        assert persisted.support_evidence_ids == [
+            "probe-webview",
+            "log-webview",
+        ]
+        assert persisted.metadata_json["platform_proof_override"] is True
+        assert (
+            persisted.metadata_json["assessment"]["verdict"]
+            == "reproduced_blackbox"
+        )
+        assert (
+            persisted.metadata_json["model_assessment"]["verdict"]
+            == "refuted_static"
+        )
+        assert (
+            persisted.metadata_json["closure_receipt"]["disposition"]
+            == "platform_proven"
+        )
 
 
 def test_identical_claims_in_separate_tasks_do_not_collide(settings) -> None:  # noqa: ANN001

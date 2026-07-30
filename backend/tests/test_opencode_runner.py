@@ -436,6 +436,7 @@ def test_personal_lab_investigate_uses_workspace_analysis_then_validates_result(
         ]
         assert payload["allowed_hypothesis_ids"] == []
         assert payload["require_hypothesis_receipts"] is True
+        assert payload["protected_hypothesis_ids"] == []
         assert payload["output_schema"]["title"] == "AgentInvestigationResult"
         assert payload["output_schema"]["additionalProperties"] is False
         result_values = payload["output_schema"]["properties"]["result"]["enum"]
