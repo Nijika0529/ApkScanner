@@ -25,6 +25,7 @@ class ScanContainer:
     name: str
     scan_workspace: Path
     sessions_root: Path
+    apk_path: Path | None = None
 
 
 class CodexDockerExecutor:
@@ -42,10 +43,12 @@ class CodexDockerExecutor:
         scan_id: str,
         scan_workspace: Path,
         sessions_root: Path,
+        apk_path: Path | None = None,
     ) -> ScanContainer:
         self._validate_scan(scan_id)
         scan_workspace = self._safe_directory(scan_workspace, "scan workspace")
         sessions_root = self._safe_directory(sessions_root, "Agent sessions root")
+        apk_path = self._safe_file(apk_path, "scan APK") if apk_path is not None else None
         with self._lock:
             existing = self._containers.get(scan_id)
             if existing is not None and self._is_running(existing):
@@ -64,6 +67,7 @@ class CodexDockerExecutor:
                 name=name,
                 scan_workspace=scan_workspace,
                 sessions_root=sessions_root,
+                apk_path=apk_path,
             )
             completed = subprocess.run(
                 command,
@@ -86,6 +90,7 @@ class CodexDockerExecutor:
                 name=name,
                 scan_workspace=scan_workspace,
                 sessions_root=sessions_root,
+                apk_path=apk_path,
             )
             self._containers[scan_id] = container
             return container
@@ -98,6 +103,7 @@ class CodexDockerExecutor:
         name: str,
         scan_workspace: Path,
         sessions_root: Path,
+        apk_path: Path | None = None,
     ) -> list[str]:
         executable = self._docker()
         command = [
@@ -129,6 +135,13 @@ class CodexDockerExecutor:
             "--mount",
             f"type=bind,source={sessions_root},target=/agent-workspaces",
         ]
+        if apk_path is not None:
+            command.extend(
+                [
+                    "--mount",
+                    f"type=bind,source={apk_path},target=/scan-input/target.apk,readonly",
+                ]
+            )
         for name in ("jadx", "apktool", "archive"):
             source = scan_workspace / name
             if source.is_dir():
@@ -277,6 +290,15 @@ class CodexDockerExecutor:
             raise ValueError(f"{label} cannot be a symbolic link")
         resolved = path.resolve()
         if not resolved.is_dir() or "," in str(resolved):
+            raise ValueError(f"{label} is unavailable or unsafe for a Docker bind mount")
+        return resolved
+
+    @staticmethod
+    def _safe_file(path: Path, label: str) -> Path:
+        if path.is_symlink():
+            raise ValueError(f"{label} cannot be a symbolic link")
+        resolved = path.resolve()
+        if not resolved.is_file() or "," in str(resolved):
             raise ValueError(f"{label} is unavailable or unsafe for a Docker bind mount")
         return resolved
 

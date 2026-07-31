@@ -82,6 +82,8 @@ def test_scan_container_command_has_scan_scope_and_no_provider_secret(settings) 
         (scan_workspace / name).mkdir(parents=True, exist_ok=True)
     sessions_root = configured.data_dir / "agent-sessions" / SCAN_ID
     sessions_root.mkdir(parents=True)
+    apk_path = configured.data_dir / "target.apk"
+    apk_path.write_bytes(b"test apk mount")
     executor = CodexDockerExecutor(configured)
 
     command = executor.build_run_command(
@@ -90,6 +92,7 @@ def test_scan_container_command_has_scan_scope_and_no_provider_secret(settings) 
         name="apk-scanner-test",
         scan_workspace=scan_workspace,
         sessions_root=sessions_root,
+        apk_path=apk_path,
     )
     rendered = " ".join(command)
 
@@ -100,6 +103,7 @@ def test_scan_container_command_has_scan_scope_and_no_provider_secret(settings) 
     assert "--security-opt=no-new-privileges" in command
     assert "io.apkscanner.role=codex-scan" in command
     assert "target=/agent-workspaces" in rendered
+    assert "target=/scan-input/target.apk,readonly" in rendered
     assert "target=/scan-input/jadx,readonly" in rendered
     assert "DEEPSEEK_API_KEY" not in rendered
     assert "docker.sock" not in rendered
@@ -163,6 +167,8 @@ def test_real_scan_container_shares_input_but_isolates_session_uids(settings) ->
     (scan_workspace / "jadx" / "Shared.java").write_text(
         "class Shared {}", encoding="utf-8"
     )
+    apk_path = configured.data_dir / "target.apk"
+    apk_path.write_bytes(b"read-only apk input")
 
     manager = AgentWorkspaceManager(configured)
     primary = manager.prepare_session(
@@ -184,6 +190,7 @@ def test_real_scan_container_shares_input_but_isolates_session_uids(settings) ->
         scan_id=SCAN_ID,
         scan_workspace=scan_workspace,
         sessions_root=primary.root.parent,
+        apk_path=apk_path,
     )
     docker = shutil.which("docker")
     assert docker is not None
@@ -201,6 +208,7 @@ def test_real_scan_container_shares_input_but_isolates_session_uids(settings) ->
                 "/bin/sh",
                 "-c",
                 "test -r /scan-input/jadx/Shared.java && "
+                "test -r /scan-input/target.apk && "
                 "printf primary > primary.txt",
             ],
             check=True,

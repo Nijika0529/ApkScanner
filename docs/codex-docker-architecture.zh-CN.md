@@ -28,7 +28,7 @@
 3. `CURRENT` Agent 默认具备文件读写、Bash、补丁、实时 Web Search 和公网访问能力；企业出口收敛仍为后续门禁。
 4. `CURRENT` 默认按一次完整 `scan_id` 创建一个长生命周期扫描容器，而不是为每个小探索任务创建容器；活跃容器数量因此约等于活跃扫描数量。
 5. `CURRENT` 容器内每个 `task_id + attempt + role` 使用独立数字 UID/GID、`0700` 可写目录、`HOME`、`CODEX_HOME`、`TMPDIR` 和持久 Worker 进程。
-6. `CURRENT` 完整 JADX、apktool 和 archive 结果通过扫描级只读 bind mount 共享，不复制到各任务工作区。
+6. `CURRENT` 完整 JADX、apktool、archive 结果及原始 `target.apk` 通过扫描级只读 bind mount 共享，不复制到各任务工作区；宿主 JADX 缺失或部分失败时，Agent 可用镜像固定的 JADX 输出到自己的可写工作区。
 7. `CURRENT` 同一 primary AgentSession 在自动探索、PoC 修正和最终裁决之间复用同一 Codex Thread；Critic/Rescue 使用新的 UID、工作区和 Thread。
 8. `CURRENT` ADB 设备由 Orchestrator 独占分配。容器进程只能通过任务级 ADB Gateway 使用分配到的 serial。
 9. `TARGET` 原始 ADB、Agent 文本、Agent 自建日志和 Agent 自报“PoC 成功”均不能直接生成 `reproduced_blackbox`；最终证明仍由平台 Proof/Oracle 完成。

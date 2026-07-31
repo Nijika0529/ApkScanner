@@ -29,7 +29,8 @@ finding without platform evidence IDs.
   downgrades.
 - One keyless keeper container per scan. Each `task + attempt + role` receives a distinct Unix UID,
   HOME, `CODEX_HOME`, TMPDIR, and writable workspace, while JADX/Apktool/archive inputs are mounted
-  read-only.
+  read-only. The original APK is also mounted read-only at `/scan-input/target.apk`, allowing the
+  container-pinned JADX to produce session-local output when host JADX is absent or partial.
 - Worker Protocol v3 keeps one SDK process and non-ephemeral Codex Thread per task/attempt/role,
   reuses the primary Thread across exploration and final evaluation, emits heartbeats, and writes a
   redacted host-only event spool.

@@ -449,6 +449,7 @@ class CodexInvestigator:
                 scan_id=scan.id,
                 scan_workspace=scan_workspace,
                 sessions_root=sessions_root,
+                apk_path=Path(scan.artifact_path),
             )
             process = self.executor.start_worker(container=container, session=agent_session)
 
