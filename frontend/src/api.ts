@@ -96,7 +96,7 @@ export const api = {
     request<InvestigationTask>(`/api/v1/tasks/${taskId}/rerun`, { method: "POST" }),
   continueTask: (taskId: string) =>
     request<InvestigationTask>(`/api/v1/tasks/${taskId}/continue`, { method: "POST" }),
-  updateScanAgentControl: (scanId: string, enabled: boolean, backend: "codex" | "opencode" | "none") =>
+  updateScanAgentControl: (scanId: string, enabled: boolean, backend: "codex" | "none") =>
     request<Scan>(`/api/v1/scans/${scanId}/agent-control`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },

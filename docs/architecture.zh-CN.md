@@ -1,5 +1,9 @@
 # APK Scanner 架构与判定模型
 
+> Codex 迁移后的扫描级 Docker、多 UID 工作区、SDK 选型、Thread、事件线、ADB/Proof、
+> DeepSeek Provider、可插拔测试入口、监督 Agent 接口和分阶段实施规范，统一见
+> [Codex + DeepSeek Docker 执行架构与迁移规范](codex-docker-architecture.zh-CN.md)。
+
 ## 目标与边界
 
 系统面向公司待上线、仅提供 APK 的安全复核。控制面运行在个人电脑本地，动态面只访问已授权的专用 Android 测试设备和测试后端。它提供覆盖面、证据和人工复核辅助，不自动阻断发布。
@@ -31,7 +35,7 @@ flowchart LR
 测试：只能使用当前任务的入口 ID；Deep Link 和 Provider URI 必须保持 Manifest 声明的
 scheme、host/authority 和 port；额外参数有数量、键名、类型和长度上限。每轮证据都会回灌
 下一次判断，最终再执行禁止申请新动作的证据总结。轮次和单轮测试数可在 1–5 / 1–1000 的
-范围内配置。每次扫描在创建时记录初始 `codex`、`opencode` 或 `none`；服务默认值的后续
+范围内配置。每次扫描在创建时记录初始 `codex` 或 `none`；服务默认值的后续
 变更不会静默改变它，只有用户在扫描控制台显式调整才会影响后续任务。
 
 扫描创建后的 Agent 控制分两层：`Scan.stats.agent_control` 是总开关和后端选择；
@@ -39,11 +43,14 @@ scheme、host/authority 和 port；额外参数有数量、键名、类型和长
 规则和确定性动态验证；总开关开启后，任务级开关仍可关闭某个入口的 AI。运行中的任务保留
 启动瞬间解析出的配置，避免一次审计调用途中切换模型；新配置只影响未启动或重新分析的任务。
 
-一个任务以 `task_id + attempt` 作为平台逻辑探索运行。为保持一次性 worker 的隔离边界，目前每次物理模型调用使用新的 Codex thread 或 OpenCode session；下一轮会重新装载完整的静态上下文、累计 Evidence 和已执行测试，因此不会依赖供应商侧隐藏状态。Web 将这些物理调用统一聚合到同一个任务时间线。
+一个任务以 `task_id + attempt` 作为平台逻辑探索运行。当前 Worker Protocol v2 的每次物理
+模型调用使用新的 Codex thread；下一轮会重新装载完整静态上下文、累计 Evidence 和已执行
+测试。扫描级 Docker 容器及同 role 工作区会复用，Web 将物理调用聚合到同一任务时间线。
+持久 Thread/resume 按专项架构文档的 Phase 4 实施。
 
 静态阶段结束即发布 preliminary report，并继续动态任务。外部工具、MobSF 请求和每个任务都有超时；超过 4 小时 preliminary 目标或 24 小时整单预算会写入事件及 coverage gap。
 
-JADX 的非零退出码不直接等同于反编译不可用。平台把结果归一化为完整成功、部分成功、部分超时或工具失败，并生成 `code_index.json`：逐个组件记录目标类是否位于失败列表、可用 Java/Smali 路径、文件 SHA-256 和有界源码片段。Codex 和 OpenCode 都接收相同的目标级代码上下文；OpenCode 不需要文件系统权限。历史扫描在任务重试时可从已有 workspace 与 `static.jadx` Evidence 懒生成索引，不会为了补上下文再次运行 JADX。
+JADX 的非零退出码不直接等同于反编译不可用。平台把结果归一化为完整成功、部分成功、部分超时或工具失败，并生成 `code_index.json`：逐个组件记录目标类是否位于失败列表、可用 Java/Smali 路径、文件 SHA-256 和有界源码片段。Codex 接收目标级物化上下文，并在 personal-lab profile 下通过 `/scan-input/*` 读取完整的只读反编译根。历史扫描在任务重试时可从已有 workspace 与 `static.jadx` Evidence 懒生成索引，不会为了补上下文再次运行 JADX。
 
 ## 多云真机调度
 
@@ -71,21 +78,18 @@ Web 健康检查使用真正的非阻塞锁；设备繁忙时读取最近一次�
 | 区域 | 可访问内容 | 约束 |
 | --- | --- | --- |
 | 本地控制面 | SQLite、APK、workspace、evidence | FastAPI 仅监听 loopback；变更 API 需要自定义请求头；内容寻址文件拒绝 symlink/摘要冲突 |
-| Codex Docker worker | 当前任务 attempt workspace、显式 Codex auth、模型网络 | 每次调用新容器、只读 bind mount/SDK sandbox/rootfs、无 ADB 参数、丢弃 capabilities、PID/CPU/内存限制；默认模式 |
-| Codex host worker | 当前任务 attempt workspace 与模型网络 | 仅作为显式 `host` 降级模式；developer instructions 禁止 ADB/目标网络请求，设备动作仍走平台 |
-| OpenCode + DeepSeek Docker worker | 独立 task workspace、完整只读反编译根、`/tmp`、DeepSeek API | workspace 可写、rootfs 只读、临时 HOME；Analyzer 允许 read/glob/grep/bash 和本地构建，独立 Finalizer 只允许 StructuredOutput；容器无设备挂载 |
-| OpenCode + DeepSeek host worker | 独立 task workspace、完整反编译根、主机工具/网络、可选 ADB | personal-lab 模式可自由分析和构建；每次调用使用临时 HOME/XDG 与带随机 Basic Auth 的 loopback server；仅适合个人受控环境 |
+| Codex 扫描级 Docker worker | 扫描只读输入、每 role 独立可写 workspace、DeepSeek/Web 网络 | 一个 scan 一个无密钥 keeper；每个 task/attempt/role 独立 UID/HOME/CODEX_HOME/TMPDIR；Codex `Sandbox.full_access`；rootfs 只读、capabilities 全丢弃、PID/CPU/内存限制；不挂 Docker socket 或设备 |
+| Codex host worker | 当前任务 attempt workspace、主机工具和模型网络 | 仅作为双开关启用的个人诊断模式；full-access sandbox，没有容器/UID/资源边界，不能作为默认部署 |
 | 云真机 | 目标 APK、可选 Probe APK、Agent PoC、测试账号 | 配置声明目标 Android/API；串行 lease；任务前后 `pm clear`；不声称完整快照复位 |
 | Probe APK | 可选的普通 App UID 通用入口快速执行器 | 只接受最初发送者为 shell/root 的调度；复杂 Binder/AIDL/漏洞链改用 Agent 专用 PoC；仍只允许安装在专用测试设备 |
 | MobSF | 上传 APK并返回广度扫描报告 | 可选、显式 URL/API Key；失败不阻断内置基线，但标为 tool gap |
 
-APK、反编译代码、资源、日志、网页和工具输出都属于不可信数据。两个 Agent 后端的
-developer instructions 都明确禁止服从这些内容中的指令。每个 `task_id + attempt` 获得独立
-workspace；并发 Agent 不共享可写目录。Codex 维持只读有界上下文。OpenCode personal-lab
-除独立可写任务目录外，还能读取完整 Apktool/JADX/archive 根，创建本地脚本、Android
-工程和预编译 PoC；host 模式配置 ADB 后可以直接探索设备。平台最终只把带稳定
+APK、反编译代码、资源、日志、网页和工具输出都属于不可信数据。Codex developer
+instructions 明确禁止服从这些内容中的指令。每个 `task_id + attempt + role` 获得独立 UID
+和可写 workspace；并发 Agent 不共享可写目录，同时可读取完整只读 Apktool/JADX/archive
+根，创建本地脚本、Android 工程和预编译 PoC。平台最终只把带稳定
 test-case/request ID 的 Probe/PoC 与客观 Oracle 作为复现证据。模型网络出口应分别限制到
-企业 Codex 或获批的 DeepSeek/代理端点。
+获批的 DeepSeek/代理端点。
 
 ## Security IR
 
@@ -187,17 +191,13 @@ Finding 数量或 SARIF。默认真值要求 `dynamic`，因此只有静态猜�
 7. `agent.cancellation`：用户停止请求、运行时确认、后端和任务阶段；此前已产生的事件继续
    保留，被停止的调用不生成新的最终结论。
 
-OpenCode 审计还记录显式执行 profile、各阶段思考模式、reasoning effort、实际 wire
-`tool_choice`、HTTP 状态和工具事件。静态阶段使用关闭思考的 Analyzer；规划、Critic 和
-自由探索阶段使用 Thinking Explorer。二者都在完整工具循环结束后只输出证据备忘录，再
-由全新 session 中关闭思考且不开放 workspace 工具的 Finalizer 通过
-`StructuredOutput` 定稿。Worker 随后执行 Ajv 和业务语义校验，失败时最多使用两个全新
-session 纠正。兼容代理只对 thinking 请求删除 OpenCode 注入的 `tool_choice: auto`，
-并保留完整 `reasoning_content` 回放；每轮 prompt、备忘录、结构化响应、校验错误、wire
-审计和 usage 都进入不可变审计记录。Flash/Pro 使用同一阶段协议，失败时不会静默换模型。
+Codex 审计额外记录冻结的执行 profile、ProviderProfile、PhaseRoute 及其 SHA-256、固定
+SDK/CLI/源码基线、reasoning effort、容器 generation、session UID/role、thread/turn、
+结构化校验和 usage。未知 SDK notification 会归一化为不含原始秘密载荷的安全摘要；事件
+带 schema version 与去重键。失败不会静默切换模型或恢复 OpenCode 路由。
 
-Codex 的 app-server notification 与 OpenCode 的 `event.subscribe()` SSE 会先归一化为
-`exploration.*` 平台事件。Web 只展示假设、阶段、动作、证据和结论等关键事件，不展示或
+Codex app-server notification 会先归一化为 `exploration.*` 平台事件。Web 只展示假设、
+阶段、动作、证据和结论等关键事件，不展示或
 持久化隐藏思维链；模型必须通过结构化字段提供可审计的简短理由。
 
 这些记录不包含模型 API Key。每份内容在写入时计算 SHA-256，Web 的“AI 审计”页和 JSON
@@ -209,7 +209,8 @@ Evidence 数和降级原因，再提供完整原始 JSON；读取时再次校验
 
 Web 把任务明确区分为等待判断、正在分析、已判断、未形成判断和已停止。排队或等待设备的
 任务取消后立即进入 `canceled`；运行中的任务先进入 `cancel_requested`，控制面再调用
-Codex `turn/interrupt`，或终止 OpenCode 的一次性进程/容器。设备清理仍在 `finally` 中
+Codex `turn/interrupt`，或终止 Docker exec 进程组及对应 session UID 的全部进程。扫描
+结束时回收 keeper 容器；设备清理仍在 `finally` 中
 执行。运行时确认后任务进入 `canceled`，Coverage 标为 partial，并把取消原因写入事件和
 `agent.cancellation` Evidence。停止不会删除已经产生的证据，也不会把半成品模型文本落为
 Finding；用户可显式重试或删除已经终止的任务。处于 `cancel_requested` 的任务也允许

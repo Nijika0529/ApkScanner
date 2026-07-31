@@ -1,7 +1,7 @@
 # APK Scanner
 
 Evidence-first Android APK security scanning with deterministic attack-surface coverage, remote
-ADB validation, and optional Codex or OpenCode + DeepSeek investigations.
+ADB validation, and optional Codex SDK + DeepSeek V4 Flash investigations.
 
 The v1 product is a single-user, localhost-only Web application. It accepts one installable APK,
 builds a versioned security IR, enumerates all Android component and deep-link entry points, records
@@ -24,14 +24,14 @@ finding without platform evidence IDs.
 - Remote ADB adapter, optional ordinary-app-UID Probe fast path, Agent PoCs, objective Oracles, `pm clear` cleanup,
   and App Link state inspection/reset.
 - Optional MobSF upload/report normalization with explicit degraded coverage when absent.
-- Official `openai-codex==0.144.4` integration with strict JSON Schema, streamed turn/item events,
-  read-only workspace inspection, no subagent fan-out, bounded adaptive platform-mediated test
-  rounds, and evidence-backed result downgrades.
-- Pinned `@opencode-ai/sdk`/OpenCode `1.18.4` integration for DeepSeek, with a stable
-  single-stage non-thinking StructuredOutput path, local Ajv/semantic and platform-ID validation,
-  explicit personal-lab workspace/ADB capabilities, bounded phase budgets, and full
-  provider-wire/runtime audit.
-- Optional per-task Docker workers with isolated task-attempt mounts and resource/capability limits.
+- Official `openai-codex==0.144.4` + DeepSeek Responses integration with strict JSON Schema,
+  streamed events, a full-access Codex sandbox, no subagent fan-out, and evidence-backed result
+  downgrades.
+- One keyless keeper container per scan. Each `task + attempt + role` receives a distinct Unix UID,
+  HOME, `CODEX_HOME`, TMPDIR, and writable workspace, while JADX/Apktool/archive inputs are mounted
+  read-only.
+- The executable OpenCode runtime, critic/fallback routes, and Node worker have been removed;
+  historical report-read compatibility remains.
 - Responsive React review console, human Finding decisions, live events, JSON/HTML/SARIF exports.
 - Proven findings are separated from static signals: only platform-verified harm with complete Evidence references counts as a Finding.
 - Light review console with confirmed deletion of completed scans and shared-artifact-safe cleanup.
@@ -70,7 +70,7 @@ scanctl scan /absolute/path/to/application.apk --investigator configured
 scanctl capabilities
 ```
 
-The Web upload dialog and CLI can pin each scan to `codex`, `opencode`, or `none`; `configured`
+The Web upload dialog and CLI can pin each scan to `codex` or `none`; `configured`
 resolves the service default when the scan is created and is persisted with that scan.
 
 ## Dynamic device configuration
@@ -106,7 +106,7 @@ retained as a separate identity and is never treated as equivalent to an ordinar
 
 When `APKSCANNER_ANDROID_SDK_ROOT` points to an SDK containing the configured compile platform and
 build-tools,
-an OpenCode Agent may create a source-only PoC or build its own signed APK under the isolated
+a Codex Agent may create a source-only PoC or build its own signed APK under the isolated
 `poc/` directory. The control plane validates paths, size, signature, package and launch metadata,
 records source/APK SHA-256 values, enters the same ADB queue, installs and launches the PoC as an
 ordinary application UID, correlates its nonce-tagged result, and uninstalls it. In host
@@ -115,16 +115,13 @@ execution can establish ordinary-app reachability. A PoC's own impact boolean re
 cannot by itself satisfy the platform harm oracle; an objective UI, target-log, crash, or other
 platform observation is still required.
 
-The default worker pool explores up to three entry points concurrently across all scans. Every
-install, reset, probe, and cleanup still passes through one global
-priority/FIFO device queue. The device is released before model planning, critic, review, and final
-evaluation turns; an accepted model-requested test reacquires the lease and prepares the device
-again. Device-queue wait is excluded from the 20-minute task budget but remains bounded by the
-24-hour scan deadline.
+The investigation pool follows the configured ADB device pool. Each task owns one device for its
+complete model, PoC replay, review, and cleanup lifecycle; with one serial, only one task runs at a
+time. The 24-hour scan deadline remains the outer bound.
 
-An investigation task receives a 20-minute budget by default. A task that reaches `timed_out`
+An investigation task receives a four-hour budget by default. A task that reaches `timed_out`
 exposes the **继续深度探索** action in the Web console. Each manual continuation receives a fresh
-20-minute budget and reloads the task's prior static, ADB, and AI Evidence instead of starting
+four-hour budget and reloads the task's prior static, ADB, and AI Evidence instead of starting
 from an empty investigation context. Continuations are explicit and unlimited by the automatic retry
 count; every continuation still creates a new attempt, model audit, device lease, and cleanup cycle.
 
@@ -139,7 +136,7 @@ the APK SHA-256 and matching selectors, then run:
 ```bash
 scanctl benchmark /path/to/private.apk \
   --truth /path/to/private-ground-truth.json \
-  --investigator opencode
+  --investigator codex
 ```
 
 An existing scan can be evaluated without scanning again:
@@ -169,100 +166,44 @@ APK, threat model, tasks, findings, Evidence ledger, and coverage ledger.
 
 ## Codex configuration
 
-Codex is opt-in. Docker is the secure default isolation mode. Build the pinned worker, provide either
-an explicit Codex auth file or `OPENAI_API_KEY`, then enable investigations:
+Codex is the only AI investigation backend and remains opt-in. The current route accepts only
+DeepSeek V4 Flash over Responses API with `openai-codex==0.144.4`. Build the pinned worker and
+provide the DeepSeek key to the control-plane process:
 
 ```bash
-docker build -f Dockerfile.worker -t apk-scanner-worker:0.1.0 .
-export APKSCANNER_CODEX_AUTH_FILE=/absolute/path/to/codex/auth.json
+docker build \
+  --build-arg DEBIAN_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian \
+  -f Dockerfile.worker \
+  -t apk-scanner-codex-worker:0.2.0 \
+  .
+
+export DEEPSEEK_API_KEY=...
+export APKSCANNER_INVESTIGATOR_BACKEND=codex
 export APKSCANNER_CODEX_ISOLATION=docker
 export APKSCANNER_CODEX_ENABLED=true
 scanctl capabilities --deep
 ```
 
-Defaults are `gpt-5.6-terra`/medium for entry workers. The integration starts a fresh thread per
-task, sets `agents.max_threads=1`, uses a strict result schema, and rejects unsupported SDK versions.
-Do not set `APKSCANNER_CODEX_BIN` unless you have explicitly tested that external CLI against the
-pinned SDK; the bundled matching runtime is the default.
+A complete scan owns one keyless keeper container instead of creating a container for every small
+exploration. Each `task + attempt + role` gets a non-reused Unix UID and private HOME,
+`CODEX_HOME`, TMPDIR, cache, and writable workspace. Scan-level `jadx/`, `apktool/`, and `archive/`
+directories are mounted read-only at `/scan-input/*`. Within this container boundary Codex uses
+`Sandbox.full_access` and `ApprovalMode.deny_all`, with Bash, patching, JADX, Apktool, Android
+Platform 36 / Build Tools 36.1, and live Web Search available. SDK subagent fan-out is disabled.
 
-`APKSCANNER_CODEX_ISOLATION=host` is an explicit fallback for a personally controlled machine. It
-does not provide the worker filesystem boundary and should not be the team-deployment default.
+The keeper starts without provider credentials. Only the UID-scoped `docker exec` inherits
+`DEEPSEEK_API_KEY`; its value is absent from Docker argv, image metadata, manifests, and events.
+Codex shell-environment policy also excludes provider credentials from Agent-launched Bash tools.
 
-## OpenCode + DeepSeek configuration
+Host mode is diagnostics-only and requires both `APKSCANNER_CODEX_ISOLATION=host` and
+`APKSCANNER_ALLOW_HOST_CODEX=true`. It has no container, UID, or resource boundary. Do not override
+`APKSCANNER_CODEX_BIN` unless the external binary has been verified against the pinned SDK.
 
-OpenCode is also opt-in and Docker is the default. The integration pins the SDK and CLI together at
-`1.18.4`; it uses DeepSeek's built-in provider and defaults to the stable
-`deepseek-v4-flash` baseline.
-
-```bash
-docker build \
-  -f Dockerfile.opencode-worker \
-  -t apk-scanner-opencode-worker:0.1.0 \
-  .
-
-export DEEPSEEK_API_KEY=...
-export APKSCANNER_INVESTIGATOR_BACKEND=opencode
-export APKSCANNER_OPENCODE_ISOLATION=docker
-export APKSCANNER_OPENCODE_ENABLED=true
-scanctl capabilities --deep
-```
-
-For a personally controlled host fallback, install the pinned worker dependencies and select host
-isolation:
-
-```bash
-npm ci --prefix opencode-worker
-export DEEPSEEK_API_KEY=...
-export APKSCANNER_OPENCODE_ISOLATION=host
-export APKSCANNER_OPENCODE_ENABLED=true
-export APKSCANNER_INVESTIGATOR_BACKEND=opencode
-scanctl capabilities --deep
-```
-
-The host worker creates a private temporary HOME/XDG tree and an authenticated loopback OpenCode
-server for each invocation. The default `personal_lab` path runs a non-thinking analyzer with
-`read`, `glob`, `grep`, and `bash`, complete read-only decompiler roots, and a writable
-per-task/attempt workspace; an isolated tool-disabled StructuredOutput turn finalizes its memo.
-Host mode may use raw ADB and authorized network access for exploration. Once the Agent has a
-working ordinary-app PoC, it writes a replay JSON file and runs
-`apkscanner-proof <file>`. The task-scoped helper immediately hands that PoC to the Python control
-plane for build, serialized device execution, Oracle evaluation, Evidence recording, and
-Hypothesis correlation while the Agent session is still active. The structured
-`requested_tests` field remains only as a compatibility fallback for Docker/no-live-replay runs;
-the Agent must not submit the same test through both paths. Set
-`APKSCANNER_AGENT_PERMISSION_PROFILE=strict` for a single tool-disabled finalizer.
-Host mode does not isolate same-UID processes or their `/proc` metadata, so it is suitable only for
-controlled personal debugging and is not a credential-security boundary. Use the default Docker
-mode for production or untrusted APKs.
-
-The `personal_lab` analyzer and finalizer both disable thinking, avoiding the unbounded thinking
-tool loop. Set `APKSCANNER_OPENCODE_THINKING_EXPLORER=true` only for explicit protocol experiments;
-the finalizer always remains non-thinking and tool-disabled.
-
-DeepSeek thinking requests reject `tool_choice`. OpenCode 1.18.4 injects `tool_choice: auto`, so the
-one-shot worker uses a loopback compatibility proxy that removes this field only when
-`thinking.type=enabled`; it preserves OpenCode's message/tool loop and full `reasoning_content`
-replay. The stable finalizer disables thinking and uses OpenCode `StructuredOutput`
-(`tool_choice: required`), then Ajv, semantic rules, and current-task Hypothesis/EntryPoint
-allowlists validate the result. Each retry uses a fresh session. A retryable local transport failure
-can rebuild the worker once within the original task budget without changing models. The legacy
-memo-writer exists only inside the opt-in experimental explorer profile and is not part of normal
-scans.
-
-Use `deepseek-v4-flash` as the default analyzer/finalizer. The text-only `deepseek-v4-pro` is
-rejected as the primary model, but may be configured as the evidence-only Critic analyzer through
-`APKSCANNER_OPENCODE_CRITIC_MODEL`; Flash converts its memo into the mandatory StructuredOutput
-contract. No failure silently switches models. `scanctl capabilities --deep`
-performs a small real, billable non-thinking StructuredOutput call rather than only checking a
-catalog. An enterprise DeepSeek-compatible gateway can be selected with
-`APKSCANNER_DEEPSEEK_BASE_URL`; remote gateways must use HTTPS, while plain HTTP is accepted only on
-loopback. Credentials, query parameters, and fragments are rejected. The worker keeps the real API
-key only in the compatibility proxy's memory, gives OpenCode a one-time loopback credential, and
-removes provider/config/server credentials from the Bash child environment. For the official endpoint use
-`https://api.deepseek.com` without `/v1`. Retired `deepseek-chat` and `deepseek-reasoner` aliases are
-rejected.
-
-The implementation rationale, protocol, security controls, and upgrade checklist are documented in
+The implemented Worker Protocol v2 still starts one ephemeral Thread per physical invocation;
+scan containers and same-role workspaces are reused, but persistent Thread/resume, the in-container
+ADB/Proof gateway, and MCP/script entry points are next-stage work. See
+[`docs/codex-docker-architecture.zh-CN.md`](docs/codex-docker-architecture.zh-CN.md). The retired
+OpenCode design remains only for historical reference in
 [`docs/opencode-deepseek.zh-CN.md`](docs/opencode-deepseek.zh-CN.md).
 
 To add MobSF breadth:
@@ -291,25 +232,27 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_POC_COMPILE_API` | `APKSCANNER_ANDROID_API` | Installed SDK platform used to compile PoC Java sources |
 | `APKSCANNER_POC_MIN_API` | `21` | Requested PoC minimum API; legacy `dx` raises the effective minimum to 26 |
 | `APKSCANNER_POC_TARGET_API` | `APKSCANNER_ANDROID_API` | PoC target SDK used to reproduce the selected Android platform behavior |
-| `APKSCANNER_INVESTIGATOR_BACKEND` | `codex` | Default: `codex`, `opencode`, or `none` |
+| `APKSCANNER_INVESTIGATOR_BACKEND` | `codex` | Default: `codex` or `none` |
 | `APKSCANNER_AGENT_PERMISSION_PROFILE` | `personal_lab` | `personal_lab` enables full decompiler access and writable tool analysis; `strict` keeps schema-only analysis |
 | `APKSCANNER_CODEX_ENABLED` | `false` | Dispatch Codex investigations |
 | `APKSCANNER_CODEX_ISOLATION` | `docker` | `docker` or explicit `host` fallback |
-| `APKSCANNER_CODEX_DOCKER_IMAGE` | `apk-scanner-worker:0.1.0` | Worker image |
-| `APKSCANNER_CODEX_AUTH_FILE` | unset | Auth file mounted only into the worker |
+| `APKSCANNER_ALLOW_HOST_CODEX` | `false` | Required second switch for host diagnostics |
+| `APKSCANNER_CODEX_DOCKER_IMAGE` | `apk-scanner-codex-worker:0.2.0` | Pinned worker image |
+| `APKSCANNER_CODEX_PROVIDER` | `deepseek` | Currently the only accepted provider |
+| `APKSCANNER_CODEX_MODEL` | `deepseek-v4-flash` | Currently the only accepted model |
+| `APKSCANNER_CODEX_REASONING_EFFORT` | `high` | `low`, `high`, or `max` |
+| `APKSCANNER_CODEX_MODEL_CATALOG` | `config/deepseek-models.json` | Pinned DeepSeek model catalog |
+| `APKSCANNER_CODEX_WEB_SEARCH` | `live` | Codex Web Search mode; the current contract requires `live` |
+| `APKSCANNER_CODEX_MAX_CONTAINERS` | `2` | Global concurrent scan-container limit |
+| `APKSCANNER_CODEX_MAX_SESSIONS` | `6` | Global UID-session limit |
+| `APKSCANNER_CODEX_MAX_SESSIONS_PER_SCAN` | `3` | Per-scan role-session limit |
+| `APKSCANNER_CODEX_UID_MIN` / `APKSCANNER_CODEX_UID_MAX` | `21000` / `21999` | Non-reused session UID pool within a scan |
+| `APKSCANNER_CODEX_CPU_LIMIT` / `APKSCANNER_CODEX_MEMORY_LIMIT` | `6` / `12g` | Per-scan container limits |
+| `APKSCANNER_CODEX_TURN_TIMEOUT` | 3600 s | Hard timeout for one Codex invocation |
+| `APKSCANNER_CODEX_NO_EVENT_TIMEOUT` | 900 s | Silent-worker timeout |
 | `APKSCANNER_CODEX_BIN` | bundled SDK runtime | Explicit tested Codex binary override |
-| `APKSCANNER_OPENCODE_ENABLED` | `false` | Allow OpenCode + DeepSeek investigations |
-| `APKSCANNER_OPENCODE_MODEL` | `deepseek-v4-flash` | Structured analyzer/finalizer model; text-only V4 Pro is rejected in this primary role |
-| `APKSCANNER_OPENCODE_CRITIC_MODEL` | `deepseek-v4-pro` | Text analysis model for evidence-only adversarial review; Flash still performs structured finalization |
-| `APKSCANNER_OPENCODE_THINKING_EXPLORER` | `false` | Experimental legacy thinking/tool-loop profile |
-| `APKSCANNER_OPENCODE_REASONING_EFFORT` | `high` | Experimental explorer effort: `high` or `max` |
-| `APKSCANNER_OPENCODE_AGENT_STEPS` | ignored | Retained for compatibility; Agent model/tool steps are not capped |
-| `APKSCANNER_OPENCODE_ISOLATION` | `docker` | `docker` or explicit `host` fallback |
-| `APKSCANNER_OPENCODE_DOCKER_IMAGE` | `apk-scanner-opencode-worker:0.1.0` | Worker image |
-| `APKSCANNER_OPENCODE_NODE_BIN` | `node` on PATH | Host-mode Node.js override |
-| `APKSCANNER_OPENCODE_WORKER_DIR` | repository `opencode-worker/` | Host worker directory |
 | `APKSCANNER_DEEPSEEK_BASE_URL` | DeepSeek default | Optional trusted HTTP(S) gateway |
-| `DEEPSEEK_API_KEY` | unset | DeepSeek credential delivered to the selected worker over its one-shot stdin request |
+| `DEEPSEEK_API_KEY` | unset | DeepSeek credential inherited only by the UID worker exec |
 | `APKSCANNER_MOBSF_URL` / `APKSCANNER_MOBSF_API_KEY` | unset | Optional MobSF API |
 | `APKSCANNER_ANDROID_VERSION` | `16` | Reported dynamic baseline |
 | `APKSCANNER_ANDROID_API` | `36` | Expected audit-device API and default PoC compile/target API |
@@ -317,7 +260,7 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_DEVICE_INSTALL_POLICY` | `install_or_reuse` | `replace`, `install_or_reuse`, or `reuse_installed` target policy |
 | `APKSCANNER_DEVICE_RESET_POLICY` | `per_round` | `per_test`, `per_round`, or `never`; each requested test may override it |
 | `APKSCANNER_MAX_UPLOAD_BYTES` | 512 MiB | Intake limit |
-| `APKSCANNER_TASK_TIMEOUT` | 1200 s | Deterministic/platform device workflow budget; does not cap an OpenCode Agent run |
+| `APKSCANNER_TASK_TIMEOUT` | 14400 s | Total investigation-task budget |
 | `APKSCANNER_TASK_MAX_ATTEMPTS` | 2 | Retry budget |
 | `APKSCANNER_AGENT_MAX_ROUNDS` | ignored | Retained for compatibility; adaptive Agent rounds are not count-capped |
 | `APKSCANNER_AGENT_TESTS_PER_ROUND` | 8 | Maximum accepted AI-requested tests per round (1–1000) |
@@ -328,7 +271,9 @@ export APKSCANNER_MOBSF_API_KEY=...
 pytest
 ruff check backend
 cd frontend && npm run lint && npm run build
-cd ../opencode-worker && npm run check && npm test
+
+# Optional: requires root, Docker, and the built pinned image
+APKSCANNER_RUN_DOCKER_TESTS=1 pytest -q backend/tests/test_codex_executor.py
 ```
 
 The test corpus uses synthetic APK-shaped ZIPs with safe/vulnerable manifest controls. Add signed
@@ -345,10 +290,8 @@ The server binds to `127.0.0.1` and rejects untrusted Host headers.
 - No source code or server authorization context is available; AUTH and PRIVACY remain partial.
 - v1 covers one APK, one dedicated Android test device, and `pm clear` rather than a
   full device snapshot.
-- The Codex worker gets a read-only task-attempt mount. OpenCode personal-lab mode gets a separate
-  writable task-attempt workspace plus complete read-only Apktool/JADX/archive roots; `read`,
-  `glob`, `grep`, `bash`, local helper/APK builds, network, and host-mode ADB exploration are
-  enabled. Final proof still uses correlated platform Probe/PoC evidence.
+- The Codex worker gets read-only scan inputs and a writable per-role workspace under a distinct
+  UID. The Codex sandbox is full access inside the container. No device or Docker socket is mounted.
 - Agent containers still have outbound networking for their selected model provider. Restrict each
   worker's egress to the approved provider/gateway before a team deployment.
 - DeepSeek receives the bounded task context and evidence summaries. Confirm company data handling,

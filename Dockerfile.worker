@@ -1,19 +1,98 @@
+FROM node:22.13-bookworm-slim AS node-runtime
+
 FROM python:3.13-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    ANDROID_HOME=/usr/lib/android-sdk \
+    ANDROID_SDK_ROOT=/usr/lib/android-sdk \
+    PATH="/opt/jadx/bin:/usr/lib/android-sdk/build-tools/36.1.0:${PATH}"
 
-LABEL io.apkscanner.version="0.1.0" \
+ARG DEBIAN_MIRROR=""
+ARG JADX_VERSION="1.5.6"
+ARG JADX_SHA256="545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974"
+ARG APKTOOL_VERSION="3.0.3"
+ARG APKTOOL_SHA256="dbf930b076c6b9be08d57c449cacefc3bdd6b71ebd59b3066fc0e1f5b14f9423"
+ARG ANDROID_PLATFORM_ARCHIVE="platform-36_r02.zip"
+ARG ANDROID_PLATFORM_SHA1="2c1a80dd4d9f7d0e6dd336ec603d9b5c55a6f576"
+ARG ANDROID_BUILD_TOOLS_ARCHIVE="build-tools_r36.1_linux.zip"
+ARG ANDROID_BUILD_TOOLS_SHA1="936a0d6bd5ae3e2118a7567dddbc95ff67ed46e9"
+
+LABEL io.apkscanner.version="0.2.0" \
       io.apkscanner.sdk-version="0.144.4" \
-      io.apkscanner.worker-protocol="2"
+      io.apkscanner.worker-protocol="2" \
+      io.apkscanner.agent-backend="codex" \
+      io.apkscanner.model-provider="deepseek" \
+      io.apkscanner.jadx-version="1.5.6" \
+      io.apkscanner.apktool-version="3.0.3" \
+      io.apkscanner.android-platform="36_r02" \
+      io.apkscanner.android-build-tools="36.1.0"
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends android-tools-adb ca-certificates \
+RUN if [ -n "${DEBIAN_MIRROR}" ]; then \
+        sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        binutils \
+        ca-certificates \
+        curl \
+        file \
+        git \
+        jq \
+        openjdk-17-jdk-headless \
+        ripgrep \
+        smali \
+        sqlite3 \
+        unzip \
+        zip \
     && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /usr/lib/android-sdk/platforms /usr/lib/android-sdk/build-tools \
+    && curl -fsSL \
+        "https://dl.google.com/android/repository/${ANDROID_PLATFORM_ARCHIVE}" \
+        -o /tmp/android-platform.zip \
+    && echo "${ANDROID_PLATFORM_SHA1}  /tmp/android-platform.zip" | sha1sum -c - \
+    && unzip -q /tmp/android-platform.zip -d /tmp/android-platform \
+    && mv /tmp/android-platform/android-* /usr/lib/android-sdk/platforms/android-36 \
+    && curl -fsSL \
+        "https://dl.google.com/android/repository/${ANDROID_BUILD_TOOLS_ARCHIVE}" \
+        -o /tmp/android-build-tools.zip \
+    && echo "${ANDROID_BUILD_TOOLS_SHA1}  /tmp/android-build-tools.zip" | sha1sum -c - \
+    && unzip -q /tmp/android-build-tools.zip -d /tmp/android-build-tools \
+    && mv /tmp/android-build-tools/android-* /usr/lib/android-sdk/build-tools/36.1.0 \
+    && rm -rf /tmp/android-platform /tmp/android-platform.zip \
+        /tmp/android-build-tools /tmp/android-build-tools.zip \
+    && curl -fsSL \
+        "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip" \
+        -o /tmp/jadx.zip \
+    && echo "${JADX_SHA256}  /tmp/jadx.zip" | sha256sum -c - \
+    && mkdir -p /opt/jadx \
+    && unzip -q /tmp/jadx.zip -d /opt/jadx \
+    && rm /tmp/jadx.zip \
+    && curl -fsSL \
+        "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar" \
+        -o /tmp/apktool.jar \
+    && echo "${APKTOOL_SHA256}  /tmp/apktool.jar" | sha256sum -c - \
+    && mkdir -p /opt/apktool \
+    && mv /tmp/apktool.jar /opt/apktool/apktool.jar
+
+COPY docker/bin/apktool /usr/local/bin/apktool
+RUN chmod 0555 /usr/local/bin/apktool
+
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
 WORKDIR /opt/apk-scanner
 COPY pyproject.toml README.md ./
+COPY docker/install-project-dependencies.py /tmp/install-project-dependencies.py
+RUN python /tmp/install-project-dependencies.py \
+    && rm /tmp/install-project-dependencies.py
 COPY backend ./backend
-RUN python -m pip install --no-cache-dir .
+COPY config/deepseek-models.json ./config/deepseek-models.json
+RUN python -m pip install --no-cache-dir --no-deps --no-build-isolation .
+RUN ln -s /usr/local/lib/python3.13/site-packages/codex_cli_bin/bin/codex \
+        /usr/local/bin/codex
 
 ENTRYPOINT ["python", "-m", "apkscanner.codex_worker"]

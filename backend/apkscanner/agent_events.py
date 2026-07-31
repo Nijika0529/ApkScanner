@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,6 +20,16 @@ class AgentRuntimeEvent:
     message: str
     data: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def dedupe_key(self) -> str:
+        payload = json.dumps(
+            {"event_type": self.event_type, "data": redact_event_data(self.data)},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
 
 AgentEventCallback = Callable[[AgentRuntimeEvent], None]
 
@@ -29,7 +42,13 @@ def emit_agent_event(
 ) -> None:
     if callback is None:
         return
-    callback(AgentRuntimeEvent(event_type=event_type, message=message, data=data or {}))
+    callback(
+        AgentRuntimeEvent(
+            event_type=event_type,
+            message=message,
+            data=redact_event_data(data or {}),
+        )
+    )
 
 
 def normalize_codex_notification(notification: Any) -> AgentRuntimeEvent | None:
@@ -63,7 +82,16 @@ def normalize_codex_notification(notification: Any) -> AgentRuntimeEvent | None:
             {"error": _safe_error(payload.get("error") or payload)},
         )
     if method not in {"item/started", "item/completed"}:
-        return None
+        if not method:
+            return None
+        return AgentRuntimeEvent(
+            "sdk.notification.unknown",
+            "Codex SDK 发出了尚未映射的运行事件",
+            {
+                "method": method[:256],
+                "payload_keys": sorted(str(key)[:128] for key in payload)[:50],
+            },
+        )
 
     item = _mapping(payload.get("item"))
     item_type = str(item.get("type") or "unknown")
@@ -118,7 +146,16 @@ def normalize_codex_notification(notification: Any) -> AgentRuntimeEvent | None:
                 }
             ),
         )
-    return None
+    return AgentRuntimeEvent(
+        "sdk.notification.unknown",
+        "Codex SDK 发出了尚未映射的 item 事件",
+        _compact(
+            {
+                **common,
+                "method": method,
+            }
+        ),
+    )
 
 
 def runtime_event_from_mapping(value: Any) -> AgentRuntimeEvent | None:
@@ -134,8 +171,34 @@ def runtime_event_from_mapping(value: Any) -> AgentRuntimeEvent | None:
     return AgentRuntimeEvent(
         event_type=event_type,
         message=message,
-        data=data if isinstance(data, dict) else {},
+        data=redact_event_data(data if isinstance(data, dict) else {}),
     )
+
+
+_SECRET_KEY = re.compile(
+    r"(?:authorization|api[_-]?key|access[_-]?token|bearer|credential|password|secret)",
+    re.I,
+)
+_SECRET_VALUE = re.compile(r"(?i)(?:bearer\s+)?sk-[A-Za-z0-9_-]{8,}")
+
+
+def redact_event_data(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): (
+                "[REDACTED]"
+                if _SECRET_KEY.search(str(key))
+                else redact_event_data(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_event_data(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_event_data(item) for item in value)
+    if isinstance(value, str):
+        return _SECRET_VALUE.sub("[REDACTED]", value)[:10_000]
+    return value
 
 
 def _model_dump(value: Any) -> dict[str, Any]:

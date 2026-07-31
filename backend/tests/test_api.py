@@ -59,10 +59,7 @@ def test_local_api_requires_console_marker_for_mutations(settings) -> None:  # n
         health = client.get("/api/v1/health").json()
         assert health["default_investigator"] == "codex"
         assert health["max_upload_bytes"] == settings.max_upload_bytes
-        assert {item["name"] for item in health["capabilities"]} >= {
-            "codex",
-            "opencode_deepseek",
-        }
+        assert {item["name"] for item in health["capabilities"]} >= {"codex"}
 
 
 def test_health_reports_a_leased_adb_pool_as_busy_not_unavailable(
@@ -963,8 +960,7 @@ def test_ai_calls_are_exposed_as_integrity_checked_audit_records(settings) -> No
         assert download.status_code == 409
 
 
-def test_opencode_audit_records_explicit_phase_execution_profile(settings) -> None:  # noqa: ANN001
-    settings = replace(settings, opencode_model="deepseek-v4-pro")
+def test_codex_audit_records_frozen_execution_and_provider_profiles(settings) -> None:  # noqa: ANN001
     app = create_app(settings)
     orchestrator = app.state.orchestrator
     with app.state.database.session_factory() as session:
@@ -1000,9 +996,9 @@ def test_opencode_audit_records_explicit_phase_execution_profile(settings) -> No
         entries=[entry],
         evidence=[],
         platform_context={"phase": "static_only"},
-        backend="opencode",
+        backend="codex",
         phase="static_only",
-        capability={"version": "1.18.4"},
+        capability={"version": "0.144.4", "runtime_version": "0.144.4"},
     )
     transport = {
         "mode": "structured_output_tool",
@@ -1050,7 +1046,7 @@ def test_opencode_audit_records_explicit_phase_execution_profile(settings) -> No
         scan_id=scan.id,
         task_id=task.id,
         audit_id=audit_id,
-        backend="opencode",
+        backend="codex",
         phase="static_only",
         attempt=1,
         result=result,
@@ -1061,44 +1057,38 @@ def test_opencode_audit_records_explicit_phase_execution_profile(settings) -> No
         assert response.status_code == 200
         audit = response.json()[0]
         request = audit["artifacts"]["request"]["content"]
-        assert request["runtime_options"]["output_mode"] == "analyze_then_finalize"
-        assert (
-            request["runtime_options"]["execution_profile"]["name"]
-            == "stable_analyzer"
-        )
-        assert (
-            request["runtime_options"]["execution_profile"]["stages"][0][
-                "thinking_mode"
-            ]
-            == "disabled"
-        )
-        assert request["runtime_options"]["schema_validator"] == "ajv@8.20.0"
+        assert request["backend"] == "codex"
+        assert request["provider"] == "deepseek"
+        assert request["model"] == "deepseek-v4-flash"
+        assert request["runtime_options"]["output_mode"] == "json_schema"
+        assert request["runtime_options"]["execution_profile"]["sandbox"] == "full_access"
+        assert request["runtime_options"]["execution_profile"]["container_scope"] == "scan"
+        assert request["runtime_options"]["provider_profile"]["wire_api"] == "responses"
+        assert request["runtime_options"]["provider_profile"]["credential_env"] == "DEEPSEEK_API_KEY"
+        assert request["runtime_options"]["schema_validator"] == "pydantic@2"
         assert request["runtime_options"]["semantic_validator"] == "apkscanner@1.0"
         assert request["runtime_options"]["max_agent_steps"] is None
         assert request["runtime_options"]["max_provider_requests"] is None
         assert request["tool_boundary"]["model_tools_enabled"] is True
-        assert request["tool_boundary"]["workspace_tool_profile"] == "workspace_shell"
+        assert request["tool_boundary"]["workspace_tool_profile"] == "codex_full_access"
         assert request["tool_boundary"]["workspace_tools"] == [
-            "read",
-            "glob",
-            "grep",
-            "bash",
-            "write",
-            "edit",
+            "file",
+            "shell",
+            "apply_patch",
+            "web_search",
         ]
         assert request["tool_boundary"]["shell_enabled"] is True
         assert request["tool_boundary"]["write_enabled"] is True
         assert request["tool_boundary"]["native_write_tools_enabled"] is True
         assert request["tool_boundary"]["allowed_write_roots"] == [
-            "task_attempt_workspace",
-            "/tmp",
+            "session_workspace",
+            "session_tmp",
         ]
         assert request["tool_boundary"]["shared_scan_workspace_exposed"] is True
         assert request["tool_boundary"]["adb_enabled"] is False
-        assert request["tool_boundary"]["structured_output_tool_enabled"] is True
+        assert request["tool_boundary"]["structured_output_tool_enabled"] is False
         assert "DEEPSEEK_THINKING_OUTPUT_ADAPTER" not in request["prompt"]
-        assert request["explorer_prompt"] is not None
-        assert "Inspect context.json first" in request["explorer_prompt"]
+        assert "explorer_prompt" not in request
         recorded_transport = audit["artifacts"]["response"]["content"][
             "output_transport"
         ]
@@ -1127,12 +1117,12 @@ def test_scan_and_task_agent_controls_are_persisted(settings) -> None:  # noqa: 
         scan_response = client.patch(
             f"/api/v1/scans/{scan.id}/agent-control",
             headers={"X-APKScanner-Request": "console"},
-            json={"enabled": False, "backend": "opencode"},
+            json={"enabled": False, "backend": "codex"},
         )
         assert scan_response.status_code == 200
         control = scan_response.json()["stats"]["agent_control"]
         assert control["enabled"] is False
-        assert control["backend"] == "opencode"
+        assert control["backend"] == "codex"
         assert control["updated_at"]
 
         task_response = client.patch(

@@ -76,10 +76,8 @@ class BenchmarkEvaluator:
                 if len(observed_models) == 1
                 else f"mixed:{','.join(observed_models)}"
                 if observed_models
-                else self.settings.codex_worker_model
+                else self.settings.codex_model
                 if backend == "codex"
-                else self.settings.opencode_model
-                if backend == "opencode"
                 else None
             )
             result["model_attribution"] = {

@@ -27,6 +27,7 @@ def consume_worker_process(
     *,
     payload: dict[str, Any],
     timeout_seconds: int | None,
+    no_event_timeout_seconds: int | None = None,
     event_callback: AgentEventCallback | None = None,
     on_timeout: Callable[[], None] | None = None,
     cancel_event: threading.Event | None = None,
@@ -47,6 +48,7 @@ def consume_worker_process(
         if timeout_seconds is None
         else time.monotonic() + max(timeout_seconds, 0)
     )
+    last_event_at = time.monotonic()
     owns_process_group = False
     if os.name == "posix":
         with suppress(OSError):
@@ -135,10 +137,23 @@ def consume_worker_process(
             if remaining is not None and remaining <= 0:
                 terminate_process(on_timeout)
                 raise WorkerTimeoutError(f"worker exceeded {timeout_seconds} seconds")
-            try:
-                kind, raw = messages.get(
-                    timeout=0.25 if remaining is None else min(0.25, remaining)
+            event_remaining = (
+                None
+                if no_event_timeout_seconds is None
+                else last_event_at + max(no_event_timeout_seconds, 0) - time.monotonic()
+            )
+            if event_remaining is not None and event_remaining <= 0:
+                terminate_process(on_timeout)
+                raise WorkerTimeoutError(
+                    f"worker emitted no event for {no_event_timeout_seconds} seconds"
                 )
+            wait_seconds = 0.25
+            if remaining is not None:
+                wait_seconds = min(wait_seconds, remaining)
+            if event_remaining is not None:
+                wait_seconds = min(wait_seconds, event_remaining)
+            try:
+                kind, raw = messages.get(timeout=wait_seconds)
             except queue.Empty:
                 continue
             if kind == "stdin_error":
@@ -152,6 +167,7 @@ def consume_worker_process(
                 continue
             if kind != "stdout" or not isinstance(raw, str) or not raw.strip():
                 continue
+            last_event_at = time.monotonic()
             try:
                 value = json.loads(raw)
             except json.JSONDecodeError as exc:

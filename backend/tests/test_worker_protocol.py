@@ -106,6 +106,33 @@ def test_worker_protocol_timeout_covers_a_blocked_stdin_write() -> None:
     assert process.poll() is not None
 
 
+def test_worker_protocol_no_event_timeout_terminates_a_silent_worker() -> None:
+    script = """
+import json
+import sys
+import time
+
+json.load(sys.stdin)
+time.sleep(30)
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    with pytest.raises(WorkerTimeoutError, match="emitted no event"):
+        consume_worker_process(
+            process,
+            payload={"schema_version": "1.0"},
+            timeout_seconds=5,
+            no_event_timeout_seconds=0.1,
+        )
+    assert process.poll() is not None
+
+
 def test_worker_protocol_cancellation_covers_a_blocked_stdin_write() -> None:
     process = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(30)"],

@@ -1,5 +1,11 @@
 # APK Scanner 项目总结与汇报材料
 
+> **迁移前历史快照**：本文记录 2026-07-31 `main` 分支在 Codex 重构前的汇报口径，
+> 其中 OpenCode 路由、Worker、测试数量和代码路径不再代表
+> `feature/codex-docker-migration`。当前实现状态以
+> [Codex + DeepSeek Docker 执行架构与迁移规范](codex-docker-architecture.zh-CN.md)
+> 和仓库 README 为准；后续应在迁移完成、真实 Provider/设备评测后重新生成本汇报。
+
 > 文档基线：2026-07-31，基于当前 `main` 分支实现整理。
 >
 > 使用场景：项目总结、方案评审、阶段汇报和现场演示。

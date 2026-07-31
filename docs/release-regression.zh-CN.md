@@ -320,7 +320,7 @@ POST /api/v1/scans/{baseline_scan_id}/successors
 Content-Type: multipart/form-data
 
 apk=<file>
-investigator=configured|codex|opencode|none
+investigator=configured|codex|none
 retest_scope=active_cases|none
 ```
 

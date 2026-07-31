@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
-import shutil
 import sys
-from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from .agent_events import normalize_codex_notification
-from .codex_runner import CodexInvestigator
+from .codex_runner import CodexInvestigator, codex_config_overrides
 
 
 class WorkerRequest(BaseModel):
@@ -20,19 +17,12 @@ class WorkerRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=10_000_000)
     developer_instructions: str = Field(min_length=1, max_length=100_000)
     model: str = Field(min_length=1, max_length=256)
+    model_provider: Literal["deepseek"]
+    reasoning_effort: Literal["low", "high", "max"]
+    provider_base_url: str = Field(min_length=1, max_length=2048)
+    model_catalog_path: str = Field(min_length=1, max_length=4096)
+    workspace_path: str = Field(pattern=r"^/agent-workspaces/[a-z0-9-]+/workspace$")
     output_schema: dict[str, Any]
-
-
-def _prepare_auth() -> None:
-    source_value = os.getenv("APKSCANNER_CODEX_AUTH_FILE")
-    if not source_value:
-        return
-    source = Path(source_value)
-    codex_home = Path(os.environ.get("CODEX_HOME", "/codex-home"))
-    codex_home.mkdir(parents=True, exist_ok=True)
-    target = codex_home / "auth.json"
-    shutil.copyfile(source, target)
-    target.chmod(0o600)
 
 
 def main() -> None:
@@ -40,19 +30,30 @@ def main() -> None:
     if len(raw) > 10_000_000:
         raise ValueError("worker request exceeds 10 MB")
     request = WorkerRequest.model_validate_json(raw)
-    _prepare_auth()
 
     from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
     from openai_codex.generated.v2_all import ReasoningEffort
 
-    with Codex(CodexConfig(config_overrides=("agents.max_threads=1",))) as codex:
+    with Codex(
+        CodexConfig(
+            config_overrides=codex_config_overrides(
+                provider=request.model_provider,
+                model=request.model,
+                reasoning_effort=request.reasoning_effort,
+                base_url=request.provider_base_url,
+                model_catalog_path=request.model_catalog_path,
+                web_search="live",
+            )
+        )
+    ) as codex:
         thread = codex.thread_start(
             approval_mode=ApprovalMode.deny_all,
-            cwd="/workspace",
+            cwd=request.workspace_path,
             developer_instructions=request.developer_instructions,
             ephemeral=True,
             model=request.model,
-            sandbox=Sandbox.read_only,
+            model_provider=request.model_provider,
+            sandbox=Sandbox.full_access,
             service_name="apk-scanner-container-worker",
         )
         _emit_event(
@@ -63,11 +64,11 @@ def main() -> None:
         handle = thread.turn(
             request.prompt,
             approval_mode=ApprovalMode.deny_all,
-            cwd="/workspace",
-            effort=ReasoningEffort.medium,
+            cwd=request.workspace_path,
+            effort=ReasoningEffort(request.reasoning_effort),
             model=request.model,
             output_schema=request.output_schema,
-            sandbox=Sandbox.read_only,
+            sandbox=Sandbox.full_access,
         )
         from openai_codex.api import _collect_turn_result
 

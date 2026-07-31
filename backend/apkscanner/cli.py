@@ -158,12 +158,11 @@ def capabilities_command(args: argparse.Namespace) -> int:
         "default_investigator": orchestrator.resolve_investigator(),
         "enabled_investigators": [
             name
-            for name in ("codex", "opencode")
+            for name in ("codex",)
             if orchestrator.settings.investigator_enabled(name)
         ],
         "tools": discover_tools(orchestrator.runner),
         "codex": orchestrator.codex.capability(deep=args.deep),
-        "opencode": orchestrator.opencode.capability(deep=args.deep),
         "device": orchestrator.device_pool.capability(),
         "mobsf": orchestrator.mobsf.capability(),
     }
@@ -231,7 +230,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("apk")
     scan.add_argument(
         "--investigator",
-        choices=("configured", "codex", "opencode", "none"),
+        choices=("configured", "codex", "none"),
         default="configured",
         help="AI investigator backend for this scan",
     )
@@ -244,7 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--truth", required=True)
     benchmark.add_argument(
         "--investigator",
-        choices=("configured", "codex", "opencode", "none"),
+        choices=("configured", "codex", "none"),
         default="configured",
     )
     benchmark.set_defaults(handler=benchmark_command)

@@ -8,7 +8,6 @@ import shutil
 import subprocess
 import threading
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import suppress
@@ -23,6 +22,9 @@ from .agent_events import (
     normalize_codex_notification,
 )
 from .agent_prompt import developer_instructions, investigation_prompt
+from .agent_workspace import AgentWorkspaceManager
+from .codex_executor import CodexDockerExecutor
+from .codex_sdk_baseline import PINNED_SDK_VERSION, runtime_capability
 from .config import Settings
 from .models import EntryPoint, InvestigationTask, Scan
 from .schemas import AGENT_RESULT_JSON_SCHEMA, AgentInvestigationResult
@@ -44,19 +46,36 @@ class CodexRunResult:
 class CodexInvestigator:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.workspaces = AgentWorkspaceManager(settings)
+        self.executor = CodexDockerExecutor(settings)
         self._deep_capability: dict[str, Any] | None = None
         self._capability_lock = threading.Lock()
 
     def capability(self, *, deep: bool = False) -> dict[str, Any]:
-        try:
-            version = importlib.metadata.version("openai-codex")
-        except importlib.metadata.PackageNotFoundError:
-            return {"available": False, "detail": "openai-codex==0.144.4 is not installed"}
-        capability: dict[str, Any] = {"available": True, "version": version}
-        if version != "0.144.4":
-            capability["available"] = False
-            capability["detail"] = f"expected 0.144.4, found {version}"
+        capability = runtime_capability()
+        if not capability.get("available"):
             return capability
+        try:
+            frozen = self.settings.frozen_agent_configuration()
+        except ValueError as exc:
+            return {**capability, "available": False, "detail": str(exc)}
+        capability.update(
+            {
+                "provider": frozen.provider.provider,
+                "model": frozen.provider.model,
+                "reasoning_effort": frozen.provider.reasoning_effort,
+                "credential_mode": "development_direct_env",
+                "execution_profile": frozen.execution.id,
+                "execution_profile_sha256": frozen.execution.fingerprint(),
+                "provider_profile_sha256": frozen.provider.fingerprint(),
+            }
+        )
+        if not self.settings.codex_model_catalog.is_file():
+            return {
+                **capability,
+                "available": False,
+                "detail": f"Codex model catalog is missing: {self.settings.codex_model_catalog}",
+            }
         capability["isolation"] = self.settings.codex_isolation
         if self.settings.codex_isolation not in {"host", "docker"}:
             capability["available"] = False
@@ -64,6 +83,12 @@ class CodexInvestigator:
             return capability
         if self.settings.codex_isolation == "docker":
             return self._docker_capability(capability)
+        if not self.settings.codex_allow_host:
+            return {
+                **capability,
+                "available": False,
+                "detail": "host Codex requires APKSCANNER_ALLOW_HOST_CODEX=true",
+            }
         if deep:
             with self._capability_lock:
                 if self._deep_capability is not None:
@@ -109,9 +134,11 @@ class CodexInvestigator:
         )
         if self.settings.codex_isolation == "docker":
             return self._investigate_docker(
+                scan=scan,
                 prompt=prompt,
-                task_id=task.id,
+                task=task,
                 workspace=workspace,
+                platform_context=platform_context or {},
                 timeout_seconds=timeout_seconds,
                 event_callback=event_callback,
                 cancel_event=cancel_event,
@@ -124,8 +151,9 @@ class CodexInvestigator:
                 cwd=str(workspace),
                 developer_instructions=developer_instructions(direct_tool_access=True),
                 ephemeral=False,
-                model=self.settings.codex_worker_model,
-                sandbox=Sandbox.read_only,
+                model=self.settings.codex_model,
+                model_provider=self.settings.codex_provider,
+                sandbox=Sandbox.full_access,
                 service_name="apk-scanner",
             )
             emit_agent_event(
@@ -138,10 +166,10 @@ class CodexInvestigator:
                 prompt,
                 approval_mode=ApprovalMode.deny_all,
                 cwd=str(workspace),
-                effort=ReasoningEffort.medium,
-                model=self.settings.codex_worker_model,
+                effort=ReasoningEffort(self.settings.codex_reasoning_effort),
+                model=self.settings.codex_model,
                 output_schema=AGENT_RESULT_JSON_SCHEMA,
-                sandbox=Sandbox.read_only,
+                sandbox=Sandbox.full_access,
             )
 
             def consume_turn():  # noqa: ANN202
@@ -164,6 +192,10 @@ class CodexInvestigator:
                 if timeout_seconds is None
                 else timeout_seconds
             )
+            effective_timeout = min(
+                effective_timeout,
+                self.settings.codex_turn_timeout_seconds,
+            )
             deadline = time.monotonic() + effective_timeout
             while True:
                 if cancel_event is not None and cancel_event.is_set():
@@ -185,7 +217,7 @@ class CodexInvestigator:
                         handle.interrupt()
                     executor.shutdown(wait=False, cancel_futures=True)
                     raise TimeoutError(
-                        f"Codex investigation exceeded {timeout_seconds} seconds"
+                        f"Codex investigation exceeded {effective_timeout} seconds"
                     )
                 try:
                     turn = future.result(timeout=min(0.25, remaining))
@@ -250,33 +282,28 @@ class CodexInvestigator:
                 "available": False,
                 "detail": f"build the worker image first: {image}",
             }
-        if inspected.stdout.strip() != "0.144.4|2":
+        if inspected.stdout.strip() != f"{PINNED_SDK_VERSION}|2":
             return {
                 **capability,
                 "available": False,
                 "detail": "worker image is stale or has an incompatible Codex SDK label",
             }
-        auth_file = self.settings.codex_auth_file
-        if auth_file is not None and not auth_file.is_file():
+        if not os.getenv("DEEPSEEK_API_KEY"):
             return {
                 **capability,
                 "available": False,
-                "detail": "APKSCANNER_CODEX_AUTH_FILE does not exist",
-            }
-        if auth_file is None and not os.getenv("OPENAI_API_KEY"):
-            return {
-                **capability,
-                "available": False,
-                "detail": "Docker mode requires APKSCANNER_CODEX_AUTH_FILE or OPENAI_API_KEY",
+                "detail": "Docker mode requires DEEPSEEK_API_KEY in the host process environment",
             }
         return capability
 
     def _investigate_docker(
         self,
         *,
+        scan: Scan,
         prompt: str,
-        task_id: str,
+        task: InvestigationTask,
         workspace: Path,
+        platform_context: dict[str, Any],
         timeout_seconds: int | None,
         event_callback: AgentEventCallback | None,
         cancel_event: threading.Event | None,
@@ -290,92 +317,68 @@ class CodexInvestigator:
         )
         if not capability.get("available"):
             raise RuntimeError(str(capability.get("detail")))
-        workspace = workspace.resolve()
-        if not workspace.is_dir() or "," in str(workspace):
-            raise ValueError("scan workspace is unavailable or unsafe for a Docker bind mount")
-        executable = shutil.which("docker")
-        assert executable is not None
-        safe_task = re.sub(r"[^a-z0-9-]", "-", task_id.lower())[:36]
-        container_name = f"apk-scanner-{safe_task}-{uuid.uuid4().hex[:8]}"
-        command = [
-            executable,
-            "run",
-            "--rm",
-            "--name",
-            container_name,
-            "--read-only",
-            "--cap-drop=ALL",
-            "--security-opt=no-new-privileges",
-            "--pids-limit=256",
-            "--memory=4g",
-            "--cpus=2",
-            "--network=bridge",
-            "--tmpfs",
-            "/tmp:rw,noexec,nosuid,nodev,size=512m",
-            "--tmpfs",
-            "/codex-home:rw,nosuid,nodev,size=256m",
-            "--mount",
-            f"type=bind,source={workspace},target=/workspace,readonly",
-            "--workdir",
-            "/workspace",
-            "--env",
-            "CODEX_HOME=/codex-home",
-        ]
-        auth_file = self.settings.codex_auth_file
-        if auth_file is not None:
-            if "," in str(auth_file):
-                raise ValueError("Codex auth path is unsafe for a Docker bind mount")
-            command.extend(
-                [
-                    "--mount",
-                    f"type=bind,source={auth_file},target=/run/secrets/codex-auth,readonly",
-                    "--env",
-                    "APKSCANNER_CODEX_AUTH_FILE=/run/secrets/codex-auth",
-                ]
-            )
-        if os.getenv("OPENAI_API_KEY"):
-            command.extend(["--env", "OPENAI_API_KEY"])
-        command.append(self.settings.codex_docker_image)
+        scan_workspace = (self.settings.data_dir / "workspaces" / scan.id).resolve()
+        if not scan_workspace.is_dir() or "," in str(scan_workspace):
+            raise ValueError("scan decompiler workspace is unavailable or unsafe")
+        phase = str(platform_context.get("phase") or "exploration_round")
+        role = (
+            "critic"
+            if phase == "adversarial_review"
+            else "rescue"
+            if phase in {"rescue_review", "rescue_exploration"}
+            else "primary"
+        )
+        sessions_root = self.workspaces.prepare_scan(scan.id)
+        agent_session = self.workspaces.prepare_session(
+            scan_id=scan.id,
+            task_id=task.id,
+            attempt=task.attempts,
+            role=role,
+            source_workspace=workspace,
+            context={"phase": phase},
+        )
+        container = self.executor.ensure_scan_container(
+            scan_id=scan.id,
+            scan_workspace=scan_workspace,
+            sessions_root=sessions_root,
+        )
         payload = {
             "schema_version": "1.0",
             "prompt": prompt,
             "developer_instructions": developer_instructions(direct_tool_access=True),
-            "model": self.settings.codex_worker_model,
+            "model": self.settings.codex_model,
+            "model_provider": self.settings.codex_provider,
+            "reasoning_effort": self.settings.codex_reasoning_effort,
+            "provider_base_url": self.settings.deepseek_base_url,
+            "model_catalog_path": "/opt/apk-scanner/config/deepseek-models.json",
+            "workspace_path": agent_session.container_workspace,
             "output_schema": AGENT_RESULT_JSON_SCHEMA,
         }
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
+        process = self.executor.start_worker(container=container, session=agent_session)
 
-        def stop_container() -> None:
+        def stop_session() -> None:
             self._kill_process_group(process)
-            subprocess.run(
-                [executable, "rm", "-f", container_name],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                timeout=20,
-                check=False,
-            )
+            self.executor.kill_session(container, agent_session)
 
+        effective_worker_timeout = min(
+            (
+                self.settings.task_timeout_seconds
+                if timeout_seconds is None
+                else timeout_seconds
+            ),
+            self.settings.codex_turn_timeout_seconds,
+        )
         try:
             result, _stderr = consume_worker_process(
                 process,
                 payload=payload,
-                timeout_seconds=(
-                    self.settings.task_timeout_seconds
-                    if timeout_seconds is None
-                    else timeout_seconds
-                ),
+                timeout_seconds=effective_worker_timeout,
+                no_event_timeout_seconds=self.settings.codex_no_event_timeout_seconds,
                 event_callback=event_callback,
-                on_timeout=stop_container,
+                on_timeout=stop_session,
                 cancel_event=cancel_event,
-                on_cancel=stop_container,
-                on_error_cleanup=stop_container,
+                on_cancel=stop_session,
+                on_error_cleanup=stop_session,
             )
         except WorkerCancelledError as exc:
             raise AgentCancelledError(
@@ -383,7 +386,8 @@ class CodexInvestigator:
             ) from exc
         except WorkerTimeoutError as exc:
             raise TimeoutError(
-                f"containerized Codex investigation exceeded {timeout_seconds} seconds"
+                "containerized Codex investigation exceeded its timeout: "
+                f"{exc}"
             ) from exc
         except RuntimeError as exc:
             raise RuntimeError(f"containerized Codex worker failed: {exc}") from exc
@@ -393,6 +397,13 @@ class CodexInvestigator:
             result=AgentInvestigationResult.model_validate(result["result"]),
             usage=result.get("usage") or {},
         )
+
+    def close_scan(self, scan_id: str) -> None:
+        self.executor.close_scan(scan_id)
+        self.workspaces.forget_scan(scan_id)
+
+    def shutdown(self) -> None:
+        self.executor.shutdown()
 
     @staticmethod
     def _kill_process_group(process: subprocess.Popen[str]) -> None:
@@ -409,7 +420,14 @@ class CodexInvestigator:
 
         config = CodexConfig(
             codex_bin=self.settings.codex_bin,
-            config_overrides=("agents.max_threads=1",),
+            config_overrides=codex_config_overrides(
+                provider=self.settings.codex_provider,
+                model=self.settings.codex_model,
+                reasoning_effort=self.settings.codex_reasoning_effort,
+                base_url=self.settings.deepseek_base_url,
+                model_catalog_path=self.settings.codex_model_catalog,
+                web_search=self.settings.codex_web_search,
+            ),
         )
         return Codex(config=config)
 
@@ -443,3 +461,46 @@ class CodexInvestigator:
             platform_context,
             direct_tool_access=True,
         )
+
+
+def codex_config_overrides(
+    *,
+    provider: str,
+    model: str,
+    reasoning_effort: str,
+    base_url: str,
+    model_catalog_path: str | Path,
+    web_search: str,
+) -> tuple[str, ...]:
+    value = json.dumps
+    return (
+        f"model={value(model)}",
+        f"model_provider={value(provider)}",
+        f"model_reasoning_effort={value(reasoning_effort)}",
+        f"model_catalog_json={value(str(model_catalog_path))}",
+        'preferred_auth_method="apikey"',
+        'forced_login_method="api"',
+        f"web_search={value(web_search)}",
+        "project_root_markers=[]",
+        "project_doc_max_bytes=0",
+        "agents.max_threads=1",
+        'history.persistence="save-all"',
+        f"model_providers.{provider}.name={value(provider)}",
+        f"model_providers.{provider}.base_url={value(base_url)}",
+        f'model_providers.{provider}.wire_api="responses"',
+        f'model_providers.{provider}.env_key="DEEPSEEK_API_KEY"',
+        f"model_providers.{provider}.request_max_retries=2",
+        f"model_providers.{provider}.stream_max_retries=2",
+        f"model_providers.{provider}.stream_idle_timeout_ms=900000",
+        'shell_environment_policy.inherit="core"',
+        (
+            "shell_environment_policy.include_only="
+            '["^PATH$","^HOME$","^TMPDIR$","^LANG$","^LC_ALL$","^TERM$",'
+            '"^ANDROID_SERIAL$","^APKSCANNER_ADB_.*$","^APKSCANNER_PROOF_.*$",'
+            '"^HTTP_PROXY$","^HTTPS_PROXY$","^NO_PROXY$"]'
+        ),
+        (
+            'shell_environment_policy.exclude=["^DEEPSEEK_API_KEY$",'
+            '"^OPENAI_API_KEY$","^CODEX_API_KEY$"]'
+        ),
+    )

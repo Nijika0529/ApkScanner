@@ -25,29 +25,36 @@ class Settings:
     tool_timeout_seconds: int = 600
     preliminary_after_seconds: int = 4 * 60 * 60
     scan_deadline_seconds: int = 24 * 60 * 60
-    task_timeout_seconds: int = 20 * 60
+    task_timeout_seconds: int = 4 * 60 * 60
     task_max_attempts: int = 2
     agent_max_rounds: int = 3
     agent_tests_per_round: int = 8
     agent_permission_profile: str = "personal_lab"
     investigator_backend: str = "codex"
     codex_enabled: bool = False
-    codex_worker_model: str = "gpt-5.6-terra"
+    codex_provider: str = "deepseek"
+    codex_model: str = "deepseek-v4-flash"
+    codex_reasoning_effort: str = "high"
     codex_bin: str | None = None
     codex_isolation: str = "docker"
-    codex_docker_image: str = "apk-scanner-worker:0.1.0"
-    codex_auth_file: Path | None = None
-    opencode_enabled: bool = False
-    opencode_model: str = "deepseek-v4-flash"
-    opencode_critic_model: str = "deepseek-v4-pro"
-    opencode_node_bin: str | None = None
-    opencode_worker_dir: Path | None = None
-    opencode_isolation: str = "docker"
-    opencode_docker_image: str = "apk-scanner-opencode-worker:0.1.0"
-    opencode_reasoning_effort: str = "high"
-    opencode_agent_steps: int = 1_000
-    opencode_thinking_explorer: bool = False
-    deepseek_base_url: str | None = None
+    codex_allow_host: bool = False
+    codex_container_scope: str = "scan"
+    codex_docker_image: str = "apk-scanner-codex-worker:0.2.0"
+    codex_model_catalog: Path = Path("config/deepseek-models.json")
+    codex_web_search: str = "live"
+    codex_shell_network: str = "public_egress"
+    codex_max_containers: int = 2
+    codex_max_sessions: int = 6
+    codex_max_sessions_per_scan: int = 3
+    codex_uid_min: int = 21_000
+    codex_uid_max: int = 21_999
+    codex_cpu_limit: float = 6.0
+    codex_memory_limit: str = "12g"
+    codex_pids_limit: int = 768
+    codex_tmpfs_size: str = "1g"
+    codex_turn_timeout_seconds: int = 3_600
+    codex_no_event_timeout_seconds: int = 900
+    deepseek_base_url: str = "https://api.deepseek.com/"
     adb_serial: str | None = None
     adb_serials: tuple[str, ...] = ()
     probe_apk_path: Path | None = None
@@ -89,14 +96,14 @@ class Settings:
         legacy_serial = (os.getenv("APKSCANNER_ADB_SERIAL") or "").strip() or None
         if not configured_serials and legacy_serial:
             configured_serials = (legacy_serial,)
-        return cls(
+        settings = cls(
             data_dir=data_dir,
             database_url=database_url,
             max_upload_bytes=int(os.getenv("APKSCANNER_MAX_UPLOAD_BYTES", 512 * 1024 * 1024)),
             tool_timeout_seconds=int(os.getenv("APKSCANNER_TOOL_TIMEOUT", 600)),
             preliminary_after_seconds=int(os.getenv("APKSCANNER_PRELIMINARY_AFTER", 14_400)),
             scan_deadline_seconds=int(os.getenv("APKSCANNER_SCAN_DEADLINE", 86_400)),
-            task_timeout_seconds=int(os.getenv("APKSCANNER_TASK_TIMEOUT", 1_200)),
+            task_timeout_seconds=int(os.getenv("APKSCANNER_TASK_TIMEOUT", 14_400)),
             task_max_attempts=int(os.getenv("APKSCANNER_TASK_MAX_ATTEMPTS", 2)),
             agent_max_rounds=max(
                 1, min(5, int(os.getenv("APKSCANNER_AGENT_MAX_ROUNDS", 3)))
@@ -111,48 +118,53 @@ class Settings:
                 "APKSCANNER_INVESTIGATOR_BACKEND", "codex"
             ).lower(),
             codex_enabled=_env_bool("APKSCANNER_CODEX_ENABLED"),
-            codex_worker_model=os.getenv("APKSCANNER_CODEX_WORKER_MODEL", "gpt-5.6-terra"),
+            codex_provider=os.getenv("APKSCANNER_CODEX_PROVIDER", "deepseek").lower(),
+            codex_model=os.getenv("APKSCANNER_CODEX_MODEL", "deepseek-v4-flash"),
+            codex_reasoning_effort=os.getenv(
+                "APKSCANNER_CODEX_REASONING_EFFORT", "high"
+            ).lower(),
             codex_bin=os.getenv("APKSCANNER_CODEX_BIN"),
             codex_isolation=os.getenv("APKSCANNER_CODEX_ISOLATION", "docker").lower(),
+            codex_allow_host=_env_bool("APKSCANNER_ALLOW_HOST_CODEX"),
+            codex_container_scope=os.getenv(
+                "APKSCANNER_CODEX_CONTAINER_SCOPE", "scan"
+            ).lower(),
             codex_docker_image=os.getenv(
-                "APKSCANNER_CODEX_DOCKER_IMAGE", "apk-scanner-worker:0.1.0"
+                "APKSCANNER_CODEX_DOCKER_IMAGE", "apk-scanner-codex-worker:0.2.0"
             ),
-            codex_auth_file=(
-                Path(os.environ["APKSCANNER_CODEX_AUTH_FILE"]).resolve()
-                if os.getenv("APKSCANNER_CODEX_AUTH_FILE")
-                else None
-            ),
-            opencode_enabled=_env_bool("APKSCANNER_OPENCODE_ENABLED"),
-            opencode_model=os.getenv(
-                "APKSCANNER_OPENCODE_MODEL", "deepseek-v4-flash"
-            ),
-            opencode_critic_model=os.getenv(
-                "APKSCANNER_OPENCODE_CRITIC_MODEL", "deepseek-v4-pro"
-            ),
-            opencode_node_bin=os.getenv("APKSCANNER_OPENCODE_NODE_BIN"),
-            opencode_worker_dir=(
-                Path(os.environ["APKSCANNER_OPENCODE_WORKER_DIR"]).resolve()
-                if os.getenv("APKSCANNER_OPENCODE_WORKER_DIR")
-                else None
-            ),
-            opencode_isolation=os.getenv(
-                "APKSCANNER_OPENCODE_ISOLATION", "docker"
+            codex_model_catalog=Path(
+                os.getenv("APKSCANNER_CODEX_MODEL_CATALOG", "config/deepseek-models.json")
+            ).resolve(),
+            codex_web_search=os.getenv("APKSCANNER_CODEX_WEB_SEARCH", "live").lower(),
+            codex_shell_network=os.getenv(
+                "APKSCANNER_CODEX_SHELL_NETWORK", "public_egress"
             ).lower(),
-            opencode_docker_image=os.getenv(
-                "APKSCANNER_OPENCODE_DOCKER_IMAGE",
-                "apk-scanner-opencode-worker:0.1.0",
+            codex_max_containers=max(
+                1, int(os.getenv("APKSCANNER_CODEX_MAX_CONTAINERS", 2))
             ),
-            opencode_reasoning_effort=os.getenv(
-                "APKSCANNER_OPENCODE_REASONING_EFFORT", "high"
-            ).lower(),
-            opencode_agent_steps=max(
-                50,
-                min(1_000, int(os.getenv("APKSCANNER_OPENCODE_AGENT_STEPS", 1_000))),
+            codex_max_sessions=max(
+                1, int(os.getenv("APKSCANNER_CODEX_MAX_SESSIONS", 6))
             ),
-            opencode_thinking_explorer=_env_bool(
-                "APKSCANNER_OPENCODE_THINKING_EXPLORER"
+            codex_max_sessions_per_scan=max(
+                1, int(os.getenv("APKSCANNER_CODEX_MAX_SESSIONS_PER_SCAN", 3))
             ),
-            deepseek_base_url=os.getenv("APKSCANNER_DEEPSEEK_BASE_URL"),
+            codex_uid_min=int(os.getenv("APKSCANNER_CODEX_UID_MIN", 21_000)),
+            codex_uid_max=int(os.getenv("APKSCANNER_CODEX_UID_MAX", 21_999)),
+            codex_cpu_limit=float(os.getenv("APKSCANNER_CODEX_CPU_LIMIT", 6)),
+            codex_memory_limit=os.getenv("APKSCANNER_CODEX_MEMORY_LIMIT", "12g"),
+            codex_pids_limit=max(
+                64, int(os.getenv("APKSCANNER_CODEX_PIDS_LIMIT", 768))
+            ),
+            codex_tmpfs_size=os.getenv("APKSCANNER_CODEX_TMPFS_SIZE", "1g"),
+            codex_turn_timeout_seconds=max(
+                30, int(os.getenv("APKSCANNER_CODEX_TURN_TIMEOUT", 3_600))
+            ),
+            codex_no_event_timeout_seconds=max(
+                30, int(os.getenv("APKSCANNER_CODEX_NO_EVENT_TIMEOUT", 900))
+            ),
+            deepseek_base_url=os.getenv(
+                "APKSCANNER_DEEPSEEK_BASE_URL", "https://api.deepseek.com/"
+            ),
             adb_serial=configured_serials[0] if configured_serials else legacy_serial,
             adb_serials=configured_serials,
             probe_apk_path=(
@@ -226,13 +238,44 @@ class Settings:
             mobsf_timeout_seconds=int(os.getenv("APKSCANNER_MOBSF_TIMEOUT", 900)),
             frontend_dist=Path(frontend).resolve() if frontend else None,
         )
+        settings.validate_codex_configuration()
+        return settings
+
+    def validate_codex_configuration(self) -> None:
+        from .agent_execution import frozen_agent_configuration
+
+        if self.investigator_backend not in {"codex", "none"}:
+            raise ValueError("APKSCANNER_INVESTIGATOR_BACKEND must be codex or none")
+        if self.codex_isolation not in {"docker", "host"}:
+            raise ValueError("APKSCANNER_CODEX_ISOLATION must be docker or host")
+        if self.codex_isolation == "host" and not self.codex_allow_host:
+            raise ValueError(
+                "host Codex is disabled; set APKSCANNER_ALLOW_HOST_CODEX=true only for diagnostics"
+            )
+        if self.codex_container_scope != "scan":
+            raise ValueError(
+                "APKSCANNER_CODEX_CONTAINER_SCOPE currently supports only scan; "
+                "task_strict is reserved for a future executor"
+            )
+        if self.codex_uid_min < 10_000 or self.codex_uid_max > 60_000:
+            raise ValueError("Codex UID pool must stay within 10000..60000")
+        if self.codex_uid_min > self.codex_uid_max:
+            raise ValueError("APKSCANNER_CODEX_UID_MIN cannot exceed UID_MAX")
+        if self.codex_max_sessions_per_scan > self.codex_max_sessions:
+            raise ValueError("per-scan Codex session limit cannot exceed the global limit")
+        if self.codex_no_event_timeout_seconds > self.codex_turn_timeout_seconds:
+            raise ValueError("Codex no-event timeout cannot exceed the turn timeout")
+        if self.codex_turn_timeout_seconds > self.task_timeout_seconds:
+            raise ValueError("Codex turn timeout cannot exceed the task timeout")
+        frozen_agent_configuration(self)
+
+    def frozen_agent_configuration(self):  # noqa: ANN202
+        from .agent_execution import frozen_agent_configuration
+
+        return frozen_agent_configuration(self)
 
     def investigator_enabled(self, backend: str) -> bool:
-        if backend == "codex":
-            return self.codex_enabled
-        if backend == "opencode":
-            return self.opencode_enabled
-        return False
+        return backend == "codex" and self.codex_enabled
 
     @property
     def configured_adb_serials(self) -> tuple[str, ...]:

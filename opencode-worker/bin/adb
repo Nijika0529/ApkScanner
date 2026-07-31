@@ -1,3 +1,0 @@
-#!/bin/sh
-printf '%s\n' "adb is disabled inside the ApkScanner OpenCode worker" >&2
-exit 126

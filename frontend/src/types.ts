@@ -262,9 +262,9 @@ export interface Health {
   status: "ok"
   version: string
   max_upload_bytes: number
-  default_investigator: "codex" | "opencode" | "none"
-  enabled_investigators: Array<"codex" | "opencode">
+  default_investigator: "codex" | "none"
+  enabled_investigators: Array<"codex">
   capabilities: Capability[]
 }
 
-export type InvestigatorChoice = "configured" | "codex" | "opencode" | "none"
+export type InvestigatorChoice = "configured" | "codex" | "none"

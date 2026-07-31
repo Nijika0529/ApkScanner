@@ -148,7 +148,7 @@ class FindingReview(BaseModel):
 
 class ScanAgentControl(BaseModel):
     enabled: StrictBool
-    backend: Literal["codex", "opencode", "none"] | None = None
+    backend: Literal["codex", "none"] | None = None
 
 
 class TaskAgentControl(BaseModel):
@@ -256,8 +256,8 @@ class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
     version: str
     max_upload_bytes: int = Field(gt=0)
-    default_investigator: Literal["codex", "opencode", "none"] = "codex"
-    enabled_investigators: list[Literal["codex", "opencode"]] = Field(default_factory=list)
+    default_investigator: Literal["codex", "none"] = "codex"
+    enabled_investigators: list[Literal["codex"]] = Field(default_factory=list)
     capabilities: list[Capability]
 
 

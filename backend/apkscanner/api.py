@@ -165,15 +165,6 @@ def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> Health
             detail=codex.get("detail"),
         )
     )
-    opencode = orchestrator.opencode.capability(deep=False)
-    capabilities.append(
-        Capability(
-            name="opencode_deepseek",
-            available=bool(opencode.get("available")),
-            version=opencode.get("version"),
-            detail=opencode.get("detail"),
-        )
-    )
     device = orchestrator.device_pool.capability(non_blocking=True)
     capabilities.append(
         Capability(
@@ -206,7 +197,7 @@ def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> Health
         default_investigator=orchestrator.resolve_investigator(),
         enabled_investigators=[
             name
-            for name in ("codex", "opencode")
+            for name in ("codex",)
             if orchestrator.settings.investigator_enabled(name)
         ],
         capabilities=capabilities,
@@ -783,7 +774,7 @@ def update_scan_agent_control(
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     if control.enabled and backend == "none":
-        raise HTTPException(422, "An enabled AI control requires codex or opencode")
+        raise HTTPException(422, "An enabled AI control requires codex")
 
     scan.stats = {
         **scan.stats,

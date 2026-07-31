@@ -1,5 +1,10 @@
 # OpenCode + DeepSeek 接入设计
 
+> **已退役（2026-07-31）**：OpenCode SDK、Node Worker、critic、rescue 和 fallback
+> 可执行路径已从项目删除。本文件只保留迁移前的故障分析和历史决策，所有命令与配置均
+> 不再有效。当前实现及后续规范见
+> [Codex + DeepSeek Docker 执行架构与迁移规范](codex-docker-architecture.zh-CN.md)。
+
 ## 结论
 
 默认 `personal_lab` 路径运行关闭思考的工具分析器，再由隔离的 StructuredOutput 定稿器

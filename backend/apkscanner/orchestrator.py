@@ -52,14 +52,6 @@ from .models import (
     Scan,
     SecurityHypothesis,
 )
-from .opencode_runner import (
-    AJV_VERSION,
-    OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL,
-    OPENCODE_TOOL_PROFILE,
-    OPENCODE_WORKSPACE_TOOLS,
-    OpenCodeInvestigator,
-    opencode_execution_profile,
-)
 from .planner import InvestigationPlanner
 from .poc import PocBuilder, PocBuildResult
 from .repository import add_event, now
@@ -141,11 +133,7 @@ class ScanOrchestrator:
         self.security_evolution = SecurityEvolutionService()
         self.mobsf = MobSFAdapter(settings)
         self.codex = CodexInvestigator(settings)
-        self.opencode = OpenCodeInvestigator(settings)
-        self.investigators = {
-            "codex": self.codex,
-            "opencode": self.opencode,
-        }
+        self.investigators = {"codex": self.codex}
         self._running: set[str] = set()
         self._resubmit_requested: set[str] = set()
         self._running_lock = asyncio.Lock()
@@ -572,7 +560,7 @@ class ScanOrchestrator:
             else requested.strip().lower()
         )
         if backend not in {*self.investigators, "none"}:
-            raise ValueError("investigator must be configured, codex, opencode, or none")
+            raise ValueError("investigator must be configured, codex, or none")
         return backend
 
     def resolve_task_investigator(
@@ -649,8 +637,8 @@ class ScanOrchestrator:
         if proof_server is not None:
             proof_server.shutdown()
             proof_server.server_close()
+        self.codex.shutdown()
         self.runner.shutdown()
-        self.opencode.shutdown()
 
     def recover_interrupted_device_tasks(self) -> None:
         """Normalize transient single-device states after a control-plane restart."""
@@ -839,6 +827,8 @@ class ScanOrchestrator:
                         }
                     add_event(session, scan_id, "scan.failed", "Scan failed", {"error": str(exc)})
                     session.commit()
+        finally:
+            self.codex.close_scan(scan_id)
 
     def _run_static(self, scan_id: str) -> None:
         with self.database.session_factory() as session:
@@ -1866,10 +1856,8 @@ class ScanOrchestrator:
                     "run_id": f"{task.id}:attempt:{task.attempts}",
                     "agent_backend": agent_backend,
                     "model": (
-                        self.settings.codex_worker_model
+                        self.settings.codex_model
                         if agent_backend == "codex"
-                        else self.settings.opencode_model
-                        if agent_backend == "opencode"
                         else None
                     ),
                     "entry_point_ids": list(task.target_entry_ids),
@@ -1983,7 +1971,6 @@ class ScanOrchestrator:
         task_device: AdbDeviceAdapter | None = None
         device_lease_owned = False
         device_lease_acquired = False
-        device_prepared = False
 
         def current_device_capability() -> dict[str, Any]:
             capability = dict(device_capability)
@@ -2176,19 +2163,9 @@ class ScanOrchestrator:
                         else None
                     ),
                     "proof_replay": {
-                        "available": bool(
-                            device_prepared
-                            and agent_backend == "opencode"
-                            and self.settings.opencode_isolation == "host"
-                            and phase
-                            not in {
-                                "adversarial_review",
-                                "rescue_review",
-                                "final_evaluation",
-                            }
-                        ),
+                        "available": False,
                         "command": "apkscanner-proof <proof-replay.json>",
-                        "mode": "single_final_platform_attestation",
+                        "mode": "docker_gateway_pending",
                     },
                 }
                 agent_workspace = self._materialize_agent_evidence(
@@ -2226,34 +2203,12 @@ class ScanOrchestrator:
                     capability=capability,
                 )
                 proof_token: str | None = None
-                if (
-                    device_prepared
-                    and agent_backend == "opencode"
-                    and self.settings.opencode_isolation == "host"
-                    and phase not in {"adversarial_review", "rescue_review"}
-                ):
-                    proof_token = secrets.token_urlsafe(32)
-                    self._register_live_proof_context(
-                        _LiveProofContext(
-                            token=proof_token,
-                            scan_id=scan_id,
-                            task_id=task_id,
-                            package_name=package_name,
-                            workspace=agent_workspace,
-                            entries=testable_entries,
-                            default_entry_id=entries[0].id,
-                            hypotheses=hypothesis_context,
-                            budget=budget,
-                            evidence_summaries=evidence_summaries,
-                            cancel_event=cancel_event,
-                            round_index=round_index,
-                            device=task_device,
-                        )
-                    )
 
                 def on_runtime_event(event: AgentRuntimeEvent) -> None:
                     record = {
+                        "schema_version": "1.0",
                         "sequence": len(runtime_events) + 1,
+                        "dedupe_key": event.dedupe_key,
                         "event_type": event.event_type,
                         "message": event.message,
                         "data": event.data,
@@ -2302,12 +2257,6 @@ class ScanOrchestrator:
                     "event_callback": on_runtime_event,
                     "cancel_event": cancel_event,
                 }
-                if agent_backend == "opencode":
-                    investigation_kwargs["proof_replay_token"] = proof_token
-                    if proof_token is not None:
-                        investigation_kwargs["proof_replay_url"] = (
-                            self._ensure_live_proof_endpoint()
-                        )
                 try:
                     result = investigator.investigate(**investigation_kwargs)
                 finally:
@@ -2343,15 +2292,7 @@ class ScanOrchestrator:
                     role=role,
                     phase=phase,
                     backend=agent_backend,
-                    model=(
-                        self.settings.codex_worker_model
-                        if agent_backend == "codex"
-                        else (
-                            self.settings.opencode_critic_model
-                            if phase in {"adversarial_review", "rescue_review"}
-                            else self.settings.opencode_model
-                        )
-                    ),
+                    model=self.settings.codex_model,
                     payload=argument_payload,
                 )
                 self._record_agent_runtime_events(
@@ -2729,8 +2670,6 @@ class ScanOrchestrator:
                         coverage_gaps.append(f"Device preparation failed: {failures}")
                     else:
                         prepared = True
-                        device_prepared = True
-
                         for entry in entries:
                             if budget.expired:
                                 break
@@ -3285,11 +3224,7 @@ class ScanOrchestrator:
                     payload=payload,
                     result_value=result_value,
                     backend=agent_backend,
-                    model=(
-                        self.settings.codex_worker_model
-                        if agent_backend == "codex"
-                        else self.settings.opencode_model
-                    ),
+                    model=self.settings.codex_model,
                     session=session,
                 )
                 add_event(
@@ -4318,79 +4253,33 @@ class ScanOrchestrator:
         phase: str,
         capability: dict[str, Any],
     ) -> str:
-        provider = "openai" if backend == "codex" else "deepseek"
-        model = (
-            self.settings.codex_worker_model
-            if backend == "codex"
-            else (
-                self.settings.opencode_critic_model
-                if phase in {"adversarial_review", "rescue_review"}
-                else self.settings.opencode_model
-            )
-        )
-        execution_profile = (
-            opencode_execution_profile(
-                phase,
-                reasoning_effort=self.settings.opencode_reasoning_effort,
-                enable_thinking_explorer=self.settings.opencode_thinking_explorer,
-                enable_workspace_analyzer=(
-                    self.settings.agent_permission_profile == "personal_lab"
-                ),
-                default_model=self.settings.opencode_model,
-                critic_model=self.settings.opencode_critic_model,
-            )
-            if backend == "opencode"
-            else None
-        )
-        opencode_workspace_tools = bool(
-            execution_profile and any(stage.workspace_tools for stage in execution_profile.stages)
-        )
-        opencode_analysis_stage = next(
-            (
-                stage
-                for stage in (execution_profile.stages if execution_profile else ())
-                if stage.output_mode == "text"
-            ),
-            None,
-        )
-        direct_tool_access = backend == "codex" or opencode_workspace_tools
-        shell_access = backend == "codex" or opencode_workspace_tools
-        workspace_write = backend == "opencode" and opencode_workspace_tools
+        if backend != "codex":
+            raise ValueError("OpenCode and other agent backends are not executable")
+        frozen = self.settings.frozen_agent_configuration()
+        provider = frozen.provider
+        execution = frozen.execution
+        frozen.phase_route.provider_profile_id(phase)
+        direct_tool_access = True
+        shell_access = execution.bash
+        workspace_write = execution.workspace_write
         assigned_device = platform_context.get("device")
         assigned_device_serial = (
             assigned_device.get("serial") if isinstance(assigned_device, dict) else None
         )
-        adb_access = (
-            backend == "opencode"
-            and self.settings.agent_permission_profile == "personal_lab"
-            and self.settings.opencode_isolation == "host"
-            and bool(assigned_device_serial)
-        )
-        network_access = (
-            backend == "opencode"
-            and self.settings.agent_permission_profile == "personal_lab"
-            and opencode_workspace_tools
-        )
-        output_mode = (
-            execution_profile.output_mode if execution_profile is not None else "json_schema"
-        )
-        isolation = (
-            self.settings.codex_isolation
-            if backend == "codex"
-            else self.settings.opencode_isolation
-        )
+        adb_access = execution.adb == "task_gateway" and bool(assigned_device_serial)
+        network_access = execution.shell_network == "public_egress"
         audit_id = str(uuid.uuid4())
         metadata = {
             "audit_id": audit_id,
-            "backend": backend,
-            "provider": provider,
-            "model": model,
-            "stage_models": (
-                {stage.name: stage.model for stage in execution_profile.stages}
-                if execution_profile is not None
-                else None
-            ),
-            "isolation": isolation,
+            "backend": "codex",
+            "provider": provider.provider,
+            "model": provider.model,
+            "execution_profile_id": execution.id,
+            "execution_profile_sha256": execution.fingerprint(),
+            "provider_profile_id": provider.id,
+            "provider_profile_sha256": provider.fingerprint(),
+            "phase_route_sha256": frozen.phase_route.fingerprint(),
+            "isolation": self.settings.codex_isolation,
             "phase": phase,
             "attempt": task.attempts,
         }
@@ -4408,16 +4297,13 @@ class ScanOrchestrator:
         )
         request = {
             "schema_version": "1.0",
-            "backend": backend,
-            "provider": provider,
-            "model": model,
+            "backend": "codex",
+            "provider": provider.provider,
+            "model": provider.model,
             "sdk_version": capability.get("version"),
-            "isolation": isolation,
-            "provider_base_url": (
-                self.settings.deepseek_base_url or "provider_default"
-                if backend == "opencode"
-                else "provider_default"
-            ),
+            "runtime_version": capability.get("runtime_version"),
+            "isolation": self.settings.codex_isolation,
+            "provider_base_url": provider.base_url,
             "phase": phase,
             "task_id": task.id,
             "attempt": task.attempts,
@@ -4429,78 +4315,22 @@ class ScanOrchestrator:
                 network_access=network_access,
             ),
             "prompt": prompt,
-            "explorer_instructions": (
-                developer_instructions(
-                    direct_tool_access=bool(
-                        opencode_analysis_stage and opencode_analysis_stage.workspace_tools
-                    ),
-                    shell_access=bool(
-                        opencode_analysis_stage and opencode_analysis_stage.workspace_tools
-                    ),
-                    workspace_write=bool(
-                        opencode_analysis_stage and opencode_analysis_stage.workspace_tools
-                    ),
-                    adb_access=bool(
-                        adb_access
-                        and opencode_analysis_stage
-                        and opencode_analysis_stage.workspace_tools
-                    ),
-                    network_access=bool(
-                        network_access
-                        and opencode_analysis_stage
-                        and opencode_analysis_stage.workspace_tools
-                    ),
-                    response_contract="analysis_memo",
-                )
-                if backend == "opencode" and opencode_analysis_stage is not None
-                else None
-            ),
-            "explorer_prompt": (
-                investigation_prompt(
-                    scan,
-                    task,
-                    entries,
-                    evidence,
-                    platform_context,
-                    direct_tool_access=opencode_analysis_stage.workspace_tools,
-                    shell_access=opencode_analysis_stage.workspace_tools,
-                    workspace_write=opencode_analysis_stage.workspace_tools,
-                    adb_access=bool(adb_access and opencode_analysis_stage.workspace_tools),
-                    network_access=bool(network_access and opencode_analysis_stage.workspace_tools),
-                    response_contract="analysis_memo",
-                )
-                if backend == "opencode" and opencode_analysis_stage is not None
-                else None
-            ),
             "output_schema": AGENT_RESULT_JSON_SCHEMA,
             "tool_boundary": {
-                "direct_tool_access": direct_tool_access,
-                "model_tools_enabled": direct_tool_access,
-                "workspace_tool_profile": (
-                    OPENCODE_TOOL_PROFILE if backend == "opencode" else "codex_readonly"
-                ),
-                "workspace_tools": (
-                    list(OPENCODE_WORKSPACE_TOOLS)
-                    if backend == "opencode" and opencode_workspace_tools
-                    else ["file", "shell"]
-                    if backend == "codex"
-                    else []
-                ),
+                "direct_tool_access": True,
+                "model_tools_enabled": True,
+                "workspace_tool_profile": "codex_full_access",
+                "workspace_tools": ["file", "shell", "apply_patch", "web_search"],
                 "shell_enabled": shell_access,
                 "write_enabled": workspace_write,
-                "native_write_tools_enabled": (backend == "opencode" and opencode_workspace_tools),
-                "allowed_write_roots": (
-                    ["task_attempt_workspace", "/tmp"] if workspace_write else []
-                ),
-                "shared_scan_workspace_exposed": (
-                    backend == "opencode"
-                    and self.settings.agent_permission_profile == "personal_lab"
-                ),
+                "native_write_tools_enabled": execution.apply_patch,
+                "allowed_write_roots": ["session_workspace", "session_tmp"],
+                "shared_scan_workspace_exposed": True,
                 "network_enabled": network_access,
                 "network_policy": (
-                    "authorized_target_and_test_backend_only"
+                    execution.shell_network
                     if network_access
-                    else "sandbox_disabled"
+                    else "disabled"
                 ),
                 "adb_enabled": adb_access,
                 "adb_evidence_policy": (
@@ -4509,46 +4339,24 @@ class ScanOrchestrator:
                     else "disabled"
                 ),
                 "subagents_enabled": False,
-                "structured_output_tool_enabled": (
-                    backend == "opencode"
-                    and execution_profile is not None
-                    and any(
-                        stage.output_mode == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
-                        for stage in execution_profile.stages
-                    )
-                ),
+                "mcp_allowlist": list(execution.mcp_allowlist),
+                "structured_output_tool_enabled": False,
                 "platform_executes_requested_tests": True,
             },
             "runtime_options": {
-                "reasoning_effort": (
-                    "medium" if backend == "codex" else self.settings.opencode_reasoning_effort
-                ),
-                "output_mode": output_mode,
-                "execution_profile": (
-                    execution_profile.as_payload() if execution_profile is not None else None
-                ),
+                "reasoning_effort": provider.reasoning_effort,
+                "output_mode": "json_schema",
+                "execution_profile": execution.model_dump(mode="json"),
+                "execution_profile_sha256": execution.fingerprint(),
+                "provider_profile": provider.model_dump(mode="json"),
+                "provider_profile_sha256": provider.fingerprint(),
+                "phase_route": frozen.phase_route.model_dump(mode="json"),
+                "phase_route_sha256": frozen.phase_route.fingerprint(),
                 "max_agent_steps": None,
                 "max_provider_requests": None,
-                "structured_output_retries": (
-                    2
-                    if backend == "opencode"
-                    and execution_profile is not None
-                    and any(
-                        stage.output_mode == OPENCODE_OUTPUT_MODE_STRUCTURED_TOOL
-                        for stage in execution_profile.stages
-                    )
-                    else None
-                ),
-                "schema_validator": (
-                    f"ajv@{AJV_VERSION}"
-                    if backend == "opencode" and execution_profile is not None
-                    else None
-                ),
-                "semantic_validator": (
-                    "apkscanner@1.0"
-                    if backend == "opencode" and execution_profile is not None
-                    else None
-                ),
+                "structured_output_retries": 1,
+                "schema_validator": "pydantic@2",
+                "semantic_validator": "apkscanner@1.0",
             },
         }
         with self.database.session_factory() as session:
@@ -4578,21 +4386,9 @@ class ScanOrchestrator:
         metadata = {
             "audit_id": audit_id,
             "backend": backend,
-            "provider": "openai" if backend == "codex" else "deepseek",
-            "model": (
-                self.settings.codex_worker_model
-                if backend == "codex"
-                else (
-                    self.settings.opencode_critic_model
-                    if phase in {"adversarial_review", "rescue_review"}
-                    else self.settings.opencode_model
-                )
-            ),
-            "isolation": (
-                self.settings.codex_isolation
-                if backend == "codex"
-                else self.settings.opencode_isolation
-            ),
+            "provider": self.settings.codex_provider,
+            "model": self.settings.codex_model,
+            "isolation": self.settings.codex_isolation,
             "phase": phase,
             "attempt": attempt,
             "thread_id": result.thread_id,
@@ -4635,21 +4431,9 @@ class ScanOrchestrator:
         metadata = {
             "audit_id": audit_id,
             "backend": backend,
-            "provider": "openai" if backend == "codex" else "deepseek",
-            "model": (
-                self.settings.codex_worker_model
-                if backend == "codex"
-                else (
-                    self.settings.opencode_critic_model
-                    if phase in {"adversarial_review", "rescue_review"}
-                    else self.settings.opencode_model
-                )
-            ),
-            "isolation": (
-                self.settings.codex_isolation
-                if backend == "codex"
-                else self.settings.opencode_isolation
-            ),
+            "provider": self.settings.codex_provider,
+            "model": self.settings.codex_model,
+            "isolation": self.settings.codex_isolation,
             "phase": phase,
             "attempt": attempt,
         }
@@ -4682,17 +4466,9 @@ class ScanOrchestrator:
         metadata = {
             "audit_id": audit_id,
             "backend": backend,
-            "provider": "openai" if backend == "codex" else "deepseek",
-            "model": (
-                self.settings.codex_worker_model
-                if backend == "codex"
-                else self.settings.opencode_model
-            ),
-            "isolation": (
-                self.settings.codex_isolation
-                if backend == "codex"
-                else self.settings.opencode_isolation
-            ),
+            "provider": self.settings.codex_provider,
+            "model": self.settings.codex_model,
+            "isolation": self.settings.codex_isolation,
             "phase": phase,
             "attempt": attempt,
         }
@@ -4730,17 +4506,9 @@ class ScanOrchestrator:
         metadata = {
             "audit_id": audit_id,
             "backend": backend,
-            "provider": "openai" if backend == "codex" else "deepseek",
-            "model": (
-                self.settings.codex_worker_model
-                if backend == "codex"
-                else self.settings.opencode_model
-            ),
-            "isolation": (
-                self.settings.codex_isolation
-                if backend == "codex"
-                else self.settings.opencode_isolation
-            ),
+            "provider": self.settings.codex_provider,
+            "model": self.settings.codex_model,
+            "isolation": self.settings.codex_isolation,
             "phase": phase,
             "attempt": attempt,
         }
@@ -5083,9 +4851,7 @@ class ScanOrchestrator:
             platform_context or {},
         )
         scan_workspace = (self.settings.data_dir / "workspaces" / scan_id).resolve()
-        expose_shared_workspace = (
-            self.settings.agent_permission_profile == "personal_lab" and not static_review
-        )
+        expose_shared_workspace = self.settings.agent_permission_profile == "personal_lab"
         shared_names = [
             name for name in ("jadx", "apktool", "archive") if (scan_workspace / name).is_dir()
         ]
@@ -5095,11 +4861,10 @@ class ScanOrchestrator:
             "context_file": "context.json",
             "decompiled_roots": (
                 {
-                    "host": [str((scan_workspace / name).resolve()) for name in shared_names],
-                    "container": [f"/scan-workspace/{name}" for name in shared_names],
+                    "container": [f"/scan-input/{name}" for name in shared_names],
                 }
                 if expose_shared_workspace
-                else {"host": [], "container": []}
+                else {"container": []}
             ),
             "reason": (
                 "This bounded static semantic task receives the exact signal sources and "
@@ -5914,13 +5679,7 @@ class ScanOrchestrator:
     ) -> None:
         payload = task.result
         evidence_ids = list(payload.get("evidence_ids", []))
-        model = (
-            self.settings.codex_worker_model
-            if agent_backend == "codex"
-            else self.settings.opencode_model
-            if agent_backend == "opencode"
-            else None
-        )
+        model = self.settings.codex_model if agent_backend == "codex" else None
         hypotheses = list(
             session.scalars(
                 select(SecurityHypothesis)

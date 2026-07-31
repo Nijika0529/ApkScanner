@@ -1325,9 +1325,9 @@ def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # no
     second_context = json.loads((second / "context.json").read_text(encoding="utf-8"))
     assert first_context["task_id"] != second_context["task_id"]
     assert first_context["workspace_policy"]["shared_scan_workspace_exposed"] is True
-    assert str(source.parents[2]) in first_context["workspace_policy"][
-        "decompiled_roots"
-    ]["host"]
+    assert first_context["workspace_policy"]["decompiled_roots"] == {
+        "container": ["/scan-input/jadx"]
+    }
     assert first_context["evidence"][0]["artifact"] == (
         f"evidence/{evidence.id}.json"
     )
@@ -1359,10 +1359,9 @@ def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # no
     )
     assert bounded.is_relative_to(settings.data_dir / "agent_context" / scan_id)
     assert not bounded.is_relative_to(settings.data_dir / "workspaces" / scan_id)
-    assert bounded_context["workspace_policy"]["shared_scan_workspace_exposed"] is False
+    assert bounded_context["workspace_policy"]["shared_scan_workspace_exposed"] is True
     assert bounded_context["workspace_policy"]["decompiled_roots"] == {
-        "host": [],
-        "container": [],
+        "container": ["/scan-input/jadx"],
     }
     assert (bounded / materialized).is_file()
     assert (
@@ -1396,7 +1395,8 @@ def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(setting
 
     orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
     assert orchestrator.resolve_investigator() == "codex"
-    assert orchestrator.resolve_investigator("opencode") == "opencode"
+    with pytest.raises(ValueError, match="codex"):
+        orchestrator.resolve_investigator("opencode")
     assert orchestrator.resolve_investigator("none") == "none"
     orchestrator._run_sync(scan_id)
 
