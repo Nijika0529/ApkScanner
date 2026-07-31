@@ -72,9 +72,6 @@ const DETAIL_REFRESH_EVENTS = [
   "exploration.update",
 ] as const
 
-const DETAIL_CACHE_LIMIT = 8
-const TERMINAL_SCAN_STATUSES = new Set<Scan["status"]>(["final", "failed"])
-
 function statusTone(status: string): "neutral" | "good" | "warning" | "danger" | "info" {
   if (["final", "completed", "covered", "accepted", "reproduced_blackbox", "proven"].includes(status)) return "good"
   if (["failed", "critical", "high", "tool_failed"].includes(status)) return "danger"
@@ -119,27 +116,7 @@ function App() {
   const [freshRunTarget, setFreshRunTarget] = useState<Scan | null>(null)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const detailRequestRef = useRef(0)
-  const detailCacheRef = useRef(new Map<string, DetailData>())
   const selectedIdRef = useRef<string | null>(selectedId)
-
-  const readCachedDetail = useCallback((id: string) => {
-    const cached = detailCacheRef.current.get(id)
-    if (!cached) return null
-    detailCacheRef.current.delete(id)
-    detailCacheRef.current.set(id, cached)
-    return cached
-  }, [])
-
-  const writeCachedDetail = useCallback((data: DetailData) => {
-    const cache = detailCacheRef.current
-    cache.delete(data.scan.id)
-    cache.set(data.scan.id, data)
-    while (cache.size > DETAIL_CACHE_LIMIT) {
-      const oldestId = cache.keys().next().value
-      if (typeof oldestId !== "string") break
-      cache.delete(oldestId)
-    }
-  }, [])
 
   const loadScans = useCallback(async () => {
     const data = await api.scans()
@@ -174,7 +151,6 @@ function App() {
       ])
       if (signal?.aborted || requestId !== detailRequestRef.current) return false
       const data = { scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events, securitySnapshot, versionDiff, patternMatches }
-      writeCachedDetail(data)
       setDetail(data)
       setScans((items) => items.map((item) => item.id === scan.id ? scan : item))
       return true
@@ -186,7 +162,7 @@ function App() {
     } finally {
       if (!signal?.aborted && requestId === detailRequestRef.current) setLoading(false)
     }
-  }, [writeCachedDetail])
+  }, [])
 
   const refreshDetail = useCallback(async (
     id: string,
@@ -229,12 +205,8 @@ function App() {
       return
     }
     const controller = new AbortController()
-    const cached = readCachedDetail(selectedId)
-    setDetail(cached)
-    setLoading(!cached)
-    if (cached && TERMINAL_SCAN_STATUSES.has(cached.scan.status)) {
-      return () => controller.abort()
-    }
+    setDetail(null)
+    setLoading(true)
     const source = new EventSource(`/api/v1/scans/${selectedId}/events/stream`)
     let refreshTimer: ReturnType<typeof setTimeout> | undefined
     let initialRefreshPending = true
@@ -265,7 +237,7 @@ function App() {
       controller.abort()
       source.close()
     }
-  }, [selectedId, readCachedDetail, refreshDetail])
+  }, [selectedId, refreshDetail])
 
   async function onUploaded(scan: Scan) {
     setUploadOpen(false)
@@ -280,13 +252,11 @@ function App() {
   async function onDeleted(scanId: string, warnings: string[]) {
     const remaining = scans.filter((scan) => scan.id !== scanId)
     detailRequestRef.current += 1
-    detailCacheRef.current.delete(scanId)
     setDeleteTarget(null)
     setScans(remaining)
+    setDetail(null)
+    setLoading(Boolean(remaining[0]))
     selectedIdRef.current = remaining[0]?.id ?? null
-    const cached = selectedIdRef.current ? readCachedDetail(selectedIdRef.current) : null
-    setDetail(cached)
-    setLoading(Boolean(selectedIdRef.current && !cached))
     setSelectedId(selectedIdRef.current)
     if (warnings.length) setError(`扫描已删除，但有文件未能清理：${warnings.join("；")}`)
   }
@@ -299,9 +269,8 @@ function App() {
       onSelect={(id) => {
         if (id !== selectedId) {
           detailRequestRef.current += 1
-          const cached = readCachedDetail(id)
-          setDetail(cached)
-          setLoading(!cached)
+          setDetail(null)
+          setLoading(true)
           selectedIdRef.current = id
           setSelectedId(id)
         }
