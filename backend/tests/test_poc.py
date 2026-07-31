@@ -1038,9 +1038,9 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
         hypothesis_id=hypothesis.id,
         poc=poc_spec(),
         oracle=AgentOracleSpec(
-            kind="log_contains",
+            kind="ui_text",
             expected_text="security_impact_observed",
-            impact="unauthorized_state_change",
+            impact="unauthorized_data_access",
         ),
         rationale="Replay the final working ordinary-app PoC.",
     )
@@ -1065,6 +1065,20 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
             replay,
         )
     context.hypotheses[0]["claim"] = hypothesis.claim
+    with pytest.raises(ValueError, match="not an independent live harm Oracle"):
+        orchestrator.execute_live_proof_replay(
+            task_id,
+            "secret-token",
+            replay.model_copy(
+                update={
+                    "oracle": AgentOracleSpec(
+                        kind="log_contains",
+                        expected_text="service-secret",
+                        impact="unauthorized_data_access",
+                    )
+                }
+            ),
+        )
     with pytest.raises(ValueError, match="non-none Oracle impact"):
         orchestrator.execute_live_proof_replay(
             task_id,

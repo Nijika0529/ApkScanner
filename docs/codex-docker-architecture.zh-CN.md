@@ -150,9 +150,11 @@ Docker 容器共享宿主内核，镜像层在并发扫描间复用。`--memory`
   `reproduced_blackbox` Finding：DeepLink/WebView JS Bridge、`target_activity` 内部组件重定向、
   `inner_intent` 嵌套 Intent 重定向和无权限 Provider 读。ground-truth 结果为 4 TP、0 FP、
   2 FN，precision 1.0、recall 0.666667、F0.5 0.909091（90.91 分）。
-- Service PoC 已由普通 App UID 成功 bind/transact 并取回 `service-secret`，但该次 Agent 把
-  Oracle 错配为 `impact=none`，因此平台只保留 reachability 而未签发 Finding；当前实现已在
-  Proof Gateway 无条件拒绝 live `impact=none`，要求 Agent 修正为可判定危害的 Oracle 后再占用设备。
+- Service PoC 已由普通 App UID 成功 bind/transact 并取回 `service-secret`，但当前平台没有能独立
+  证明“Binder reply 来自目标而非 PoC 自报”的结果 Oracle，因此 `log_contains/impact=none` 只保留
+  reachability 而未签发 Finding。Proof Gateway 现无条件拒绝 live `impact=none`，避免继续占用设备；
+  同时拒绝 PoC-owned `log_contains` 充当 live harm Oracle。Binder reply Oracle 是明确的后续能力缺口，
+  在实现前 Agent 应通过 ADB 做诊断并如实报告 gap，不能把 PoC 自报升级为危害证据。
 - Receiver PoC 确实将广播送入目标进程，但 Pixel 4 Android 13 的系统日志明确记录
   `allowBackgroundActivityStart: false` / `Abort background activity starts`；平台将
   `background_activity_start_blocked=true` 保存为 `blackbox.poc_system_logcat`，故当前系统配置下

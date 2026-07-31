@@ -353,6 +353,11 @@ class ScanOrchestrator:
             selected_hypothesis = next(
                 item for item in context.hypotheses if str(item["id"]) == hypothesis_id
             )
+            if replay.oracle.kind == "log_contains":
+                raise ValueError(
+                    "a PoC-owned log_contains result is not an independent live harm Oracle; "
+                    "use target_uid_log_contains for target-owned effects or report an Oracle gap"
+                )
             if replay.oracle.impact == "none":
                 raise ValueError(
                     "live proof replay requires a non-none Oracle impact and a concrete "
