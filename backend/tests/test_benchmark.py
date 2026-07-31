@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from apkscanner.benchmark import BenchmarkEvaluator
 from apkscanner.db import Database
-from apkscanner.models import EntryPoint, Evidence, Finding, Scan
+from apkscanner.models import BenchmarkEvaluation, EntryPoint, Evidence, Finding, Scan
 from apkscanner.schemas import BenchmarkSpec
 from pydantic import ValidationError
 
@@ -305,3 +305,129 @@ def test_benchmark_rejects_nonfinal_scan(settings) -> None:  # noqa: ANN001
     )
     with pytest.raises(ValueError, match="completed final scan"):
         BenchmarkEvaluator(settings, database).evaluate(scan_id, spec)
+
+
+def test_synthetic_recall_scenario_is_deterministic_and_creates_no_findings(
+    settings,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            status="final",
+            filename="rehearsal.apk",
+            artifact_sha256="e" * 64,
+            artifact_path=str(settings.data_dir / "rehearsal.apk"),
+        )
+        session.add(scan)
+        session.commit()
+        scan_id = scan.id
+
+    spec = BenchmarkSpec.model_validate(
+        {
+            "name": "report-rehearsal",
+            "apk_sha256": "e" * 64,
+            "vulnerabilities": [
+                {
+                    "id": f"GT-{index}",
+                    "title": f"Known issue {index}",
+                    "harm": f"Known impact {index}",
+                    "severity": "high",
+                    "match": {"rule_ids": [f"RULE-{index}"]},
+                }
+                for index in range(1, 6)
+            ],
+        }
+    )
+    evaluator = BenchmarkEvaluator(settings, database)
+    first = evaluator.simulate(
+        scan_id,
+        spec,
+        target_recall=0.6,
+        seed="stable-report",
+    )
+    second = evaluator.simulate(
+        scan_id,
+        spec,
+        target_recall=0.6,
+        seed="stable-report",
+    )
+
+    assert first.result["data_provenance"] == {
+        "kind": "synthetic_demo",
+        "assessment_scope": "android_apk_security",
+        "phone_verified": False,
+        "target_apk_executed": False,
+        "creates_findings": False,
+        "creates_evidence": False,
+        "disclaimer": (
+            "Synthetic recall scenario for presentation rehearsal only; "
+            "it is not scanner output or phone-verified evidence."
+        ),
+    }
+    assert first.result["metrics"]["true_positives"] == 3
+    assert first.result["metrics"]["false_negatives"] == 2
+    assert first.result["metrics"]["recall"] == 0.6
+    assert first.result["simulation"]["detected_ground_truth_ids"] == second.result[
+        "simulation"
+    ]["detected_ground_truth_ids"]
+    assert all(item["finding_id"] is None for item in first.result["matches"])
+    assert all(not item["evidence_ids"] for item in first.result["matches"])
+    assert first.investigator_backend == "synthetic_demo"
+    assert first.model is None
+
+    with database.session_factory() as session:
+        assert list(session.query(Finding)) == []
+        assert list(session.query(Evidence)) == []
+        assert len(list(session.query(BenchmarkEvaluation))) == 2
+
+
+def test_synthetic_recall_scenario_supports_explicit_omissions_and_rejects_unknown_ids(
+    settings,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            status="final",
+            filename="explicit.apk",
+            artifact_sha256="f" * 64,
+            artifact_path=str(settings.data_dir / "explicit.apk"),
+        )
+        session.add(scan)
+        session.commit()
+        scan_id = scan.id
+
+    spec = BenchmarkSpec.model_validate(
+        {
+            "name": "explicit-omission",
+            "vulnerabilities": [
+                {
+                    "id": "GT-1",
+                    "title": "Detected issue",
+                    "harm": "Detected impact",
+                    "severity": "high",
+                    "match": {"rule_ids": ["RULE-1"]},
+                },
+                {
+                    "id": "GT-2",
+                    "title": "Missed issue",
+                    "harm": "Missed impact",
+                    "severity": "medium",
+                    "match": {"rule_ids": ["RULE-2"]},
+                },
+            ],
+        }
+    )
+    evaluator = BenchmarkEvaluator(settings, database)
+    evaluation = evaluator.simulate(scan_id, spec, omitted_ids={"GT-2"})
+    assert evaluation.result["simulation"]["detected_ground_truth_ids"] == ["GT-1"]
+    assert evaluation.result["simulation"]["omitted_ground_truth_ids"] == ["GT-2"]
+    assert evaluation.result["metrics"]["recall"] == 0.5
+
+    with pytest.raises(ValueError, match="unknown ground-truth"):
+        evaluator.simulate(scan_id, spec, omitted_ids={"GT-404"})
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        evaluator.simulate(scan_id, spec, target_recall=1.1)

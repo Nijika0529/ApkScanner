@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from sqlalchemy import select
@@ -27,13 +28,7 @@ class BenchmarkEvaluator:
 
     def evaluate(self, scan_id: str, spec: BenchmarkSpec) -> BenchmarkEvaluation:
         with self.database.session_factory() as session:
-            scan = session.get(Scan, scan_id)
-            if scan is None:
-                raise ValueError("scan not found")
-            if scan.status != ScanStatus.FINAL.value:
-                raise ValueError("benchmark evaluation requires a completed final scan")
-            if spec.apk_sha256 and spec.apk_sha256 != scan.artifact_sha256:
-                raise ValueError("ground truth APK SHA-256 does not match the selected scan")
+            scan = self._require_compatible_scan(session, scan_id, spec)
             entries = list(
                 session.scalars(select(EntryPoint).where(EntryPoint.scan_id == scan_id))
             )
@@ -109,6 +104,176 @@ class BenchmarkEvaluator:
             session.add(evaluation)
             session.commit()
             return evaluation
+
+    def simulate(
+        self,
+        scan_id: str,
+        spec: BenchmarkSpec,
+        *,
+        detected_ids: set[str] | None = None,
+        omitted_ids: set[str] | None = None,
+        target_recall: float | None = None,
+        seed: str = "apkscanner-demo-v1",
+    ) -> BenchmarkEvaluation:
+        """Persist an explicitly synthetic recall scenario without fabricating findings.
+
+        The resulting row is intentionally incompatible with real evidence attribution:
+        it has no Finding IDs, no Evidence IDs, no model identity, and carries a
+        machine-readable synthetic provenance marker.
+        """
+
+        configured_modes = sum(
+            value is not None for value in (detected_ids, omitted_ids, target_recall)
+        )
+        if configured_modes != 1:
+            raise ValueError(
+                "choose exactly one simulation selector: detected IDs, omitted IDs, "
+                "or target recall"
+            )
+        if not seed:
+            raise ValueError("simulation seed must not be empty")
+
+        truth_ids = {item.id for item in spec.vulnerabilities}
+        if detected_ids is not None:
+            self._reject_unknown_truth_ids(detected_ids, truth_ids)
+            selected_ids = set(detected_ids)
+            selection_mode = "explicit_detected_ids"
+        elif omitted_ids is not None:
+            self._reject_unknown_truth_ids(omitted_ids, truth_ids)
+            selected_ids = truth_ids - omitted_ids
+            selection_mode = "explicit_omitted_ids"
+        else:
+            assert target_recall is not None
+            if not 0.0 <= target_recall <= 1.0:
+                raise ValueError("target recall must be between 0 and 1")
+            target_count = round(len(spec.vulnerabilities) * target_recall)
+            ranked = sorted(
+                spec.vulnerabilities,
+                key=lambda item: (
+                    hashlib.sha256(f"{seed}\0{item.id}".encode()).hexdigest(),
+                    item.id,
+                ),
+            )
+            selected_ids = {item.id for item in ranked[:target_count]}
+            selection_mode = "seeded_target_recall"
+
+        with self.database.session_factory() as session:
+            scan = self._require_compatible_scan(session, scan_id, spec)
+            matches = []
+            missed = []
+            for truth in spec.vulnerabilities:
+                if truth.id in selected_ids:
+                    matches.append(
+                        {
+                            "ground_truth_id": truth.id,
+                            "ground_truth_title": truth.title,
+                            "finding_id": None,
+                            "finding_title": f"[仿真命中] {truth.title}",
+                            "finding_status": "synthetic_demo",
+                            "finding_severity": truth.severity,
+                            "evidence_ids": [],
+                            "minimum_proof": truth.minimum_proof,
+                        }
+                    )
+                else:
+                    missed.append(
+                        {
+                            "ground_truth_id": truth.id,
+                            "title": truth.title,
+                            "harm": truth.harm,
+                            "minimum_proof": truth.minimum_proof,
+                        }
+                    )
+
+            true_positives = len(matches)
+            false_negatives = len(missed)
+            recall = self._ratio(true_positives, true_positives + false_negatives)
+            precision = 1.0 if true_positives else 0.0
+            f_half = (
+                0.0
+                if precision == 0.0 or recall == 0.0
+                else (1.25 * precision * recall) / ((0.25 * precision) + recall)
+            )
+            omitted = sorted(truth_ids - selected_ids)
+            result = {
+                "schema_version": "1.0",
+                "data_provenance": {
+                    "kind": "synthetic_demo",
+                    "assessment_scope": "android_apk_security",
+                    "phone_verified": False,
+                    "target_apk_executed": False,
+                    "creates_findings": False,
+                    "creates_evidence": False,
+                    "disclaimer": (
+                        "Synthetic recall scenario for presentation rehearsal only; "
+                        "it is not scanner output or phone-verified evidence."
+                    ),
+                },
+                "simulation": {
+                    "selection_mode": selection_mode,
+                    "seed": seed,
+                    "requested_target_recall": target_recall,
+                    "detected_ground_truth_ids": sorted(selected_ids),
+                    "omitted_ground_truth_ids": omitted,
+                },
+                "score_policy": {
+                    "primary_metric": "f0.5",
+                    "simulation_only": True,
+                    "false_positives_simulated": False,
+                    "candidate_or_inconclusive_counts_as_discovery": False,
+                },
+                "metrics": {
+                    "ground_truth_count": len(spec.vulnerabilities),
+                    "confirmed_finding_count": 0,
+                    "true_positives": true_positives,
+                    "false_positives": 0,
+                    "false_negatives": false_negatives,
+                    "precision": round(precision, 6),
+                    "recall": round(recall, 6),
+                    "f0_5": round(f_half, 6),
+                    "score_100": round(f_half * 100, 2),
+                    "unproven_ai_noise": 0,
+                },
+                "matches": matches,
+                "missed": missed,
+                "false_positives": [],
+                "unproven_ai_noise": [],
+                "model_attribution": {
+                    "backend": "synthetic_demo",
+                    "backends": [],
+                    "models": [],
+                    "source": "simulation_config",
+                },
+            }
+            evaluation = BenchmarkEvaluation(
+                scan_id=scan_id,
+                name=f"{spec.name}（仿真）",
+                artifact_sha256=scan.artifact_sha256,
+                investigator_backend="synthetic_demo",
+                model=None,
+                ground_truth=spec.model_dump(mode="json"),
+                result=result,
+            )
+            session.add(evaluation)
+            session.commit()
+            return evaluation
+
+    @staticmethod
+    def _require_compatible_scan(session, scan_id: str, spec: BenchmarkSpec) -> Scan:  # noqa: ANN001
+        scan = session.get(Scan, scan_id)
+        if scan is None:
+            raise ValueError("scan not found")
+        if scan.status != ScanStatus.FINAL.value:
+            raise ValueError("benchmark evaluation requires a completed final scan")
+        if spec.apk_sha256 and spec.apk_sha256 != scan.artifact_sha256:
+            raise ValueError("ground truth APK SHA-256 does not match the selected scan")
+        return scan
+
+    @staticmethod
+    def _reject_unknown_truth_ids(values: set[str], truth_ids: set[str]) -> None:
+        unknown = sorted(values - truth_ids)
+        if unknown:
+            raise ValueError(f"unknown ground-truth vulnerability IDs: {', '.join(unknown)}")
 
     @classmethod
     def _score(

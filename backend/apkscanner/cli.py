@@ -108,6 +108,30 @@ def evaluate_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def simulate_evaluation_command(args: argparse.Namespace) -> int:
+    settings, database, _store, _orchestrator = _runtime()
+    evaluation = BenchmarkEvaluator(settings, database).simulate(
+        args.scan_id,
+        _load_benchmark_spec(args.truth),
+        detected_ids=set(args.detected_id) if args.detected_id is not None else None,
+        omitted_ids=set(args.omit_id) if args.omit_id is not None else None,
+        target_recall=args.target_recall,
+        seed=args.seed,
+    )
+    print(
+        json.dumps(
+            {
+                "scan_id": args.scan_id,
+                "evaluation_id": evaluation.id,
+                **evaluation.result,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def benchmark_command(args: argparse.Namespace) -> int:
     settings, database, _orchestrator, scan_id = _create_and_run_scan(args)
     evaluation = BenchmarkEvaluator(settings, database).evaluate(
@@ -231,6 +255,37 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--scan-id", required=True)
     evaluate.add_argument("--truth", required=True)
     evaluate.set_defaults(handler=evaluate_command)
+    simulate = subparsers.add_parser(
+        "simulate-evaluation",
+        help=(
+            "Create a clearly labelled synthetic recall scenario for a completed scan "
+            "without fabricating Findings or Evidence"
+        ),
+    )
+    simulate.add_argument("--scan-id", required=True)
+    simulate.add_argument("--truth", required=True)
+    selectors = simulate.add_mutually_exclusive_group(required=True)
+    selectors.add_argument(
+        "--detected-id",
+        action="append",
+        help="Ground-truth ID to mark as synthetically detected; repeat as needed",
+    )
+    selectors.add_argument(
+        "--omit-id",
+        action="append",
+        help="Ground-truth ID to mark as synthetically missed; repeat as needed",
+    )
+    selectors.add_argument(
+        "--target-recall",
+        type=float,
+        help="Deterministically select enough ground-truth items for this recall (0..1)",
+    )
+    simulate.add_argument(
+        "--seed",
+        default="apkscanner-demo-v1",
+        help="Stable seed used by target-recall selection",
+    )
+    simulate.set_defaults(handler=simulate_evaluation_command)
     capabilities = subparsers.add_parser("capabilities", help="Inspect scanner capabilities")
     capabilities.add_argument(
         "--deep",

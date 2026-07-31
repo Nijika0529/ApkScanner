@@ -632,9 +632,15 @@ function HypothesisPipeline({ scanId, scanStatus, hypotheses, evaluations, entri
       <SectionTitle icon={Gauge} title="私有真值评测" description="只计算平台确认并达到 ground truth 最低证明等级的 Finding" />
       <div className="mt-4 grid gap-3 md:grid-cols-2">{evaluations.map((evaluation) => {
         const metrics = recordValue(evaluation.result.metrics)
-        return <div key={evaluation.id} className="rounded-xl border border-cyan-200 bg-cyan-50/60 p-4">
-          <div className="flex items-center justify-between gap-3"><div><p className="font-semibold text-slate-900">{evaluation.name}</p><p className="mt-1 text-xs text-slate-600">{evaluation.investigator_backend}{evaluation.model ? ` · ${evaluation.model}` : ""}</p></div><Badge tone="info">{numberValue(metrics?.score_100)?.toFixed(2) ?? "0.00"} 分</Badge></div>
+        const provenance = recordValue(evaluation.result.data_provenance)
+        const simulation = recordValue(evaluation.result.simulation)
+        const synthetic = textValue(provenance?.kind) === "synthetic_demo"
+        const omittedIds = Array.isArray(simulation?.omitted_ground_truth_ids) ? simulation.omitted_ground_truth_ids.filter((item): item is string => typeof item === "string") : []
+        return <div key={evaluation.id} className={cn("rounded-xl border p-4", synthetic ? "border-amber-300 bg-amber-50/70" : "border-cyan-200 bg-cyan-50/60")}>
+          <div className="flex items-center justify-between gap-3"><div><div className="flex flex-wrap items-center gap-2"><p className="font-semibold text-slate-900">{evaluation.name}</p>{synthetic && <Badge tone="warning">仿真数据</Badge>}</div><p className="mt-1 text-xs text-slate-600">{evaluation.investigator_backend}{evaluation.model ? ` · ${evaluation.model}` : ""}</p></div><Badge tone={synthetic ? "warning" : "info"}>{synthetic ? `召回 ${((numberValue(metrics?.recall) ?? 0) * 100).toFixed(2)}%` : `${numberValue(metrics?.score_100)?.toFixed(2) ?? "0.00"} 分`}</Badge></div>
+          {synthetic && <div className="mt-3 rounded-lg border border-amber-300 bg-white/70 px-3 py-2 text-xs leading-5 text-amber-950">此卡仅用于汇报演练：未执行目标 APK、未连接真机，也没有生成 Finding 或 Evidence。仿真召回率为 {((numberValue(metrics?.recall) ?? 0) * 100).toFixed(2)}%；选择性漏报 {omittedIds.length} 项。</div>}
           <div className="mt-4 grid grid-cols-3 gap-2 text-center text-xs"><div className="rounded-lg bg-white p-2"><strong className="block text-base text-emerald-700">{numberValue(metrics?.true_positives) ?? 0}</strong>命中</div><div className="rounded-lg bg-white p-2"><strong className="block text-base text-rose-700">{numberValue(metrics?.false_positives) ?? 0}</strong>有害误报</div><div className="rounded-lg bg-white p-2"><strong className="block text-base text-amber-700">{numberValue(metrics?.false_negatives) ?? 0}</strong>漏报</div></div>
+          {synthetic && omittedIds.length > 0 && <p className="mt-3 break-words text-xs leading-5 text-slate-600">仿真漏报：{omittedIds.join("、")}</p>}
         </div>
       })}</div>
     </div>}

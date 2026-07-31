@@ -69,6 +69,24 @@ scanctl evaluate --scan-id SCAN_ID \
   --truth /absolute/path/to/ground-truth.json
 ```
 
+如果只需要提前演练汇报页面，可以在一个已完成扫描上创建明确标注的召回率仿真。该命令
+只新增 `BenchmarkEvaluation`，不会伪造 Finding、Evidence、模型归因或真机验证：
+
+```bash
+scanctl simulate-evaluation --scan-id SCAN_ID \
+  --truth /absolute/path/to/ground-truth.json \
+  --target-recall 0.75 \
+  --seed report-rehearsal-v1
+
+# 或显式指定应当漏掉的已知漏洞，便于模拟当前能力边界
+scanctl simulate-evaluation --scan-id SCAN_ID \
+  --truth /absolute/path/to/ground-truth.json \
+  --omit-id GT-004 --omit-id GT-009
+```
+
+仿真卡片始终显示“仿真数据”水印，并记录 `synthetic_demo` provenance、选择规则与完整漏报
+列表。它只能用于界面和汇报流程演练，不能作为目标 APK 的扫描结论或 phone-verified 证据。
+
 `candidate`、`inconclusive`、人工 accepted 和没有平台证明的模型描述都不算“发现”。普通
 Probe 成功只记录 `execution_demonstrated`；动态真值还要求领域 Prover 给出平台可校验的
 `security_impact_observed`。真值默认使用 `minimum_proof: dynamic`；仅仅发现导出声明、
