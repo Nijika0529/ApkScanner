@@ -65,6 +65,35 @@ def test_local_api_requires_console_marker_for_mutations(settings) -> None:  # n
         }
 
 
+def test_health_reports_a_leased_adb_pool_as_busy_not_unavailable(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    monkeypatch.setattr(
+        app.state.orchestrator.device_pool,
+        "capability",
+        lambda **_kwargs: {
+            "available": True,
+            "busy": True,
+            "detail": "All configured ADB devices are assigned to active tasks",
+        },
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/health")
+
+    assert response.status_code == 200
+    device = next(
+        item
+        for item in response.json()["capabilities"]
+        if item["name"] == "remote_android_device"
+    )
+    assert device["available"] is True
+    assert device["busy"] is True
+    assert "active tasks" in device["detail"]
+
+
 def test_in_memory_sqlite_is_shared_with_app_worker_threads(settings) -> None:  # noqa: ANN001
     app = create_app(replace(settings, database_url="sqlite:///:memory:"))
 

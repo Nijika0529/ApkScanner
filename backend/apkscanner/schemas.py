@@ -247,6 +247,7 @@ class AgentAuditOut(BaseModel):
 class Capability(BaseModel):
     name: str
     available: bool
+    busy: bool = False
     version: str | None = None
     detail: str | None = None
 

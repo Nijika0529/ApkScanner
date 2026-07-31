@@ -8,6 +8,7 @@ import pytest
 from apkscanner.config import Settings
 from apkscanner.device import (
     AdbDeviceAdapter,
+    AdbDevicePool,
     DeviceLeaseCancelledError,
     DevicePoolScheduler,
     SingleDeviceScheduler,
@@ -32,6 +33,62 @@ def test_settings_parse_a_comma_separated_device_pool(
 
     assert settings.adb_serial == "device-a"
     assert settings.configured_adb_serials == ("device-a", "device-b")
+
+
+def test_fully_leased_device_pool_is_busy_but_still_available() -> None:
+    class AvailableRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+    class FakeAdapter:
+        def __init__(self, serial: str) -> None:
+            self.serial = serial
+            self.runner = AvailableRunner()
+            self._active_cancel_event = None
+
+        @staticmethod
+        def capability(*, non_blocking: bool = False) -> dict:  # noqa: ARG004
+            raise AssertionError("busy pool health must not issue an ADB command")
+
+    pool = AdbDevicePool(
+        [FakeAdapter("device-a"), FakeAdapter("device-b")]  # type: ignore[list-item]
+    )
+    both_acquired = threading.Event()
+    release = threading.Event()
+    acquired_count = 0
+    acquired_lock = threading.Lock()
+
+    def hold(task_id: str) -> None:
+        nonlocal acquired_count
+        with pool.task_lease(
+            task_id,
+            priority=90,
+            cancel_event=threading.Event(),
+        ):
+            with acquired_lock:
+                acquired_count += 1
+                if acquired_count == 2:
+                    both_acquired.set()
+            assert release.wait(timeout=5)
+
+    workers = [
+        threading.Thread(target=hold, args=(f"task-{index}",))
+        for index in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    assert both_acquired.wait(timeout=5)
+
+    capability = pool.capability(non_blocking=True)
+    assert capability["available"] is True
+    assert capability["busy"] is True
+    assert set(capability["active"]) == {"device-a", "device-b"}
+
+    release.set()
+    for worker in workers:
+        worker.join(timeout=5)
+        assert not worker.is_alive()
 
 
 def test_single_device_scheduler_orders_waiters_by_priority_then_fifo() -> None:

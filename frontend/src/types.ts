@@ -253,6 +253,7 @@ export interface ScanRerunResult {
 export interface Capability {
   name: string
   available: boolean
+  busy: boolean
   version: string | null
   detail: string | null
 }

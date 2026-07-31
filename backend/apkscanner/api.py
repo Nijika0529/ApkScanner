@@ -179,6 +179,7 @@ def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> Health
         Capability(
             name="remote_android_device",
             available=bool(device.get("available")),
+            busy=bool(device.get("busy")),
             version=device.get("android_version"),
             detail=device.get("detail"),
         )

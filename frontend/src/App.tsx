@@ -72,6 +72,9 @@ const DETAIL_REFRESH_EVENTS = [
   "exploration.update",
 ] as const
 
+const DETAIL_CACHE_LIMIT = 8
+const TERMINAL_SCAN_STATUSES = new Set<Scan["status"]>(["final", "failed"])
+
 function statusTone(status: string): "neutral" | "good" | "warning" | "danger" | "info" {
   if (["final", "completed", "covered", "accepted", "reproduced_blackbox", "proven"].includes(status)) return "good"
   if (["failed", "critical", "high", "tool_failed"].includes(status)) return "danger"
@@ -115,7 +118,27 @@ function App() {
   const [deleteTarget, setDeleteTarget] = useState<Scan | null>(null)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const detailRequestRef = useRef(0)
+  const detailCacheRef = useRef(new Map<string, DetailData>())
   const selectedIdRef = useRef<string | null>(selectedId)
+
+  const readCachedDetail = useCallback((id: string) => {
+    const cached = detailCacheRef.current.get(id)
+    if (!cached) return null
+    detailCacheRef.current.delete(id)
+    detailCacheRef.current.set(id, cached)
+    return cached
+  }, [])
+
+  const writeCachedDetail = useCallback((data: DetailData) => {
+    const cache = detailCacheRef.current
+    cache.delete(data.scan.id)
+    cache.set(data.scan.id, data)
+    while (cache.size > DETAIL_CACHE_LIMIT) {
+      const oldestId = cache.keys().next().value
+      if (typeof oldestId !== "string") break
+      cache.delete(oldestId)
+    }
+  }, [])
 
   const loadScans = useCallback(async () => {
     const data = await api.scans()
@@ -149,7 +172,9 @@ function App() {
         api.patternMatches(id, signal),
       ])
       if (signal?.aborted || requestId !== detailRequestRef.current) return false
-      setDetail({ scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events, securitySnapshot, versionDiff, patternMatches })
+      const data = { scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events, securitySnapshot, versionDiff, patternMatches }
+      writeCachedDetail(data)
+      setDetail(data)
       setScans((items) => items.map((item) => item.id === scan.id ? scan : item))
       return true
     } catch (reason) {
@@ -160,7 +185,7 @@ function App() {
     } finally {
       if (!signal?.aborted && requestId === detailRequestRef.current) setLoading(false)
     }
-  }, [])
+  }, [writeCachedDetail])
 
   const refreshDetail = useCallback(async (
     id: string,
@@ -188,6 +213,11 @@ function App() {
     void api.health()
       .then(setHealth)
       .catch((reason: Error) => setError(reason.message))
+    const healthTimer = window.setInterval(
+      () => void api.health().then(setHealth).catch(() => undefined),
+      15_000,
+    )
+    return () => window.clearInterval(healthTimer)
   }, [loadScans])
 
   useEffect(() => {
@@ -198,8 +228,12 @@ function App() {
       return
     }
     const controller = new AbortController()
-    setDetail(null)
-    setLoading(true)
+    const cached = readCachedDetail(selectedId)
+    setDetail(cached)
+    setLoading(!cached)
+    if (cached && TERMINAL_SCAN_STATUSES.has(cached.scan.status)) {
+      return () => controller.abort()
+    }
     const source = new EventSource(`/api/v1/scans/${selectedId}/events/stream`)
     let refreshTimer: ReturnType<typeof setTimeout> | undefined
     let initialRefreshPending = true
@@ -230,7 +264,7 @@ function App() {
       controller.abort()
       source.close()
     }
-  }, [selectedId, refreshDetail])
+  }, [selectedId, readCachedDetail, refreshDetail])
 
   async function onUploaded(scan: Scan) {
     setUploadOpen(false)
@@ -245,11 +279,13 @@ function App() {
   async function onDeleted(scanId: string, warnings: string[]) {
     const remaining = scans.filter((scan) => scan.id !== scanId)
     detailRequestRef.current += 1
+    detailCacheRef.current.delete(scanId)
     setDeleteTarget(null)
     setScans(remaining)
-    setDetail(null)
-    setLoading(Boolean(remaining[0]))
     selectedIdRef.current = remaining[0]?.id ?? null
+    const cached = selectedIdRef.current ? readCachedDetail(selectedIdRef.current) : null
+    setDetail(cached)
+    setLoading(Boolean(selectedIdRef.current && !cached))
     setSelectedId(selectedIdRef.current)
     if (warnings.length) setError(`扫描已删除，但有文件未能清理：${warnings.join("；")}`)
   }
@@ -262,8 +298,9 @@ function App() {
       onSelect={(id) => {
         if (id !== selectedId) {
           detailRequestRef.current += 1
-          setDetail(null)
-          setLoading(true)
+          const cached = readCachedDetail(id)
+          setDetail(cached)
+          setLoading(!cached)
           selectedIdRef.current = id
           setSelectedId(id)
         }
@@ -310,7 +347,7 @@ function App() {
 }
 
 function Sidebar({ scans, selectedId, health, onSelect, onUpload }: { scans: Scan[]; selectedId: string | null; health: Health | null; onSelect: (id: string) => void; onUpload: () => void }) {
-  const ready = health?.capabilities.filter((item) => item.available).length ?? 0
+  const ready = health?.capabilities.filter((item) => item.available || item.busy).length ?? 0
   const total = health?.capabilities.length ?? 0
   return (
     <div className="flex h-full flex-col">
@@ -399,7 +436,7 @@ function Overview({ scan, events, health, coverage }: { scan: Scan; events: Scan
   const baselines = coverage.filter((item) => item.control_id.endsWith("-BASELINE"))
   return <div className="grid gap-6 xl:grid-cols-[1.35fr_.65fr]">
     <div><SectionTitle icon={Activity} title="扫描活动" description="平台事件与证据生成轨迹" /><ol className="mt-4 space-y-1">{events.slice().reverse().map((event, index) => <li key={event.id} className="relative flex gap-4 py-3"><div className="relative flex w-5 justify-center"><span className={cn("mt-1.5 h-2.5 w-2.5 rounded-full border-2", index === 0 ? "border-cyan-300 bg-cyan-600" : "border-slate-300 bg-slate-100")} />{index < events.length - 1 && <span className="absolute left-1/2 top-6 h-[calc(100%-10px)] w-px -translate-x-1/2 bg-slate-100" />}</div><div className="min-w-0"><p className="text-sm text-slate-800">{event.message}</p><p className="mt-1 text-xs text-slate-600">{formatDate(event.created_at)} · {event.event_type}</p></div></li>)}{!events.length && <EmptyRow text="扫描事件尚未生成" />}</ol></div>
-    <div className="space-y-6"><div><SectionTitle icon={ListChecks} title="MASVS 基线" description="APK-only 初始覆盖" /><div className="mt-4 space-y-3">{baselines.map((item) => <div key={item.id} className="rounded-xl border border-slate-200 bg-slate-50 p-3"><div className="mb-2 flex items-center justify-between gap-3"><span className="text-xs font-semibold text-slate-700">{item.domain.replace("MASVS-", "")}</span><Badge tone={statusTone(item.status)}>{statusLabel(item.status)}</Badge></div><p className="text-xs leading-relaxed text-slate-500">{item.gap_reason ?? item.title}</p></div>)}</div></div><div><SectionTitle icon={ServerCog} title="运行能力" description="缺失能力会形成覆盖缺口" /><div className="mt-4 grid grid-cols-2 gap-2">{health?.capabilities.map((item) => <div key={item.name} className="flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-xs"><span className={cn("h-2 w-2 rounded-full", item.available ? "bg-emerald-400" : "bg-slate-300")} /><span className="truncate text-slate-600">{item.name}</span></div>)}</div></div></div>
+    <div className="space-y-6"><div><SectionTitle icon={ListChecks} title="MASVS 基线" description="APK-only 初始覆盖" /><div className="mt-4 space-y-3">{baselines.map((item) => <div key={item.id} className="rounded-xl border border-slate-200 bg-slate-50 p-3"><div className="mb-2 flex items-center justify-between gap-3"><span className="text-xs font-semibold text-slate-700">{item.domain.replace("MASVS-", "")}</span><Badge tone={statusTone(item.status)}>{statusLabel(item.status)}</Badge></div><p className="text-xs leading-relaxed text-slate-500">{item.gap_reason ?? item.title}</p></div>)}</div></div><div><SectionTitle icon={ServerCog} title="运行能力" description="缺失能力会形成覆盖缺口" /><div className="mt-4 grid grid-cols-2 gap-2">{health?.capabilities.map((item) => <div key={item.name} title={item.detail ?? undefined} className="flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-xs"><span className={cn("h-2 w-2 rounded-full", item.busy ? "bg-amber-400" : item.available ? "bg-emerald-400" : "bg-slate-300")} /><span className="truncate text-slate-600">{item.name}{item.busy ? " · 忙碌" : ""}</span></div>)}</div></div></div>
     {scan.error && <p className="text-rose-700">{scan.error}</p>}
   </div>
 }
@@ -682,7 +719,9 @@ function Tasks({ scan, tasks, entries, audits, events, health, onRefresh }: { sc
   const configuredBackend = textValue(agentControl?.backend) ?? textValue(scan.stats.investigator) ?? "none"
   const backend: "codex" | "opencode" | "none" = configuredBackend === "opencode" ? "opencode" : configuredBackend === "codex" ? "codex" : "none"
   const masterEnabled = booleanValue(agentControl?.enabled) ?? backend !== "none"
-  const deviceReady = Boolean(health?.capabilities.find((item) => item.name === "remote_android_device")?.available)
+  const deviceCapability = health?.capabilities.find((item) => item.name === "remote_android_device")
+  const deviceBusy = Boolean(deviceCapability?.busy)
+  const deviceReady = Boolean(deviceCapability?.available || deviceBusy)
   const codexReady = Boolean(health?.enabled_investigators.includes("codex") && health.capabilities.find((item) => item.name === "codex")?.available)
   const opencodeReady = Boolean(health?.enabled_investigators.includes("opencode") && health.capabilities.find((item) => item.name === "opencode_deepseek")?.available)
   const selectedBackendReady = backend === "codex" ? codexReady : backend === "opencode" ? opencodeReady : false
@@ -731,7 +770,7 @@ function Tasks({ scan, tasks, entries, audits, events, health, onRefresh }: { sc
             <Button variant="secondary" size="sm" onClick={() => setRerunOpen(true)} disabled={!["final", "failed"].includes(scan.status) || incompleteCount === 0}><RefreshCw className="h-3.5 w-3.5" />补扫信息不全项 · {incompleteCount}</Button>
           </div>
         </div>
-        <div className="mt-3 flex flex-wrap gap-2 text-xs"><Badge tone={deviceReady ? "good" : "warning"}>{deviceReady ? "ADB 已就绪" : "ADB 当前不可用"}</Badge><Badge tone={masterEnabled && selectedBackendReady ? "good" : "warning"}>{masterEnabled ? selectedBackendReady ? "AI 后端已就绪" : "AI 后端未就绪" : "AI 已关闭"}</Badge><span className="text-violet-800">补扫会复用 Manifest、JADX/Smali 和静态 Evidence，只重新执行设备验证与 AI。</span></div>
+        <div className="mt-3 flex flex-wrap gap-2 text-xs"><Badge tone={deviceBusy ? "warning" : deviceReady ? "good" : "warning"}>{deviceBusy ? "ADB 忙碌 · 扫描任务占用" : deviceReady ? "ADB 已就绪" : "ADB 当前不可用"}</Badge><Badge tone={masterEnabled && selectedBackendReady ? "good" : "warning"}>{masterEnabled ? selectedBackendReady ? "AI 后端已就绪" : "AI 后端未就绪" : "AI 已关闭"}</Badge><span className="text-violet-800">补扫会复用 Manifest、JADX/Smali 和静态 Evidence，只重新执行设备验证与 AI。</span></div>
         {controlError && <p role="alert" className="mt-3 text-xs text-rose-700">{controlError}</p>}
       </div>
       <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5" aria-label="探索任务状态汇总">
@@ -829,7 +868,7 @@ function Tasks({ scan, tasks, entries, audits, events, health, onRefresh }: { sc
         onOpenChange={(open) => !open && setCancelTarget(null)}
         onCancelled={async () => { setCancelTarget(null); await onRefresh() }}
       />
-      <RerunIncompleteDialog scan={rerunOpen ? scan : null} count={incompleteCount} deviceReady={deviceReady} onOpenChange={setRerunOpen} onQueued={onRefresh} />
+      <RerunIncompleteDialog scan={rerunOpen ? scan : null} count={incompleteCount} deviceReady={deviceReady} deviceBusy={deviceBusy} onOpenChange={setRerunOpen} onQueued={onRefresh} />
     </div>
   )
 }
@@ -867,7 +906,7 @@ function isTerminalTask(status: string) {
   return !["queued", "awaiting_device", "running", "cancel_requested"].includes(status)
 }
 
-function RerunIncompleteDialog({ scan, count, deviceReady, onOpenChange, onQueued }: { scan: Scan | null; count: number; deviceReady: boolean; onOpenChange: (open: boolean) => void; onQueued: () => Promise<void> }) {
+function RerunIncompleteDialog({ scan, count, deviceReady, deviceBusy, onOpenChange, onQueued }: { scan: Scan | null; count: number; deviceReady: boolean; deviceBusy: boolean; onOpenChange: (open: boolean) => void; onQueued: () => Promise<void> }) {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   useEffect(() => setError(null), [scan?.id])
@@ -890,7 +929,7 @@ function RerunIncompleteDialog({ scan, count, deviceReady, onOpenChange, onQueue
       <DialogContent>
         <DialogTitle className="text-xl font-bold text-slate-950">补扫所有信息不全项？</DialogTitle>
         <DialogDescription className="mt-2 text-sm leading-6 text-slate-600">将重新排队 {count} 个设备阻塞、执行失败、超时或平台结论为“证据不足”的任务。静态扫描和反编译结果会直接复用，不会再次运行 JADX。</DialogDescription>
-        <div className={cn("mt-5 rounded-xl border p-4 text-sm", deviceReady ? "border-emerald-200 bg-emerald-50 text-emerald-900" : "border-amber-200 bg-amber-50 text-amber-950")}>{deviceReady ? "ADB 当前已就绪，可以开始补充动态证据。" : "ADB 当前仍不可用；继续补扫可能再次得到证据不足。"} AI 是否执行由总开关和各任务开关共同决定。</div>
+        <div className={cn("mt-5 rounded-xl border p-4 text-sm", deviceBusy ? "border-cyan-200 bg-cyan-50 text-cyan-950" : deviceReady ? "border-emerald-200 bg-emerald-50 text-emerald-900" : "border-amber-200 bg-amber-50 text-amber-950")}>{deviceBusy ? "ADB 设备当前都被扫描任务占用；补扫可以正常入队，设备释放后会自动执行。" : deviceReady ? "ADB 当前已就绪，可以开始补充动态证据。" : "ADB 当前仍不可用；继续补扫可能再次得到证据不足。"} AI 是否执行由总开关和各任务开关共同决定。</div>
         {error && <p role="alert" className="mt-4 text-sm text-rose-700">{error}</p>}
         <div className="mt-6 flex justify-end gap-2"><Button variant="ghost" onClick={() => onOpenChange(false)} disabled={submitting}>取消</Button><Button onClick={rerun} disabled={submitting}>{submitting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{submitting ? "正在排队" : `确认补扫 ${count} 项`}</Button></div>
       </DialogContent>

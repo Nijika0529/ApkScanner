@@ -1749,7 +1749,9 @@ class AdbDevicePool:
         ]
         if non_blocking and not available:
             return {
-                "available": False,
+                # The pool is healthy but temporarily has no free lease. Callers
+                # must distinguish this from a disconnected or invalid device.
+                "available": True,
                 "busy": True,
                 "detail": "All configured ADB devices are assigned to active tasks",
                 "serials": list(self.serials),
@@ -1758,7 +1760,7 @@ class AdbDevicePool:
             }
         failures: list[dict[str, Any]] = []
         for adapter in available or list(self.adapters):
-            capability = adapter.capability(non_blocking=False)
+            capability = adapter.capability(non_blocking=non_blocking)
             if capability.get("available"):
                 return {
                     **capability,
