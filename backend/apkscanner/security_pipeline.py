@@ -180,11 +180,7 @@ class HypothesisLedger:
                 if isinstance(hypothesis_id, str) and hypothesis_id in hypothesis_ids:
                     scoped_ids.add(hypothesis_id)
             selected = (
-                [
-                    hypothesis
-                    for hypothesis in hypotheses
-                    if hypothesis.id in scoped_ids
-                ]
+                [hypothesis for hypothesis in hypotheses if hypothesis.id in scoped_ids]
                 if scoped_ids
                 else hypotheses
             )
@@ -300,10 +296,7 @@ class HypothesisLedger:
             attempt.status = ProofAttemptStatus.EXECUTING.value
             attempt.started_at = now()
             hypothesis = session.get(SecurityHypothesis, attempt.hypothesis_id)
-            if (
-                hypothesis is not None
-                and hypothesis.status != HypothesisStatus.PROVEN.value
-            ):
+            if hypothesis is not None and hypothesis.status != HypothesisStatus.PROVEN.value:
                 hypothesis.status = HypothesisStatus.EXECUTING.value
             session.commit()
 
@@ -316,14 +309,11 @@ class HypothesisLedger:
     ) -> None:
         if proof_attempt_id is None:
             return
-        evidence_ids = [
-            item["id"] for item in evidence if isinstance(item.get("id"), str)
-        ]
+        evidence_ids = [item["id"] for item in evidence if isinstance(item.get("id"), str)]
         request_ids = {
             item.get("metadata", {}).get("request_id")
             for item in evidence
-            if item.get("kind") == "blackbox.probe_app"
-            and item.get("exit_code") == 0
+            if item.get("kind") == "blackbox.probe_app" and item.get("exit_code") == 0
         }
         observed_ids = {
             item.get("metadata", {}).get("request_id")
@@ -334,8 +324,7 @@ class HypothesisLedger:
         poc_request_ids = {
             item.get("metadata", {}).get("request_id")
             for item in evidence
-            if item.get("kind") == "blackbox.poc_launch"
-            and item.get("exit_code") == 0
+            if item.get("kind") == "blackbox.poc_launch" and item.get("exit_code") == 0
         }
         poc_observed_ids = {
             item.get("metadata", {}).get("request_id")
@@ -364,12 +353,10 @@ class HypothesisLedger:
         )
         execution_demonstrated = probe_succeeded or poc_succeeded
         impact_observed = any(
-            item.get("metadata", {}).get("security_impact_observed") is True
-            for item in evidence
+            item.get("metadata", {}).get("security_impact_observed") is True for item in evidence
         )
         oracle_refuted = any(
-            item.get("metadata", {}).get("oracle_refuted") is True
-            for item in evidence
+            item.get("metadata", {}).get("oracle_refuted") is True for item in evidence
         )
         harm_demonstrated = execution_demonstrated and impact_observed
         status = (
@@ -415,10 +402,7 @@ class HypothesisLedger:
                         hypothesis.support_evidence_ids,
                         evidence_ids,
                     )
-                elif (
-                    oracle_refuted
-                    and hypothesis.status != HypothesisStatus.PROVEN.value
-                ):
+                elif oracle_refuted and hypothesis.status != HypothesisStatus.PROVEN.value:
                     hypothesis.status = HypothesisStatus.CHALLENGED.value
                     hypothesis.refute_evidence_ids = self._merge_ids(
                         hypothesis.refute_evidence_ids,
@@ -473,9 +457,7 @@ class HypothesisLedger:
             value for value in payload.get("evidence_ids", []) if isinstance(value, str)
         ]
         hypotheses = list(
-            session.scalars(
-                select(SecurityHypothesis).where(SecurityHypothesis.task_id == task_id)
-            )
+            session.scalars(select(SecurityHypothesis).where(SecurityHypothesis.task_id == task_id))
         )
         hypothesis_ids = {hypothesis.id for hypothesis in hypotheses}
         tested_ids = {
@@ -547,11 +529,7 @@ class HypothesisLedger:
                 )
             )
             platform_proven = bool(proven_attempts)
-            effective_status = (
-                HypothesisStatus.PROVEN.value
-                if platform_proven
-                else model_status
-            )
+            effective_status = HypothesisStatus.PROVEN.value if platform_proven else model_status
             effective_verdict = (
                 FindingStatus.REPRODUCED_BLACKBOX.value
                 if platform_proven
@@ -561,9 +539,7 @@ class HypothesisLedger:
                 evidence_ids,
                 proof_evidence_ids,
             )
-            disposition = (
-                "platform_proven" if platform_proven else model_disposition
-            )
+            disposition = "platform_proven" if platform_proven else model_disposition
             effective_assessment = (
                 {
                     **dict(assessment or {}),
@@ -591,9 +567,7 @@ class HypothesisLedger:
             }
             argument_payload = {
                 "platform_result": (
-                    FindingStatus.REPRODUCED_BLACKBOX.value
-                    if platform_proven
-                    else result_value
+                    FindingStatus.REPRODUCED_BLACKBOX.value if platform_proven else result_value
                 ),
                 "assessment": effective_assessment,
                 "model_assessment": assessment,
@@ -619,8 +593,7 @@ class HypothesisLedger:
             if not platform_proven or not hypothesis.impact:
                 hypothesis.impact = str(
                     (
-                        assessment.get("sink")
-                        or assessment.get("reachable_path")
+                        assessment.get("sink") or assessment.get("reachable_path")
                         if assessment is not None
                         else None
                     )
@@ -682,9 +655,7 @@ class HypothesisLedger:
                 return None
             evidence_ids = list(
                 dict.fromkeys(
-                    evidence_id
-                    for attempt in attempts
-                    for evidence_id in attempt.evidence_ids
+                    evidence_id for attempt in attempts for evidence_id in attempt.evidence_ids
                 )
             )
             return FindingStatus.REPRODUCED_BLACKBOX.value, evidence_ids
@@ -797,6 +768,7 @@ class HypothesisLedger:
         if verdict in {
             FindingStatus.SUPPORTED_STATIC.value,
             FindingStatus.REPRODUCED_BLACKBOX.value,
+            "needs_dynamic_proof",
         }:
             return HypothesisStatus.ACCEPTED_FOR_PROOF.value
         if verdict in {

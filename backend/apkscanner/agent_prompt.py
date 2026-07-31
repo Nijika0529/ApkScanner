@@ -98,11 +98,11 @@ def developer_instructions(
         "An inconclusive receipt permits another replay only when the next PoC changes one "
         "concrete control variable, implementation defect, or Oracle predicate identified by the "
         "receipt; otherwise stop dynamic exploration and state the remaining runtime-policy gap. "
-            "When using the advertised platform source-only PoC builder, create and verify only "
-            "the manifest and Java sources, then invoke apkscanner-proof without discovering or "
-            "invoking an Android SDK toolchain. Do not add package-visibility workarounds merely "
-            "for the platform build: it normalizes the target SDK and target package/provider "
-            "visibility. One existence/path check for each PoC source is sufficient; do not "
+        "When using the advertised platform source-only PoC builder, create and verify only "
+        "the manifest and Java sources, then invoke apkscanner-proof without discovering or "
+        "invoking an Android SDK toolchain. Do not add package-visibility workarounds merely "
+        "for the platform build: it normalizes the target SDK and target package/provider "
+        "visibility. One existence/path check for each PoC source is sufficient; do not "
         "re-read or re-verify an unchanged file with repeated cat, grep, stat, checksum, xxd, or "
         "directory-listing commands. "
         if direct_tool_access
@@ -308,6 +308,10 @@ def investigation_prompt(
             "reflection, file, database, or native transitions. Return requested_tests=[]. If any "
             "concrete code/evidence edge warrants tool exploration, use supported_static and describe "
             "the exact lead and next verification action in hypothesis_assessments and followups. "
+            "This strategy phase intentionally has no workspace, PoC inventory, proof replay, or "
+            "device tools. Their absence is expected and must not be reported as a coverage gap or "
+            "reason to downgrade a source-backed lead. Name the exact helper classes, methods, URI "
+            "keys, route literals, and sinks that rescue_exploration should open next. "
             "Use refuted_static only when every issued hypothesis has a concrete closure basis in the "
             "supplied evidence; absence of a discovered chain, incomplete decompilation, or missing "
             "dynamic proof is not a closure basis. "
@@ -393,6 +397,25 @@ def investigation_prompt(
         phase,
         "Work only on the assigned seed and stop when the supplied hypotheses are accounted for.",
     )
+    deep_link_instruction = ""
+    if any(entry.kind == "deep_link" for entry in entries):
+        deep_link_instruction = (
+            "Deep-link-specific workflow: a manifest uri_template ending in `/` with path_kind=null "
+            "means the manifest constrains only the scheme/authority; `/` is not evidence that the "
+            "application has only one root route. Derive actual route candidates only from exact "
+            "path literals, comparisons, router tables, and branches in the assigned handler. "
+            "Treat all externally supplied Intent channels as one ingress family: action, categories, "
+            "data URI path/query/fragment, duplicate or encoded parameters, extras, ClipData, and "
+            "nested JSON/URI values. Build a small source-backed input matrix and trace each consumed "
+            "field through parsers and dispatchers to its final authorization check and sink. An empty "
+            "explicit component start tests only component reachability; it does not test a deep-link "
+            "route, query parameter, or extra-driven path. If an attacker-controlled URL reaches a "
+            "WebView, inspect the exact domain decision, redirect/navigation code, JavaScript settings, "
+            "and every bridge exposed to that page; do not stop at loadUrl reachability. If the seed "
+            "names a helper, router, internal Activity, WebView client, or bridge handler, that exact "
+            "reference is in scope and must be followed until a guard, harmless terminal, or concrete "
+            "sink is established. "
+        )
     if task.task_type == "static_review":
         phase_instruction = (
             "This is a bounded static semantic review seeded by a high-value code signal, not an "
@@ -455,8 +478,7 @@ def investigation_prompt(
         "已确认漏洞, or otherwise imply that exploitation succeeded."
         if response_contract == "structured_result"
         else (
-            "Because this memo is provisional, do not call an issue 已复现、动态证实、"
-            "已确认漏洞."
+            "Because this memo is provisional, do not call an issue 已复现、动态证实、已确认漏洞."
         )
     )
     scope_root = (
@@ -480,7 +502,7 @@ def investigation_prompt(
         )
     )
     return (
-        f"{phase_instruction} {scope_root} {workspace_scope} "
+        f"{phase_instruction} {deep_link_instruction} {scope_root} {workspace_scope} "
         "Do not inventory, grep for, or open unrelated components "
         "merely because they are accessible. A zero-result reference search is proof that the "
         "proposed expansion lacks an edge; do not open those target files afterward. Stop a path "
@@ -519,7 +541,12 @@ def investigation_prompt(
         "the supplied context; never abbreviate "
         f"an ID. A vulnerability is not proven merely because an entry is exported or a dangerous API "
         "is present: identify the attacker capability, reachable action, missing guard, and concrete "
-        f"unauthorized impact. {verdict_instruction} {claim_instruction} Describe adb-shell-only "
+        f"unauthorized impact. {verdict_instruction} For an individual hypothesis whose static path "
+        "is concrete but still needs an ordinary-app or impact replay, use assessment verdict "
+        "needs_dynamic_proof; absence of a replay, an empty PoC directory, or an unexecuted test is "
+        "never not_reproduced or refuted_static. not_reproduced requires a platform-correlated "
+        "negative Oracle, while refuted_static requires a concrete static guard or unreachable edge. "
+        f"{claim_instruction} Describe adb-shell-only "
         "observations strictly as shell-identity "
         "reachability, never as ordinary-app exploitation or demonstrated harm. Lower confidence "
         "and list concrete follow-ups when evidence is weaker, but never "
@@ -528,13 +555,13 @@ def investigation_prompt(
         "compatibility field: always return requested_tests=[] and use the live command instead. "
         "The proof JSON contains mandatory hypothesis_id and entry_point_id plus poc, oracle, "
         "rationale, and optional extras/reset. Copy both IDs exactly from the supplied task "
-        "context. Use this shape: {\"hypothesis_id\":\"<exact-id>\",\"entry_point_id\":"
-        "\"<exact-seed-id>\",\"poc\":{\"project_path\":\"poc/name\",\"package_name\":"
-        "\"io.apkscanner.poc.name\",\"launch_component\":\".MainActivity\",\"log_tag\":"
-        "\"APKSCANNER_POC\"},\"oracle\":{\"kind\":\"target_uid_log_contains\","
-        "\"expected_text\":\"APKSCANNER_TARGET_COMMAND_MARKER\","
-        "\"impact\":\"privileged_action\"},\"rationale\":"
-        "\"final ordinary-app replay\"}. "
+        'context. Use this shape: {"hypothesis_id":"<exact-id>","entry_point_id":'
+        '"<exact-seed-id>","poc":{"project_path":"poc/name","package_name":'
+        '"io.apkscanner.poc.name","launch_component":".MainActivity","log_tag":'
+        '"APKSCANNER_POC"},"oracle":{"kind":"target_uid_log_contains",'
+        '"expected_text":"APKSCANNER_TARGET_COMMAND_MARKER",'
+        '"impact":"privileged_action"},"rationale":'
+        '"final ordinary-app replay"}. '
         "Before submitting a PoC, verify with shell tools that its exact project_path exists relative to the "
         "task workspace and contains the matching manifest and Java source. Never emit a poc object "
         "for a planned-but-unwritten directory. If the same missing-path failure is already present "
@@ -576,8 +603,7 @@ def investigation_prompt(
         "has a supported/refuted receipt, a platform Oracle is terminal, or no changed PoC/input can "
         "resolve the remaining gap, return requested_tests=[] and stop. During final_evaluation, request no "
         f"additional tests and decide from platform-issued evidence. {response_instruction}"
-        "\n\nTASK_CONTEXT_JSON:\n"
-        + json.dumps(payload, ensure_ascii=False, indent=2)
+        "\n\nTASK_CONTEXT_JSON:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
     )
 
 

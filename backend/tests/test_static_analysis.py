@@ -183,7 +183,7 @@ def test_high_value_code_signals_create_bounded_static_review_surfaces(
             "new-instance v0, Lcom/example/agent/AgentBinder;\n"
         ),
         "smali_classes2/com/example/agent/AgentApp.smali": (
-            '.field private static final APP_SECRET:Ljava/lang/String; = '
+            ".field private static final APP_SECRET:Ljava/lang/String; = "
             '"0123456789ABCDEF0123456789ABCDEF"\n'
             'const-string v0, "https://gateway-pre.example.test"\n'
         ),
@@ -216,13 +216,9 @@ def test_high_value_code_signals_create_bounded_static_review_surfaces(
         "shell_execution_boundary",
         "release_configuration_boundary",
     }
-    shell = next(
-        item for item in surfaces if item.family == "shell_execution_boundary"
-    )
+    shell = next(item for item in surfaces if item.family == "shell_execution_boundary")
     assert all("okhttp3" not in item["path"] for item in shell.locations)
-    release = next(
-        item for item in surfaces if item.family == "release_configuration_boundary"
-    )
+    release = next(item for item in surfaces if item.family == "release_configuration_boundary")
     assert set(release.rule_ids) == {
         "CODE-HARDCODED-SECRET",
         "CODE-NONPRODUCTION-ENDPOINT",
@@ -270,37 +266,38 @@ def test_inspector_rejects_zip_path_traversal(settings, tmp_path) -> None:  # no
 def test_partial_jadx_is_scoped_to_the_target_component(tmp_path) -> None:
     workspace = tmp_path / "workspace"
     jadx_dir = workspace / "jadx"
-    source = (
-        jadx_dir
-        / "sources"
-        / "com"
-        / "example"
-        / "vulnerable"
-        / "DataProvider.java"
-    )
+    source = jadx_dir / "sources" / "com" / "example" / "vulnerable" / "DataProvider.java"
     source.parent.mkdir(parents=True)
     source.write_text(
         "package com.example.vulnerable;\n"
-        "public class DataProvider { public String query() { return \"ok\"; } }\n",
+        "public class DataProvider {\n"
+        '  public String query() { return RouteHelper.open("/a"); }\n'
+        "}\n",
+        encoding="utf-8",
+    )
+    helper = source.with_name("RouteHelper.java")
+    helper.write_text(
+        "package com.example.vulnerable;\n"
+        "final class RouteHelper {\n"
+        "  static String open(String route) { return route; }\n"
+        "}\n",
         encoding="utf-8",
     )
     command = CommandResult(
         argv=["jadx", "fixture.apk"],
         exit_code=3,
         stdout="ERROR - finished with errors, count: 322",
-        stderr=(
-            "ERROR - Failed to decompile class: "
-            "com.example.unrelated.BrokenClass\n"
-        ),
+        stderr=("ERROR - Failed to decompile class: com.example.unrelated.BrokenClass\n"),
     )
     summary = ApkInspector._jadx_decompilation_summary(command, jadx_dir)
     assert summary["status"] == "partial_success"
-    assert summary["generated_java_files"] == 1
+    assert summary["generated_java_files"] == 2
     assert summary["reported_error_count"] == 322
     assert summary["failed_classes"] == ["com.example.unrelated.BrokenClass"]
 
     index = ApkInspector._build_code_index(
         result_entries=parse_manifest(MANIFEST).entries,
+        package_name="com.example.vulnerable",
         workspace=workspace,
         jadx_dir=jadx_dir,
         decoded_dir=workspace / "apktool",
@@ -312,6 +309,11 @@ def test_partial_jadx_is_scoped_to_the_target_component(tmp_path) -> None:
     assert provider["target_in_jadx_failure_list"] is False
     assert provider["anchors"][0]["path"].endswith("DataProvider.java")
     assert "public class DataProvider" in provider["anchors"][0]["content"]
+    assert any(
+        anchor["path"].endswith("RouteHelper.java")
+        and anchor["relationship"] == "outbound_reference"
+        for anchor in provider["anchors"]
+    )
 
 
 def test_manifest_only_roots_do_not_claim_code_coverage(tmp_path) -> None:

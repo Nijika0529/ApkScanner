@@ -327,11 +327,15 @@ class AgentOracleSpec(BaseModel):
 
     @model_validator(mode="after")
     def validate_predicate(self) -> Self:
-        if self.kind in {
-            "ui_text",
-            "log_contains",
-            "target_uid_log_contains",
-        } and not self.expected_text:
+        if (
+            self.kind
+            in {
+                "ui_text",
+                "log_contains",
+                "target_uid_log_contains",
+            }
+            and not self.expected_text
+        ):
             raise ValueError(f"{self.kind} requires expected_text")
         if self.kind == "provider_rows" and self.minimum_rows is None:
             self.minimum_rows = 1
@@ -350,9 +354,7 @@ class AgentOracleSpec(BaseModel):
         }
         if self.impact not in allowed_impacts[self.kind]:
             supported = ", ".join(sorted(allowed_impacts[self.kind]))
-            raise ValueError(
-                f"{self.kind} Oracle supports only these impacts: {supported}"
-            )
+            raise ValueError(f"{self.kind} Oracle supports only these impacts: {supported}")
         return self
 
 
@@ -433,6 +435,7 @@ class AgentHypothesisAssessment(BaseModel):
         "refuted_static",
         "reproduced_blackbox",
         "not_reproduced",
+        "needs_dynamic_proof",
     ]
     source: str = Field(default="", max_length=2000)
     control: str = Field(default="", max_length=2000)
@@ -474,9 +477,7 @@ class AgentObjectionResolution(BaseModel):
 class AgentInvestigationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    _rejected_requested_tests: list[dict[str, Any]] = PrivateAttr(
-        default_factory=list
-    )
+    _rejected_requested_tests: list[dict[str, Any]] = PrivateAttr(default_factory=list)
 
     schema_version: Literal["1.0"] = "1.0"
     summary: str = Field(
@@ -537,10 +538,7 @@ class AgentInvestigationResult(BaseModel):
                     isinstance(uri, str)
                     and uri.startswith("content://")
                     and request.get("operation") != "call"
-                    and (
-                        request.get("method") is not None
-                        or request.get("argument") is not None
-                    )
+                    and (request.get("method") is not None or request.get("argument") is not None)
                 ):
                     normalized_request = {
                         **request,
@@ -566,9 +564,7 @@ class AgentInvestigationResult(BaseModel):
                     }
             try:
                 accepted.append(
-                    AgentRequestedTest.model_validate(normalized_request).model_dump(
-                        mode="python"
-                    )
+                    AgentRequestedTest.model_validate(normalized_request).model_dump(mode="python")
                 )
             except ValidationError as exc:
                 rejected.append(

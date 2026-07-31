@@ -346,6 +346,10 @@ test("critic uses V4 Pro text with no tools then V4 Flash StructuredOutput", asy
       JSON.stringify(requests[1].messages),
       /OBJ-1/,
     )
+    assert.doesNotMatch(
+      JSON.stringify(requests[1].messages),
+      /POC_WORKSPACE_INVENTORY/,
+    )
   } finally {
     api.close()
     await rm(root, { recursive: true, force: true })

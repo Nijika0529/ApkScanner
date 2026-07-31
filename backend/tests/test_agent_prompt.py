@@ -69,7 +69,12 @@ def test_agent_adb_policy_keeps_full_access_with_hard_safety_boundary() -> None:
     assert "poc_builder.source_build_available=true" in instructions
 
 
-def _phase_prompt(phase: str, *, response_contract: str = "structured_result") -> str:
+def _phase_prompt(
+    phase: str,
+    *,
+    response_contract: str = "structured_result",
+    entry_kind: str = "activity",
+) -> str:
     scan = Scan(
         id="00000000-0000-0000-0000-000000000001",
         status="investigating",
@@ -81,10 +86,17 @@ def _phase_prompt(phase: str, *, response_contract: str = "structured_result") -
     entry = EntryPoint(
         id="00000000-0000-0000-0000-000000000002",
         scan_id=scan.id,
-        kind="activity",
-        name="com.example.sample.MainActivity",
+        kind=entry_kind,
+        name=(
+            "sample://router/" if entry_kind == "deep_link" else "com.example.sample.MainActivity"
+        ),
         owner_component="com.example.sample.MainActivity",
         exported=True,
+        metadata_json=(
+            {"path_kind": None, "uri_template": "sample://router/"}
+            if entry_kind == "deep_link"
+            else {}
+        ),
     )
     task = InvestigationTask(
         id="00000000-0000-0000-0000-000000000003",
@@ -156,6 +168,20 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     assert "proof JSON hypothesis_id is mandatory" in planning
 
 
+def test_deep_link_prompt_requires_route_matrix_and_pending_proof_semantics() -> None:
+    planning = _phase_prompt("test_planning", entry_kind="deep_link")
+    rescue = _phase_prompt("rescue_review", entry_kind="deep_link")
+
+    assert "path_kind=null" in planning
+    assert "nested JSON/URI values" in planning
+    assert "empty explicit component start tests only component reachability" in planning
+    assert "every bridge exposed to that page" in planning
+    assert "needs_dynamic_proof" in planning
+    assert "platform-correlated negative Oracle" in planning
+    assert "intentionally has no workspace, PoC inventory" in rescue
+    assert "must not be reported as a coverage gap" in rescue
+
+
 def test_requested_tests_can_be_omitted_when_no_platform_replay_is_needed() -> None:
     result = AgentInvestigationResult.model_validate(
         {
@@ -175,9 +201,7 @@ def test_requested_tests_can_be_omitted_when_no_platform_replay_is_needed() -> N
 
 
 def test_critic_cannot_expand_beyond_two_objections() -> None:
-    payload = _result(
-        "Critic 只应保留可能改变最终结论的实质异议。"
-    ).model_dump(mode="json")
+    payload = _result("Critic 只应保留可能改变最终结论的实质异议。").model_dump(mode="json")
     payload["review_objections"] = [
         {
             "objection_id": f"OBJ-{index}",
@@ -241,9 +265,7 @@ def test_invalid_optional_requested_test_does_not_discard_static_verdict() -> No
     assert result.rejected_requested_tests[0]["errors"] == [
         {
             "location": "",
-            "message": (
-                "Value error, method and argument are only valid for provider call"
-            ),
+            "message": ("Value error, method and argument are only valid for provider call"),
             "type": "value_error",
         }
     ]
@@ -277,9 +299,7 @@ def test_poc_log_oracle_recovers_an_omitted_expected_text() -> None:
                 "poc": {
                     "project_path": "poc/deep_link",
                     "package_name": "io.apkscanner.poc.deep_link",
-                    "launch_component": (
-                        "io.apkscanner.poc.deep_link.MainActivity"
-                    ),
+                    "launch_component": ("io.apkscanner.poc.deep_link.MainActivity"),
                 },
                 "rationale": "用独立 PoC 应用验证目标入口。",
             }
@@ -290,10 +310,7 @@ def test_poc_log_oracle_recovers_an_omitted_expected_text() -> None:
 
     assert result.rejected_requested_tests == []
     assert len(result.requested_tests) == 1
-    assert (
-        result.requested_tests[0].oracle.expected_text
-        == "security_impact_observed"
-    )
+    assert result.requested_tests[0].oracle.expected_text == "security_impact_observed"
 
 
 def test_content_provider_method_implies_call_operation() -> None:

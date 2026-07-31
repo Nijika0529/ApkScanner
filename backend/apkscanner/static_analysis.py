@@ -13,6 +13,8 @@ from .manifest import ManifestDocument, aapt2_xmltree_to_xml, parse_manifest
 from .permissions import ensure_private_directory
 from .tools import CommandResult, TimeBudget, ToolRunner, discover_tools
 
+CODE_INDEX_CONTEXT_VERSION = "component-one-hop-v1"
+
 
 class InvalidApkError(ValueError):
     pass
@@ -91,9 +93,7 @@ class ApkInspector:
                     searchable_roots.append(decoded_dir)
 
         if manifest_path is None and self.runner.available("apkanalyzer"):
-            result = self._run(
-                ["apkanalyzer", "manifest", "print", str(apk_path)], budget, 120
-            )
+            result = self._run(["apkanalyzer", "manifest", "print", str(apk_path)], budget, 120)
             tool_results["apkanalyzer"] = self._serialize_result(result)
             if result.exit_code == 0 and result.stdout.lstrip().startswith("<"):
                 manifest_path = workspace / "AndroidManifest.xml"
@@ -162,9 +162,7 @@ class ApkInspector:
                 searchable_roots.insert(0, jadx_dir)
 
         if self.runner.available("aapt2"):
-            result = self._run(
-                ["aapt2", "dump", "badging", str(apk_path)], budget, 120
-            )
+            result = self._run(["aapt2", "dump", "badging", str(apk_path)], budget, 120)
             tool_results["aapt2"] = self._serialize_result(result)
             self._merge_badging(manifest, result.stdout)
 
@@ -180,6 +178,7 @@ class ApkInspector:
 
         code_index = self._build_code_index(
             result_entries=manifest.entries,
+            package_name=manifest.package_name,
             workspace=workspace,
             jadx_dir=jadx_dir,
             decoded_dir=decoded_dir,
@@ -190,6 +189,7 @@ class ApkInspector:
             json.dumps(
                 {
                     "schema_version": "1.0",
+                    "context_version": CODE_INDEX_CONTEXT_VERSION,
                     "decompilation": decompilation,
                     "components": code_index,
                 },
@@ -211,9 +211,7 @@ class ApkInspector:
             code_index=code_index,
         )
 
-    def _run(
-        self, argv: list[str], budget: TimeBudget | None, timeout_cap: int
-    ) -> CommandResult:
+    def _run(self, argv: list[str], budget: TimeBudget | None, timeout_cap: int) -> CommandResult:
         timeout = timeout_cap if budget is None else budget.remaining(timeout_cap)
         if timeout <= 0:
             return CommandResult(
@@ -249,7 +247,10 @@ class ApkInspector:
                 total_uncompressed += item.file_size
                 if total_uncompressed > self.settings.max_uncompressed_bytes:
                     raise InvalidApkError("APK uncompressed size exceeds the configured limit")
-                if item.compress_size and item.file_size / item.compress_size > self.settings.max_compression_ratio:
+                if (
+                    item.compress_size
+                    and item.file_size / item.compress_size > self.settings.max_compression_ratio
+                ):
                     raise InvalidApkError(f"suspicious compression ratio for {item.filename}")
                 if item.filename.startswith("lib/") and item.filename.endswith(".so"):
                     native_libraries.append(item.filename)
@@ -283,7 +284,10 @@ class ApkInspector:
         total = 0
         with zipfile.ZipFile(apk_path) as archive:
             for item in archive.infolist():
-                if item.is_dir() or PurePosixPath(item.filename).suffix.lower() not in allowed_suffixes:
+                if (
+                    item.is_dir()
+                    or PurePosixPath(item.filename).suffix.lower() not in allowed_suffixes
+                ):
                     continue
                 if item.file_size > 2_000_000:
                     continue
@@ -319,9 +323,7 @@ class ApkInspector:
             flags=re.IGNORECASE,
         )
         reported_error_count = (
-            int(error_count_match.group(1))
-            if error_count_match
-            else len(failed_classes)
+            int(error_count_match.group(1)) if error_count_match else len(failed_classes)
         )
         if result.timed_out:
             status = "partial_timeout" if generated else "timed_out"
@@ -358,6 +360,7 @@ class ApkInspector:
         cls,
         *,
         result_entries: list[Any],
+        package_name: str,
         workspace: Path,
         jadx_dir: Path,
         decoded_dir: Path,
@@ -379,9 +382,7 @@ class ApkInspector:
             for path in paths:
                 java_by_simple.setdefault(path.stem, []).append(path)
 
-        failed_classes = {
-            str(value) for value in decompilation.get("failed_classes", [])
-        }
+        failed_classes = {str(value) for value in decompilation.get("failed_classes", [])}
         component_names = {
             str(entry.owner_component or entry.name)
             for entry in result_entries
@@ -414,6 +415,23 @@ class ApkInspector:
                 cls._source_anchor(path, workspace, include_content=True)
                 for path in source_matches[:3]
             ]
+            seen_anchor_paths = {path.resolve() for path in source_matches[:3]}
+            package_path = (package_name or "").replace(".", "/")
+            if package_path:
+                for path, relationship in cls._one_hop_app_references(
+                    source_matches[:3],
+                    [jadx_dir, decoded_dir, archive_dir],
+                    package_path=package_path,
+                    depth_limits=(6,),
+                    include_inbound=False,
+                ):
+                    resolved = path.resolve()
+                    if resolved in seen_anchor_paths:
+                        continue
+                    seen_anchor_paths.add(resolved)
+                    anchor = cls._source_anchor(path, workspace, include_content=True)
+                    anchor["relationship"] = relationship
+                    anchors.append(anchor)
             source_has_errors = any(
                 bool(anchor.get("decompiler_error_markers"))
                 for anchor in anchors
@@ -511,20 +529,14 @@ class ApkInspector:
         seen: set[Path] = set()
         seed_sources: list[Path] = []
         allowed_roots = {
-            path.name: path.resolve()
-            for path in result.searchable_roots
-            if path.is_dir()
+            path.name: path.resolve() for path in result.searchable_roots if path.is_dir()
         }
         for location in locations:
             root = allowed_roots.get(str(location.get("root") or ""))
             if root is None:
                 continue
             candidate = (root / str(location.get("path") or "")).resolve()
-            if (
-                candidate in seen
-                or not candidate.is_relative_to(root)
-                or not candidate.is_file()
-            ):
+            if candidate in seen or not candidate.is_relative_to(root) or not candidate.is_file():
                 continue
             seen.add(candidate)
             seed_sources.append(candidate)
@@ -573,6 +585,8 @@ class ApkInspector:
         searchable_roots: list[Path],
         *,
         package_path: str,
+        depth_limits: tuple[int, ...] = (6, 4, 4),
+        include_inbound: bool = True,
     ) -> list[tuple[Path, str]]:
         """Resolve exact app-owned class references without exposing the whole APK."""
 
@@ -587,12 +601,18 @@ class ApkInspector:
             class_match = re.search(r"(?m)^\.class[^\n]* L([^;]+);", text)
             if class_match:
                 seed_descriptors.add(class_match.group(1))
-            for descriptor in re.findall(r"L([A-Za-z0-9_/$]+);", text):
-                if (
-                    not descriptor.startswith(f"{package_path}/")
-                    or descriptor in seed_descriptors
-                    or descriptor in seen_descriptors
-                ):
+            package_match = re.search(
+                r"(?m)^\s*package\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*;",
+                text,
+            )
+            if source.suffix == ".java" and package_match:
+                seed_descriptors.add(f"{package_match.group(1).replace('.', '/')}/{source.stem}")
+            for descriptor in ApkInspector._app_reference_descriptors(
+                text,
+                package_path=package_path,
+                java_package=package_match.group(1) if package_match else None,
+            ):
+                if descriptor in seed_descriptors or descriptor in seen_descriptors:
                     continue
                 seen_descriptors.add(descriptor)
                 descriptors.append(descriptor)
@@ -600,7 +620,7 @@ class ApkInspector:
         resolved: list[tuple[Path, str]] = []
         seen_paths: set[Path] = set()
         frontier = descriptors
-        for depth, depth_limit in enumerate((6, 4, 4)):
+        for depth, depth_limit in enumerate(depth_limits):
             next_frontier: list[str] = []
             added_this_depth = 0
             for descriptor in sorted(
@@ -609,11 +629,10 @@ class ApkInspector:
                 reverse=True,
             ):
                 outer_class = descriptor.split("$", 1)[0]
-                candidates: list[Path] = []
-                for root in searchable_roots:
-                    for smali_root in sorted(root.glob("smali*")):
-                        candidates.append(smali_root / f"{outer_class}.smali")
-                    candidates.append(root / "sources" / f"{outer_class}.java")
+                candidates = ApkInspector._reference_candidates(
+                    outer_class,
+                    searchable_roots,
+                )
                 for candidate in candidates:
                     candidate = candidate.resolve()
                     if candidate in seen_paths or not candidate.is_file():
@@ -621,7 +640,7 @@ class ApkInspector:
                     seen_paths.add(candidate)
                     resolved.append((candidate, "outbound_reference"))
                     added_this_depth += 1
-                    if depth < 2:
+                    if depth + 1 < len(depth_limits):
                         try:
                             linked_text = candidate.read_text(
                                 encoding="utf-8",
@@ -629,15 +648,17 @@ class ApkInspector:
                             )
                         except OSError:
                             linked_text = ""
-                        for linked in re.findall(
-                            r"L([A-Za-z0-9_/$]+);",
+                        linked_package = re.search(
+                            r"(?m)^\s*package\s+"
+                            r"([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*;",
                             linked_text,
+                        )
+                        for linked in ApkInspector._app_reference_descriptors(
+                            linked_text,
+                            package_path=package_path,
+                            java_package=(linked_package.group(1) if linked_package else None),
                         ):
-                            if (
-                                linked.startswith(f"{package_path}/")
-                                and linked not in seed_descriptors
-                                and linked not in seen_descriptors
-                            ):
+                            if linked not in seed_descriptors and linked not in seen_descriptors:
                                 seen_descriptors.add(linked)
                                 next_frontier.append(linked)
                     break
@@ -645,13 +666,14 @@ class ApkInspector:
                     break
             frontier = next_frontier
 
+        if not include_inbound:
+            return resolved
+
         inbound_frontier = set(seed_descriptors)
         for inbound_limit in (4, 2):
             if not inbound_frontier:
                 break
-            needles = tuple(
-                f"L{descriptor};" for descriptor in sorted(inbound_frontier)
-            )
+            needles = tuple(f"L{descriptor};" for descriptor in sorted(inbound_frontier))
             next_inbound_frontier: set[str] = set()
             added_this_depth = 0
             for root in searchable_roots:
@@ -691,6 +713,56 @@ class ApkInspector:
         return resolved
 
     @staticmethod
+    def _app_reference_descriptors(
+        text: str,
+        *,
+        package_path: str,
+        java_package: str | None,
+    ) -> list[str]:
+        """Extract exact app-owned class names from Smali and Java source."""
+
+        found = {
+            descriptor
+            for descriptor in re.findall(r"L([A-Za-z0-9_/$]+);", text)
+            if descriptor.startswith(f"{package_path}/")
+        }
+        package_dot = package_path.replace("/", ".")
+        for qualified in re.findall(
+            rf"\b({re.escape(package_dot)}(?:\.[A-Za-z_$][\w$]*)+)\b",
+            text,
+        ):
+            found.add(qualified.replace(".", "/"))
+        if java_package and (
+            java_package == package_dot or java_package.startswith(f"{package_dot}.")
+        ):
+            for simple_name in re.findall(r"\b[A-Z][A-Za-z0-9_$]*\b", text):
+                found.add(f"{java_package.replace('.', '/')}/{simple_name}")
+        return sorted(found)
+
+    @staticmethod
+    def _reference_candidates(
+        descriptor: str,
+        searchable_roots: list[Path],
+    ) -> list[Path]:
+        candidates: list[Path] = []
+        seen: set[Path] = set()
+        for root in searchable_roots:
+            possible = [
+                root / "sources" / f"{descriptor}.java",
+                root / f"{descriptor}.java",
+            ]
+            for smali_root in sorted(root.glob("smali*")):
+                possible.append(smali_root / f"{descriptor}.smali")
+            possible.append(root / f"{descriptor}.smali")
+            for candidate in possible:
+                resolved = candidate.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                candidates.append(resolved)
+        return candidates
+
+    @staticmethod
     def _reference_priority(descriptor: str) -> tuple[int, int, str]:
         lowered = descriptor.lower()
         security_terms = (
@@ -701,6 +773,16 @@ class ApkInspector:
             "auth",
             "bridge",
             "web",
+            "javascript",
+            "h5",
+            "url",
+            "uri",
+            "route",
+            "router",
+            "handler",
+            "controller",
+            "jump",
+            "launch",
             "shell",
             "command",
             "path",
@@ -720,6 +802,7 @@ class ApkInspector:
             json.dumps(
                 {
                     "schema_version": "1.0",
+                    "context_version": CODE_INDEX_CONTEXT_VERSION,
                     "decompilation": result.decompilation,
                     "components": result.code_index,
                 },

@@ -1096,7 +1096,7 @@ function AuditConclusion({ audit, current, taskResult }: { audit: AgentAudit; cu
   const rejectedEvidenceIds = stringValues(validation?.rejected_evidence_ids)
   const gaps = stringValues(validatedOutput.coverage_gaps)
   const downgraded = validation?.downgraded === true
-  const presentation = auditResultPresentation(result, current)
+  const presentation = auditResultPresentation(result, current, audit.phase)
   const headingId = `audit-conclusion-${audit.id}`
 
   return (
@@ -1104,7 +1104,7 @@ function AuditConclusion({ audit, current, taskResult }: { audit: AgentAudit; cu
       <div className="flex flex-col gap-4 p-4 sm:flex-row sm:items-start sm:justify-between">
         <div className="flex min-w-0 gap-3">
           <div className={cn("grid h-11 w-11 shrink-0 place-items-center rounded-xl ring-1 ring-inset", presentation.iconContainer)}>
-            {["not_reproduced", "refuted_static"].includes(result) ? <ShieldCheck className="h-5 w-5" /> : ["inconclusive", "unknown"].includes(result) ? <AlertTriangle className="h-5 w-5" /> : <ShieldX className="h-5 w-5" />}
+            {result === "refuted_static" || (current && result === "not_reproduced") ? <ShieldCheck className="h-5 w-5" /> : ["inconclusive", "unknown", "not_reproduced"].includes(result) ? <AlertTriangle className="h-5 w-5" /> : <ShieldX className="h-5 w-5" />}
           </div>
           <div className="min-w-0">
             <p className={cn("text-[11px] font-bold uppercase tracking-[0.16em]", presentation.eyebrow)}>{current ? "任务当前最终结论" : validation ? "历史平台校验记录" : "中间模型输出"}</p>
@@ -1120,7 +1120,7 @@ function AuditConclusion({ audit, current, taskResult }: { audit: AgentAudit; cu
       </div>
       {(downgraded || gaps.length > 0 || rejectedEvidenceIds.length > 0) && (
         <div className="border-t border-current/10 bg-white/55 px-4 py-3">
-          {downgraded && <div role="status" className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /><span>平台将模型声明从“{auditResultPresentation(claimedResult ?? "unknown", false).label}”调整为“{presentation.label}”。</span></div>}
+          {downgraded && <div role="status" className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /><span>平台将模型声明从“{auditResultPresentation(claimedResult ?? "unknown", false, audit.phase).label}”调整为“{presentation.label}”。</span></div>}
           <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-xs text-slate-600">
             {gaps.slice(0, 3).map((gap, index) => <span key={`${index}-${gap}`} className="flex items-start gap-1.5"><CircleDot className="mt-0.5 h-3 w-3 shrink-0" />{gap}</span>)}
             {rejectedEvidenceIds.length > 0 && <span>拒绝了 {rejectedEvidenceIds.length} 个无效 Evidence ID</span>}
@@ -1150,12 +1150,14 @@ function ConclusionMetric({ label, value }: { label: string; value: string }) {
   return <div className="rounded-lg border border-white/70 bg-white/75 px-2 py-2 text-center shadow-sm"><p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">{label}</p><p className="mt-1 text-xs font-bold text-slate-900">{value}</p></div>
 }
 
-function auditResultPresentation(result: string, current: boolean) {
+function auditResultPresentation(result: string, current: boolean, phase?: string) {
   const prefix = current ? "" : "过程输出："
   if (result === "reproduced_blackbox") return { label: `${prefix}已完成黑盒复现`, container: "border-rose-200 bg-rose-50/80", iconContainer: "bg-rose-100 text-rose-700 ring-rose-200", eyebrow: "text-rose-700" }
-  if (result === "supported_static") return { label: `${prefix}静态证据支持风险`, container: "border-orange-200 bg-orange-50/80", iconContainer: "bg-orange-100 text-orange-700 ring-orange-200", eyebrow: "text-orange-700" }
+  if (result === "supported_static") return { label: phase === "rescue_review" ? `${prefix}救援审查发现候选攻击链` : `${prefix}静态证据支持风险`, container: "border-orange-200 bg-orange-50/80", iconContainer: "bg-orange-100 text-orange-700 ring-orange-200", eyebrow: "text-orange-700" }
   if (result === "refuted_static") return { label: `${prefix}当前攻击模型下未发现可利用风险`, container: "border-emerald-200 bg-emerald-50/80", iconContainer: "bg-emerald-100 text-emerald-700 ring-emerald-200", eyebrow: "text-emerald-700" }
-  if (result === "not_reproduced") return { label: `${prefix}当前测试未能复现`, container: "border-emerald-200 bg-emerald-50/80", iconContainer: "bg-emerald-100 text-emerald-700 ring-emerald-200", eyebrow: "text-emerald-700" }
+  if (result === "not_reproduced") return current
+    ? { label: "当前测试未能复现", container: "border-emerald-200 bg-emerald-50/80", iconContainer: "bg-emerald-100 text-emerald-700 ring-emerald-200", eyebrow: "text-emerald-700" }
+    : { label: "过程输出：尚未取得有效动态复现", container: "border-amber-200 bg-amber-50/80", iconContainer: "bg-amber-100 text-amber-800 ring-amber-200", eyebrow: "text-amber-800" }
   if (result === "inconclusive") return { label: current ? "本次任务未形成有效结论" : "历史调用当时未形成结论", container: "border-amber-200 bg-amber-50/80", iconContainer: "bg-amber-100 text-amber-800 ring-amber-200", eyebrow: "text-amber-800" }
   return { label: current ? `未识别的任务结果：${result}` : `未识别的过程输出：${result}`, container: "border-slate-200 bg-slate-50/80", iconContainer: "bg-slate-100 text-slate-700 ring-slate-200", eyebrow: "text-slate-700" }
 }

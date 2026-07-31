@@ -72,7 +72,7 @@ from .schemas import (
 )
 from .security_design import build_android_threat_model, finding_identity
 from .security_pipeline import HypothesisLedger
-from .static_analysis import ApkInspector
+from .static_analysis import CODE_INDEX_CONTEXT_VERSION, ApkInspector
 from .tools import CommandResult, TimeBudget, ToolRunner
 from .versioning import SecurityEvolutionService
 
@@ -95,9 +95,8 @@ def _is_reachability_only_claim(claim: object) -> bool:
     if not isinstance(claim, str):
         return False
     normalized = " ".join(claim.strip().lower().split())
-    return (
-        claim in REACHABILITY_ONLY_HYPOTHESIS_CLAIMS
-        or any(fragment in normalized for fragment in REACHABILITY_ONLY_CLAIM_FRAGMENTS)
+    return claim in REACHABILITY_ONLY_HYPOTHESIS_CLAIMS or any(
+        fragment in normalized for fragment in REACHABILITY_ONLY_CLAIM_FRAGMENTS
     )
 
 
@@ -119,9 +118,7 @@ class _LiveProofContext:
     lock: threading.Lock = field(default_factory=threading.Lock)
     responses: dict[str, dict[str, Any]] = field(default_factory=dict)
     proof_strategies: dict[str, dict[str, Any]] = field(default_factory=dict)
-    proven_semantic_strategies: dict[str, dict[str, Any]] = field(
-        default_factory=dict
-    )
+    proven_semantic_strategies: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 class ScanOrchestrator:
@@ -136,14 +133,9 @@ class ScanOrchestrator:
         self.hypothesis_ledger = HypothesisLedger(database)
         configured_serials = settings.configured_adb_serials
         self.devices = [
-            AdbDeviceAdapter(settings, self.runner, serial=serial)
-            for serial in configured_serials
+            AdbDeviceAdapter(settings, self.runner, serial=serial) for serial in configured_serials
         ]
-        self.device = (
-            self.devices[0]
-            if self.devices
-            else AdbDeviceAdapter(settings, self.runner)
-        )
+        self.device = self.devices[0] if self.devices else AdbDeviceAdapter(settings, self.runner)
         self.device_pool = AdbDevicePool(self.devices)
         self.poc_builder = PocBuilder(settings, self.runner, store)
         self.security_evolution = SecurityEvolutionService()
@@ -172,9 +164,7 @@ class ScanOrchestrator:
             1,
             len(configured_serials),
         )
-        self._investigation_slots = threading.BoundedSemaphore(
-            self._investigation_concurrency
-        )
+        self._investigation_slots = threading.BoundedSemaphore(self._investigation_concurrency)
 
     def _register_live_proof_context(
         self,
@@ -217,9 +207,7 @@ class ScanOrchestrator:
                         self._respond(413, {"detail": "invalid proof replay size"})
                         return
                     try:
-                        replay = AgentProofReplay.model_validate_json(
-                            self.rfile.read(length)
-                        )
+                        replay = AgentProofReplay.model_validate_json(self.rfile.read(length))
                         response = orchestrator.execute_live_proof_replay(
                             match.group(1),
                             self.headers.get("X-APKScanner-Proof-Token", ""),
@@ -262,9 +250,7 @@ class ScanOrchestrator:
             thread.start()
             self._live_proof_server = server
             self._live_proof_server_thread = thread
-            self._live_proof_base_url = (
-                f"http://127.0.0.1:{server.server_address[1]}"
-            )
+            self._live_proof_base_url = f"http://127.0.0.1:{server.server_address[1]}"
             return self._live_proof_base_url
 
     def execute_live_proof_replay(
@@ -288,9 +274,7 @@ class ScanOrchestrator:
             cached = context.responses.get(signature)
             if cached is not None:
                 deduplicated = {
-                    key: value
-                    for key, value in cached.items()
-                    if key != "receipt_signature"
+                    key: value for key, value in cached.items() if key != "receipt_signature"
                 }
                 deduplicated["deduplicated"] = True
                 receipt_payload = json.dumps(
@@ -312,15 +296,10 @@ class ScanOrchestrator:
             if hypothesis_id not in hypothesis_ids:
                 raise ValueError("proof replay hypothesis is outside this task")
             selected_hypothesis = next(
-                item
-                for item in context.hypotheses
-                if str(item["id"]) == hypothesis_id
+                item for item in context.hypotheses if str(item["id"]) == hypothesis_id
             )
-            if (
-                replay.oracle.impact != "none"
-                and _is_reachability_only_claim(
-                    selected_hypothesis.get("claim")
-                )
+            if replay.oracle.impact != "none" and _is_reachability_only_claim(
+                selected_hypothesis.get("claim")
             ):
                 raise ValueError(
                     "an impactful proof replay must target the concrete harm or "
@@ -350,9 +329,7 @@ class ScanOrchestrator:
                         "poc_package": replay.poc.package_name,
                         "extras": replay.extras,
                         "oracle": replay.oracle.model_dump(mode="json"),
-                        "rationale": " ".join(
-                            replay.rationale.lower().split()
-                        ),
+                        "rationale": " ".join(replay.rationale.lower().split()),
                     },
                     sort_keys=True,
                     separators=(",", ":"),
@@ -379,12 +356,8 @@ class ScanOrchestrator:
                     ],
                     "deduplicated": False,
                     "deduplicated_strategy": True,
-                    "prior_hypothesis_id": prior_proven_strategy[
-                        "hypothesis_id"
-                    ],
-                    "prior_evidence_ids": prior_proven_strategy[
-                        "evidence_ids"
-                    ],
+                    "prior_hypothesis_id": prior_proven_strategy["hypothesis_id"],
+                    "prior_evidence_ids": prior_proven_strategy["evidence_ids"],
                 }
                 receipt_payload = json.dumps(
                     response,
@@ -405,13 +378,9 @@ class ScanOrchestrator:
                     {
                         "source": "platform",
                         "hypothesis_id": hypothesis_id,
-                        "prior_hypothesis_id": prior_proven_strategy[
-                            "hypothesis_id"
-                        ],
+                        "prior_hypothesis_id": prior_proven_strategy["hypothesis_id"],
                         "entry_point_id": entry_id,
-                        "semantic_strategy_signature": (
-                            semantic_strategy_signature
-                        ),
+                        "semantic_strategy_signature": (semantic_strategy_signature),
                     },
                 )
                 return response
@@ -436,9 +405,7 @@ class ScanOrchestrator:
                 )
             strategy_signature: str | None = None
             if accepted:
-                artifact = artifacts.get(
-                    self._poc_request_key(accepted[0])
-                )
+                artifact = artifacts.get(self._poc_request_key(accepted[0]))
                 if artifact is not None and artifact.ok:
                     strategy_signature = hashlib.sha256(
                         json.dumps(
@@ -454,9 +421,7 @@ class ScanOrchestrator:
                             separators=(",", ":"),
                         ).encode()
                     ).hexdigest()
-                    prior_strategy = context.proof_strategies.get(
-                        strategy_signature
-                    )
+                    prior_strategy = context.proof_strategies.get(strategy_signature)
                     if prior_strategy is not None:
                         new_evidence = context.evidence_summaries[before:]
                         self._materialize_live_evidence(context, new_evidence)
@@ -483,12 +448,8 @@ class ScanOrchestrator:
                             ],
                             "deduplicated": False,
                             "deduplicated_strategy": True,
-                            "prior_hypothesis_id": prior_strategy[
-                                "hypothesis_id"
-                            ],
-                            "prior_evidence_ids": prior_strategy[
-                                "evidence_ids"
-                            ],
+                            "prior_hypothesis_id": prior_strategy["hypothesis_id"],
+                            "prior_evidence_ids": prior_strategy["evidence_ids"],
                         }
                         receipt_payload = json.dumps(
                             response,
@@ -509,9 +470,7 @@ class ScanOrchestrator:
                             {
                                 "source": "platform",
                                 "hypothesis_id": hypothesis_id,
-                                "prior_hypothesis_id": prior_strategy[
-                                    "hypothesis_id"
-                                ],
+                                "prior_hypothesis_id": prior_strategy["hypothesis_id"],
                                 "entry_point_id": entry_id,
                                 "strategy_signature": strategy_signature,
                             },
@@ -535,14 +494,10 @@ class ScanOrchestrator:
                 )
             new_evidence = context.evidence_summaries[before:]
             self._materialize_live_evidence(context, new_evidence)
-            proven_hypotheses = (
-                self.hypothesis_ledger.task_proven_hypotheses(context.task_id)
-            )
+            proven_hypotheses = self.hypothesis_ledger.task_proven_hypotheses(context.task_id)
             proof_evidence_ids = proven_hypotheses.get(hypothesis_id)
             result = (
-                FindingStatus.REPRODUCED_BLACKBOX.value
-                if proof_evidence_ids
-                else "inconclusive"
+                FindingStatus.REPRODUCED_BLACKBOX.value if proof_evidence_ids else "inconclusive"
             )
             replay_gaps = [
                 *validation_gaps,
@@ -567,9 +522,7 @@ class ScanOrchestrator:
                 # are claim-specific security evidence.
                 "result": result,
                 "evidence_ids": [
-                    str(item["id"])
-                    for item in new_evidence
-                    if isinstance(item.get("id"), str)
+                    str(item["id"]) for item in new_evidence if isinstance(item.get("id"), str)
                 ],
                 "evidence": new_evidence,
                 "gaps": replay_gaps,
@@ -592,9 +545,7 @@ class ScanOrchestrator:
                     "evidence_ids": list(response["evidence_ids"]),
                 }
             if result == FindingStatus.REPRODUCED_BLACKBOX.value:
-                context.proven_semantic_strategies[
-                    semantic_strategy_signature
-                ] = {
+                context.proven_semantic_strategies[semantic_strategy_signature] = {
                     "hypothesis_id": hypothesis_id,
                     "evidence_ids": list(response["evidence_ids"]),
                 }
@@ -762,8 +713,7 @@ class ScanOrchestrator:
                 else:
                     queue_data = dict((task.result or {}).get("device_queue") or {})
                     device_session_active = bool(
-                        queue_data.get("acquired_at")
-                        and not queue_data.get("released_at")
+                        queue_data.get("acquired_at") and not queue_data.get("released_at")
                     )
                     if not device_session_active:
                         task.status = TaskStatus.QUEUED.value
@@ -868,9 +818,7 @@ class ScanOrchestrator:
                         )
                     )
                     for task in interrupted:
-                        cancellation_requested = (
-                            task.status == TaskStatus.CANCEL_REQUESTED.value
-                        )
+                        cancellation_requested = task.status == TaskStatus.CANCEL_REQUESTED.value
                         task.status = (
                             TaskStatus.CANCELED.value
                             if cancellation_requested
@@ -921,15 +869,15 @@ class ScanOrchestrator:
                 1, int((preliminary_deadline - datetime.now(UTC)).total_seconds())
             )
             preliminary_budget = TimeBudget.from_seconds(preliminary_remaining)
-            result = self.inspector.inspect(
-                Path(scan.artifact_path), scan.id, preliminary_budget
-            )
+            result = self.inspector.inspect(Path(scan.artifact_path), scan.id, preliminary_budget)
             findings, coverage = self.rules.evaluate(result)
             mobsf_result = None
             mobsf_error = None
             if self.mobsf.configured:
                 if preliminary_budget.expired:
-                    mobsf_error = "MobSF skipped because the preliminary-report budget was exhausted"
+                    mobsf_error = (
+                        "MobSF skipped because the preliminary-report budget was exhausted"
+                    )
                 else:
                     try:
                         mobsf_result = self.mobsf.scan(
@@ -985,11 +933,7 @@ class ScanOrchestrator:
                     {},
                 )
                 public_anchors = [
-                    {
-                        key: value
-                        for key, value in anchor.items()
-                        if key != "content"
-                    }
+                    {key: value for key, value in anchor.items() if key != "content"}
                     for anchor in code_context.get("anchors", [])
                     if isinstance(anchor, dict)
                 ]
@@ -1013,9 +957,7 @@ class ScanOrchestrator:
                                 code_context.get("target_in_jadx_failure_list")
                             ),
                             "target_source_has_decompiler_errors": bool(
-                                code_context.get(
-                                    "target_source_has_decompiler_errors"
-                                )
+                                code_context.get("target_source_has_decompiler_errors")
                             ),
                             "global_status": code_context.get(
                                 "global_decompilation_status",
@@ -1029,11 +971,7 @@ class ScanOrchestrator:
             for surface in static_review_surfaces:
                 code_context = result.code_index.get(surface.name, {})
                 public_anchors = [
-                    {
-                        key: value
-                        for key, value in anchor.items()
-                        if key != "content"
-                    }
+                    {key: value for key, value in anchor.items() if key != "content"}
                     for anchor in code_context.get("anchors", [])
                     if isinstance(anchor, dict)
                 ]
@@ -1085,7 +1023,9 @@ class ScanOrchestrator:
             persisted_findings: list[Finding] = []
             for draft in findings:
                 entry_ids = [
-                    entry_id for name in draft.entry_names for entry_id in entry_ids_by_name.get(name, [])
+                    entry_id
+                    for name in draft.entry_names
+                    for entry_id in entry_ids_by_name.get(name, [])
                 ]
                 identity = finding_identity(
                     scan=scan,
@@ -1180,9 +1120,7 @@ class ScanOrchestrator:
                 metadata = (
                     {
                         key: value
-                        for key, value in dict(
-                            payload.get("decompilation") or {}
-                        ).items()
+                        for key, value in dict(payload.get("decompilation") or {}).items()
                         if key != "failed_classes"
                     }
                     if tool == "jadx"
@@ -1222,9 +1160,7 @@ class ScanOrchestrator:
             investigation_plan = planner.plan_with_decisions(scan.id, entries)
             tasks = investigation_plan.tasks
             static_closures = investigation_plan.static_closures
-            closures_by_entry = {
-                closure.entry_point_id: closure for closure in static_closures
-            }
+            closures_by_entry = {closure.entry_point_id: closure for closure in static_closures}
             for entry_id, closure in closures_by_entry.items():
                 coverage_item = entry_coverage[entry_id]
                 coverage_item.status = CoverageStatus.COVERED.value
@@ -1261,9 +1197,7 @@ class ScanOrchestrator:
                 tasks=tasks,
                 diff=version_diff,
             )
-            for replay_task in (
-                task for task in tasks if task.task_type == "version_replay"
-            ):
+            for replay_task in (task for task in tasks if task.task_type == "version_replay"):
                 for entry_id in replay_task.target_entry_ids:
                     coverage_item = entry_coverage.get(entry_id)
                     if coverage_item is None:
@@ -1275,9 +1209,7 @@ class ScanOrchestrator:
                         "agent": "pending",
                         "blackbox": "pending",
                         "version_replay": "pending",
-                        "indirect_chain": (
-                            "retained_for_scan_wide_seed_exploration"
-                        ),
+                        "indirect_chain": ("retained_for_scan_wide_seed_exploration"),
                     }
                     coverage_item.gap_reason = (
                         "普通应用直接入口已静态阻断；历史漏洞 PoC 仍需在"
@@ -1301,9 +1233,7 @@ class ScanOrchestrator:
                         "threat_model": "ordinary_app_uid",
                         "scope": "direct_invocation_only",
                         "indirect_chain_targets_retained": True,
-                        "decisions": [
-                            closure.as_dict() for closure in static_closures[:200]
-                        ],
+                        "decisions": [closure.as_dict() for closure in static_closures[:200]],
                         "truncated": len(static_closures) > 200,
                     },
                 )
@@ -1466,13 +1396,10 @@ class ScanOrchestrator:
             created_at = scan.created_at
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=UTC)
-            scan_deadline = created_at + timedelta(
-                seconds=self.settings.scan_deadline_seconds
-            )
+            scan_deadline = created_at + timedelta(seconds=self.settings.scan_deadline_seconds)
             task_result = dict(task.result or {})
             manual_dispatch = bool(
-                task_result.get("manual_rerun")
-                or task_result.get("manual_continuation")
+                task_result.get("manual_rerun") or task_result.get("manual_continuation")
             )
             remaining = (
                 self.settings.task_timeout_seconds
@@ -1888,9 +1815,7 @@ class ScanOrchestrator:
                     session.rollback()
                 return
             persisted_task_result = dict(task.result or {})
-            continuation_context = dict(
-                persisted_task_result.get("manual_continuation") or {}
-            )
+            continuation_context = dict(persisted_task_result.get("manual_continuation") or {})
             manual_dispatch = bool(
                 persisted_task_result.get("manual_rerun")
                 or persisted_task_result.get("manual_continuation")
@@ -1930,9 +1855,7 @@ class ScanOrchestrator:
                     ),
                     "entry_point_ids": list(task.target_entry_ids),
                     "hypotheses": list(task.hypotheses),
-                    "continuation_number": continuation_context.get(
-                        "continuation_number"
-                    ),
+                    "continuation_number": continuation_context.get("continuation_number"),
                     "reusing_task_evidence": bool(continuation_context),
                     "investigation_concurrency": self._investigation_concurrency,
                 },
@@ -1944,9 +1867,7 @@ class ScanOrchestrator:
         hypothesis_ids = {item["id"] for item in hypothesis_context}
         self._raise_if_cancelled(cancel_event)
         task_budget_seconds = (
-            self.settings.task_timeout_seconds
-            if timeout_seconds is None
-            else timeout_seconds
+            self.settings.task_timeout_seconds if timeout_seconds is None else timeout_seconds
         )
         budget = TimeBudget.from_seconds(task_budget_seconds)
         scan_deadline: float | None = None
@@ -1977,9 +1898,7 @@ class ScanOrchestrator:
                 "已装载历次静态、设备和 AI Evidence，继续深度探索",
                 {
                     "source": "platform",
-                    "continuation_number": continuation_context.get(
-                        "continuation_number"
-                    ),
+                    "continuation_number": continuation_context.get("continuation_number"),
                     "prior_evidence_count": len(evidence_summaries),
                     "new_budget_seconds": task_budget_seconds,
                 },
@@ -1990,8 +1909,7 @@ class ScanOrchestrator:
             adb_configured=self.device_pool.configured,
         ).plan_with_decisions(scan_id, scan_entries)
         static_closures_by_entry = {
-            closure.entry_point_id: closure
-            for closure in scope_plan.static_closures
+            closure.entry_point_id: closure for closure in scope_plan.static_closures
         }
         statically_closed_entry_ids = set(static_closures_by_entry)
         testable_entries = [
@@ -2002,9 +1920,7 @@ class ScanOrchestrator:
         ]
         seed_entry_ids = set(task.target_entry_ids)
         direct_test_entry_ids = {
-            entry.id
-            for entry in testable_entries
-            if entry.id in seed_entry_ids
+            entry.id for entry in testable_entries if entry.id in seed_entry_ids
         }
         entry_scope = {
             "policy": "seed_entry_with_scan_wide_chain_exploration",
@@ -2053,9 +1969,7 @@ class ScanOrchestrator:
         def current_device_capability() -> dict[str, Any]:
             capability = dict(device_capability)
             if task_device is not None:
-                capability.update(
-                    task_device.capability(non_blocking=False)
-                )
+                capability.update(task_device.capability(non_blocking=False))
             if device_lease_owned:
                 capability.update(
                     {
@@ -2122,10 +2036,7 @@ class ScanOrchestrator:
             audit_id: str | None = None
             runtime_events: list[dict[str, Any]] = []
             self._raise_if_cancelled(cancel_event)
-            if (
-                phase in single_pass_phases
-                and phase_counts.get(phase, 0) >= 1
-            ):
+            if phase in single_pass_phases and phase_counts.get(phase, 0) >= 1:
                 self._record_exploration_event(
                     scan_id,
                     task_id,
@@ -2157,42 +2068,28 @@ class ScanOrchestrator:
             capability = investigator.capability(deep=True)
             self._raise_if_cancelled(cancel_event)
             if not capability.get("available"):
-                return None, capability.get(
-                    "detail", f"{agent_backend} capability probe failed"
-                )
+                return None, capability.get("detail", f"{agent_backend} capability probe failed")
             remaining = dispatch_remaining()
             if remaining <= 0:
                 return None, "task time budget exhausted during AI capability probe"
             try:
-                task_threat_model = deepcopy(
-                    (scan.stats or {}).get("threat_model")
-                )
+                task_threat_model = deepcopy((scan.stats or {}).get("threat_model"))
                 if isinstance(task_threat_model, dict):
                     attack_surface = task_threat_model.get("attack_surface")
                     if isinstance(attack_surface, dict):
-                        seed_names = {
-                            entry.name
-                            for entry in entries
-                        } | {
-                            entry.owner_component
-                            for entry in entries
-                            if entry.owner_component
+                        seed_names = {entry.name for entry in entries} | {
+                            entry.owner_component for entry in entries if entry.owner_component
                         }
-                        representatives = attack_surface.get(
-                            "representative_entries"
-                        )
+                        representatives = attack_surface.get("representative_entries")
                         if isinstance(representatives, list):
                             attack_surface["representative_entries"] = [
                                 item
                                 for item in representatives
-                                if isinstance(item, dict)
-                                and item.get("name") in seed_names
+                                if isinstance(item, dict) and item.get("name") in seed_names
                             ]
                 critic_turn = phase == "adversarial_review"
                 critic_evidence_ids = (
-                    self._candidate_evidence_ids(candidate_under_review)
-                    if critic_turn
-                    else set()
+                    self._candidate_evidence_ids(candidate_under_review) if critic_turn else set()
                 )
                 dispatch_evidence = (
                     [
@@ -2217,22 +2114,14 @@ class ScanOrchestrator:
                     "output_language": "zh-CN",
                     "device": current_device_capability(),
                     "poc_builder": self.poc_builder.capability(),
-                    "coverage_gaps": (
-                        [] if blind_rescue or critic_turn else coverage_gaps
-                    ),
+                    "coverage_gaps": ([] if blind_rescue or critic_turn else coverage_gaps),
                     "target_code_context": dispatch_code_context,
                     "entry_scope": entry_scope,
-                    "executed_agent_tests": (
-                        [] if critic_turn else executed_tests or []
-                    ),
+                    "executed_agent_tests": ([] if critic_turn else executed_tests or []),
                     "agent_round_history": (
-                        []
-                        if blind_rescue or critic_turn
-                        else deepcopy(agent_round_history)
+                        [] if blind_rescue or critic_turn else deepcopy(agent_round_history)
                     ),
-                    "further_test_rounds_available": (
-                        phase != "final_evaluation"
-                    ),
+                    "further_test_rounds_available": (phase != "final_evaluation"),
                     "exploration_limits": {
                         "max_rounds": None,
                         "tests_per_round": self.settings.agent_tests_per_round,
@@ -2243,9 +2132,7 @@ class ScanOrchestrator:
                     "platform_proven_hypotheses": (
                         self.hypothesis_ledger.task_proven_hypotheses(task_id)
                     ),
-                    "candidate_under_review": (
-                        None if blind_rescue else candidate_under_review
-                    ),
+                    "candidate_under_review": (None if blind_rescue else candidate_under_review),
                     "critic_scope": (
                         {
                             "mode": "candidate_and_cited_evidence_only",
@@ -2303,8 +2190,7 @@ class ScanOrchestrator:
                         "round_index": round_index,
                         "evidence_count": len(evidence_summaries),
                         "target_code_statuses": [
-                            item.get("status")
-                            for item in target_code_context.get("components", [])
+                            item.get("status") for item in target_code_context.get("components", [])
                         ],
                         "executed_test_count": len(executed_tests or []),
                         "agent_backend": agent_backend,
@@ -2418,9 +2304,7 @@ class ScanOrchestrator:
                     attempt=task.attempts,
                     result=result,
                 )
-                rejected_requested_tests = self._rejected_requested_tests(
-                    result.result
-                )
+                rejected_requested_tests = self._rejected_requested_tests(result.result)
                 argument_payload = result.result.model_dump(mode="json")
                 if rejected_requested_tests:
                     argument_payload["platform_model_validation"] = {
@@ -2473,9 +2357,7 @@ class ScanOrchestrator:
                         "thread_id": result.thread_id,
                         "turn_id": result.turn_id,
                         "requested_test_count": len(result.result.requested_tests),
-                        "rejected_requested_test_count": len(
-                            rejected_requested_tests
-                        ),
+                        "rejected_requested_test_count": len(rejected_requested_tests),
                     },
                 )
                 for hypothesis in result.result.hypotheses_tested[:12]:
@@ -2492,9 +2374,7 @@ class ScanOrchestrator:
                             "hypothesis": hypothesis,
                         },
                     )
-                for request in result.result.requested_tests[
-                    : self.settings.agent_tests_per_round
-                ]:
+                for request in result.result.requested_tests[: self.settings.agent_tests_per_round]:
                     self._record_exploration_event(
                         scan_id,
                         task_id,
@@ -2508,12 +2388,8 @@ class ScanOrchestrator:
                             "entry_point_id": request.entry_point_id,
                             "state": request.state,
                             "rationale_summary": request.rationale,
-                            "poc_package": (
-                                request.poc.package_name if request.poc else None
-                            ),
-                            "poc_project_path": (
-                                request.poc.project_path if request.poc else None
-                            ),
+                            "poc_package": (request.poc.package_name if request.poc else None),
+                            "poc_project_path": (request.poc.project_path if request.poc else None),
                         },
                     )
                 agent_round_history.append(
@@ -2786,10 +2662,7 @@ class ScanOrchestrator:
             and self.device_pool.configured
             and package_name
             and self.device_pool.package_safe(package_name)
-            and (
-                device_capability.get("available")
-                or device_capability.get("busy")
-            )
+            and (device_capability.get("available") or device_capability.get("busy"))
         )
         if not device_ready:
             agent_result, agent_error = invoke_agent(
@@ -2819,9 +2692,7 @@ class ScanOrchestrator:
                     prepare_commands = task_device.prepare(
                         Path(scan.artifact_path), package_name, budget
                     )
-                    self._record_commands(
-                        scan_id, task_id, prepare_commands, evidence_summaries
-                    )
+                    self._record_commands(scan_id, task_id, prepare_commands, evidence_summaries)
                     target_installed = any(
                         kind == "device.install" and result.exit_code == 0
                         for kind, result, _metadata in prepare_commands
@@ -2878,11 +2749,7 @@ class ScanOrchestrator:
                     )
                     initial_executed_test_count = len(executed_agent_tests)
                     agent_result, agent_error = invoke_agent(
-                        phase=(
-                            "final_evaluation"
-                            if replay_proof_terminal
-                            else "test_planning"
-                        ),
+                        phase=("final_evaluation" if replay_proof_terminal else "test_planning"),
                         executed_tests=executed_agent_tests,
                         round_index=0,
                     )
@@ -2899,21 +2766,13 @@ class ScanOrchestrator:
                             candidate_under_review=candidate_payload,
                             round_index=0,
                         )
-                        proof_after_critic = (
-                            self.hypothesis_ledger.task_proof_result(task_id)
-                        )
+                        proof_after_critic = self.hypothesis_ledger.task_proof_result(task_id)
                         if critic_result is not None and proof_after_critic is None:
                             critic_payload = critic_result.result.model_dump(mode="json")
-                            material_objections = list(
-                                critic_payload.get("review_objections", [])
-                            )
+                            material_objections = list(critic_payload.get("review_objections", []))
                             critic_requested_test_count = len(
                                 critic_result.result.requested_tests
-                            ) + len(
-                                self._rejected_requested_tests(
-                                    critic_result.result
-                                )
-                            )
+                            ) + len(self._rejected_requested_tests(critic_result.result))
                             if critic_requested_test_count:
                                 coverage_gaps.append(
                                     "Critic proposed device tests, but Critic is evidence-only; "
@@ -2926,9 +2785,7 @@ class ScanOrchestrator:
                                     "critic_thread_id": critic_result.thread_id,
                                     "critic_turn_id": critic_result.turn_id,
                                 }
-                                debate_policy["outcome"] = (
-                                    "critic_objections_require_one_arbiter"
-                                )
+                                debate_policy["outcome"] = "critic_objections_require_one_arbiter"
                                 merged_result = agent_result.result.model_copy(
                                     update={
                                         "coverage_gaps": list(
@@ -2949,22 +2806,16 @@ class ScanOrchestrator:
                                     "Critic 提出实质异议，任务仅进入一次最终裁决",
                                     {
                                         "source": "platform",
-                                        "candidate_result": candidate_payload.get(
-                                            "result"
-                                        ),
+                                        "candidate_result": candidate_payload.get("result"),
                                         "critic_result": critic_payload.get("result"),
-                                        "critic_objection_count": len(
-                                            material_objections
-                                        ),
+                                        "critic_objection_count": len(material_objections),
                                         "critic_test_proposals_ignored": (
                                             critic_requested_test_count
                                         ),
                                     },
                                 )
                             else:
-                                debate_policy["outcome"] = (
-                                    "candidate_kept_without_arbiter"
-                                )
+                                debate_policy["outcome"] = "candidate_kept_without_arbiter"
                                 self._record_exploration_event(
                                     scan_id,
                                     task_id,
@@ -2972,9 +2823,7 @@ class ScanOrchestrator:
                                     "Critic 未提出实质异议，保留候选结论并停止辩论",
                                     {
                                         "source": "platform",
-                                        "candidate_result": candidate_payload.get(
-                                            "result"
-                                        ),
+                                        "candidate_result": candidate_payload.get("result"),
                                         "critic_result": critic_payload.get("result"),
                                         "critic_objection_count": 0,
                                         "critic_test_proposals_ignored": (
@@ -2983,9 +2832,7 @@ class ScanOrchestrator:
                                     },
                                 )
                         elif critic_result is not None:
-                            debate_policy["outcome"] = (
-                                "platform_proof_stopped_debate"
-                            )
+                            debate_policy["outcome"] = "platform_proof_stopped_debate"
                             self._record_exploration_event(
                                 scan_id,
                                 task_id,
@@ -3025,9 +2872,7 @@ class ScanOrchestrator:
                     ):
                         planning_result = agent_result
                         planning_turn_id = planning_result.turn_id
-                        model_rejections = self._rejected_requested_tests(
-                            planning_result.result
-                        )
+                        model_rejections = self._rejected_requested_tests(planning_result.result)
                         submitted_tests = [
                             item.model_dump(mode="json")
                             for item in planning_result.result.requested_tests
@@ -3085,9 +2930,7 @@ class ScanOrchestrator:
                                     "state": accepted.state,
                                     "rationale_summary": accepted.rationale,
                                     "poc_package": (
-                                        accepted.poc.package_name
-                                        if accepted.poc
-                                        else None
+                                        accepted.poc.package_name if accepted.poc else None
                                     ),
                                 },
                             )
@@ -3136,9 +2979,7 @@ class ScanOrchestrator:
                             task_id=task_id,
                             turn_id=planning_turn_id,
                             submitted=submitted_tests,
-                            accepted=[
-                                item.model_dump(mode="json") for item in requested
-                            ],
+                            accepted=[item.model_dump(mode="json") for item in requested],
                             executed=executed_this_round,
                             gaps=[*request_gaps, *execution_gaps],
                             model_rejected=model_rejections,
@@ -3148,8 +2989,7 @@ class ScanOrchestrator:
                                 round_handoff["test_validation"] = {
                                     "submitted": submitted_tests,
                                     "accepted": [
-                                        item.model_dump(mode="json")
-                                        for item in requested
+                                        item.model_dump(mode="json") for item in requested
                                     ],
                                     "executed": executed_this_round,
                                     "gaps": [*request_gaps, *execution_gaps],
@@ -3186,11 +3026,7 @@ class ScanOrchestrator:
                         agent_error = None
 
                     if (
-                        (
-                            len(executed_agent_tests)
-                            > initial_executed_test_count
-                            or debate_context
-                        )
+                        (len(executed_agent_tests) > initial_executed_test_count or debate_context)
                         and not replay_proof_terminal
                         and self.hypothesis_ledger.task_proof_result(task_id) is None
                         and not budget.expired
@@ -3218,8 +3054,7 @@ class ScanOrchestrator:
                                 f"{final_error}"
                             )
                     elif (
-                        len(executed_agent_tests) > initial_executed_test_count
-                        or debate_context
+                        len(executed_agent_tests) > initial_executed_test_count or debate_context
                     ) and budget.expired:
                         coverage_gaps.append(
                             "Final AI evaluation could not start because the parent task "
@@ -3280,13 +3115,9 @@ class ScanOrchestrator:
                 )
             )
             if rescue_gate:
-                validated_payload["negative_closure_rescue"] = deepcopy(
-                    rescue_gate
-                )
+                validated_payload["negative_closure_rescue"] = deepcopy(rescue_gate)
             validated_payload["debate_policy"] = deepcopy(debate_policy)
-            proven_hypotheses = (
-                self.hypothesis_ledger.task_proven_hypotheses(task_id)
-            )
+            proven_hypotheses = self.hypothesis_ledger.task_proven_hypotheses(task_id)
             if proven_hypotheses:
                 proof_status = FindingStatus.REPRODUCED_BLACKBOX.value
                 if validated_result_value != proof_status:
@@ -3304,9 +3135,7 @@ class ScanOrchestrator:
                 validated_payload = self._apply_platform_proof_overrides(
                     validated_payload,
                     proven_hypotheses=proven_hypotheses,
-                    proven_severity=self.hypothesis_ledger.task_proven_severity(
-                        task_id
-                    ),
+                    proven_severity=self.hypothesis_ledger.task_proven_severity(task_id),
                     agent_round_history=agent_round_history,
                     debate_context=debate_context,
                 )
@@ -3385,8 +3214,8 @@ class ScanOrchestrator:
                                 ),
                             ],
                             "agent_backend": agent_backend,
-                                "negative_closure_rescue": deepcopy(rescue_gate),
-                                "debate_policy": deepcopy(debate_policy),
+                            "negative_closure_rescue": deepcopy(rescue_gate),
+                            "debate_policy": deepcopy(debate_policy),
                         },
                     },
                 )
@@ -3418,17 +3247,13 @@ class ScanOrchestrator:
             if transition.rowcount != 1:
                 session.rollback()
                 current_status = session.scalar(
-                    select(InvestigationTask.status).where(
-                        InvestigationTask.id == task_id
-                    )
+                    select(InvestigationTask.status).where(InvestigationTask.id == task_id)
                 )
                 if current_status in {
                     TaskStatus.CANCEL_REQUESTED.value,
                     TaskStatus.DELETED.value,
                 }:
-                    raise AgentCancelledError(
-                        "task cancellation won the terminal-state transition"
-                    )
+                    raise AgentCancelledError("task cancellation won the terminal-state transition")
                 return
 
             # The conditional update is the task's terminal-state linearization
@@ -3464,9 +3289,7 @@ class ScanOrchestrator:
                         "evidence_ids": payload.get("evidence_ids", []),
                     },
                 )
-                self._supersede_prior_agent_findings(
-                    session, task, result_value, agent_backend
-                )
+                self._supersede_prior_agent_findings(session, task, result_value, agent_backend)
                 self._persist_agent_finding(
                     session,
                     scan,
@@ -3532,8 +3355,7 @@ class ScanOrchestrator:
                 "indirect_chain_paths_evaluated": False,
                 "threat_model": "ordinary_app_uid",
                 "entry_decisions": [
-                    closures_by_entry[entry_id].as_dict()
-                    for entry_id in sorted(linked_entries)
+                    closures_by_entry[entry_id].as_dict() for entry_id in sorted(linked_entries)
                 ],
             },
         }
@@ -3547,9 +3369,7 @@ class ScanOrchestrator:
                     return
                 observed_status = task.status
                 completed_at = now()
-                existing_cancellation = dict(
-                    (task.result or {}).get("cancellation") or {}
-                )
+                existing_cancellation = dict((task.result or {}).get("cancellation") or {})
                 if observed_status == TaskStatus.DELETED.value:
                     cancellation_result = {
                         **dict(task.result or {}),
@@ -3685,25 +3505,19 @@ class ScanOrchestrator:
     def _needs_adversarial_review(result: Any) -> bool:
         """Spend a critic turn only on a material positive claim."""
 
-        return (
-            str(getattr(result, "result", FindingStatus.REFUTED_STATIC.value))
-            in {
-                FindingStatus.SUPPORTED_STATIC.value,
-                FindingStatus.REPRODUCED_BLACKBOX.value,
-            }
-            and (
-                str(getattr(result, "severity_proposal", "info")) != "info"
-                or str(getattr(result, "confidence", "low")) == "high"
-            )
+        return str(getattr(result, "result", FindingStatus.REFUTED_STATIC.value)) in {
+            FindingStatus.SUPPORTED_STATIC.value,
+            FindingStatus.REPRODUCED_BLACKBOX.value,
+        } and (
+            str(getattr(result, "severity_proposal", "info")) != "info"
+            or str(getattr(result, "confidence", "low")) == "high"
         )
 
     @staticmethod
     def _needs_rescue_review(result: Any) -> bool:
         """Independently review every model-derived negative on a dispatched seed."""
 
-        return str(
-            getattr(result, "result", FindingStatus.REFUTED_STATIC.value)
-        ) in {
+        return str(getattr(result, "result", FindingStatus.REFUTED_STATIC.value)) in {
             FindingStatus.REFUTED_STATIC.value,
             FindingStatus.NOT_REPRODUCED.value,
         }
@@ -3723,9 +3537,7 @@ class ScanOrchestrator:
                 for key, item in value.items():
                     if key == "evidence_ids" and isinstance(item, list):
                         evidence_ids.update(
-                            evidence_id
-                            for evidence_id in item
-                            if isinstance(evidence_id, str)
+                            evidence_id for evidence_id in item if isinstance(evidence_id, str)
                         )
                     elif key in {
                         "hypothesis_assessments",
@@ -3754,16 +3566,11 @@ class ScanOrchestrator:
         rejected = getattr(result, "rejected_requested_tests", [])
         if not isinstance(rejected, list):
             return []
-        return deepcopy(
-            [item for item in rejected if isinstance(item, dict)]
-        )
+        return deepcopy([item for item in rejected if isinstance(item, dict)])
 
     @classmethod
     def _has_requested_test_work(cls, result: Any) -> bool:
-        return bool(
-            getattr(result, "requested_tests", [])
-            or cls._rejected_requested_tests(result)
-        )
+        return bool(getattr(result, "requested_tests", []) or cls._rejected_requested_tests(result))
 
     @staticmethod
     def _rejected_requested_test_gaps(
@@ -3774,9 +3581,7 @@ class ScanOrchestrator:
             index = item.get("index", fallback_index)
             errors = item.get("errors")
             if not isinstance(errors, list) or not errors:
-                gaps.append(
-                    f"requested_tests[{index}] failed model schema validation."
-                )
+                gaps.append(f"requested_tests[{index}] failed model schema validation.")
                 continue
             for error in errors:
                 if not isinstance(error, dict):
@@ -3850,10 +3655,7 @@ class ScanOrchestrator:
                 and request.hypothesis_id not in hypothesis_ids
             ):
                 reason = "hypothesis is outside this task"
-            elif any(
-                not re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", key)
-                for key in request.extras
-            ):
+            elif any(not re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", key) for key in request.extras):
                 reason = "an extra key is unsafe"
             elif any(
                 (isinstance(value, str) and len(value) > 1000)
@@ -3867,15 +3669,12 @@ class ScanOrchestrator:
                         "provider query/delete probes do not accept values; use a call, "
                         "insert, or update operation"
                     )
-            elif (
-                request.oracle.kind == "provider_rows"
-                and request.operation not in {"auto", "query"}
-            ):
+            elif request.oracle.kind == "provider_rows" and request.operation not in {
+                "auto",
+                "query",
+            }:
                 reason = "provider_rows Oracle requires a provider query operation"
-            elif (
-                (request.intent_action or request.categories)
-                and entry.kind == "provider"
-            ):
+            elif (request.intent_action or request.categories) and entry.kind == "provider":
                 reason = "provider requests do not accept Intent routing fields"
             elif (
                 request.poc is not None
@@ -3888,7 +3687,9 @@ class ScanOrchestrator:
             elif entry.kind == "deep_link" and not entry.name:
                 reason = "deep-link URI is unavailable"
             if reason:
-                gaps.append(f"Rejected agent-requested test for {request.entry_point_id}: {reason}.")
+                gaps.append(
+                    f"Rejected agent-requested test for {request.entry_point_id}: {reason}."
+                )
                 continue
             signature = ScanOrchestrator._requested_test_signature(request)
             if signature in seen:
@@ -3984,14 +3785,9 @@ class ScanOrchestrator:
             project.mkdir(parents=True)
             try:
                 with zipfile.ZipFile(source_path) as archive:
-                    members = [
-                        member for member in archive.infolist() if not member.is_dir()
-                    ]
+                    members = [member for member in archive.infolist() if not member.is_dir()]
                     source_size = sum(item.file_size for item in members)
-                    if (
-                        len(members) > 64
-                        or source_size > self.settings.poc_max_source_bytes
-                    ):
+                    if len(members) > 64 or source_size > self.settings.poc_max_source_bytes:
                         raise ValueError("archived PoC exceeds source safety limits")
                     for member in members:
                         destination = (project / member.filename).resolve()
@@ -4007,12 +3803,8 @@ class ScanOrchestrator:
                 gaps.append(f"Version replay source migration failed: {exc}.")
                 continue
             substitutions: dict[str, str] = {}
-            old_manifest = dict(
-                (replay.get("baseline_entry") or {}).get("manifest") or {}
-            )
-            new_manifest = dict(
-                (replay.get("target_entry") or {}).get("manifest") or {}
-            )
+            old_manifest = dict((replay.get("baseline_entry") or {}).get("manifest") or {})
+            new_manifest = dict((replay.get("target_entry") or {}).get("manifest") or {})
             for key in ("name", "owner_component", "authorities"):
                 old_value = old_manifest.get(key)
                 new_value = new_manifest.get(key)
@@ -4119,15 +3911,11 @@ class ScanOrchestrator:
         with self.database.session_factory() as session:
             scan = session.get(Scan, scan_id)
             target_package = scan.package_name if scan is not None else None
-            requested_entry_ids = {
-                request.entry_point_id for request in requests
-            }
+            requested_entry_ids = {request.entry_point_id for request in requests}
             requested_entries = {
                 entry.id: entry
                 for entry in session.scalars(
-                    select(EntryPoint).where(
-                        EntryPoint.id.in_(requested_entry_ids)
-                    )
+                    select(EntryPoint).where(EntryPoint.id.in_(requested_entry_ids))
                 )
             }
         for request in requests:
@@ -4138,10 +3926,7 @@ class ScanOrchestrator:
             outcome = artifacts.get(key)
             if outcome is None:
                 request_entry = requested_entries.get(request.entry_point_id)
-                provider_request = (
-                    request_entry is not None
-                    and request_entry.kind == "provider"
-                )
+                provider_request = request_entry is not None and request_entry.kind == "provider"
                 self._record_exploration_event(
                     scan_id,
                     task_id,
@@ -4160,9 +3945,7 @@ class ScanOrchestrator:
                     request.poc,
                     cancel_event=cancel_event,
                     visible_packages=(
-                        (target_package,)
-                        if provider_request and target_package
-                        else ()
+                        (target_package,) if provider_request and target_package else ()
                     ),
                     visible_provider_authorities=tuple(
                         authority.strip()
@@ -4198,8 +3981,7 @@ class ScanOrchestrator:
                                 **outcome.metadata,
                             },
                             summary=(
-                                "Platform built and signed an Agent PoC APK "
-                                f"{outcome.apk_sha256}"
+                                f"Platform built and signed an Agent PoC APK {outcome.apk_sha256}"
                             ),
                             metadata={
                                 **outcome.metadata,
@@ -4237,13 +4019,8 @@ class ScanOrchestrator:
                     )
             if outcome.ok:
                 effective_request = request
-                if (
-                    outcome.effective_spec is not None
-                    and outcome.effective_spec != request.poc
-                ):
-                    effective_request = request.model_copy(
-                        update={"poc": outcome.effective_spec}
-                    )
+                if outcome.effective_spec is not None and outcome.effective_spec != request.poc:
+                    effective_request = request.model_copy(update={"poc": outcome.effective_spec})
                     artifacts[self._poc_request_key(effective_request)] = outcome
                 accepted.append(effective_request)
             else:
@@ -4325,8 +4102,7 @@ class ScanOrchestrator:
         poc_artifacts = poc_artifacts or {}
         entries_by_id = {entry.id: entry for entry in entries}
         indexed = [
-            (f"agent-r{round_index}-{index + 1}", request)
-            for index, request in enumerate(requests)
+            (f"agent-r{round_index}-{index + 1}", request) for index, request in enumerate(requests)
         ]
         executed: list[dict[str, Any]] = []
         gaps: list[str] = []
@@ -4357,9 +4133,7 @@ class ScanOrchestrator:
                         "entry_point_id": request.entry_point_id,
                         "state": state,
                         "rationale_summary": request.rationale,
-                        "poc_package": (
-                            request.poc.package_name if request.poc else None
-                        ),
+                        "poc_package": (request.poc.package_name if request.poc else None),
                         "operation": request.operation,
                         "reset": request.reset,
                         "oracle": request.oracle.model_dump(mode="json"),
@@ -4376,12 +4150,8 @@ class ScanOrchestrator:
                         for kind, result, metadata in commands
                     ]
 
-                should_reset = (
-                    request.reset == "clean"
-                    or (
-                        request.reset == "inherit"
-                        and self.settings.device_reset_policy == "per_test"
-                    )
+                should_reset = request.reset == "clean" or (
+                    request.reset == "inherit" and self.settings.device_reset_policy == "per_test"
                 )
                 if should_reset:
                     reset = tagged(active_device.reset_session(package_name, budget))
@@ -4397,23 +4167,16 @@ class ScanOrchestrator:
                         gaps.append(error)
                         continue
                 elif request.oracle.kind in {"log_contains", "process_crash"}:
-                    observation_reset = tagged(
-                        active_device.reset_observation_window(budget)
-                    )
+                    observation_reset = tagged(active_device.reset_observation_window(budget))
                     self._record_commands(
                         scan_id,
                         task_id,
                         observation_reset,
                         evidence_summaries,
                     )
-                    if any(
-                        result.exit_code != 0
-                        for _kind, result, _metadata in observation_reset
-                    ):
+                    if any(result.exit_code != 0 for _kind, result, _metadata in observation_reset):
                         proof_evidence = evidence_summaries[before:]
-                        error = (
-                            f"Could not isolate logs for {state} test {test_case_id}."
-                        )
+                        error = f"Could not isolate logs for {state} test {test_case_id}."
                         self.hypothesis_ledger.complete_proof(
                             proof_attempt_id,
                             proof_evidence,
@@ -4470,9 +4233,7 @@ class ScanOrchestrator:
                             oracle=request.oracle,
                             test_case_id=test_case_id,
                         )
-                    self._record_commands(
-                        scan_id, task_id, probe.commands, evidence_summaries
-                    )
+                    self._record_commands(scan_id, task_id, probe.commands, evidence_summaries)
                 except Exception as exc:
                     execution_error = exc
 
@@ -4481,13 +4242,9 @@ class ScanOrchestrator:
                     for item in evidence_summaries[before:]
                     if item.get("metadata", {}).get("test_case_id") == test_case_id
                 ]
-                if (
-                    request.poc is None
-                    and not any(
-                        item.get("kind") == "blackbox.probe_app"
-                        and item.get("exit_code") == 0
-                        for item in proof_evidence
-                    )
+                if request.poc is None and not any(
+                    item.get("kind") == "blackbox.probe_app" and item.get("exit_code") == 0
+                    for item in proof_evidence
                 ):
                     gaps.append(
                         f"Optional Probe fast path was unavailable for {test_case_id}; "
@@ -4567,8 +4324,7 @@ class ScanOrchestrator:
             else None
         )
         opencode_workspace_tools = bool(
-            execution_profile
-            and any(stage.workspace_tools for stage in execution_profile.stages)
+            execution_profile and any(stage.workspace_tools for stage in execution_profile.stages)
         )
         opencode_analysis_stage = next(
             (
@@ -4583,9 +4339,7 @@ class ScanOrchestrator:
         workspace_write = backend == "opencode" and opencode_workspace_tools
         assigned_device = platform_context.get("device")
         assigned_device_serial = (
-            assigned_device.get("serial")
-            if isinstance(assigned_device, dict)
-            else None
+            assigned_device.get("serial") if isinstance(assigned_device, dict) else None
         )
         adb_access = (
             backend == "opencode"
@@ -4599,9 +4353,7 @@ class ScanOrchestrator:
             and opencode_workspace_tools
         )
         output_mode = (
-            execution_profile.output_mode
-            if execution_profile is not None
-            else "json_schema"
+            execution_profile.output_mode if execution_profile is not None else "json_schema"
         )
         isolation = (
             self.settings.codex_isolation
@@ -4615,10 +4367,7 @@ class ScanOrchestrator:
             "provider": provider,
             "model": model,
             "stage_models": (
-                {
-                    stage.name: stage.model
-                    for stage in execution_profile.stages
-                }
+                {stage.name: stage.model for stage in execution_profile.stages}
                 if execution_profile is not None
                 else None
             ),
@@ -4664,16 +4413,13 @@ class ScanOrchestrator:
             "explorer_instructions": (
                 developer_instructions(
                     direct_tool_access=bool(
-                        opencode_analysis_stage
-                        and opencode_analysis_stage.workspace_tools
+                        opencode_analysis_stage and opencode_analysis_stage.workspace_tools
                     ),
                     shell_access=bool(
-                        opencode_analysis_stage
-                        and opencode_analysis_stage.workspace_tools
+                        opencode_analysis_stage and opencode_analysis_stage.workspace_tools
                     ),
                     workspace_write=bool(
-                        opencode_analysis_stage
-                        and opencode_analysis_stage.workspace_tools
+                        opencode_analysis_stage and opencode_analysis_stage.workspace_tools
                     ),
                     adb_access=bool(
                         adb_access
@@ -4687,8 +4433,7 @@ class ScanOrchestrator:
                     ),
                     response_contract="analysis_memo",
                 )
-                if backend == "opencode"
-                and opencode_analysis_stage is not None
+                if backend == "opencode" and opencode_analysis_stage is not None
                 else None
             ),
             "explorer_prompt": (
@@ -4701,16 +4446,11 @@ class ScanOrchestrator:
                     direct_tool_access=opencode_analysis_stage.workspace_tools,
                     shell_access=opencode_analysis_stage.workspace_tools,
                     workspace_write=opencode_analysis_stage.workspace_tools,
-                    adb_access=bool(
-                        adb_access and opencode_analysis_stage.workspace_tools
-                    ),
-                    network_access=bool(
-                        network_access and opencode_analysis_stage.workspace_tools
-                    ),
+                    adb_access=bool(adb_access and opencode_analysis_stage.workspace_tools),
+                    network_access=bool(network_access and opencode_analysis_stage.workspace_tools),
                     response_contract="analysis_memo",
                 )
-                if backend == "opencode"
-                and opencode_analysis_stage is not None
+                if backend == "opencode" and opencode_analysis_stage is not None
                 else None
             ),
             "output_schema": AGENT_RESULT_JSON_SCHEMA,
@@ -4729,9 +4469,7 @@ class ScanOrchestrator:
                 ),
                 "shell_enabled": shell_access,
                 "write_enabled": workspace_write,
-                "native_write_tools_enabled": (
-                    backend == "opencode" and opencode_workspace_tools
-                ),
+                "native_write_tools_enabled": (backend == "opencode" and opencode_workspace_tools),
                 "allowed_write_roots": (
                     ["task_attempt_workspace", "/tmp"] if workspace_write else []
                 ),
@@ -4764,15 +4502,11 @@ class ScanOrchestrator:
             },
             "runtime_options": {
                 "reasoning_effort": (
-                    "medium"
-                    if backend == "codex"
-                    else self.settings.opencode_reasoning_effort
+                    "medium" if backend == "codex" else self.settings.opencode_reasoning_effort
                 ),
                 "output_mode": output_mode,
                 "execution_profile": (
-                    execution_profile.as_payload()
-                    if execution_profile is not None
-                    else None
+                    execution_profile.as_payload() if execution_profile is not None else None
                 ),
                 "max_agent_steps": None,
                 "max_provider_requests": None,
@@ -4788,14 +4522,12 @@ class ScanOrchestrator:
                 ),
                 "schema_validator": (
                     f"ajv@{AJV_VERSION}"
-                    if backend == "opencode"
-                    and execution_profile is not None
+                    if backend == "opencode" and execution_profile is not None
                     else None
                 ),
                 "semantic_validator": (
                     "apkscanner@1.0"
-                    if backend == "opencode"
-                    and execution_profile is not None
+                    if backend == "opencode" and execution_profile is not None
                     else None
                 ),
             },
@@ -4853,9 +4585,7 @@ class ScanOrchestrator:
             "turn_id": result.turn_id,
             "structured_output": result.result.model_dump(mode="json"),
             "model_validation": {
-                "rejected_requested_tests": self._rejected_requested_tests(
-                    result.result
-                ),
+                "rejected_requested_tests": self._rejected_requested_tests(result.result),
             },
             "usage": result.usage,
             "output_transport": getattr(result, "output_transport", {}),
@@ -5075,14 +4805,10 @@ class ScanOrchestrator:
                     "severity_disposition": validated_payload.get(
                         "severity_disposition", "accepted"
                     ),
-                    "downgraded": (
-                        raw_payload.get("result") != validated_payload.get("result")
-                    ),
+                    "downgraded": (raw_payload.get("result") != validated_payload.get("result")),
                     "claimed_evidence_ids": claimed_evidence,
                     "accepted_evidence_ids": accepted_evidence,
-                    "rejected_evidence_ids": sorted(
-                        set(claimed_evidence) - set(accepted_evidence)
-                    ),
+                    "rejected_evidence_ids": sorted(set(claimed_evidence) - set(accepted_evidence)),
                     "raw_structured_output": raw_payload,
                     "validated_output": validated_payload,
                 },
@@ -5202,15 +4928,11 @@ class ScanOrchestrator:
                 {
                     "component": name,
                     "status": raw.get("status", "source_not_found"),
-                    "target_in_jadx_failure_list": bool(
-                        raw.get("target_in_jadx_failure_list")
-                    ),
+                    "target_in_jadx_failure_list": bool(raw.get("target_in_jadx_failure_list")),
                     "target_source_has_decompiler_errors": bool(
                         raw.get("target_source_has_decompiler_errors")
                     ),
-                    "global_decompilation_status": raw.get(
-                        "global_decompilation_status"
-                    ),
+                    "global_decompilation_status": raw.get("global_decompilation_status"),
                     "anchors": anchors,
                 }
             )
@@ -5229,17 +4951,17 @@ class ScanOrchestrator:
         index_path = workspace / "code_index.json"
         try:
             value = json.loads(index_path.read_text(encoding="utf-8"))
-            if isinstance(value, dict):
+            if (
+                isinstance(value, dict)
+                and value.get("context_version") == CODE_INDEX_CONTEXT_VERSION
+            ):
                 return value
         except (OSError, json.JSONDecodeError):
             pass
 
         with self.database.session_factory() as session:
-            entries = list(
-                session.scalars(
-                    select(EntryPoint).where(EntryPoint.scan_id == scan_id)
-                )
-            )
+            entries = list(session.scalars(select(EntryPoint).where(EntryPoint.scan_id == scan_id)))
+            scan = session.get(Scan, scan_id)
             jadx_evidence = session.scalar(
                 select(Evidence)
                 .where(
@@ -5249,7 +4971,7 @@ class ScanOrchestrator:
                 .order_by(Evidence.created_at.desc())
                 .limit(1)
             )
-        if not entries or not workspace.is_dir():
+        if not entries or scan is None or not workspace.is_dir():
             return None
 
         payload: dict[str, Any] = {}
@@ -5268,11 +4990,7 @@ class ScanOrchestrator:
         if not isinstance(decompilation, dict):
             exit_code = payload.get("exit_code")
             command_result = CommandResult(
-                argv=[
-                    str(value)
-                    for value in payload.get("argv", [])
-                    if isinstance(value, str)
-                ],
+                argv=[str(value) for value in payload.get("argv", []) if isinstance(value, str)],
                 exit_code=exit_code if isinstance(exit_code, int) else 1,
                 stdout=str(payload.get("stdout") or ""),
                 stderr=str(payload.get("stderr") or ""),
@@ -5284,6 +5002,7 @@ class ScanOrchestrator:
             )
         code_index = self.inspector._build_code_index(
             result_entries=entries,
+            package_name=scan.package_name,
             workspace=workspace,
             jadx_dir=workspace / "jadx",
             decoded_dir=workspace / "apktool",
@@ -5292,6 +5011,7 @@ class ScanOrchestrator:
         )
         value = {
             "schema_version": "1.0",
+            "context_version": CODE_INDEX_CONTEXT_VERSION,
             "decompilation": decompilation,
             "components": code_index,
             "generated_lazily": True,
@@ -5343,17 +5063,12 @@ class ScanOrchestrator:
             task_root,
             platform_context or {},
         )
-        scan_workspace = (
-            self.settings.data_dir / "workspaces" / scan_id
-        ).resolve()
+        scan_workspace = (self.settings.data_dir / "workspaces" / scan_id).resolve()
         expose_shared_workspace = (
-            self.settings.agent_permission_profile == "personal_lab"
-            and not static_review
+            self.settings.agent_permission_profile == "personal_lab" and not static_review
         )
         shared_names = [
-            name
-            for name in ("jadx", "apktool", "archive")
-            if (scan_workspace / name).is_dir()
+            name for name in ("jadx", "apktool", "archive") if (scan_workspace / name).is_dir()
         ]
         workspace_policy = {
             "writable_root": ".",
@@ -5361,13 +5076,8 @@ class ScanOrchestrator:
             "context_file": "context.json",
             "decompiled_roots": (
                 {
-                    "host": [
-                        str((scan_workspace / name).resolve())
-                        for name in shared_names
-                    ],
-                    "container": [
-                        f"/scan-workspace/{name}" for name in shared_names
-                    ],
+                    "host": [str((scan_workspace / name).resolve()) for name in shared_names],
+                    "container": [f"/scan-workspace/{name}" for name in shared_names],
                 }
                 if expose_shared_workspace
                 else {"host": [], "container": []}
@@ -5378,8 +5088,7 @@ class ScanOrchestrator:
                 "The full decompiler workspace is intentionally omitted to prevent unrelated "
                 "package inventory."
                 if static_review
-                else
-                "The task root is independently writable. Complete decompiler outputs are exposed "
+                else "The task root is independently writable. Complete decompiler outputs are exposed "
                 "read-only; relevant target sources and immutable evidence are also materialized "
                 "locally."
                 if expose_shared_workspace
@@ -5417,8 +5126,7 @@ class ScanOrchestrator:
             return False
         catalog = entry_scope.get("catalog")
         return isinstance(catalog, list) and any(
-            isinstance(item, dict)
-            and item.get("kind") == EntryPointKind.STATIC_SURFACE.value
+            isinstance(item, dict) and item.get("kind") == EntryPointKind.STATIC_SURFACE.value
             for item in catalog
         )
 
@@ -5429,17 +5137,13 @@ class ScanOrchestrator:
     ) -> None:
         """Copy immutable evidence records into an active Agent workspace."""
 
-        identifiers = [
-            item["id"] for item in summaries if isinstance(item.get("id"), str)
-        ]
+        identifiers = [item["id"] for item in summaries if isinstance(item.get("id"), str)]
         if not identifiers:
             return
         evidence_root = task_root / "evidence"
         evidence_root.mkdir(parents=True, exist_ok=True)
         with self.database.session_factory() as session:
-            records = list(
-                session.scalars(select(Evidence).where(Evidence.id.in_(identifiers)))
-            )
+            records = list(session.scalars(select(Evidence).where(Evidence.id.in_(identifiers))))
         by_id = {record.id: record for record in records}
         allowed_root = (self.settings.data_dir / "evidence").resolve()
         for summary in summaries:
@@ -5494,9 +5198,7 @@ class ScanOrchestrator:
         components = target_context.get("components")
         if not isinstance(components, list):
             return
-        scan_workspace = (
-            self.settings.data_dir / "workspaces" / scan_id
-        ).resolve()
+        scan_workspace = (self.settings.data_dir / "workspaces" / scan_id).resolve()
         source_root = (task_root / "target_source").resolve()
         copied_bytes = 0
         if self._is_static_review_context(platform_context):
@@ -5580,10 +5282,7 @@ class ScanOrchestrator:
                 if not isinstance(raw_path, str):
                     continue
                 source = (scan_workspace / raw_path).resolve()
-                if (
-                    not source.is_relative_to(scan_workspace)
-                    or not source.is_file()
-                ):
+                if not source.is_relative_to(scan_workspace) or not source.is_file():
                     continue
                 size = source.stat().st_size
                 if copied_bytes + size > max_bytes:
@@ -5731,11 +5430,7 @@ class ScanOrchestrator:
             for item in assessments
             if isinstance(item.get("hypothesis_id"), str)
         }
-        tested = [
-            value
-            for value in payload.get("hypotheses_tested", [])
-            if isinstance(value, str)
-        ]
+        tested = [value for value in payload.get("hypotheses_tested", []) if isinstance(value, str)]
         all_proof_evidence_ids: list[str] = []
         for hypothesis_id, proof_evidence_ids in proven_hypotheses.items():
             all_proof_evidence_ids.extend(proof_evidence_ids)
@@ -5789,9 +5484,7 @@ class ScanOrchestrator:
             for round_item in agent_round_history
             if isinstance((model_result := round_item.get("model_result")), dict)
         )
-        valid_severities = [
-            value for value in severity_candidates if value in severity_rank
-        ]
+        valid_severities = [value for value in severity_candidates if value in severity_rank]
         severity = max(
             valid_severities or ["info"],
             key=severity_rank.__getitem__,
@@ -5918,22 +5611,15 @@ class ScanOrchestrator:
         valid_ids = list(dict.fromkeys(resolved_claims))
         valid_ids = list(dict.fromkeys([*valid_ids, *nested_ids]))
         unknown = sorted(set(unknown))
-        result_value = str(
-            payload.get("result", FindingStatus.REFUTED_STATIC.value)
-        )
+        result_value = str(payload.get("result", FindingStatus.REFUTED_STATIC.value))
         static_evidence_attached = False
-        if (
-            result_value
-            in {
-                FindingStatus.SUPPORTED_STATIC.value,
-                FindingStatus.REFUTED_STATIC.value,
-                FindingStatus.REPRODUCED_BLACKBOX.value,
-                FindingStatus.NOT_REPRODUCED.value,
-            }
-            and not any(
-                evidence_by_id[evidence_id]["kind"].startswith("static.")
-                for evidence_id in valid_ids
-            )
+        if result_value in {
+            FindingStatus.SUPPORTED_STATIC.value,
+            FindingStatus.REFUTED_STATIC.value,
+            FindingStatus.REPRODUCED_BLACKBOX.value,
+            FindingStatus.NOT_REPRODUCED.value,
+        } and not any(
+            evidence_by_id[evidence_id]["kind"].startswith("static.") for evidence_id in valid_ids
         ):
             static_ids = [
                 evidence_id
@@ -5954,10 +5640,7 @@ class ScanOrchestrator:
         gaps = [
             str(gap)
             for gap in payload.get("coverage_gaps", [])
-            if not any(
-                marker in str(gap).lower()
-                for marker in optional_static_tool_markers
-            )
+            if not any(marker in str(gap).lower() for marker in optional_static_tool_markers)
             and not (
                 any(
                     marker in str(gap).lower()
@@ -5980,13 +5663,9 @@ class ScanOrchestrator:
             )
         ]
         if unknown:
-            gaps.append(
-                f"Ignored {len(unknown)} evidence ID(s) not issued for this scan and task."
-            )
+            gaps.append(f"Ignored {len(unknown)} evidence ID(s) not issued for this scan and task.")
         if static_evidence_attached:
-            gaps.append(
-                "Platform attached the issued static Evidence omitted by the model."
-            )
+            gaps.append("Platform attached the issued static Evidence omitted by the model.")
         cited = [evidence_by_id[value] for value in valid_ids]
         probe_request_tests = {
             (
@@ -6039,8 +5718,7 @@ class ScanOrchestrator:
         correlated_request_tests = probe_correlated_tests | poc_correlated_tests
         correlated_blackbox = bool(correlated_request_tests)
         correlated_blackbox_test_ids = {
-            test_case_id
-            for _request_id, test_case_id in correlated_request_tests
+            test_case_id for _request_id, test_case_id in correlated_request_tests
         }
         successful_blackbox = correlated_blackbox and any(
             (
@@ -6100,9 +5778,7 @@ class ScanOrchestrator:
         harmful_blackbox = successful_blackbox and bool(
             successful_blackbox_test_ids & impact_test_ids
         )
-        explicitly_refuted = bool(
-            refuted_test_ids & correlated_blackbox_test_ids
-        )
+        explicitly_refuted = bool(refuted_test_ids & correlated_blackbox_test_ids)
         evidence_valid = True
         if result_value in {
             FindingStatus.SUPPORTED_STATIC.value,
@@ -6122,10 +5798,11 @@ class ScanOrchestrator:
                     "conclusion at static-evidence strength."
                 )
             elif static_cited and result_value == FindingStatus.NOT_REPRODUCED.value:
-                result_value = FindingStatus.REFUTED_STATIC.value
+                result_value = FindingStatus.SUPPORTED_STATIC.value
                 gaps.append(
-                    "The negative Oracle was not correlated by the platform; retained the "
-                    "negative conclusion at static-evidence strength."
+                    "No platform-correlated negative Oracle exists; the platform refused to "
+                    "turn an unexecuted or inconclusive replay into static refutation and "
+                    "retained the task as a static risk pending dynamic proof."
                 )
             else:
                 raise ValueError(
@@ -6134,18 +5811,31 @@ class ScanOrchestrator:
         for assessment in payload.get("hypothesis_assessments", []):
             if not isinstance(assessment, dict):
                 continue
-            assessment_payload, assessment_result = (
-                ScanOrchestrator._validated_agent_payload(
-                    {
-                        "result": assessment.get("verdict"),
-                        "evidence_ids": assessment.get("evidence_ids", []),
-                        "coverage_gaps": [],
-                        "hypothesis_assessments": [],
-                    },
-                    evidence_summaries,
-                )
+            claimed_assessment = str(assessment.get("verdict") or "")
+            validation_verdict = (
+                FindingStatus.SUPPORTED_STATIC.value
+                if claimed_assessment == "needs_dynamic_proof"
+                else claimed_assessment
             )
-            assessment["verdict"] = assessment_result
+            assessment_payload, assessment_result = ScanOrchestrator._validated_agent_payload(
+                {
+                    "result": validation_verdict,
+                    "evidence_ids": assessment.get("evidence_ids", []),
+                    "coverage_gaps": [],
+                    "hypothesis_assessments": [],
+                },
+                evidence_summaries,
+            )
+            assessment["verdict"] = (
+                "needs_dynamic_proof"
+                if claimed_assessment
+                in {
+                    "needs_dynamic_proof",
+                    FindingStatus.NOT_REPRODUCED.value,
+                }
+                and assessment_result == FindingStatus.SUPPORTED_STATIC.value
+                else assessment_result
+            )
             assessment["evidence_ids"] = assessment_payload["evidence_ids"]
             assessment["proof_gaps"] = list(
                 dict.fromkeys(
@@ -6221,13 +5911,9 @@ class ScanOrchestrator:
         )
         entry_name_by_id = {
             entry.id: entry.name
-            for entry in session.scalars(
-                select(EntryPoint).where(EntryPoint.scan_id == scan.id)
-            )
+            for entry in session.scalars(select(EntryPoint).where(EntryPoint.scan_id == scan.id))
         }
-        proven_hypotheses: list[
-            tuple[SecurityHypothesis, list[ProofAttempt]]
-        ] = []
+        proven_hypotheses: list[tuple[SecurityHypothesis, list[ProofAttempt]]] = []
         for hypothesis in hypotheses:
             attempts = list(
                 session.scalars(
@@ -6241,9 +5927,7 @@ class ScanOrchestrator:
             )
             if attempts:
                 proven_hypotheses.append((hypothesis, attempts))
-        proven_hypothesis_ids = {
-            hypothesis.id for hypothesis, _attempts in proven_hypotheses
-        }
+        proven_hypothesis_ids = {hypothesis.id for hypothesis, _attempts in proven_hypotheses}
 
         if proven_hypotheses:
             for hypothesis, attempts in proven_hypotheses:
@@ -6266,9 +5950,7 @@ class ScanOrchestrator:
                 proof_status = FindingStatus.REPRODUCED_BLACKBOX.value
                 proof_evidence_ids = list(
                     dict.fromkeys(
-                        evidence_id
-                        for attempt in attempts
-                        for evidence_id in attempt.evidence_ids
+                        evidence_id for attempt in attempts for evidence_id in attempt.evidence_ids
                     )
                 )
                 dedupe = f"agent:{task.id}:hypothesis:{hypothesis.id}"
@@ -6291,8 +5973,7 @@ class ScanOrchestrator:
                         rule_id="AGENT-ENTRY-INVESTIGATION",
                         category=hypothesis.category,
                         entry_names=[
-                            entry_name_by_id.get(entry_id, entry_id)
-                            for entry_id in chain_entry_ids
+                            entry_name_by_id.get(entry_id, entry_id) for entry_id in chain_entry_ids
                         ],
                         claim=hypothesis.claim,
                     ),
@@ -6349,9 +6030,7 @@ class ScanOrchestrator:
                 )
                 if pattern is not None:
                     all_entries = list(
-                        session.scalars(
-                            select(EntryPoint).where(EntryPoint.scan_id == scan.id)
-                        )
+                        session.scalars(select(EntryPoint).where(EntryPoint.scan_id == scan.id))
                     )
                     new_matches = self.security_evolution.search_patterns(
                         session,
@@ -6402,28 +6081,26 @@ class ScanOrchestrator:
                 for entry_id in hypothesis.entry_point_ids
             )
         ) or list(task.target_entry_ids)
-        signal_evidence_ids = list(
-            dict.fromkeys(
-                evidence_id
-                for assessment in supported_assessments
-                for evidence_id in assessment.get("evidence_ids", [])
-                if isinstance(evidence_id, str) and evidence_id
+        signal_evidence_ids = (
+            list(
+                dict.fromkeys(
+                    evidence_id
+                    for assessment in supported_assessments
+                    for evidence_id in assessment.get("evidence_ids", [])
+                    if isinstance(evidence_id, str) and evidence_id
+                )
             )
-        ) or evidence_ids
+            or evidence_ids
+        )
         signal_result_value = (
-            FindingStatus.SUPPORTED_STATIC.value
-            if supported_assessments
-            else result_value
+            FindingStatus.SUPPORTED_STATIC.value if supported_assessments else result_value
         )
         dedupe = f"agent:{task.id}:{signal_result_value}"
         signal_identity = finding_identity(
             scan=scan,
             rule_id="AGENT-ENTRY-INVESTIGATION",
             category=f"android.{task.task_type}",
-            entry_names=[
-                entry_name_by_id.get(entry_id, entry_id)
-                for entry_id in signal_entry_ids
-            ],
+            entry_names=[entry_name_by_id.get(entry_id, entry_id) for entry_id in signal_entry_ids],
             claim=" | ".join(hypothesis.claim for hypothesis in signal_hypotheses),
         )
         proof_gaps = list(
@@ -6474,9 +6151,7 @@ class ScanOrchestrator:
             "requested_test_count": (
                 len(requested_tests) if isinstance(requested_tests, list) else 0
             ),
-            "executed_test_count": (
-                len(executed_tests) if isinstance(executed_tests, list) else 0
-            ),
+            "executed_test_count": (len(executed_tests) if isinstance(executed_tests, list) else 0),
         }
         finding = session.scalar(
             select(Finding).where(
@@ -6506,9 +6181,7 @@ class ScanOrchestrator:
                     "model": model,
                     "coverage_gaps": payload.get("coverage_gaps", []),
                     "harm_demonstrated": False,
-                    "excluded_proven_hypothesis_ids": sorted(
-                        proven_hypothesis_ids
-                    ),
+                    "excluded_proven_hypothesis_ids": sorted(proven_hypothesis_ids),
                     "proof_backlog": proof_backlog,
                     "identity": signal_identity,
                 },
@@ -6531,9 +6204,7 @@ class ScanOrchestrator:
                 "model": model,
                 "coverage_gaps": payload.get("coverage_gaps", []),
                 "harm_demonstrated": False,
-                "excluded_proven_hypothesis_ids": sorted(
-                    proven_hypothesis_ids
-                ),
+                "excluded_proven_hypothesis_ids": sorted(proven_hypothesis_ids),
                 "proof_backlog": proof_backlog,
                 "identity": signal_identity,
             }
@@ -6561,9 +6232,7 @@ class ScanOrchestrator:
             item_stages["deterministic_dynamic"] = (
                 "attempted" if stages["device_attempted"] else "blocked"
             )
-            item_stages["blackbox"] = (
-                "attempted" if stages["blackbox_attempted"] else "not_tested"
-            )
+            item_stages["blackbox"] = "attempted" if stages["blackbox_attempted"] else "not_tested"
             item_stages["agent"] = "completed" if agent_completed else "not_tested"
             item.stages = item_stages
             complete = agent_completed
@@ -6607,9 +6276,7 @@ class ScanOrchestrator:
             "scan_id": scan.id,
             "artifact_sha256": scan.artifact_sha256,
             "package": scan.package_name,
-            "threat_model_digest": (
-                ((scan.stats or {}).get("threat_model") or {}).get("digest")
-            ),
+            "threat_model_digest": (((scan.stats or {}).get("threat_model") or {}).get("digest")),
             "tasks": [
                 {
                     "id": task.id,
@@ -6629,14 +6296,10 @@ class ScanOrchestrator:
                 {
                     "record_id": finding.id,
                     "finding_id": (
-                        (finding.metadata_json or {})
-                        .get("identity", {})
-                        .get("finding_id")
+                        (finding.metadata_json or {}).get("identity", {}).get("finding_id")
                     ),
                     "occurrence_id": (
-                        (finding.metadata_json or {})
-                        .get("identity", {})
-                        .get("occurrence_id")
+                        (finding.metadata_json or {}).get("identity", {}).get("occurrence_id")
                     ),
                     "status": finding.status,
                     "evidence_ids": sorted(finding.evidence_ids),

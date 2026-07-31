@@ -125,9 +125,7 @@ def test_optional_jadx_absence_is_not_preserved_as_a_verdict_gap() -> None:
     )
 
     assert result == "refuted_static"
-    assert validated["coverage_gaps"] == [
-        "A device replay could validate the negative path."
-    ]
+    assert validated["coverage_gaps"] == ["A device replay could validate the negative path."]
 
 
 def test_unique_evidence_uuid_prefix_is_normalized_to_full_platform_id() -> None:
@@ -252,9 +250,32 @@ def test_invalid_negative_assessment_degrades_without_failing_proven_task() -> N
 
     assert result == "reproduced_blackbox"
     assessment = validated["hypothesis_assessments"][0]
-    assert assessment["verdict"] == "refuted_static"
+    assert assessment["verdict"] == "needs_dynamic_proof"
     assert assessment["evidence_ids"] == ["static"]
-    assert any("static-evidence strength" in gap for gap in assessment["proof_gaps"])
+    assert any("pending dynamic proof" in gap for gap in assessment["proof_gaps"])
+
+
+def test_needs_dynamic_proof_preserves_a_source_backed_open_hypothesis() -> None:
+    hypothesis_id = "00000000-0000-0000-0000-000000000001"
+    payload = _payload("supported_static", ["static"])
+    payload["hypothesis_assessments"] = [
+        {
+            "hypothesis_id": hypothesis_id,
+            "verdict": "needs_dynamic_proof",
+            "evidence_ids": ["static"],
+            "proof_gaps": ["需要普通应用身份验证 WebView 最终加载地址。"],
+        }
+    ]
+
+    validated, result = ScanOrchestrator._validated_agent_payload(
+        payload,
+        [{"id": "static", "kind": "static.jadx", "metadata": {}}],
+    )
+
+    assert result == "supported_static"
+    assessment = validated["hypothesis_assessments"][0]
+    assert assessment["verdict"] == "needs_dynamic_proof"
+    assert assessment["evidence_ids"] == ["static"]
 
 
 def test_not_reproduced_requires_correlated_explicit_negative_oracle() -> None:
@@ -291,7 +312,8 @@ def test_not_reproduced_requires_correlated_explicit_negative_oracle() -> None:
         _payload("not_reproduced", ["static", "probe", "log"]),
         evidence,
     )
-    assert result == "refuted_static"
+    assert result == "supported_static"
+    assert any("pending dynamic proof" in gap for gap in payload["coverage_gaps"])
 
     evidence[1]["metadata"]["oracle_refuted"] = True
     payload, result = ScanOrchestrator._validated_agent_payload(
@@ -369,9 +391,7 @@ def test_agent_requested_deep_link_must_preserve_declared_origin() -> None:
         extras={},
         rationale="Should not leave scope",
     )
-    accepted, gaps = ScanOrchestrator._validate_requested_tests(
-        [allowed, rejected], [entry]
-    )
+    accepted, gaps = ScanOrchestrator._validate_requested_tests([allowed, rejected], [entry])
     assert accepted == [allowed]
     assert any("preserve" in gap for gap in gaps)
 
@@ -405,9 +425,7 @@ def test_activity_request_accepts_its_declared_deep_link_and_android_extra_key()
         extras={":settings:fragment_args_key": "clipboard_privacy_protect"},
         rationale="Exercise the activity's declared deep link and framework-style extra",
     )
-    rejected = allowed.model_copy(
-        update={"uri": "iqoo://unrelated.example/smart_privacy"}
-    )
+    rejected = allowed.model_copy(update={"uri": "iqoo://unrelated.example/smart_privacy"})
 
     accepted, gaps = ScanOrchestrator._validate_requested_tests(
         [allowed, rejected],
