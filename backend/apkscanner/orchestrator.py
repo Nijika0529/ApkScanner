@@ -11,6 +11,7 @@ import threading
 import uuid
 import zipfile
 from collections import defaultdict
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager, suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -28,7 +29,7 @@ from .artifacts import ArtifactStore
 from .codex_runner import CodexInvestigator
 from .config import Settings
 from .db import Database
-from .device import AdbDeviceAdapter, DeviceLeaseCancelledError
+from .device import AdbDeviceAdapter, AdbDevicePool, DeviceLeaseCancelledError
 from .enums import (
     CoverageStatus,
     EntryPointKind,
@@ -114,6 +115,7 @@ class _LiveProofContext:
     evidence_summaries: list[dict[str, Any]]
     cancel_event: threading.Event
     round_index: int
+    device: AdbDeviceAdapter | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
     responses: dict[str, dict[str, Any]] = field(default_factory=dict)
     proof_strategies: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -132,7 +134,17 @@ class ScanOrchestrator:
         self.rules = BuiltinRuleEngine()
         self.evidence = EvidenceRecorder(store)
         self.hypothesis_ledger = HypothesisLedger(database)
-        self.device = AdbDeviceAdapter(settings, self.runner)
+        configured_serials = settings.configured_adb_serials
+        self.devices = [
+            AdbDeviceAdapter(settings, self.runner, serial=serial)
+            for serial in configured_serials
+        ]
+        self.device = (
+            self.devices[0]
+            if self.devices
+            else AdbDeviceAdapter(settings, self.runner)
+        )
+        self.device_pool = AdbDevicePool(self.devices)
         self.poc_builder = PocBuilder(settings, self.runner, store)
         self.security_evolution = SecurityEvolutionService()
         self.mobsf = MobSFAdapter(settings)
@@ -153,13 +165,16 @@ class ScanOrchestrator:
         self._live_proof_base_url: str | None = None
         self._task_cancellations_lock = threading.Lock()
         self._shutting_down = threading.Event()
-        # Bound task workers across all scans handled by this control-plane
-        # process. Per-scan executors may queue work, but model/device orchestration
-        # cannot exceed this shared limit.
-        # A task owns the only ADB device for its complete multi-round
-        # investigation. Serialize before claiming a task so other scans leave
-        # their work visibly queued instead of creating idle "running" workers.
-        self._investigation_lock = threading.Lock()
+        # One task owns one ADB device for its complete multi-round
+        # investigation. The global semaphore prevents scans from collectively
+        # exceeding the configured device pool.
+        self._investigation_concurrency = max(
+            1,
+            len(configured_serials),
+        )
+        self._investigation_slots = threading.BoundedSemaphore(
+            self._investigation_concurrency
+        )
 
     def _register_live_proof_context(
         self,
@@ -516,6 +531,7 @@ class ScanOrchestrator:
                     evidence_summaries=context.evidence_summaries,
                     round_index=context.round_index,
                     poc_artifacts=artifacts,
+                    device=context.device or self.device,
                 )
             new_evidence = context.evidence_summaries[before:]
             self._materialize_live_evidence(context, new_evidence)
@@ -1201,7 +1217,7 @@ class ScanOrchestrator:
                 )
             planner = InvestigationPlanner(
                 android_version=self.settings.device_android_version,
-                adb_configured=self.device.configured,
+                adb_configured=self.device_pool.configured,
             )
             investigation_plan = planner.plan_with_decisions(scan.id, entries)
             tasks = investigation_plan.tasks
@@ -1340,14 +1356,15 @@ class ScanOrchestrator:
             session.commit()
 
     def _run_tasks(self, scan_id: str) -> None:
+        adb_concurrency = max(1, len(self.device_pool.serials))
         with self.database.session_factory() as session:
             scan = session.get(Scan, scan_id)
             assert scan is not None
             scan.stats = {
                 **dict(scan.stats or {}),
                 "execution_policy": {
-                    "investigation_concurrency": 1,
-                    "adb_concurrency": 1,
+                    "investigation_concurrency": self._investigation_concurrency,
+                    "adb_concurrency": adb_concurrency,
                     "device_ownership": "complete_task",
                     "agent_workspace_scope": "task_attempt",
                 },
@@ -1356,24 +1373,77 @@ class ScanOrchestrator:
                 session,
                 scan_id,
                 "investigation.pool.started",
-                "单任务探索已启动：每次只有一个任务完整占有 ADB",
+                (
+                    "多设备探索池已启动：每个任务完整独占一台 ADB 设备"
+                    if adb_concurrency > 1
+                    else "单任务探索已启动：每次只有一个任务完整占有 ADB"
+                ),
                 {
-                    "investigation_concurrency": 1,
-                    "adb_concurrency": 1,
+                    "investigation_concurrency": self._investigation_concurrency,
+                    "adb_concurrency": adb_concurrency,
+                    "device_serials": list(self.device_pool.serials),
                     "device_ownership": "complete_task",
                 },
             )
             session.commit()
-        while True:
-            with self._investigation_lock:
-                claimed = self._claim_next_task(scan_id)
-                if claimed is None:
+        futures: set[Future[None]] = set()
+        with ThreadPoolExecutor(
+            max_workers=self._investigation_concurrency,
+            thread_name_prefix="investigation",
+        ) as executor:
+            while True:
+                while len(futures) < self._investigation_concurrency:
+                    if not self._has_queued_tasks(scan_id):
+                        break
+                    self._investigation_slots.acquire()
+                    claimed = self._claim_next_task(scan_id)
+                    if claimed is None:
+                        self._investigation_slots.release()
+                        break
+                    task_id, timeout_seconds = claimed
+                    futures.add(
+                        executor.submit(
+                            self._run_claimed_task,
+                            scan_id,
+                            task_id,
+                            timeout_seconds,
+                        )
+                    )
+                if not futures:
                     return
-                task_id, timeout_seconds = claimed
-                try:
-                    self._run_task(scan_id, task_id, timeout_seconds)
-                except Exception as exc:
-                    self._mark_task_worker_failed(scan_id, task_id, exc)
+                completed, futures = wait(
+                    futures,
+                    return_when=FIRST_COMPLETED,
+                )
+                for future in completed:
+                    future.result()
+
+    def _has_queued_tasks(self, scan_id: str) -> bool:
+        with self.database.session_factory() as session:
+            return (
+                session.scalar(
+                    select(InvestigationTask.id)
+                    .where(
+                        InvestigationTask.scan_id == scan_id,
+                        InvestigationTask.status == TaskStatus.QUEUED.value,
+                    )
+                    .limit(1)
+                )
+                is not None
+            )
+
+    def _run_claimed_task(
+        self,
+        scan_id: str,
+        task_id: str,
+        timeout_seconds: int | None,
+    ) -> None:
+        try:
+            self._run_task(scan_id, task_id, timeout_seconds)
+        except Exception as exc:
+            self._mark_task_worker_failed(scan_id, task_id, exc)
+        finally:
+            self._investigation_slots.release()
 
     def _claim_next_task(self, scan_id: str) -> tuple[str, int] | None:
         with self.database.session_factory() as session:
@@ -1489,6 +1559,7 @@ class ScanOrchestrator:
                 return False
             event.set()
             self.device.scheduler.wake_waiters()
+            self.device_pool.wake_waiters()
             return True
 
     def _device_queue_priority(self, scan_id: str, task_id: str) -> int | None:
@@ -1503,9 +1574,9 @@ class ScanOrchestrator:
                     TaskStatus.RUNNING.value,
                     TaskStatus.AWAITING_DEVICE.value,
                 }
-                or not self.device.configured
+                or not self.device_pool.configured
                 or not scan.package_name
-                or not self.device.package_safe(scan.package_name)
+                or not self.device_pool.package_safe(scan.package_name)
             ):
                 return None
             return int(task.priority)
@@ -1530,7 +1601,8 @@ class ScanOrchestrator:
                 **dict(task.result or {}),
                 "device_queue": {
                     "history": history,
-                    "serial": self.device.serial,
+                    "serial": None,
+                    "candidate_serials": list(self.device_pool.serials),
                     "position_at_enqueue": position,
                     "requested_at": requested_at.isoformat(),
                 },
@@ -1539,13 +1611,13 @@ class ScanOrchestrator:
                 session,
                 scan_id,
                 "task.awaiting_device",
-                f"任务正在等待唯一云真机，当前排队位置 {position}",
+                f"任务正在等待可用真机，当前排队位置 {position}",
                 {
                     "task_id": task_id,
                     "status": TaskStatus.AWAITING_DEVICE.value,
                     "queue_position": position,
                     "priority": task.priority,
-                    "device_serial": self.device.serial,
+                    "device_serials": list(self.device_pool.serials),
                 },
             )
             add_event(
@@ -1558,7 +1630,7 @@ class ScanOrchestrator:
                     "source": "platform",
                     "queue_position": position,
                     "priority": task.priority,
-                    "device_serial": self.device.serial,
+                    "device_serials": list(self.device_pool.serials),
                 },
             )
             session.commit()
@@ -1568,6 +1640,7 @@ class ScanOrchestrator:
         scan_id: str,
         task_id: str,
         waited_seconds: float,
+        device_serial: str | None,
     ) -> None:
         acquired_at = now()
         with self.database.session_factory() as session:
@@ -1582,6 +1655,7 @@ class ScanOrchestrator:
                 **dict(task.result or {}),
                 "device_queue": {
                     **queue_data,
+                    "serial": device_serial,
                     "acquired_at": acquired_at.isoformat(),
                     "wait_seconds": round(waited_seconds, 3),
                 },
@@ -1594,7 +1668,7 @@ class ScanOrchestrator:
                 f"任务已独占云真机，等待 {waited_seconds:.1f} 秒",
                 {
                     "task_id": task_id,
-                    "device_serial": self.device.serial,
+                    "device_serial": device_serial,
                     "wait_seconds": round(waited_seconds, 3),
                 },
             )
@@ -1606,7 +1680,7 @@ class ScanOrchestrator:
                 {
                     "task_id": task_id,
                     "source": "platform",
-                    "device_serial": self.device.serial,
+                    "device_serial": device_serial,
                     "wait_seconds": round(waited_seconds, 3),
                 },
             )
@@ -1617,6 +1691,7 @@ class ScanOrchestrator:
         scan_id: str,
         task_id: str,
         held_seconds: float,
+        device_serial: str | None,
     ) -> None:
         released_at = now()
         with self.database.session_factory() as session:
@@ -1639,7 +1714,7 @@ class ScanOrchestrator:
                 "云真机清理完成，独占租约已释放",
                 {
                     "task_id": task_id,
-                    "device_serial": self.device.serial,
+                    "device_serial": device_serial,
                     "held_seconds": round(held_seconds, 3),
                 },
             )
@@ -1651,7 +1726,7 @@ class ScanOrchestrator:
                 {
                     "task_id": task_id,
                     "source": "platform",
-                    "device_serial": self.device.serial,
+                    "device_serial": device_serial,
                     "held_seconds": round(held_seconds, 3),
                 },
             )
@@ -1667,23 +1742,54 @@ class ScanOrchestrator:
         cancel_event: threading.Event,
     ):  # noqa: ANN201
         try:
-            with self.device.task_lease(
-                task_id,
-                priority=priority,
-                cancel_event=cancel_event,
-                on_queued=lambda position: self._mark_task_awaiting_device(
-                    scan_id, task_id, position
-                ),
-                on_acquired=lambda waited: self._record_device_acquired(
-                    scan_id, task_id, waited
-                ),
-                on_released=lambda held: self._record_device_released(
-                    scan_id, task_id, held
-                ),
-            ) as lease:
-                self._raise_if_cancelled(cancel_event)
-                yield lease
-                self._raise_if_cancelled(cancel_event)
+            if len(self.device_pool.serials) <= 1:
+                with self.device.task_lease(
+                    task_id,
+                    priority=priority,
+                    cancel_event=cancel_event,
+                    on_queued=lambda position: self._mark_task_awaiting_device(
+                        scan_id, task_id, position
+                    ),
+                    on_acquired=lambda waited: self._record_device_acquired(
+                        scan_id,
+                        task_id,
+                        waited,
+                        self.device.serial,
+                    ),
+                    on_released=lambda held: self._record_device_released(
+                        scan_id,
+                        task_id,
+                        held,
+                        self.device.serial,
+                    ),
+                ) as lease:
+                    self._raise_if_cancelled(cancel_event)
+                    yield {**lease, "serial": self.device.serial, "device": self.device}
+                    self._raise_if_cancelled(cancel_event)
+            else:
+                with self.device_pool.task_lease(
+                    task_id,
+                    priority=priority,
+                    cancel_event=cancel_event,
+                    on_queued=lambda position: self._mark_task_awaiting_device(
+                        scan_id, task_id, position
+                    ),
+                    on_acquired=lambda waited, adapter: self._record_device_acquired(
+                        scan_id,
+                        task_id,
+                        waited,
+                        adapter.serial,
+                    ),
+                    on_released=lambda held, adapter: self._record_device_released(
+                        scan_id,
+                        task_id,
+                        held,
+                        adapter.serial,
+                    ),
+                ) as lease:
+                    self._raise_if_cancelled(cancel_event)
+                    yield lease
+                    self._raise_if_cancelled(cancel_event)
         except DeviceLeaseCancelledError as exc:
             raise AgentCancelledError(str(exc)) from exc
 
@@ -1828,7 +1934,7 @@ class ScanOrchestrator:
                         "continuation_number"
                     ),
                     "reusing_task_evidence": bool(continuation_context),
-                    "investigation_concurrency": 1,
+                    "investigation_concurrency": self._investigation_concurrency,
                 },
             )
             session.commit()
@@ -1881,7 +1987,7 @@ class ScanOrchestrator:
         target_code_context = self._target_code_context(scan_id, entries)
         scope_plan = InvestigationPlanner(
             android_version=self.settings.device_android_version,
-            adb_configured=self.device.configured,
+            adb_configured=self.device_pool.configured,
         ).plan_with_decisions(scan_id, scan_entries)
         static_closures_by_entry = {
             closure.entry_point_id: closure
@@ -1938,13 +2044,18 @@ class ScanOrchestrator:
             "device_attempted": False,
             "blackbox_attempted": False,
         }
-        device_capability = self.device.capability(non_blocking=True)
+        device_capability = self.device_pool.capability(non_blocking=True)
+        task_device: AdbDeviceAdapter | None = None
         device_lease_owned = False
         device_lease_acquired = False
         device_prepared = False
 
         def current_device_capability() -> dict[str, Any]:
             capability = dict(device_capability)
+            if task_device is not None:
+                capability.update(
+                    task_device.capability(non_blocking=False)
+                )
             if device_lease_owned:
                 capability.update(
                     {
@@ -1952,6 +2063,7 @@ class ScanOrchestrator:
                         "busy": False,
                         "lease_owned_by_current_task": True,
                         "active_task_id": task_id,
+                        "serial": task_device.serial if task_device else None,
                         "detail": (
                             "当前任务已独占设备；本任务申请的测试会在该 lease 内"
                             "直接串行执行，无需重新排队。"
@@ -2230,6 +2342,7 @@ class ScanOrchestrator:
                             evidence_summaries=evidence_summaries,
                             cancel_event=cancel_event,
                             round_index=round_index,
+                            device=task_device,
                         )
                     )
 
@@ -2670,9 +2783,9 @@ class ScanOrchestrator:
         # an explicit unavailable result should degrade directly to static AI.
         device_ready = bool(
             task.task_type != TaskType.STATIC_REVIEW.value
-            and self.device.configured
+            and self.device_pool.configured
             and package_name
-            and self.device.package_safe(package_name)
+            and self.device_pool.package_safe(package_name)
             and (
                 device_capability.get("available")
                 or device_capability.get("busy")
@@ -2691,6 +2804,7 @@ class ScanOrchestrator:
                 cancel_event=cancel_event,
             )
             lease_metadata = device_session.__enter__()
+            task_device = lease_metadata["device"]
             device_lease_owned = True
             device_lease_acquired = True
             budget = budget.extend(
@@ -2702,7 +2816,7 @@ class ScanOrchestrator:
                 target_installed = False
                 try:
                     stages["device_attempted"] = True
-                    prepare_commands = self.device.prepare(
+                    prepare_commands = task_device.prepare(
                         Path(scan.artifact_path), package_name, budget
                     )
                     self._record_commands(
@@ -2730,7 +2844,7 @@ class ScanOrchestrator:
                         for entry in entries:
                             if budget.expired:
                                 break
-                            probe = self.device.probe(
+                            probe = task_device.probe(
                                 entry, package_name, state="guest", budget=budget
                             )
                             stages["blackbox_attempted"] = True
@@ -2754,6 +2868,7 @@ class ScanOrchestrator:
                                 budget=budget,
                                 evidence_summaries=evidence_summaries,
                                 cancel_event=cancel_event,
+                                device=task_device,
                             )
                             executed_agent_tests.extend(replay_results)
                             coverage_gaps.extend(replay_gaps)
@@ -3007,6 +3122,7 @@ class ScanOrchestrator:
                                 evidence_summaries=evidence_summaries,
                                 round_index=completed_rounds + 1,
                                 poc_artifacts=poc_artifacts,
+                                device=task_device,
                             )
                             executed_agent_tests.extend(executed_this_round)
                             coverage_gaps.extend(execution_gaps)
@@ -3123,7 +3239,7 @@ class ScanOrchestrator:
                         )
                 finally:
                     if device_session is not None and target_installed:
-                        cleanup = self.device.cleanup(package_name)
+                        cleanup = task_device.cleanup(package_name)
                         self._record_commands(scan_id, task_id, cleanup, None)
                     if device_session is not None:
                         final_device_session = device_session
@@ -3806,6 +3922,7 @@ class ScanOrchestrator:
         budget: TimeBudget,
         evidence_summaries: list[dict[str, Any]],
         cancel_event: threading.Event,
+        device: AdbDeviceAdapter,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         """Migrate proven source PoCs and replay them before fresh exploration."""
         workspace = (
@@ -3970,6 +4087,7 @@ class ScanOrchestrator:
             evidence_summaries=evidence_summaries,
             round_index=0,
             poc_artifacts=artifacts,
+            device=device,
         )
         gaps.extend(execution_gaps)
         self._record_exploration_event(
@@ -4201,7 +4319,9 @@ class ScanOrchestrator:
         evidence_summaries: list[dict[str, Any]],
         round_index: int,
         poc_artifacts: dict[str, PocBuildResult] | None = None,
+        device: AdbDeviceAdapter | None = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
+        active_device = device or self.device
         poc_artifacts = poc_artifacts or {}
         entries_by_id = {entry.id: entry for entry in entries}
         indexed = [
@@ -4264,7 +4384,7 @@ class ScanOrchestrator:
                     )
                 )
                 if should_reset:
-                    reset = tagged(self.device.reset_session(package_name, budget))
+                    reset = tagged(active_device.reset_session(package_name, budget))
                     self._record_commands(scan_id, task_id, reset, evidence_summaries)
                     if any(result.exit_code != 0 for _kind, result, _metadata in reset):
                         proof_evidence = evidence_summaries[before:]
@@ -4278,7 +4398,7 @@ class ScanOrchestrator:
                         continue
                 elif request.oracle.kind in {"log_contains", "process_crash"}:
                     observation_reset = tagged(
-                        self.device.reset_observation_window(budget)
+                        active_device.reset_observation_window(budget)
                     )
                     self._record_commands(
                         scan_id,
@@ -4310,7 +4430,7 @@ class ScanOrchestrator:
                             raise RuntimeError(
                                 "Agent PoC was not built by the platform before execution"
                             )
-                        probe = self.device.execute_poc(
+                        probe = active_device.execute_poc(
                             artifact.apk_path,
                             request.poc,
                             target_package_name=package_name,
@@ -4335,7 +4455,7 @@ class ScanOrchestrator:
                                 },
                             )
                     else:
-                        probe = self.device.probe(
+                        probe = active_device.probe(
                             entries_by_id[request.entry_point_id],
                             package_name,
                             state=state,
@@ -4461,11 +4581,17 @@ class ScanOrchestrator:
         direct_tool_access = backend == "codex" or opencode_workspace_tools
         shell_access = backend == "codex" or opencode_workspace_tools
         workspace_write = backend == "opencode" and opencode_workspace_tools
+        assigned_device = platform_context.get("device")
+        assigned_device_serial = (
+            assigned_device.get("serial")
+            if isinstance(assigned_device, dict)
+            else None
+        )
         adb_access = (
             backend == "opencode"
             and self.settings.agent_permission_profile == "personal_lab"
             and self.settings.opencode_isolation == "host"
-            and bool(self.settings.adb_serial)
+            and bool(assigned_device_serial)
         )
         network_access = (
             backend == "opencode"
@@ -5481,13 +5607,22 @@ class ScanOrchestrator:
     ) -> None:
         with self.database.session_factory() as session:
             for kind, command_result, metadata in commands:
+                command_metadata = dict(metadata)
+                argv = list(getattr(command_result, "argv", []) or [])
+                if (
+                    "device_serial" not in command_metadata
+                    and len(argv) >= 3
+                    and argv[0] == "adb"
+                    and argv[1] == "-s"
+                ):
+                    command_metadata["device_serial"] = argv[2]
                 item = self.evidence.command(
                     session,
                     scan_id=scan_id,
                     task_id=task_id,
                     kind=kind,
                     result=command_result,
-                    metadata=metadata,
+                    metadata=command_metadata,
                 )
                 if summaries is not None:
                     summaries.append(self._evidence_summary(item))
@@ -5503,8 +5638,9 @@ class ScanOrchestrator:
                         "evidence_kind": kind,
                         "exit_code": item.exit_code,
                         "summary": item.summary,
-                        "test_case_id": metadata.get("test_case_id"),
-                        "request_id": metadata.get("request_id"),
+                        "test_case_id": command_metadata.get("test_case_id"),
+                        "request_id": command_metadata.get("request_id"),
+                        "device_serial": command_metadata.get("device_serial"),
                     },
                 )
             session.commit()

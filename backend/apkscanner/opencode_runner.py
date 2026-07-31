@@ -403,6 +403,17 @@ class OpenCodeInvestigator:
         workspace_tools_enabled = any(
             stage.workspace_tools for stage in execution_profile.stages
         )
+        device_context = context.get("device")
+        assigned_device_serial = (
+            str(device_context.get("serial"))
+            if isinstance(device_context, dict) and device_context.get("serial")
+            else None
+        )
+        adb_enabled = (
+            self.settings.agent_permission_profile == "personal_lab"
+            and self.settings.opencode_isolation == "host"
+            and assigned_device_serial is not None
+        )
         prompt = investigation_prompt(
             scan,
             task,
@@ -412,11 +423,7 @@ class OpenCodeInvestigator:
             direct_tool_access=workspace_tools_enabled,
             shell_access=workspace_tools_enabled,
             workspace_write=workspace_tools_enabled,
-            adb_access=(
-                self.settings.agent_permission_profile == "personal_lab"
-                and self.settings.opencode_isolation == "host"
-                and bool(self.settings.adb_serial)
-            ),
+            adb_access=adb_enabled,
             network_access=self.settings.agent_permission_profile == "personal_lab",
             response_contract="structured_result",
         )
@@ -424,11 +431,7 @@ class OpenCodeInvestigator:
             direct_tool_access=workspace_tools_enabled,
             shell_access=workspace_tools_enabled,
             workspace_write=workspace_tools_enabled,
-            adb_access=(
-                self.settings.agent_permission_profile == "personal_lab"
-                and self.settings.opencode_isolation == "host"
-                and bool(self.settings.adb_serial)
-            ),
+            adb_access=adb_enabled,
             network_access=self.settings.agent_permission_profile == "personal_lab",
             response_contract="structured_result",
         )
@@ -459,11 +462,8 @@ class OpenCodeInvestigator:
             "execution_profile": execution_profile.as_payload(),
             "max_agent_steps": None,
             "permission_profile": self.settings.agent_permission_profile,
-            "allow_adb": (
-                self.settings.agent_permission_profile == "personal_lab"
-                and self.settings.opencode_isolation == "host"
-                and bool(self.settings.adb_serial)
-            ),
+            "allow_adb": adb_enabled,
+            "assigned_adb_serial": assigned_device_serial,
             "allow_network": self.settings.agent_permission_profile == "personal_lab",
             "external_read_roots": external_read_roots,
             "_readonly_mounts": [
@@ -1008,6 +1008,11 @@ class OpenCodeInvestigator:
             env = self._worker_environment(
                 root,
                 allow_adb=bool(payload.get("allow_adb")),
+                adb_serial=(
+                    str(payload["assigned_adb_serial"])
+                    if payload.get("assigned_adb_serial")
+                    else None
+                ),
                 proof_replay_token=proof_replay_token,
                 proof_task_id=proof_task_id,
                 proof_replay_url=proof_replay_url,
@@ -1060,6 +1065,7 @@ class OpenCodeInvestigator:
         root: Path,
         *,
         allow_adb: bool = False,
+        adb_serial: str | None = None,
         proof_replay_token: str | None = None,
         proof_task_id: str | None = None,
         proof_replay_url: str | None = None,
@@ -1083,9 +1089,14 @@ class OpenCodeInvestigator:
         bin_dir = self.worker_dir / "node_modules" / ".bin"
         blocker_dir = self.worker_dir / "bin"
         platform_bin_dir = self.worker_dir / "platform-bin"
+        adb_wrapper_dir: Path | None = None
+        if allow_adb and adb_serial:
+            adb_wrapper_dir = root / "adb-bin"
+            self._write_adb_serial_wrapper(adb_wrapper_dir, adb_serial)
         env["PATH"] = os.pathsep.join(
             value
             for value in (
+                str(adb_wrapper_dir) if adb_wrapper_dir else None,
                 str(platform_bin_dir),
                 None if allow_adb else str(blocker_dir),
                 str(bin_dir),
@@ -1093,6 +1104,8 @@ class OpenCodeInvestigator:
             )
             if value
         )
+        if allow_adb and adb_serial:
+            env["ANDROID_SERIAL"] = adb_serial
         env.update(
             {
                 "HOME": str(root / "home"),
@@ -1116,6 +1129,45 @@ class OpenCodeInvestigator:
                 }
             )
         return env
+
+    @staticmethod
+    def _write_adb_serial_wrapper(directory: Path, serial: str) -> None:
+        real_adb = shutil.which("adb")
+        if real_adb is None:
+            raise RuntimeError("adb is not installed")
+        directory.mkdir(parents=True, exist_ok=True)
+        wrapper = directory / "adb"
+        script = """#!/usr/bin/python3
+import os
+import sys
+
+ASSIGNED = __APKSCANNER_ASSIGNED_SERIAL__
+REAL_ADB = __APKSCANNER_REAL_ADB__
+args = sys.argv[1:]
+blocked = {"connect", "disconnect", "devices", "kill-server", "start-server", "reconnect"}
+if not args or args[0] in blocked or args[0] in {"-d", "-e", "-t"}:
+    sys.stderr.write("adb command is outside the assigned device lease\\n")
+    raise SystemExit(126)
+if "-s" in args:
+    index = args.index("-s")
+    if index + 1 >= len(args) or args[index + 1] != ASSIGNED:
+        sys.stderr.write("adb serial does not match the assigned device lease\\n")
+        raise SystemExit(126)
+else:
+    args = ["-s", ASSIGNED, *args]
+os.execv(REAL_ADB, [REAL_ADB, *args])
+"""
+        wrapper.write_text(
+            script.replace(
+                "__APKSCANNER_ASSIGNED_SERIAL__",
+                json.dumps(serial),
+            ).replace(
+                "__APKSCANNER_REAL_ADB__",
+                json.dumps(real_adb),
+            ),
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o700)
 
     def _invoke_docker(
         self,

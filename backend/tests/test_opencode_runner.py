@@ -232,6 +232,7 @@ def test_live_proof_bridge_is_exposed_only_with_an_active_task(
     active = investigator._worker_environment(
         tmp_path / "active",
         allow_adb=True,
+        adb_serial="device-a",
         proof_replay_token="proof-secret",
         proof_task_id="task-id",
         proof_replay_url="http://127.0.0.1:8000",
@@ -240,7 +241,17 @@ def test_live_proof_bridge_is_exposed_only_with_an_active_task(
     assert "APKSCANNER_PROOF_TOKEN" not in inactive
     assert active["APKSCANNER_PROOF_TOKEN"] == "proof-secret"
     assert active["APKSCANNER_PROOF_TASK_ID"] == "task-id"
+    assert active["ANDROID_SERIAL"] == "device-a"
     assert "platform-bin" in active["PATH"]
+    rejected = subprocess.run(
+        ["adb", "-s", "device-b", "get-state"],
+        env=active,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rejected.returncode == 126
+    assert "does not match" in rejected.stderr
 
 
 @pytest.mark.skipif(not hasattr(os, "chown"), reason="requires POSIX ownership")

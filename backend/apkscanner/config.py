@@ -49,6 +49,7 @@ class Settings:
     opencode_thinking_explorer: bool = False
     deepseek_base_url: str | None = None
     adb_serial: str | None = None
+    adb_serials: tuple[str, ...] = ()
     probe_apk_path: Path | None = None
     android_sdk_root: Path | None = None
     android_build_tools_version: str | None = None
@@ -78,6 +79,16 @@ class Settings:
             "APKSCANNER_DATABASE_URL", f"sqlite:///{data_dir / 'apkscanner.db'}"
         )
         frontend = os.getenv("APKSCANNER_FRONTEND_DIST")
+        configured_serials = tuple(
+            dict.fromkeys(
+                serial.strip()
+                for serial in os.getenv("APKSCANNER_ADB_SERIALS", "").split(",")
+                if serial.strip()
+            )
+        )
+        legacy_serial = (os.getenv("APKSCANNER_ADB_SERIAL") or "").strip() or None
+        if not configured_serials and legacy_serial:
+            configured_serials = (legacy_serial,)
         return cls(
             data_dir=data_dir,
             database_url=database_url,
@@ -142,7 +153,8 @@ class Settings:
                 "APKSCANNER_OPENCODE_THINKING_EXPLORER"
             ),
             deepseek_base_url=os.getenv("APKSCANNER_DEEPSEEK_BASE_URL"),
-            adb_serial=os.getenv("APKSCANNER_ADB_SERIAL"),
+            adb_serial=configured_serials[0] if configured_serials else legacy_serial,
+            adb_serials=configured_serials,
             probe_apk_path=(
                 Path(os.environ["APKSCANNER_PROBE_APK"]).resolve()
                 if os.getenv("APKSCANNER_PROBE_APK")
@@ -221,6 +233,12 @@ class Settings:
         if backend == "opencode":
             return self.opencode_enabled
         return False
+
+    @property
+    def configured_adb_serials(self) -> tuple[str, ...]:
+        if self.adb_serials:
+            return tuple(dict.fromkeys(self.adb_serials))
+        return (self.adb_serial,) if self.adb_serial else ()
 
     def ensure_directories(self) -> None:
         for path in (

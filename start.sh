@@ -85,7 +85,7 @@ cleanup_orphan_opencode_servers() {
   echo "cleaned ${#targets[@]} orphaned OpenCode server(s) from this project"
 }
 
-detect_adb_serial() {
+detect_adb_serials() {
   local -a devices=()
   local attempt
   for attempt in $(seq 1 5); do
@@ -93,12 +93,10 @@ detect_adb_serial() {
       adb devices 2>/dev/null |
         awk 'NR > 1 && $2 == "device" { print $1 }'
     )
-    if [ "${#devices[@]}" -eq 1 ]; then
-      printf '%s\n' "${devices[0]}"
-      return
-    fi
-    if [ "${#devices[@]}" -gt 1 ]; then
-      echo "multiple ADB devices are online; set APKSCANNER_ADB_SERIAL explicitly" >&2
+    if [ "${#devices[@]}" -gt 0 ]; then
+      local joined
+      joined="$(IFS=,; echo "${devices[*]}")"
+      printf '%s\n' "$joined"
       return
     fi
     sleep 1
@@ -120,7 +118,8 @@ export APKSCANNER_OPENCODE_MODEL="deepseek-v4-flash"
 export APKSCANNER_OPENCODE_CRITIC_MODEL="deepseek-v4-pro"
 export APKSCANNER_OPENCODE_THINKING_EXPLORER="false"
 export APKSCANNER_AGENT_PERMISSION_PROFILE="personal_lab"
-export APKSCANNER_ADB_SERIAL="${APKSCANNER_ADB_SERIAL:-$(detect_adb_serial)}"
+export APKSCANNER_ADB_SERIALS="${APKSCANNER_ADB_SERIALS:-$(detect_adb_serials)}"
+export APKSCANNER_ADB_SERIAL="${APKSCANNER_ADB_SERIAL:-${APKSCANNER_ADB_SERIALS%%,*}}"
 export APKSCANNER_DEVICE_INSTALL_POLICY="install_or_reuse"
 export APKSCANNER_DEVICE_RESET_POLICY="per_round"
 export APKSCANNER_FRONTEND_DIST="$PROJECT_DIR/frontend/dist"
@@ -136,6 +135,7 @@ nohup setsid env \
   APKSCANNER_OPENCODE_THINKING_EXPLORER="$APKSCANNER_OPENCODE_THINKING_EXPLORER" \
   APKSCANNER_AGENT_PERMISSION_PROFILE="$APKSCANNER_AGENT_PERMISSION_PROFILE" \
   APKSCANNER_ADB_SERIAL="$APKSCANNER_ADB_SERIAL" \
+  APKSCANNER_ADB_SERIALS="$APKSCANNER_ADB_SERIALS" \
   APKSCANNER_DEVICE_INSTALL_POLICY="$APKSCANNER_DEVICE_INSTALL_POLICY" \
   APKSCANNER_DEVICE_RESET_POLICY="$APKSCANNER_DEVICE_RESET_POLICY" \
   APKSCANNER_FRONTEND_DIST="$APKSCANNER_FRONTEND_DIST" \

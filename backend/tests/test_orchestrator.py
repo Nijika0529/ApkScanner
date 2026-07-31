@@ -206,6 +206,89 @@ def test_task_dispatch_runs_one_investigation_at_a_time(settings) -> None:  # no
     assert statuses == ["completed"] * 6
 
 
+def test_two_configured_devices_run_two_investigations_concurrently(settings) -> None:  # noqa: ANN001
+    configured = replace(
+        settings,
+        adb_serial="device-a",
+        adb_serials=("device-a", "device-b"),
+    )
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            status="preliminary_ready",
+            filename="two-devices.apk",
+            artifact_sha256="8" * 64,
+            artifact_path=str(configured.data_dir / "two-devices.apk"),
+        )
+        session.add(scan)
+        session.flush()
+        session.add_all(
+            [
+                InvestigationTask(
+                    scan_id=scan.id,
+                    task_type="component",
+                    status="queued",
+                    priority=100 - index,
+                )
+                for index in range(4)
+            ]
+        )
+        session.commit()
+        scan_id = scan.id
+
+    orchestrator = ScanOrchestrator(
+        configured,
+        database,
+        ArtifactStore(configured),
+    )
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_run_task(
+        _scan_id: str,
+        task_id: str,
+        _timeout_seconds: int | None = None,
+    ) -> None:
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.08)
+        with database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            assert task is not None
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            session.commit()
+        with state_lock:
+            active -= 1
+
+    orchestrator._run_task = fake_run_task  # type: ignore[method-assign]
+    orchestrator._run_tasks(scan_id)
+
+    assert max_active == 2
+    with database.session_factory() as session:
+        persisted_scan = session.get(Scan, scan_id)
+        statuses = list(
+            session.scalars(
+                select(InvestigationTask.status).where(
+                    InvestigationTask.scan_id == scan_id
+                )
+            )
+        )
+    assert persisted_scan is not None
+    assert persisted_scan.stats["execution_policy"] == {
+        "investigation_concurrency": 2,
+        "adb_concurrency": 2,
+        "device_ownership": "complete_task",
+        "agent_workspace_scope": "task_attempt",
+    }
+    assert statuses == ["completed"] * 4
+
+
 def test_single_investigation_limit_is_shared_across_scans(settings) -> None:  # noqa: ANN001
     settings.ensure_directories()
     database = Database(settings)

@@ -174,7 +174,7 @@ def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> Health
             detail=opencode.get("detail"),
         )
     )
-    device = orchestrator.device.capability(non_blocking=True)
+    device = orchestrator.device_pool.capability(non_blocking=True)
     capabilities.append(
         Capability(
             name="remote_android_device",

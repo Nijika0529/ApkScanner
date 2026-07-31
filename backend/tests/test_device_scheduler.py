@@ -5,14 +5,33 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from apkscanner.config import Settings
 from apkscanner.device import (
     AdbDeviceAdapter,
     DeviceLeaseCancelledError,
+    DevicePoolScheduler,
     SingleDeviceScheduler,
 )
 from apkscanner.models import EntryPoint
 from apkscanner.schemas import AgentOracleSpec, AgentPocSpec
 from apkscanner.tools import CommandResult
+
+
+def test_settings_parse_a_comma_separated_device_pool(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # noqa: ANN001
+    monkeypatch.setenv("APKSCANNER_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv(
+        "APKSCANNER_ADB_SERIALS",
+        "device-a, device-b,device-a",
+    )
+    monkeypatch.delenv("APKSCANNER_ADB_SERIAL", raising=False)
+
+    settings = Settings.from_env()
+
+    assert settings.adb_serial == "device-a"
+    assert settings.configured_adb_serials == ("device-a", "device-b")
 
 
 def test_single_device_scheduler_orders_waiters_by_priority_then_fifo() -> None:
@@ -140,6 +159,49 @@ def test_queue_callback_failure_does_not_poison_the_device_queue() -> None:
         cancel_event=threading.Event(),
     ):
         assert scheduler.snapshot()["active_task_id"] == "next"
+
+
+def test_device_pool_assigns_two_tasks_to_distinct_devices() -> None:
+    scheduler = DevicePoolScheduler(("device-a", "device-b"))
+    both_acquired = threading.Event()
+    release = threading.Event()
+    lock = threading.Lock()
+    assignments: dict[str, str] = {}
+
+    def hold(task_id: str) -> None:
+        with scheduler.lease(
+            task_id,
+            priority=90,
+            cancel_event=threading.Event(),
+        ) as lease:
+            with lock:
+                assignments[task_id] = lease["serial"]
+                if len(assignments) == 2:
+                    both_acquired.set()
+            assert release.wait(timeout=5)
+
+    workers = [
+        threading.Thread(target=hold, args=(f"task-{index}",))
+        for index in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    assert both_acquired.wait(timeout=5)
+    assert set(assignments.values()) == {"device-a", "device-b"}
+    assert scheduler.snapshot()["active"] == {
+        assignments["task-0"]: "task-0",
+        assignments["task-1"]: "task-1",
+    }
+
+    release.set()
+    for worker in workers:
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+    assert scheduler.snapshot() == {
+        "capacity": 2,
+        "active": {},
+        "waiting": [],
+    }
 
 
 def test_health_capability_does_not_enter_an_active_device_session(settings) -> None:  # noqa: ANN001

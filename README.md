@@ -82,6 +82,15 @@ adb connect cloud-device.example:5555
 export APKSCANNER_ADB_SERIAL=cloud-device.example:5555
 ```
 
+For two-device parallel investigation, connect both devices and provide a comma-separated pool:
+
+```bash
+export APKSCANNER_ADB_SERIALS=cloud-device-a.example:5555,cloud-device-b.example:5555
+```
+
+Each investigation keeps one serial for its complete lifecycle. The legacy
+`APKSCANNER_ADB_SERIAL` remains supported as a one-device pool.
+
 For fast generic Activity, Service, Receiver, Provider, and deep-link calls from an ordinary app
 UID, optionally build the deliberately exported helper in [`probe/`](probe/) on an Android SDK 36
 workstation, install it only on a dedicated test device, and configure its path:
@@ -271,6 +280,7 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_DATABASE_URL` | SQLite in data dir | SQLAlchemy database URL |
 | `APKSCANNER_FRONTEND_DIST` | unset | Built frontend directory served by FastAPI |
 | `APKSCANNER_ADB_SERIAL` | unset | Remote cloud-device ADB serial |
+| `APKSCANNER_ADB_SERIALS` | unset | Comma-separated ADB device pool; investigation concurrency follows the pool size |
 | `APKSCANNER_PROBE_APK` | unset | Built Probe APK path |
 | `APKSCANNER_ANDROID_SDK_ROOT` | Android SDK env/unset | SDK used for platform-managed Agent PoC builds |
 | `APKSCANNER_ANDROID_BUILD_TOOLS_VERSION` | newest installed/unset | Pin one coherent SDK `build-tools/<version>` directory; when unset, compatible aapt2 resource-table failures may retry other installed versions |

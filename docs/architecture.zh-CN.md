@@ -45,16 +45,18 @@ scheme、host/authority 和 port；额外参数有数量、键名、类型和长
 
 JADX 的非零退出码不直接等同于反编译不可用。平台把结果归一化为完整成功、部分成功、部分超时或工具失败，并生成 `code_index.json`：逐个组件记录目标类是否位于失败列表、可用 Java/Smali 路径、文件 SHA-256 和有界源码片段。Codex 和 OpenCode 都接收相同的目标级代码上下文；OpenCode 不需要文件系统权限。历史扫描在任务重试时可从已有 workspace 与 `static.jadx` Evidence 懒生成索引，不会为了补上下文再次运行 JADX。
 
-## 单云真机调度
+## 多云真机调度
 
-v1 只有一个 `APKSCANNER_ADB_SERIAL`，因此所有扫描共享一个全局调查任务锁。控制面先获取
-该锁，再按扫描内风险优先级领取任务；未获得锁的工作保持 `queued`，不会提前占用 worker
-或显示成 `awaiting_device`。当前任务从健康检查、安装/复用、初始探索、Agent 多轮分析、
-实时 PoC 回放、Review 到最终清理持续拥有设备，其他 APK 的状态和日志不能在中途穿插。
+`APKSCANNER_ADB_SERIALS` 接受逗号分隔的设备池；未设置时继续兼容单个
+`APKSCANNER_ADB_SERIAL`。调查并发数自动等于设备数。控制面按风险优先级领取任务，每个任务
+从健康检查、安装/复用、初始探索、Agent 多轮分析、实时 PoC 回放、Review 到最终清理始终
+绑定同一个 serial。同一台设备上不会穿插其他 APK 的状态和日志，两台设备则可各运行一个
+完整任务。
 
-设备适配器内部仍保留命令互斥和所有者检查，作为意外重入的防线；它不再承担正常流程中的
-多 worker 优先级排队。任务结果继续记录 `requested_at`、`acquired_at`、`released_at`
-和 `held_seconds`，Web 展示当前任务的设备关键事件。
+设备池保留全局优先级队列，每台适配器内部继续保留命令互斥。实时 PoC Proof Context 保存
+任务实际获得的 Device Adapter，API 回放不能落到另一台手机。任务结果继续记录
+`requested_at`、`acquired_at`、`released_at`、`held_seconds` 和 `serial`，Web 展示当前
+任务的设备关键事件。
 
 运行中的 ADB 子进程使用独立进程组；停止任务会终止当前命令，
 后续设备命令直接返回 canceled，但 `pm clear` 和 App Link reset 清理仍会忽略取消信号执行。

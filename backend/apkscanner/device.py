@@ -133,15 +133,129 @@ class SingleDeviceScheduler:
         heapq.heapify(self._queue)
 
 
+class DevicePoolScheduler:
+    """Priority queue that assigns one complete task to one free device."""
+
+    def __init__(self, serials: tuple[str, ...]) -> None:
+        self._serials = serials
+        self._condition = threading.Condition()
+        self._queue: list[_DeviceWaiter] = []
+        self._sequence = 0
+        self._active_by_serial: dict[str, str] = {}
+
+    @contextmanager
+    def lease(
+        self,
+        task_id: str,
+        *,
+        priority: int,
+        cancel_event: threading.Event,
+        on_queued=None,  # noqa: ANN001
+        on_acquired=None,  # noqa: ANN001
+    ):  # noqa: ANN201
+        with self._condition:
+            self._sequence += 1
+            waiter = _DeviceWaiter(
+                sort_key=(-priority, self._sequence),
+                task_id=task_id,
+                enqueued_at=time.monotonic(),
+                cancel_event=cancel_event,
+            )
+            heapq.heappush(self._queue, waiter)
+            position = self._position(waiter)
+            self._condition.notify_all()
+        acquired_serial: str | None = None
+        try:
+            if on_queued is not None:
+                on_queued(position)
+            with self._condition:
+                while True:
+                    if cancel_event.is_set():
+                        self._remove(waiter)
+                        self._condition.notify_all()
+                        raise DeviceLeaseCancelledError(
+                            "device lease was cancelled while queued"
+                        )
+                    available_serial = next(
+                        (
+                            serial
+                            for serial in self._serials
+                            if serial not in self._active_by_serial
+                        ),
+                        None,
+                    )
+                    if (
+                        available_serial is not None
+                        and self._queue
+                        and self._queue[0] is waiter
+                    ):
+                        heapq.heappop(self._queue)
+                        self._active_by_serial[available_serial] = task_id
+                        acquired_serial = available_serial
+                        break
+                    self._condition.wait(timeout=0.25)
+            waited_seconds = max(0.0, time.monotonic() - waiter.enqueued_at)
+            if on_acquired is not None:
+                on_acquired(waited_seconds, acquired_serial)
+            yield {
+                "task_id": task_id,
+                "serial": acquired_serial,
+                "wait_seconds": waited_seconds,
+            }
+        finally:
+            with self._condition:
+                if acquired_serial is None:
+                    self._remove(waiter)
+                elif self._active_by_serial.get(acquired_serial) == task_id:
+                    self._active_by_serial.pop(acquired_serial, None)
+                self._condition.notify_all()
+
+    def wake_waiters(self) -> None:
+        with self._condition:
+            self._condition.notify_all()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._condition:
+            waiting = sorted(self._queue)
+            return {
+                "capacity": len(self._serials),
+                "active": dict(self._active_by_serial),
+                "waiting": [
+                    {
+                        "task_id": waiter.task_id,
+                        "position": index,
+                        "priority": -waiter.sort_key[0],
+                    }
+                    for index, waiter in enumerate(waiting, start=1)
+                ],
+            }
+
+    def _position(self, target: _DeviceWaiter) -> int:
+        return sorted(self._queue).index(target) + 1
+
+    def _remove(self, target: _DeviceWaiter) -> None:
+        try:
+            self._queue.remove(target)
+        except ValueError:
+            return
+        heapq.heapify(self._queue)
+
+
 class AdbDeviceAdapter:
     """Serialized remote-ADB adapter for the single-device MVP."""
 
     NON_BLOCKING_CAPABILITY_TTL_SECONDS = 30.0
 
-    def __init__(self, settings: Settings, runner: ToolRunner):
+    def __init__(
+        self,
+        settings: Settings,
+        runner: ToolRunner,
+        *,
+        serial: str | None = None,
+    ):
         self.settings = settings
         self.runner = runner
-        self.serial = settings.adb_serial
+        self.serial = serial or settings.adb_serial
         self._lease = threading.RLock()
         self.scheduler = SingleDeviceScheduler()
         self._last_capability: dict[str, Any] | None = None
@@ -1584,3 +1698,123 @@ class AdbDeviceAdapter:
         return bool(
             re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+", package_name)
         )
+
+
+class AdbDevicePool:
+    """Assign each investigation one exclusive adapter for its complete task."""
+
+    def __init__(self, adapters: list[AdbDeviceAdapter]) -> None:
+        self.adapters = tuple(
+            adapter for adapter in adapters if adapter.serial is not None
+        )
+        self._by_serial = {
+            str(adapter.serial): adapter for adapter in self.adapters
+        }
+        self.scheduler = DevicePoolScheduler(tuple(self._by_serial))
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.adapters) and all(
+            adapter.runner.available("adb") for adapter in self.adapters
+        )
+
+    @property
+    def capacity(self) -> int:
+        return len(self.adapters) if self.configured else 1
+
+    @property
+    def serials(self) -> tuple[str, ...]:
+        return tuple(self._by_serial)
+
+    @staticmethod
+    def package_safe(package_name: str) -> bool:
+        return AdbDeviceAdapter.package_safe(package_name)
+
+    def wake_waiters(self) -> None:
+        self.scheduler.wake_waiters()
+
+    def capability(self, *, non_blocking: bool = False) -> dict[str, Any]:
+        if not self.configured:
+            return {
+                "available": False,
+                "detail": "No ADB device serial is configured",
+                "serials": list(self.serials),
+            }
+        snapshot = self.scheduler.snapshot()
+        active_serials = set(snapshot["active"])
+        available = [
+            adapter
+            for adapter in self.adapters
+            if adapter.serial not in active_serials
+        ]
+        if non_blocking and not available:
+            return {
+                "available": False,
+                "busy": True,
+                "detail": "All configured ADB devices are assigned to active tasks",
+                "serials": list(self.serials),
+                "active": snapshot["active"],
+                "waiting_count": len(snapshot["waiting"]),
+            }
+        failures: list[dict[str, Any]] = []
+        for adapter in available or list(self.adapters):
+            capability = adapter.capability(non_blocking=False)
+            if capability.get("available"):
+                return {
+                    **capability,
+                    "pool_capacity": len(self.adapters),
+                    "pool_serials": list(self.serials),
+                }
+            failures.append(
+                {
+                    "serial": adapter.serial,
+                    "detail": capability.get("detail"),
+                }
+            )
+        return {
+            "available": False,
+            "busy": False,
+            "detail": "No configured ADB device passed its capability check",
+            "serials": list(self.serials),
+            "failures": failures,
+        }
+
+    @contextmanager
+    def task_lease(
+        self,
+        task_id: str,
+        *,
+        priority: int,
+        cancel_event: threading.Event,
+        on_queued=None,  # noqa: ANN001
+        on_acquired=None,  # noqa: ANN001
+        on_released=None,  # noqa: ANN001
+    ):  # noqa: ANN201
+        with self.scheduler.lease(
+            task_id,
+            priority=priority,
+            cancel_event=cancel_event,
+            on_queued=on_queued,
+        ) as metadata:
+            serial = str(metadata["serial"])
+            adapter = self._by_serial[serial]
+            acquired_at = time.monotonic()
+            session_started = False
+            try:
+                if cancel_event.is_set():
+                    raise DeviceLeaseCancelledError(
+                        "device lease was cancelled before the command session"
+                    )
+                adapter._active_cancel_event = cancel_event
+                session_started = True
+                if on_acquired is not None:
+                    on_acquired(metadata["wait_seconds"], adapter)
+                yield {
+                    **metadata,
+                    "device": adapter,
+                }
+            finally:
+                held_seconds = max(0.0, time.monotonic() - acquired_at)
+                adapter._active_cancel_event = None
+                if session_started and on_released is not None:
+                    on_released(held_seconds, adapter)

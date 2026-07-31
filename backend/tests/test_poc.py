@@ -14,6 +14,7 @@ from xml.etree import ElementTree
 import pytest
 from apkscanner.artifacts import ArtifactStore
 from apkscanner.db import Database
+from apkscanner.device import AdbDeviceAdapter
 from apkscanner.models import EntryPoint, InvestigationTask, ProofAttempt, Scan
 from apkscanner.orchestrator import ScanOrchestrator, _LiveProofContext
 from apkscanner.poc import PocBuilder, PocBuildResult
@@ -924,6 +925,7 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
         metadata={},
     )
     captured: list[AgentRequestedTest] = []
+    replay_devices: list[str | None] = []
 
     def build(*, requests, **_kwargs):  # noqa: ANN001
         captured.extend(requests)
@@ -932,6 +934,7 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
         }, []
 
     def execute(**kwargs):  # noqa: ANN003, ANN202
+        replay_devices.append(kwargs["device"].serial)
         kwargs["evidence_summaries"].append(
             {"id": "evidence-live", "kind": "blackbox.poc_logcat"}
         )
@@ -964,6 +967,11 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
         evidence_summaries=evidence,
         cancel_event=threading.Event(),
         round_index=0,
+        device=AdbDeviceAdapter(
+            settings,
+            orchestrator.runner,
+            serial="device-b",
+        ),
     )
     orchestrator._register_live_proof_context(context)
     replay = AgentProofReplay(
@@ -1022,6 +1030,7 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
     assert captured[0].hypothesis_id == hypothesis.id
     assert captured[0].entry_point_id == entry_id
     assert first["result"] == "reproduced_blackbox"
+    assert replay_devices == ["device-b"]
     assert first["evidence_ids"] == ["evidence-live"]
     assert first["deduplicated"] is False
     first_unsigned = {
