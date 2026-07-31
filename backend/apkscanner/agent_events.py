@@ -81,6 +81,15 @@ def normalize_codex_notification(notification: Any) -> AgentRuntimeEvent | None:
             "Codex SDK 报告运行错误",
             {"error": _safe_error(payload.get("error") or payload)},
         )
+    if method in {"thread/tokenUsage/updated", "turn/diff/updated"}:
+        # Final usage and file-change lifecycle data are persisted elsewhere;
+        # these repeated snapshots add volume but no new audit transition.
+        return None
+    if method.startswith("item/") and method.lower().endswith("delta"):
+        # High-frequency reasoning and command-output fragments contain no
+        # additional lifecycle information. The corresponding item start/end
+        # events remain in the durable timeline.
+        return None
     if method not in {"item/started", "item/completed"}:
         if not method:
             return None
@@ -105,6 +114,8 @@ def normalize_codex_notification(notification: Any) -> AgentRuntimeEvent | None:
         }
     )
     normalized = item_type.replace("_", "").lower()
+    if normalized == "usermessage":
+        return None
     if normalized == "reasoning":
         return AgentRuntimeEvent(
             f"model.reasoning.{state}",
@@ -133,11 +144,7 @@ def normalize_codex_notification(notification: Any) -> AgentRuntimeEvent | None:
     }:
         return AgentRuntimeEvent(
             f"model.tool.{state}",
-            (
-                f"Codex 开始执行 {item_type}"
-                if state == "started"
-                else f"Codex 已完成 {item_type}"
-            ),
+            (f"Codex 开始执行 {item_type}" if state == "started" else f"Codex 已完成 {item_type}"),
             _compact(
                 {
                     **common,
@@ -185,11 +192,7 @@ _SECRET_VALUE = re.compile(r"(?i)(?:bearer\s+)?sk-[A-Za-z0-9_-]{8,}")
 def redact_event_data(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            str(key): (
-                "[REDACTED]"
-                if _SECRET_KEY.search(str(key))
-                else redact_event_data(item)
-            )
+            str(key): ("[REDACTED]" if _SECRET_KEY.search(str(key)) else redact_event_data(item))
             for key, item in value.items()
         }
     if isinstance(value, list):

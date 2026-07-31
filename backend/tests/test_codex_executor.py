@@ -11,7 +11,8 @@ from pathlib import Path
 import pytest
 from apkscanner.agent_workspace import AgentWorkspaceManager
 from apkscanner.codex_executor import CodexDockerExecutor, ScanContainer
-from apkscanner.codex_protocol import PersistentWorkerClient
+from apkscanner.codex_protocol import PersistentWorkerClient, PersistentWorkerError
+from apkscanner.codex_runner import CodexInvestigator
 
 SCAN_ID = "00000000-0000-0000-0000-000000000101"
 TASK_ID = "00000000-0000-0000-0000-000000000102"
@@ -19,6 +20,41 @@ TASK_ID = "00000000-0000-0000-0000-000000000102"
 
 def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
+
+
+def _valid_agent_result() -> dict:
+    return {
+        "schema_version": "1.0",
+        "summary": "该入口没有发现可利用路径。",
+        "result": "refuted_static",
+        "hypotheses_tested": [],
+        "hypothesis_assessments": [],
+        "review_objections": [],
+        "objection_resolutions": [],
+        "test_cases": [],
+        "evidence_ids": [],
+        "severity_proposal": "info",
+        "confidence": "medium",
+        "coverage_gaps": [],
+        "followups": [],
+        "requested_tests": [],
+    }
+
+
+def test_codex_response_accepts_one_schema_valid_trailing_json_object() -> None:
+    payload = _valid_agent_result()
+
+    parsed = CodexInvestigator._parse_response(
+        "平台验证已完成，现返回结构化结论。\n\n" + json.dumps(payload)
+    )
+
+    assert parsed.result == "refuted_static"
+    assert parsed.summary == payload["summary"]
+
+
+def test_codex_response_rejects_prose_without_a_complete_trailing_object() -> None:
+    with pytest.raises(ValueError, match="complete trailing JSON object"):
+        CodexInvestigator._parse_response('说明 {"schema_version":"1.0"} trailing')
 
 
 def test_workspace_manager_reuses_role_session_and_isolates_critic_uid(settings) -> None:  # noqa: ANN001
@@ -75,6 +111,45 @@ def test_workspace_manager_reuses_role_session_and_isolates_critic_uid(settings)
     ] == {"phase": "final_evaluation"}
 
 
+def test_workspace_manager_releases_terminal_task_slot_without_reusing_uid(settings) -> None:  # noqa: ANN001
+    configured = replace(
+        settings,
+        codex_uid_min=21_120,
+        codex_uid_max=21_125,
+        codex_max_sessions=1,
+        codex_max_sessions_per_scan=1,
+    )
+    source = configured.data_dir / "source"
+    source.mkdir()
+    manager = AgentWorkspaceManager(configured)
+    first = manager.prepare_session(
+        scan_id=SCAN_ID,
+        task_id=TASK_ID,
+        attempt=1,
+        role="primary",
+        source_workspace=source,
+    )
+    snapshots = first.codex_home / "shell_snapshots"
+    snapshots.mkdir()
+    (snapshots / "environment.sh").write_text(
+        'declare -x DEEPSEEK_API_KEY="test-only-secret"',
+        encoding="utf-8",
+    )
+
+    manager.forget_task(SCAN_ID, TASK_ID)
+    second = manager.prepare_session(
+        scan_id=SCAN_ID,
+        task_id="11111111-0000-0000-0000-000000000103",
+        attempt=1,
+        role="primary",
+        source_workspace=source,
+    )
+
+    assert first.root.is_dir()
+    assert not snapshots.exists()
+    assert second.uid != first.uid
+
+
 def test_scan_container_command_has_scan_scope_and_no_provider_secret(settings) -> None:  # noqa: ANN001
     configured = replace(settings, codex_docker_image="test-worker:fixed")
     scan_workspace = configured.data_dir / "workspaces" / SCAN_ID
@@ -109,9 +184,7 @@ def test_scan_container_command_has_scan_scope_and_no_provider_secret(settings) 
     assert "docker.sock" not in rendered
 
 
-def test_worker_exec_injects_only_key_name_for_one_uid(
-    settings, monkeypatch
-) -> None:  # noqa: ANN001
+def test_worker_exec_injects_only_key_name_for_one_uid(settings, monkeypatch) -> None:  # noqa: ANN001
     monkeypatch.setenv("DEEPSEEK_API_KEY", "unit-test-secret-must-not-enter-argv")
     configured = replace(settings, codex_uid_min=21_200, codex_uid_max=21_210)
     source = configured.data_dir / "source"
@@ -164,9 +237,7 @@ def test_real_scan_container_shares_input_but_isolates_session_uids(settings) ->
     (source / "seed.txt").write_text("session seed", encoding="utf-8")
     scan_workspace = configured.data_dir / "workspaces" / SCAN_ID
     (scan_workspace / "jadx").mkdir(parents=True)
-    (scan_workspace / "jadx" / "Shared.java").write_text(
-        "class Shared {}", encoding="utf-8"
-    )
+    (scan_workspace / "jadx" / "Shared.java").write_text("class Shared {}", encoding="utf-8")
     apk_path = configured.data_dir / "target.apk"
     apk_path.write_bytes(b"read-only apk input")
 
@@ -302,7 +373,7 @@ def test_real_worker_protocol_opens_persistent_codex_thread(
                 "model": "deepseek-v4-flash",
                 "model_provider": "deepseek",
                 "reasoning_effort": "high",
-                "provider_base_url": "https://api.deepseek.com/",
+                "provider_base_url": "http://127.0.0.1:9/",
                 "model_catalog_path": "/opt/apk-scanner/config/deepseek-models.json",
                 "workspace_path": session.container_workspace,
             },
@@ -310,6 +381,21 @@ def test_real_worker_protocol_opens_persistent_codex_thread(
         )
         assert thread_id
         assert process.poll() is None
+        with pytest.raises(PersistentWorkerError):
+            client.turn(
+                prompt="Return a JSON object with ok=true.",
+                output_schema={
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"],
+                    "additionalProperties": False,
+                },
+                timeout_seconds=30,
+                no_event_timeout_seconds=30,
+                event_callback=None,
+                cancel_event=None,
+            )
+        assert not (session.codex_home / "shell_snapshots").exists()
     finally:
         client.close()
         executor.close_scan(SCAN_ID)

@@ -4,6 +4,7 @@ import pytest
 from apkscanner.agent_prompt import developer_instructions, investigation_prompt
 from apkscanner.models import EntryPoint, InvestigationTask, Scan
 from apkscanner.schemas import (
+    AGENT_RESULT_JSON_SCHEMA,
     AgentInvestigationResult,
     AgentPocSpec,
     AgentRequestedTest,
@@ -30,6 +31,74 @@ def test_final_agent_summary_requires_chinese_text() -> None:
     assert _result("静态证据表明调用路径受到权限检查保护。").summary.startswith("静态证据")
     with pytest.raises(ValidationError, match="string_pattern_mismatch"):
         _result("The caller path is protected by a permission check.")
+
+
+def test_agent_output_schema_uses_provider_compatible_additional_properties() -> None:
+    pending: list[object] = [AGENT_RESULT_JSON_SCHEMA]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, list):
+            pending.extend(value)
+            continue
+        if not isinstance(value, dict):
+            continue
+        additional = value.get("additionalProperties")
+        assert additional is None or isinstance(additional, bool)
+        properties = value.get("properties")
+        if value.get("type") == "object":
+            assert isinstance(properties, dict) and properties
+        if isinstance(properties, dict):
+            assert value.get("required") == list(properties)
+        pending.extend(value.values())
+
+
+def test_agent_result_converts_closed_wire_extras_to_android_mapping() -> None:
+    result = AgentInvestigationResult.model_validate(
+        {
+            **_result("平台将封闭的 wire extras 转换为 Android 参数。").model_dump(mode="json"),
+            "requested_tests": [
+                {
+                    "hypothesis_id": "00000000-0000-0000-0000-000000000001",
+                    "entry_point_id": "00000000-0000-0000-0000-000000000002",
+                    "state": "guest",
+                    "uri": None,
+                    "extras": [
+                        {
+                            "key": "account",
+                            "value_type": "string",
+                            "string_value": "victim",
+                            "integer_value": None,
+                            "boolean_value": None,
+                        },
+                        {
+                            "key": "enabled",
+                            "value_type": "boolean",
+                            "string_value": None,
+                            "integer_value": None,
+                            "boolean_value": True,
+                        },
+                    ],
+                    "operation": "auto",
+                    "method": None,
+                    "argument": None,
+                    "intent_action": None,
+                    "categories": [],
+                    "reset": "inherit",
+                    "oracle": {
+                        "kind": "reachability",
+                        "expected_text": None,
+                        "minimum_rows": None,
+                        "impact": "none",
+                        "refute_on_miss": False,
+                    },
+                    "rationale": "验证参数转换",
+                    "poc": None,
+                }
+            ],
+        }
+    )
+
+    assert result.requested_tests[0].extras == {"account": "victim", "enabled": True}
 
 
 def test_agent_instructions_require_chinese_but_preserve_identifiers() -> None:
@@ -166,6 +235,7 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     assert "requested_tests is a deprecated compatibility field" in planning
     assert "apkscanner-proof" in planning
     assert "proof JSON hypothesis_id is mandatory" in planning
+    assert "never use Thread.sleep" in planning
 
 
 def test_deep_link_prompt_requires_route_matrix_and_pending_proof_semantics() -> None:

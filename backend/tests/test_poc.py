@@ -183,6 +183,45 @@ public final class MainActivity extends android.app.Activity {
         builder._validate_project(workspace, poc_spec())
 
 
+def test_poc_builder_enforces_the_runtime_result_protocol(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = write_poc_project(workspace)
+    source = next((project / "src").rglob("MainActivity.java"))
+    builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
+    oracle = AgentOracleSpec(
+        kind="provider_rows",
+        minimum_rows=1,
+        impact="unauthorized_data_access",
+    )
+
+    with pytest.raises(ValueError, match="apkscanner_request_id"):
+        builder._validate_project(workspace, poc_spec(), oracle=oracle)
+
+    source.write_text(
+        r'''package io.apkscanner.poc.providerprobe;
+public final class MainActivity extends android.app.Activity {
+  void report(int rows) {
+    String requestId = getIntent().getStringExtra("apkscanner_request_id");
+    android.util.Log.i("APKSCANNER_POC", "{\"request_id\":\"" + requestId
+      + "\",\"success\":true,\"security_impact_observed\":true,\"row_count\":"
+      + rows + "}");
+  }
+}''',
+        encoding="utf-8",
+    )
+
+    validated, *_rest = builder._validate_project(
+        workspace,
+        poc_spec(),
+        oracle=oracle,
+    )
+    assert validated == project
+
+
 def test_poc_builder_rejects_lambdas_for_dx_toolchain(
     settings,
     tmp_path,
@@ -924,13 +963,30 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
         source_path=tmp_path / "source.zip",
         metadata={},
     )
+    changed_artifact = PocBuildResult(
+        ok=True,
+        apk_sha256="4" * 64,
+        apk_path=built_apk,
+        source_sha256="5" * 64,
+        source_path=tmp_path / "changed-source.zip",
+        metadata={},
+    )
     captured: list[AgentRequestedTest] = []
     replay_devices: list[str | None] = []
+    build_attempts = 0
 
     def build(*, requests, **_kwargs):  # noqa: ANN001
+        nonlocal build_attempts
+        build_attempts += 1
         captured.extend(requests)
+        if build_attempts == 1:
+            return [], {}, [
+                "PoC source validation failed: missing structured runtime result"
+            ]
         return requests, {
-            orchestrator._poc_request_key(requests[0]): artifact
+            orchestrator._poc_request_key(requests[0]): (
+                changed_artifact if build_attempts >= 3 else artifact
+            )
         }, []
 
     def execute(**kwargs):  # noqa: ANN003, ANN202
@@ -945,7 +1001,11 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
     monkeypatch.setattr(
         orchestrator.hypothesis_ledger,
         "task_proven_hypotheses",
-        lambda _task_id: {hypothesis.id: ["evidence-live"]},
+        lambda _task_id: (
+            {hypothesis.id: ["evidence-live"]}
+            if len(replay_devices) >= 2
+            else {}
+        ),
     )
     evidence: list[dict] = []
     context = _LiveProofContext(
@@ -1005,11 +1065,46 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
             replay,
         )
     context.hypotheses[0]["claim"] = hypothesis.claim
-    first = orchestrator.execute_live_proof_replay(
+    with pytest.raises(ValueError, match="non-none Oracle impact"):
+        orchestrator.execute_live_proof_replay(
+            task_id,
+            "secret-token",
+            replay.model_copy(
+                update={
+                    "oracle": replay.oracle.model_copy(update={"impact": "none"})
+                }
+            ),
+        )
+    rejected = orchestrator.execute_live_proof_replay(
         task_id, "secret-token", replay
     )
-    second = orchestrator.execute_live_proof_replay(
+    inconclusive = orchestrator.execute_live_proof_replay(
         task_id, "secret-token", replay
+    )
+    package_only = orchestrator.execute_live_proof_replay(
+        task_id,
+        "secret-token",
+        replay.model_copy(
+            update={
+                "poc": replay.poc.model_copy(
+                    update={"package_name": "io.apkscanner.poc.renamed"}
+                )
+            }
+        ),
+    )
+    working_replay = replay.model_copy(
+        update={
+            "rationale": (
+                "Replay a materially different ordinary-app strategy after inspecting "
+                "the first platform receipt."
+            )
+        }
+    )
+    first = orchestrator.execute_live_proof_replay(
+        task_id, "secret-token", working_replay
+    )
+    second = orchestrator.execute_live_proof_replay(
+        task_id, "secret-token", working_replay
     )
     unrelated_hypothesis_id = "11111111-2222-4333-8444-555555555555"
     context.hypotheses.append(
@@ -1022,15 +1117,38 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
     unrelated = orchestrator.execute_live_proof_replay(
         task_id,
         "secret-token",
-        replay.model_copy(
-            update={"hypothesis_id": unrelated_hypothesis_id}
+        working_replay.model_copy(
+            update={
+                "hypothesis_id": unrelated_hypothesis_id,
+                "poc": working_replay.poc.model_copy(
+                    update={"package_name": "io.apkscanner.poc.anotherrename"}
+                ),
+            }
+        ),
+    )
+    context.round_index = settings.agent_max_rounds
+    limited = orchestrator.execute_live_proof_replay(
+        task_id,
+        "secret-token",
+        working_replay.model_copy(
+            update={
+                "rationale": "Try one more materially different replay after the budget."
+            }
         ),
     )
 
-    assert captured[0].hypothesis_id == hypothesis.id
-    assert captured[0].entry_point_id == entry_id
+    assert rejected["accepted"] is False
+    assert rejected["executed"] is False
+    assert rejected["deduplicated"] is False
+    assert captured[1].hypothesis_id == hypothesis.id
+    assert captured[1].entry_point_id == entry_id
+    assert inconclusive["result"] == "inconclusive"
+    assert inconclusive["executed"] is True
+    assert package_only["executed"] is False
+    assert package_only["deduplicated_strategy"] is True
+    assert package_only["prior_result"] == "inconclusive"
     assert first["result"] == "reproduced_blackbox"
-    assert replay_devices == ["device-b"]
+    assert replay_devices == ["device-b", "device-b"]
     assert first["evidence_ids"] == ["evidence-live"]
     assert first["deduplicated"] is False
     first_unsigned = {
@@ -1052,7 +1170,20 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
     assert unrelated["executed"] is False
     assert unrelated["deduplicated_strategy"] is True
     assert unrelated["prior_hypothesis_id"] == hypothesis.id
-    assert len(captured) == 1
+    assert limited["accepted"] is False
+    assert limited["executed"] is False
+    assert limited["limit_reached"] is True
+    assert limited["maximum_replays"] == settings.agent_max_rounds
+    assert len(captured) == 3
+
+    fallback = orchestrator._platform_proof_fallback_result(
+        task_id,
+        agent_error="model emitted prose before JSON",
+    )
+    assert fallback is not None
+    assert fallback.result.result == "reproduced_blackbox"
+    assert fallback.result.evidence_ids == ["evidence-live"]
+    assert fallback.usage == {"source": "platform_proof_fallback"}
 
 
 def test_live_proof_evidence_is_immediately_materialized(

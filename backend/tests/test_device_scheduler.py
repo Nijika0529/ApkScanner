@@ -15,7 +15,7 @@ from apkscanner.device import (
 )
 from apkscanner.models import EntryPoint
 from apkscanner.schemas import AgentOracleSpec, AgentPocSpec
-from apkscanner.tools import CommandResult
+from apkscanner.tools import CommandResult, ToolRunner
 
 
 def test_settings_parse_a_comma_separated_device_pool(
@@ -72,10 +72,7 @@ def test_fully_leased_device_pool_is_busy_but_still_available() -> None:
                     both_acquired.set()
             assert release.wait(timeout=5)
 
-    workers = [
-        threading.Thread(target=hold, args=(f"task-{index}",))
-        for index in range(2)
-    ]
+    workers = [threading.Thread(target=hold, args=(f"task-{index}",)) for index in range(2)]
     for worker in workers:
         worker.start()
     assert both_acquired.wait(timeout=5)
@@ -237,10 +234,7 @@ def test_device_pool_assigns_two_tasks_to_distinct_devices() -> None:
                     both_acquired.set()
             assert release.wait(timeout=5)
 
-    workers = [
-        threading.Thread(target=hold, args=(f"task-{index}",))
-        for index in range(2)
-    ]
+    workers = [threading.Thread(target=hold, args=(f"task-{index}",)) for index in range(2)]
     for worker in workers:
         worker.start()
     assert both_acquired.wait(timeout=5)
@@ -718,6 +712,7 @@ def test_missing_optional_probe_does_not_emit_a_failed_probe_broadcast(settings)
 def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
     settings,
     tmp_path,
+    monkeypatch,
 ) -> None:  # noqa: ANN001
     class PocRunner:
         request_id = ""
@@ -740,10 +735,11 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
                 )
             elif "uiautomator" in argv:
                 cls.ui_dump_count += 1
+                stdout = "UI hierarchy dumped"
+            elif "cat" in argv and any("apkscanner-ui-" in item for item in argv):
                 stdout = (
-                    '<hierarchy><node package="com.example.target" text="" />'
-                    "</hierarchy>"
-                    if cls.ui_dump_count == 1
+                    '<hierarchy><node package="com.example.target" text="" /></hierarchy>'
+                    if cls.ui_dump_count < 3
                     else (
                         '<hierarchy><node package="com.example.target" '
                         'text="Imported secret" /></hierarchy>'
@@ -757,6 +753,7 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
         replace(settings, adb_serial="cloud-device:5555"),
         PocRunner(),  # type: ignore[arg-type]
     )
+    monkeypatch.setattr("apkscanner.device.time.sleep", lambda _seconds: None)
     apk = tmp_path / "poc.apk"
     apk.write_bytes(b"APK")
     spec = AgentPocSpec(
@@ -780,35 +777,89 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
         test_case_id="agent-r1-1",
         build_metadata={"compile_api": 23, "min_api": 26, "target_api": 36},
     )
-    by_kind = {
-        kind: metadata for kind, _command_result, metadata in result.commands
-    }
+    by_kind = {kind: metadata for kind, _command_result, metadata in result.commands}
 
     assert by_kind["blackbox.poc_logcat"]["poc_success"] is True
     assert by_kind["blackbox.poc_logcat"]["poc_claimed_security_impact"] is True
     assert by_kind["blackbox.device_profile"]["device_api"] == "33"
-    assert (
-        by_kind["blackbox.device_profile"]["device_api_matches_poc_target"]
-        is False
-    )
-    assert (
-        by_kind["blackbox.device_profile"]["device_api_satisfies_poc_min"]
-        is True
-    )
+    assert by_kind["blackbox.device_profile"]["device_api_matches_poc_target"] is False
+    assert by_kind["blackbox.device_profile"]["device_api_satisfies_poc_min"] is True
     assert by_kind["blackbox.device_profile"]["poc_runtime_compatible"] is True
     assert "blackbox.poc_pre_uninstall" in by_kind
     assert "security_impact_observed" not in by_kind["blackbox.poc_logcat"]
-    assert (
-        by_kind["blackbox.poc_ui_baseline"]["target_text_present"]
-        is False
-    )
+    assert by_kind["blackbox.poc_ui_baseline"]["target_text_present"] is False
+    assert by_kind["blackbox.poc_ui_wake"]["action"] == "wake_display"
+    assert by_kind["blackbox.poc_ui_unlock"]["action"] == "dismiss_keyguard"
     assert by_kind["blackbox.poc_ui_dump"]["security_impact_observed"] is True
+    assert by_kind["blackbox.poc_system_logcat"]["background_activity_start_blocked"] is False
     assert by_kind["blackbox.poc_ui_dump"]["oracle"]["matched"] is True
+    assert by_kind["blackbox.poc_ui_dump"]["poll_attempts"] == 2
     assert (
-        by_kind["blackbox.poc_ui_dump"]["oracle"]["observation"][
-            "target_text_transition"
-        ]
-        is True
+        by_kind["blackbox.poc_ui_dump"]["oracle"]["observation"]["target_text_transition"] is True
+    )
+
+
+def test_ui_hierarchy_retry_recovers_from_android_null_root(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    class TransientUiRunner:
+        dump_attempts = 0
+
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @classmethod
+        def run(cls, argv, **_kwargs):  # noqa: ANN001, ANN206
+            if "uiautomator" in argv:
+                cls.dump_attempts += 1
+                if cls.dump_attempts == 1:
+                    return CommandResult(argv, 1, "", "ERROR: null root node returned")
+                return CommandResult(argv, 0, "UI hierarchy dumped", "")
+            if "cat" in argv and any("apkscanner-ui-" in item for item in argv):
+                return CommandResult(
+                    argv,
+                    0,
+                    '<hierarchy><node package="com.example.target" text="ready" /></hierarchy>',
+                    "",
+                )
+            return CommandResult(argv, 0, "", "")
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        TransientUiRunner(),  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr("apkscanner.device.time.sleep", lambda _seconds: None)
+
+    result, attempts = adapter._dump_ui_hierarchy_with_retry(budget=None, cap=10)
+
+    assert result.exit_code == 0
+    assert "text=\"ready\"" in result.stdout
+    assert attempts == 2
+
+
+def test_background_activity_start_denial_is_attributed_to_target_package(
+    settings,
+) -> None:  # noqa: ANN001
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        ToolRunner(30),
+    )
+    output = (
+        "W/ActivityTaskManager: Background activity start "
+        "[callingPackage: io.apkscanner.vulntest; "
+        "allowBackgroundActivityStart: false]\n"
+        "E/ActivityTaskManager: Abort background activity starts from 10421"
+    )
+
+    assert adapter._background_activity_start_blocked(
+        output,
+        "io.apkscanner.vulntest",
+    )
+    assert not adapter._background_activity_start_blocked(
+        output,
+        "com.example.other",
     )
 
 
@@ -978,14 +1029,9 @@ def test_poc_owned_ui_cannot_forge_a_target_security_impact() -> None:
 
     metadata = AdbDeviceAdapter._evaluate_ui_oracle(
         oracle,
-        (
-            '<hierarchy><node package="io.apkscanner.poc.test" '
-            'text="Imported secret" /></hierarchy>'
-        ),
+        ('<hierarchy><node package="io.apkscanner.poc.test" text="Imported secret" /></hierarchy>'),
         package_name="com.example.target",
-        baseline_output=(
-            '<hierarchy><node package="com.example.target" text="" /></hierarchy>'
-        ),
+        baseline_output=('<hierarchy><node package="com.example.target" text="" /></hierarchy>'),
         baseline_valid=True,
     )
 
@@ -1000,8 +1046,7 @@ def test_preexisting_target_ui_text_is_not_a_new_impact() -> None:
         impact="unauthorized_data_access",
     )
     target_ui = (
-        '<hierarchy><node package="com.example.target" '
-        'text="Imported secret" /></hierarchy>'
+        '<hierarchy><node package="com.example.target" text="Imported secret" /></hierarchy>'
     )
 
     metadata = AdbDeviceAdapter._evaluate_ui_oracle(
@@ -1013,10 +1058,7 @@ def test_preexisting_target_ui_text_is_not_a_new_impact() -> None:
     )
 
     assert metadata["oracle"]["matched"] is True
-    assert (
-        metadata["oracle"]["observation"]["target_text_transition"]
-        is False
-    )
+    assert metadata["oracle"]["observation"]["target_text_transition"] is False
     assert metadata["security_impact_observed"] is False
 
 
@@ -1037,10 +1079,7 @@ def test_process_crash_oracle_requires_the_target_process() -> None:
     )
     target = AdbDeviceAdapter._evaluate_target_log_oracle(
         oracle,
-        (
-            "FATAL EXCEPTION: main\n"
-            "Process: com.example.target:remote, PID: 456"
-        ),
+        ("FATAL EXCEPTION: main\nProcess: com.example.target:remote, PID: 456"),
         "com.example.target",
     )
 

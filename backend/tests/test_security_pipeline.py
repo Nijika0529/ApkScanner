@@ -119,10 +119,41 @@ def test_hypothesis_ledger_tracks_arguments_and_concrete_proof(settings) -> None
             },
         ],
     )
+    ui_proof_id = ledger.plan_proof(
+        task_id=task_id,
+        test_case_id="agent-ui",
+        request=request,
+    )
+    ledger.start_proof(ui_proof_id)
+    ledger.complete_proof(
+        ui_proof_id,
+        [
+            {
+                "id": "poc-launch-ui",
+                "kind": "blackbox.poc_launch",
+                "exit_code": 0,
+                "metadata": {"request_id": "request-ui"},
+            },
+            {
+                "id": "poc-ui",
+                "kind": "blackbox.poc_ui_dump",
+                "exit_code": 0,
+                "metadata": {
+                    "request_id": "request-ui",
+                    "security_impact_observed": True,
+                    "oracle": {
+                        "matched": True,
+                        "observation": {"target_text_transition": True},
+                    },
+                },
+            },
+        ],
+    )
     with database.session_factory() as session:
         hypothesis = session.get(SecurityHypothesis, hypothesis_id)
         proof = session.get(ProofAttempt, proof_id)
         reachability_only = session.get(ProofAttempt, reachability_only_id)
+        ui_proof = session.get(ProofAttempt, ui_proof_id)
         assert hypothesis is not None
         assert proof is not None
         assert reachability_only is not None
@@ -133,6 +164,11 @@ def test_hypothesis_ledger_tracks_arguments_and_concrete_proof(settings) -> None
         assert reachability_only.status == "inconclusive"
         assert reachability_only.harm_demonstrated is False
         assert reachability_only.oracle["execution_demonstrated"] is True
+        assert ui_proof is not None
+        assert ui_proof.status == "proven"
+        assert ui_proof.harm_demonstrated is True
+        assert ui_proof.oracle["poc_succeeded"] is False
+        assert ui_proof.oracle["platform_observed_poc_effect"] is True
         arguments = list(
             session.scalars(
                 select(HypothesisArgument).where(

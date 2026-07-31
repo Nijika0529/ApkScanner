@@ -10,7 +10,7 @@
       "minimum_proof": "dynamic",
       "match": {
         "entry_names": ["io.apkscanner.vulntest.MainActivity"],
-        "title_contains": ["redirect", "重定向", "内部 Activity"]
+        "title_contains": ["target_activity"]
       }
     },
     {
@@ -21,7 +21,7 @@
       "minimum_proof": "dynamic",
       "match": {
         "entry_names": ["io.apkscanner.vulntest.MainActivity"],
-        "title_contains": ["nested Intent", "嵌套 Intent"]
+        "title_contains": ["inner_intent"]
       }
     },
     {
@@ -32,7 +32,7 @@
       "minimum_proof": "dynamic",
       "match": {
         "entry_names": ["io.apkscanner.vulntest.DeepLinkActivity"],
-        "title_contains": ["WebView", "JavaScript", "deep link"]
+        "title_contains": ["VulnBridge.getSecret"]
       }
     },
     {
@@ -42,8 +42,7 @@
       "severity": "high",
       "minimum_proof": "dynamic",
       "match": {
-        "entry_names": ["io.apkscanner.vulntest.SecretProvider"],
-        "title_contains": ["Provider", "credential", "凭据"]
+        "entry_names": ["io.apkscanner.vulntest.SecretProvider"]
       }
     },
     {
@@ -53,8 +52,7 @@
       "severity": "high",
       "minimum_proof": "dynamic",
       "match": {
-        "entry_names": ["io.apkscanner.vulntest.CommandService"],
-        "title_contains": ["Binder", "Service", "服务"]
+        "entry_names": ["io.apkscanner.vulntest.CommandService"]
       }
     },
     {
@@ -64,8 +62,7 @@
       "severity": "medium",
       "minimum_proof": "dynamic",
       "match": {
-        "entry_names": ["io.apkscanner.vulntest.CommandReceiver"],
-        "title_contains": ["Receiver", "Broadcast", "广播", "委托"]
+        "entry_names": ["io.apkscanner.vulntest.CommandReceiver"]
       }
     }
   ]

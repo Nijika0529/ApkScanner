@@ -684,6 +684,7 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
             context = kwargs["platform_context"]
             phase = context["phase"]
             phases.append(phase)
+            assert context["exploration_limits"]["max_rounds"] == 3
             hypothesis_id = context["security_hypotheses"][0]["id"]
             requested_tests = []
             if phase == "test_planning":

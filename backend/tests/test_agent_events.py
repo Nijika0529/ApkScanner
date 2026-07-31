@@ -26,6 +26,39 @@ def test_unknown_sdk_notifications_are_safely_summarized() -> None:
     assert len(event.dedupe_key) == 64
 
 
+def test_high_frequency_codex_deltas_and_user_messages_are_not_persisted() -> None:
+    delta = normalize_codex_notification(
+        SimpleNamespace(
+            method="item/reasoning/textDelta",
+            payload={"delta": "private reasoning fragment"},
+        )
+    )
+    user_message = normalize_codex_notification(
+        SimpleNamespace(
+            method="item/started",
+            payload={"item": {"id": "item-1", "type": "userMessage"}},
+        )
+    )
+
+    assert delta is None
+    assert user_message is None
+
+
+def test_redundant_usage_and_diff_snapshots_are_not_persisted() -> None:
+    assert (
+        normalize_codex_notification(
+            SimpleNamespace(method="thread/tokenUsage/updated", payload={})
+        )
+        is None
+    )
+    assert (
+        normalize_codex_notification(
+            SimpleNamespace(method="turn/diff/updated", payload={})
+        )
+        is None
+    )
+
+
 def test_worker_events_redact_secret_keys_and_values() -> None:
     event = runtime_event_from_mapping(
         {

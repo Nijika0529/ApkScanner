@@ -27,7 +27,7 @@ def main() -> None:
     except (OSError, json.JSONDecodeError) as exc:
         raise SystemExit(f"invalid proof replay JSON: {exc}") from exc
     request = Request(
-        f"{endpoint}/api/v1/internal/tasks/{task_id}/proof-replay",
+        endpoint,
         data=json.dumps(payload, separators=(",", ":")).encode(),
         headers={
             "Content-Type": "application/json",

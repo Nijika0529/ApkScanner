@@ -176,10 +176,42 @@ class AgentWorkspaceManager:
     def forget_scan(self, scan_id: str) -> None:
         """Forget in-memory leases after the container is gone; keep files for audit/ingestion."""
         with self._lock:
-            self._leases = {
-                key: value for key, value in self._leases.items() if key[0] != scan_id
-            }
+            terminal = [value for key, value in self._leases.items() if key[0] == scan_id]
+            self._leases = {key: value for key, value in self._leases.items() if key[0] != scan_id}
             self._used_uids.pop(scan_id, None)
+            for session in terminal:
+                self._purge_shell_snapshots(session)
+
+    def forget_task(self, scan_id: str, task_id: str) -> None:
+        """Release a terminal task's active-session slots while retaining its audit files.
+
+        UIDs remain reserved until the scan container is removed. Reusing a UID
+        inside the same container could let a later task read processes or files
+        that survived an imperfect cleanup.
+        """
+        with self._lock:
+            terminal = [
+                value
+                for key, value in self._leases.items()
+                if key[0] == scan_id and key[1] == task_id
+            ]
+            self._leases = {
+                key: value
+                for key, value in self._leases.items()
+                if not (key[0] == scan_id and key[1] == task_id)
+            }
+            for session in terminal:
+                self._purge_shell_snapshots(session)
+
+    @staticmethod
+    def _purge_shell_snapshots(session: SessionWorkspace) -> None:
+        """Never retain SDK login-shell environment captures in an audit workspace."""
+
+        snapshots = session.codex_home / "shell_snapshots"
+        if snapshots.is_symlink() or snapshots.is_file():
+            snapshots.unlink(missing_ok=True)
+        elif snapshots.is_dir():
+            shutil.rmtree(snapshots)
 
     def _allocate_uid(self, scan_id: str) -> int:
         used = self._used_uids.setdefault(scan_id, set())

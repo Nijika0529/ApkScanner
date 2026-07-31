@@ -474,6 +474,57 @@ class AgentObjectionResolution(BaseModel):
     evidence_ids: list[str] = Field(default_factory=list, max_length=100)
 
 
+class AgentTestCaseSummary(BaseModel):
+    """A bounded model-authored summary; platform ProofAttempt rows remain authoritative."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    test_case_id: str = Field(min_length=1, max_length=128)
+    hypothesis_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9-]{36}$",
+    )
+    description: str = Field(min_length=1, max_length=2000)
+    status: Literal["planned", "executed", "passed", "failed", "inconclusive"]
+    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
+
+
+def _normalize_wire_extras(request: dict[str, Any]) -> dict[str, Any]:
+    """Convert the closed Responses wire representation into Android extras."""
+
+    wire_extras = request.get("extras")
+    if not isinstance(wire_extras, list):
+        return request
+    extras: dict[str, StrictStr | StrictInt | StrictBool] = {}
+    for item in wire_extras:
+        if not isinstance(item, dict):
+            return {**request, "extras": {"wire_extras": item}}
+        key = item.get("key")
+        value_type = item.get("value_type")
+        value_key = f"{value_type}_value"
+        value = item.get(value_key)
+        value_matches_type = (
+            (value_type == "string" and isinstance(value, str))
+            or (value_type == "integer" and type(value) is int)
+            or (value_type == "boolean" and type(value) is bool)
+        )
+        unused_values_are_null = all(
+            item.get(name) is None
+            for name in ("string_value", "integer_value", "boolean_value")
+            if name != value_key
+        )
+        if (
+            not isinstance(key, str)
+            or key in extras
+            or value_type not in {"string", "integer", "boolean"}
+            or not value_matches_type
+            or not unused_values_are_null
+        ):
+            return {**request, "extras": {"wire_extras": item}}
+        extras[key] = value
+    return {**request, "extras": extras}
+
+
 class AgentInvestigationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -507,7 +558,7 @@ class AgentInvestigationResult(BaseModel):
         default_factory=list,
         max_length=100,
     )
-    test_cases: list[dict[str, Any]] = Field(max_length=200)
+    test_cases: list[AgentTestCaseSummary] = Field(max_length=200)
     evidence_ids: list[str] = Field(max_length=500)
     severity_proposal: Literal["critical", "high", "medium", "low", "info"]
     confidence: Literal["high", "medium", "low"]
@@ -531,17 +582,22 @@ class AgentInvestigationResult(BaseModel):
         accepted: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
         for index, request in enumerate(requested_tests):
-            normalized_request = request
-            if isinstance(request, dict):
-                uri = request.get("uri")
+            normalized_request = (
+                _normalize_wire_extras(request) if isinstance(request, dict) else request
+            )
+            if isinstance(normalized_request, dict):
+                uri = normalized_request.get("uri")
                 if (
                     isinstance(uri, str)
                     and uri.startswith("content://")
-                    and request.get("operation") != "call"
-                    and (request.get("method") is not None or request.get("argument") is not None)
+                    and normalized_request.get("operation") != "call"
+                    and (
+                        normalized_request.get("method") is not None
+                        or normalized_request.get("argument") is not None
+                    )
                 ):
                     normalized_request = {
-                        **request,
+                        **normalized_request,
                         "operation": "call",
                     }
                 request_for_oracle = normalized_request
@@ -731,7 +787,15 @@ class BenchmarkEvaluationOut(ApiModel):
 
 
 def _inline_local_json_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:
-    """Inline Pydantic's local definitions for provider-compatible tool schemas."""
+    """Inline and normalize Pydantic definitions for provider tool schemas.
+
+    DeepSeek's Responses endpoint currently accepts ``additionalProperties`` only
+    as a boolean and requires every declared object property to appear in
+    ``required``. Pydantic emits a nested schema for typed dictionaries and omits
+    defaulted fields from ``required``. Keep their wire object shape open, require
+    the model to spell out every field, then retain stricter semantic checks in
+    ``AgentInvestigationResult.model_validate`` after the turn.
+    """
     definitions = schema.pop("$defs", {})
 
     def inline(value: Any, stack: tuple[str, ...] = ()) -> Any:
@@ -753,11 +817,18 @@ def _inline_local_json_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:
             }
             return inline(merged, (*stack, name))
 
-        return {
-            key: inline(item, stack)
-            for key, item in value.items()
-            if key not in {"$defs", "$schema"}
-        }
+        normalized: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in {"$defs", "$schema"}:
+                continue
+            if key == "additionalProperties" and isinstance(item, dict):
+                normalized[key] = True
+                continue
+            normalized[key] = inline(item, stack)
+        properties = normalized.get("properties")
+        if isinstance(properties, dict):
+            normalized["required"] = list(properties)
+        return normalized
 
     result = inline(schema)
     if not isinstance(result, dict):
@@ -765,6 +836,40 @@ def _inline_local_json_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-AGENT_RESULT_JSON_SCHEMA = _inline_local_json_schema_refs(
-    AgentInvestigationResult.model_json_schema()
-)
+def _agent_result_wire_schema() -> dict[str, Any]:
+    schema = _inline_local_json_schema_refs(AgentInvestigationResult.model_json_schema())
+    requested_test = schema["properties"]["requested_tests"]["items"]
+    requested_test["properties"]["extras"] = {
+        "type": "array",
+        "maxItems": 16,
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 100,
+                    "pattern": r"^[A-Za-z0-9_.:-]+$",
+                },
+                "value_type": {
+                    "type": "string",
+                    "enum": ["string", "integer", "boolean"],
+                },
+                "string_value": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "integer_value": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                "boolean_value": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+            },
+            "required": [
+                "key",
+                "value_type",
+                "string_value",
+                "integer_value",
+                "boolean_value",
+            ],
+        },
+    }
+    return schema
+
+
+AGENT_RESULT_JSON_SCHEMA = _agent_result_wire_schema()

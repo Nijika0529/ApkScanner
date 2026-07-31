@@ -351,7 +351,15 @@ class HypothesisLedger:
             and item.get("metadata", {}).get("poc_claimed_security_impact") is True
             for item in evidence
         )
-        execution_demonstrated = probe_succeeded or poc_succeeded
+        platform_observed_poc_effect = any(
+            item.get("kind") == "blackbox.poc_ui_dump"
+            and item.get("metadata", {}).get("request_id") in poc_request_ids
+            and item.get("metadata", {}).get("security_impact_observed") is True
+            for item in evidence
+        )
+        execution_demonstrated = (
+            probe_succeeded or poc_succeeded or platform_observed_poc_effect
+        )
         impact_observed = any(
             item.get("metadata", {}).get("security_impact_observed") is True for item in evidence
         )
@@ -380,6 +388,7 @@ class HypothesisLedger:
                 "correlated_poc_result": poc_correlated,
                 "poc_succeeded": poc_succeeded,
                 "poc_claimed_security_impact": poc_claimed_impact,
+                "platform_observed_poc_effect": platform_observed_poc_effect,
                 "execution_demonstrated": execution_demonstrated,
                 "security_impact_observed": impact_observed,
                 "oracle_refuted": oracle_refuted,

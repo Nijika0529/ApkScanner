@@ -27,7 +27,7 @@ from .adb_gateway import AdbGatewayRequest, AdbGatewayResponse
 from .agent_events import AgentCancelledError, AgentRuntimeEvent
 from .agent_prompt import developer_instructions, investigation_prompt
 from .artifacts import ArtifactStore
-from .codex_runner import CodexInvestigator
+from .codex_runner import CodexInvestigator, CodexRunResult
 from .config import Settings
 from .db import Database
 from .device import AdbDeviceAdapter, AdbDevicePool, DeviceLeaseCancelledError
@@ -59,6 +59,7 @@ from .repository import add_event, now
 from .rules import BuiltinRuleEngine
 from .schemas import (
     AGENT_RESULT_JSON_SCHEMA,
+    AgentInvestigationResult,
     AgentOracleSpec,
     AgentProofReplay,
     AgentRequestedTest,
@@ -111,6 +112,7 @@ class _LiveProofContext:
     lock: threading.Lock = field(default_factory=threading.Lock)
     responses: dict[str, dict[str, Any]] = field(default_factory=dict)
     proof_strategies: dict[str, dict[str, Any]] = field(default_factory=dict)
+    executed_semantic_strategies: dict[str, dict[str, Any]] = field(default_factory=dict)
     proven_semantic_strategies: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
@@ -351,6 +353,11 @@ class ScanOrchestrator:
             selected_hypothesis = next(
                 item for item in context.hypotheses if str(item["id"]) == hypothesis_id
             )
+            if replay.oracle.impact == "none":
+                raise ValueError(
+                    "live proof replay requires a non-none Oracle impact and a concrete "
+                    "harm hypothesis; use the ADB gateway for reachability diagnostics"
+                )
             if replay.oracle.impact != "none" and _is_reachability_only_claim(
                 selected_hypothesis.get("claim")
             ):
@@ -363,6 +370,48 @@ class ScanOrchestrator:
                 entry_id = context.default_entry_id
             if entry_id not in {entry.id for entry in context.entries}:
                 raise ValueError("proof replay entry point is outside this task")
+            if context.round_index >= self.settings.agent_max_rounds:
+                response = {
+                    "schema_version": "1.0",
+                    "accepted": False,
+                    "executed": False,
+                    "hypothesis_id": hypothesis_id,
+                    "entry_point_id": entry_id,
+                    "result": "inconclusive",
+                    "evidence_ids": [],
+                    "evidence": [],
+                    "gaps": [
+                        "The task live-proof replay budget is exhausted. Stop changing the PoC "
+                        "and return a conclusion from the existing platform evidence."
+                    ],
+                    "deduplicated": False,
+                    "limit_reached": True,
+                    "maximum_replays": self.settings.agent_max_rounds,
+                }
+                receipt_payload = json.dumps(
+                    response,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                response["receipt_signature"] = hmac.new(
+                    token.encode(),
+                    receipt_payload,
+                    hashlib.sha256,
+                ).hexdigest()
+                context.responses[signature] = response
+                self._record_exploration_event(
+                    context.scan_id,
+                    context.task_id,
+                    "proof_replay.limit_reached",
+                    "任务级 PoC 实时重放次数已达到上限",
+                    {
+                        "source": "platform",
+                        "hypothesis_id": hypothesis_id,
+                        "entry_point_id": entry_id,
+                        "maximum_replays": self.settings.agent_max_rounds,
+                    },
+                )
+                return response
             request = AgentRequestedTest(
                 hypothesis_id=hypothesis_id,
                 entry_point_id=entry_id,
@@ -379,7 +428,6 @@ class ScanOrchestrator:
                 json.dumps(
                     {
                         "entry_point_id": entry_id,
-                        "poc_package": replay.poc.package_name,
                         "extras": replay.extras,
                         "oracle": replay.oracle.model_dump(mode="json"),
                         "rationale": " ".join(replay.rationale.lower().split()),
@@ -434,6 +482,59 @@ class ScanOrchestrator:
                         "prior_hypothesis_id": prior_proven_strategy["hypothesis_id"],
                         "entry_point_id": entry_id,
                         "semantic_strategy_signature": (semantic_strategy_signature),
+                    },
+                )
+                return response
+            prior_executed_strategy = context.executed_semantic_strategies.get(
+                semantic_strategy_signature
+            )
+            if prior_executed_strategy is not None:
+                response = {
+                    "schema_version": "1.0",
+                    "accepted": True,
+                    "executed": False,
+                    "hypothesis_id": hypothesis_id,
+                    "entry_point_id": entry_id,
+                    "result": "inconclusive",
+                    "evidence_ids": [],
+                    "evidence": [],
+                    "gaps": [
+                        "This entry, input, Oracle, and exploit rationale already ran. "
+                        "Changing only the PoC package or rewriting equivalent source is "
+                        "not a materially different strategy. Inspect the existing evidence "
+                        "and describe the changed security strategy before another replay."
+                    ],
+                    "deduplicated": False,
+                    "deduplicated_strategy": True,
+                    "prior_hypothesis_id": prior_executed_strategy["hypothesis_id"],
+                    "prior_result": prior_executed_strategy["result"],
+                    "prior_evidence_ids": prior_executed_strategy["evidence_ids"],
+                }
+                receipt_payload = json.dumps(
+                    response,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                response["receipt_signature"] = hmac.new(
+                    token.encode(),
+                    receipt_payload,
+                    hashlib.sha256,
+                ).hexdigest()
+                context.responses[signature] = response
+                self._record_exploration_event(
+                    context.scan_id,
+                    context.task_id,
+                    "proof_replay.semantic_deduplicated",
+                    "同语义 PoC 已执行，修改包名或等价源码不再重复占用设备",
+                    {
+                        "source": "platform",
+                        "hypothesis_id": hypothesis_id,
+                        "prior_hypothesis_id": prior_executed_strategy[
+                            "hypothesis_id"
+                        ],
+                        "entry_point_id": entry_id,
+                        "semantic_strategy_signature": semantic_strategy_signature,
+                        "prior_result": prior_executed_strategy["result"],
                     },
                 )
                 return response
@@ -591,10 +692,21 @@ class ScanOrchestrator:
                 receipt_payload,
                 hashlib.sha256,
             ).hexdigest()
-            context.responses[signature] = response
+            # Validation/build rejection has no dynamic side effect and may be
+            # fixed by editing the PoC files while keeping the replay JSON
+            # unchanged. Caching that receipt would make the corrected source
+            # impossible to submit. Executed requests remain idempotent.
+            if accepted or executed:
+                context.responses[signature] = response
             if strategy_signature is not None and executed:
                 context.proof_strategies[strategy_signature] = {
                     "hypothesis_id": hypothesis_id,
+                    "evidence_ids": list(response["evidence_ids"]),
+                }
+            if executed:
+                context.executed_semantic_strategies[semantic_strategy_signature] = {
+                    "hypothesis_id": hypothesis_id,
+                    "result": result,
                     "evidence_ids": list(response["evidence_ids"]),
                 }
             if result == FindingStatus.REPRODUCED_BLACKBOX.value:
@@ -1241,10 +1353,7 @@ class ScanOrchestrator:
                 code_index=result.code_index,
             )
             fresh_run = (scan.stats or {}).get("fresh_run")
-            isolated_fresh_run = (
-                isinstance(fresh_run, dict)
-                and fresh_run.get("mode") == "isolated"
-            )
+            isolated_fresh_run = isinstance(fresh_run, dict) and fresh_run.get("mode") == "isolated"
             if isolated_fresh_run:
                 version_diff = None
                 pattern_matches = []
@@ -1814,6 +1923,7 @@ class ScanOrchestrator:
         except AgentCancelledError:
             self._mark_task_canceled(scan_id, task_id)
         finally:
+            self.codex.close_task(scan_id, task_id)
             with self._task_cancellations_lock:
                 if self._task_cancellations.get(task_id) is cancel_event:
                     self._task_cancellations.pop(task_id, None)
@@ -1920,11 +2030,7 @@ class ScanOrchestrator:
                     "source": "platform",
                     "run_id": f"{task.id}:attempt:{task.attempts}",
                     "agent_backend": agent_backend,
-                    "model": (
-                        self.settings.codex_model
-                        if agent_backend == "codex"
-                        else None
-                    ),
+                    "model": (self.settings.codex_model if agent_backend == "codex" else None),
                     "entry_point_ids": list(task.target_entry_ids),
                     "hypotheses": list(task.hypotheses),
                     "continuation_number": continuation_context.get("continuation_number"),
@@ -2202,7 +2308,7 @@ class ScanOrchestrator:
                     ),
                     "further_test_rounds_available": (phase != "final_evaluation"),
                     "exploration_limits": {
-                        "max_rounds": None,
+                        "max_rounds": self.settings.agent_max_rounds,
                         "tests_per_round": self.settings.agent_tests_per_round,
                     },
                     "continuation": continuation_context or None,
@@ -2964,6 +3070,7 @@ class ScanOrchestrator:
                         and self.hypothesis_ledger.task_proof_result(task_id) is None
                         and prepared
                         and not budget.expired
+                        and completed_rounds < self.settings.agent_max_rounds
                     ):
                         planning_result = agent_result
                         planning_turn_id = planning_result.turn_id
@@ -3192,6 +3299,11 @@ class ScanOrchestrator:
         validated_payload: dict[str, Any] | None = None
         validated_result_value: str | None = None
         debate_policy["phase_counts"] = dict(phase_counts)
+        if agent_result is None:
+            agent_result = self._platform_proof_fallback_result(
+                task_id,
+                agent_error=agent_error,
+            )
         if agent_result:
             raw_payload = agent_result.result.model_dump(mode="json")
             validated_payload, validated_result_value = self._validated_agent_payload(
@@ -3422,6 +3534,55 @@ class ScanOrchestrator:
                 },
             )
             session.commit()
+
+    def _platform_proof_fallback_result(
+        self,
+        task_id: str,
+        *,
+        agent_error: str | None,
+    ) -> CodexRunResult | None:
+        """Keep an immutable platform proof terminal when model finalization fails."""
+
+        proven_hypotheses = self.hypothesis_ledger.task_proven_hypotheses(task_id)
+        if not proven_hypotheses:
+            return None
+        evidence_ids = list(
+            dict.fromkeys(
+                evidence_id
+                for hypothesis_evidence in proven_hypotheses.values()
+                for evidence_id in hypothesis_evidence
+            )
+        )
+        result = AgentInvestigationResult(
+            summary=(
+                "平台已通过普通应用身份、关联执行与危害 Oracle 完成动态证明；"
+                "模型最终结构化结论不可用时，保留不可变的平台证明终态。"
+            ),
+            result=FindingStatus.REPRODUCED_BLACKBOX.value,
+            hypotheses_tested=list(proven_hypotheses),
+            hypothesis_assessments=[],
+            review_objections=[],
+            objection_resolutions=[],
+            test_cases=[],
+            evidence_ids=evidence_ids,
+            severity_proposal=(
+                self.hypothesis_ledger.task_proven_severity(task_id) or "medium"
+            ),
+            confidence="high",
+            coverage_gaps=(
+                [f"Model finalization failed after platform proof: {agent_error}"]
+                if agent_error
+                else []
+            ),
+            followups=[],
+            requested_tests=[],
+        )
+        return CodexRunResult(
+            thread_id="platform-proof-fallback",
+            turn_id="platform-proof-fallback",
+            result=result,
+            usage={"source": "platform_proof_fallback"},
+        )
 
     @staticmethod
     def _raise_if_cancelled(cancel_event: threading.Event) -> None:
@@ -4034,6 +4195,7 @@ class ScanOrchestrator:
                 outcome = self.poc_builder.build(
                     workspace,
                     request.poc,
+                    oracle=request.oracle,
                     cancel_event=cancel_event,
                     visible_packages=(
                         (target_package,) if provider_request and target_package else ()
@@ -4464,11 +4626,7 @@ class ScanOrchestrator:
                 "allowed_write_roots": ["session_workspace", "session_tmp"],
                 "shared_scan_workspace_exposed": True,
                 "network_enabled": network_access,
-                "network_policy": (
-                    execution.shell_network
-                    if network_access
-                    else "disabled"
-                ),
+                "network_policy": (execution.shell_network if network_access else "disabled"),
                 "adb_enabled": adb_access,
                 "adb_evidence_policy": (
                     "exploration_only; ordinary-app replay required for proof"
@@ -5868,6 +6026,19 @@ class ScanOrchestrator:
                         evidence_id for attempt in attempts for evidence_id in attempt.evidence_ids
                     )
                 )
+                proof_rationales = list(
+                    dict.fromkeys(
+                        str(attempt.plan["rationale"])
+                        for attempt in attempts
+                        if isinstance(attempt.plan, dict)
+                        and isinstance(attempt.plan.get("rationale"), str)
+                        and str(attempt.plan["rationale"]).strip()
+                    )
+                )
+                proof_description = "\n\n".join(proof_rationales) or payload.get(
+                    "summary",
+                    hypothesis.impact or "Platform harm Oracle succeeded.",
+                )
                 dedupe = f"agent:{task.id}:hypothesis:{hypothesis.id}"
                 finding = session.scalar(
                     select(Finding).where(
@@ -5883,6 +6054,7 @@ class ScanOrchestrator:
                     "coverage_gaps": payload.get("coverage_gaps", []),
                     "harm_demonstrated": True,
                     "proof_attempt_ids": [attempt.id for attempt in attempts],
+                    "proof_rationales": proof_rationales,
                     "identity": finding_identity(
                         scan=scan,
                         rule_id="AGENT-ENTRY-INVESTIGATION",
@@ -5900,10 +6072,7 @@ class ScanOrchestrator:
                         rule_id="AGENT-ENTRY-INVESTIGATION",
                         source=agent_backend,
                         title=f"Validated hypothesis: {hypothesis.claim}",
-                        description=payload.get(
-                            "summary",
-                            hypothesis.impact or "Platform harm Oracle succeeded.",
-                        ),
+                        description=proof_description,
                         remediation=(
                             "Review the affected handler and enforce input validation, "
                             "caller authorization, and explicit trust-boundary checks."
@@ -5922,10 +6091,7 @@ class ScanOrchestrator:
                 else:
                     finding.source = agent_backend
                     finding.title = f"Validated hypothesis: {hypothesis.claim}"
-                    finding.description = payload.get(
-                        "summary",
-                        hypothesis.impact or "Platform harm Oracle succeeded.",
-                    )
+                    finding.description = proof_description
                     finding.severity = payload.get("platform_severity") or payload.get(
                         "severity_proposal", "medium"
                     )

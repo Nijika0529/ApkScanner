@@ -203,7 +203,10 @@ Platform 36 / Build Tools 36.1, and live Web Search available. SDK subagent fan-
 
 The keeper starts without provider credentials. Only the UID-scoped `docker exec` inherits
 `DEEPSEEK_API_KEY`; its value is absent from Docker argv, image metadata, manifests, and events.
-Codex shell-environment policy also excludes provider credentials from Agent-launched Bash tools.
+Codex shell-environment policy excludes provider credentials from Agent-launched Bash tools, and
+the SDK shell-snapshot feature is disabled because it snapshots the worker environment before that
+filter is applied and would otherwise persist the Provider key under private `CODEX_HOME`. Terminal
+task/scan cleanup also purges that generated directory as a defense-in-depth migration guard.
 
 Host mode is diagnostics-only and requires both `APKSCANNER_CODEX_ISOLATION=host` and
 `APKSCANNER_ALLOW_HOST_CODEX=true`. It has no container, UID, or resource boundary. Do not override

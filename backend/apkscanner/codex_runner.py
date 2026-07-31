@@ -108,9 +108,7 @@ class CodexInvestigator:
                     with self._client() as codex:
                         account = codex.account()
                         models = codex.models()
-                        capability["account"] = account.model_dump(
-                            mode="json", exclude_none=True
-                        )
+                        capability["account"] = account.model_dump(mode="json", exclude_none=True)
                         capability["model_count"] = len(models.data)
                 except Exception as exc:  # external process/auth surface
                     capability["available"] = False
@@ -201,9 +199,7 @@ class CodexInvestigator:
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="codex-investigation")
             future = executor.submit(consume_turn)
             effective_timeout = (
-                self.settings.task_timeout_seconds
-                if timeout_seconds is None
-                else timeout_seconds
+                self.settings.task_timeout_seconds if timeout_seconds is None else timeout_seconds
             )
             effective_timeout = min(
                 effective_timeout,
@@ -221,17 +217,13 @@ class CodexInvestigator:
                         {"thread_id": thread.id, "turn_id": handle.id},
                     )
                     executor.shutdown(wait=False, cancel_futures=True)
-                    raise AgentCancelledError(
-                        "Codex investigation was cancelled by the user"
-                    )
+                    raise AgentCancelledError("Codex investigation was cancelled by the user")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     with suppress(Exception):
                         handle.interrupt()
                     executor.shutdown(wait=False, cancel_futures=True)
-                    raise TimeoutError(
-                        f"Codex investigation exceeded {effective_timeout} seconds"
-                    )
+                    raise TimeoutError(f"Codex investigation exceeded {effective_timeout} seconds")
                 try:
                     turn = future.result(timeout=min(0.25, remaining))
                     break
@@ -352,11 +344,7 @@ class CodexInvestigator:
             gateway_environment=gateway_environment if role == "primary" else None,
         )
         effective_worker_timeout = min(
-            (
-                self.settings.task_timeout_seconds
-                if timeout_seconds is None
-                else timeout_seconds
-            ),
+            (self.settings.task_timeout_seconds if timeout_seconds is None else timeout_seconds),
             self.settings.codex_turn_timeout_seconds,
         )
         try:
@@ -374,7 +362,7 @@ class CodexInvestigator:
             ) from exc
         except PersistentWorkerTimeout as exc:
             raise TimeoutError(
-                "containerized Codex investigation exceeded its timeout: " f"{exc}"
+                f"containerized Codex investigation exceeded its timeout: {exc}"
             ) from exc
         except PersistentWorkerError as exc:
             self._discard_session(scan.id, task.id, task.attempts, role)
@@ -458,7 +446,12 @@ class CodexInvestigator:
                 self.executor.kill_session(container, agent_session)
 
             session_id = f"{task.id}:a{task.attempts}:{role}"
-            spool = self.settings.data_dir / "runtime" / "events" / f"{agent_session.workspace_key}.ndjson"
+            spool = (
+                self.settings.data_dir
+                / "runtime"
+                / "events"
+                / f"{agent_session.workspace_key}.ndjson"
+            )
             client = PersistentWorkerClient(
                 process,
                 session_id=session_id,
@@ -466,14 +459,14 @@ class CodexInvestigator:
                 cleanup=stop_session,
             )
             configuration = {
-            "developer_instructions": developer_instructions(direct_tool_access=True),
-            "model": self.settings.codex_model,
-            "model_provider": self.settings.codex_provider,
-            "reasoning_effort": self.settings.codex_reasoning_effort,
-            "provider_base_url": self.settings.deepseek_base_url,
-            "model_catalog_path": "/opt/apk-scanner/config/deepseek-models.json",
-            "workspace_path": agent_session.container_workspace,
-        }
+                "developer_instructions": developer_instructions(direct_tool_access=True),
+                "model": self.settings.codex_model,
+                "model_provider": self.settings.codex_provider,
+                "reasoning_effort": self.settings.codex_reasoning_effort,
+                "provider_base_url": self.settings.deepseek_base_url,
+                "model_catalog_path": "/opt/apk-scanner/config/deepseek-models.json",
+                "workspace_path": agent_session.container_workspace,
+            }
             thread_file = agent_session.root / "thread.json"
             resume_thread_id = self._read_thread_id(thread_file)
             try:
@@ -550,15 +543,26 @@ class CodexInvestigator:
     def close_scan(self, scan_id: str) -> None:
         with self._session_lock:
             sessions = [
-                self._sessions.pop(key)
-                for key in list(self._sessions)
-                if key[0] == scan_id
+                self._sessions.pop(key) for key in list(self._sessions) if key[0] == scan_id
             ]
         for active in sessions:
             with suppress(Exception):
                 active.client.close()
         self.executor.close_scan(scan_id)
         self.workspaces.forget_scan(scan_id)
+
+    def close_task(self, scan_id: str, task_id: str) -> None:
+        """Close all Agent roles owned by one terminal task and free its slots."""
+        with self._session_lock:
+            sessions = [
+                self._sessions.pop(key)
+                for key in list(self._sessions)
+                if key[0] == scan_id and key[1] == task_id
+            ]
+        for active in sessions:
+            with suppress(Exception):
+                active.client.close()
+        self.workspaces.forget_task(scan_id, task_id)
 
     def shutdown(self) -> None:
         with self._session_lock:
@@ -603,7 +607,27 @@ class CodexInvestigator:
         fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.S)
         if fence:
             text = fence.group(1)
-        return AgentInvestigationResult.model_validate(json.loads(text))
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as direct_error:
+            value = None
+            decoder = json.JSONDecoder()
+            # DeepSeek may prepend a short natural-language handoff despite a
+            # Responses output schema. Accept only one complete trailing JSON
+            # object; Pydantic still enforces the full closed business schema.
+            for match in re.finditer(r"\{", text):
+                try:
+                    candidate, end = decoder.raw_decode(text, match.start())
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(candidate, dict) and text[end:].strip() in {"", "```"}:
+                    value = candidate
+                    break
+            if value is None:
+                raise ValueError(
+                    "Codex final response did not contain a complete trailing JSON object"
+                ) from direct_error
+        return AgentInvestigationResult.model_validate(value)
 
     @staticmethod
     def _developer_instructions() -> str:
@@ -645,6 +669,13 @@ def codex_config_overrides(
         'preferred_auth_method="apikey"',
         'forced_login_method="api"',
         f"web_search={value(web_search)}",
+        # Codex snapshots the worker's login-shell environment before applying
+        # shell_environment_policy. Because the provider credential must remain
+        # in the worker environment for Responses authentication, an enabled
+        # snapshot would persist it under CODEX_HOME/shell_snapshots. Keep the
+        # normal per-command environment filter and disable that persistence
+        # feature for every ApkScanner session.
+        "features.shell_snapshot=false",
         "project_root_markers=[]",
         "project_doc_max_bytes=0",
         "agents.max_threads=1",

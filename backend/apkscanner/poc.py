@@ -14,7 +14,7 @@ from xml.etree import ElementTree
 
 from .artifacts import ArtifactStore
 from .config import Settings
-from .schemas import AgentPocSpec
+from .schemas import AgentOracleSpec, AgentPocSpec
 from .tools import CommandResult, ToolRunner
 
 ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android"
@@ -172,6 +172,7 @@ class PocBuilder:
         workspace: Path,
         spec: AgentPocSpec,
         *,
+        oracle: AgentOracleSpec | None = None,
         cancel_event: threading.Event | None = None,
         visible_packages: tuple[str, ...] = (),
         visible_provider_authorities: tuple[str, ...] = (),
@@ -200,6 +201,7 @@ class PocBuilder:
             project, sources, manifest, effective_spec = self._validate_project(
                 workspace,
                 spec,
+                oracle=oracle,
             )
             effective_project_path = str(project.relative_to(workspace.resolve()))
             effective_spec = effective_spec.model_copy(
@@ -851,6 +853,8 @@ class PocBuilder:
         self,
         workspace: Path,
         spec: AgentPocSpec,
+        *,
+        oracle: AgentOracleSpec | None = None,
     ) -> tuple[Path, list[Path], Path, AgentPocSpec]:
         root = workspace.resolve()
         poc_root = (root / "poc").resolve()
@@ -959,6 +963,7 @@ class PocBuilder:
             )
             component = candidates[0]
         java_activities: set[str] = set()
+        java_activity_sources: dict[str, str] = {}
         log_tags: set[str] = set()
         for source in sources:
             text = source.read_text(encoding="utf-8", errors="replace")
@@ -990,9 +995,9 @@ class PocBuilder:
                 text,
             )
             if package_match and activity_match:
-                java_activities.add(
-                    f"{package_match.group(1)}.{activity_match.group(1)}"
-                )
+                activity_name = f"{package_match.group(1)}.{activity_match.group(1)}"
+                java_activities.add(activity_name)
+                java_activity_sources[activity_name] = text
             log_tags.update(
                 re.findall(
                     r'\b(?:TAG|LOG_TAG)\s*=\s*"([A-Z][A-Z0-9_]{2,31})"',
@@ -1015,6 +1020,30 @@ class PocBuilder:
                     "launch_component": candidates[0],
                 }
             )
+            component = candidates[0]
+        if oracle is not None:
+            launcher_source = java_activity_sources.get(component, "")
+            required_markers = {
+                "apkscanner_request_id": "read the injected apkscanner_request_id Intent extra",
+                "success": "log a JSON success boolean",
+                "security_impact_observed": (
+                    "log a JSON security_impact_observed boolean"
+                ),
+            }
+            if oracle.kind == "provider_rows":
+                required_markers["row_count"] = (
+                    "log the measured provider row_count integer"
+                )
+            missing = [
+                description
+                for marker, description in required_markers.items()
+                if marker not in launcher_source
+            ]
+            if missing:
+                raise ValueError(
+                    "PoC launcher must satisfy the platform result protocol: "
+                    + "; ".join(missing)
+                )
         if len(log_tags) == 1:
             effective_spec = AgentPocSpec.model_validate(
                 {
