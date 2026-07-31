@@ -1457,6 +1457,69 @@ def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(setting
         assert len(seals) == 2
 
 
+def test_isolated_fresh_run_does_not_load_version_or_pattern_history(
+    settings,
+    fixture_apk,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    target_dir = settings.data_dir / "artifacts" / "fresh"
+    target_dir.mkdir(parents=True)
+    target = target_dir / "fixture.apk"
+    shutil.copyfile(fixture_apk, target)
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="fixture.apk",
+            artifact_sha256=hashlib.sha256(target.read_bytes()).hexdigest(),
+            artifact_path=str(target),
+            stats={
+                "investigator": "none",
+                "fresh_run": {
+                    "source_scan_id": "00000000-0000-0000-0000-000000000099",
+                    "mode": "isolated",
+                    "reuse_apk_only": True,
+                },
+            },
+        )
+        session.add(scan)
+        session.commit()
+        scan_id = scan.id
+
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+
+    def reject_history(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise AssertionError("isolated fresh scans must not load historical results")
+
+    monkeypatch.setattr(
+        orchestrator.security_evolution,
+        "build_version_diff",
+        reject_history,
+    )
+    monkeypatch.setattr(
+        orchestrator.security_evolution,
+        "apply_diff_and_patterns",
+        reject_history,
+    )
+
+    orchestrator._run_sync(scan_id)
+
+    with database.session_factory() as session:
+        persisted = session.get(Scan, scan_id)
+        assert persisted is not None
+        assert persisted.status == "final"
+        assert persisted.stats["version_diff_id"] is None
+        assert persisted.stats["version_replay_candidate_count"] == 0
+        assert persisted.stats["pattern_match_count"] == 0
+        event_types = set(
+            session.scalars(
+                select(ScanEvent.event_type).where(ScanEvent.scan_id == scan_id)
+            )
+        )
+        assert "planning.fresh_run.isolated" in event_types
+
+
 def test_continuation_context_includes_prior_task_evidence(settings) -> None:  # noqa: ANN001
     settings.ensure_directories()
     database = Database(settings)

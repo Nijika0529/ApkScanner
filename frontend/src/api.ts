@@ -110,6 +110,8 @@ export const api = {
     }),
   rerunIncomplete: (scanId: string) =>
     request<ScanRerunResult>(`/api/v1/scans/${scanId}/rerun-incomplete`, { method: "POST" }),
+  freshRun: (scanId: string) =>
+    request<Scan>(`/api/v1/scans/${scanId}/fresh-run`, { method: "POST" }),
   cancelTask: (taskId: string) =>
     request<InvestigationTask>(`/api/v1/tasks/${taskId}/cancel`, { method: "POST" }),
   deleteTask: (taskId: string) =>

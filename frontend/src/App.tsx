@@ -116,6 +116,7 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [uploadOpen, setUploadOpen] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<Scan | null>(null)
+  const [freshRunTarget, setFreshRunTarget] = useState<Scan | null>(null)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const detailRequestRef = useRef(0)
   const detailCacheRef = useRef(new Map<string, DetailData>())
@@ -337,11 +338,12 @@ function App() {
         </header>
         <div className="mx-auto max-w-[1500px] p-4 sm:p-6 lg:p-8">
           {error && <div role="alert" className="mb-6 flex items-start gap-3 rounded-xl border border-rose-500/35 bg-rose-500/10 p-4 text-sm text-rose-800"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /><span>{error}</span><button className="ml-auto" onClick={() => setError(null)} aria-label="关闭错误"><X className="h-4 w-4" /></button></div>}
-          {loading && !detail ? <LoadingState /> : detail ? <ScanDetailView data={detail} health={health} onRefresh={() => refreshDetail(detail.scan.id)} onDelete={() => setDeleteTarget(detail.scan)} /> : <EmptyState onUpload={() => setUploadOpen(true)} />}
+          {loading && !detail ? <LoadingState /> : detail ? <ScanDetailView data={detail} health={health} onRefresh={() => refreshDetail(detail.scan.id)} onDelete={() => setDeleteTarget(detail.scan)} onFreshRun={() => setFreshRunTarget(detail.scan)} /> : <EmptyState onUpload={() => setUploadOpen(true)} />}
         </div>
       </main>
       <UploadDialog open={uploadOpen} onOpenChange={setUploadOpen} onUploaded={onUploaded} health={health} />
       <DeleteScanDialog scan={deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)} onDeleted={onDeleted} />
+      <FreshRunDialog scan={freshRunTarget} onOpenChange={(open) => !open && setFreshRunTarget(null)} onCreated={async (scan) => { setFreshRunTarget(null); await onUploaded(scan) }} />
     </div>
   )
 }
@@ -380,7 +382,7 @@ function Sidebar({ scans, selectedId, health, onSelect, onUpload }: { scans: Sca
   )
 }
 
-function ScanDetailView({ data, health, onRefresh, onDelete }: { data: DetailData; health: Health | null; onRefresh: () => Promise<void>; onDelete: () => void }) {
+function ScanDetailView({ data, health, onRefresh, onDelete, onFreshRun }: { data: DetailData; health: Health | null; onRefresh: () => Promise<void>; onDelete: () => void; onFreshRun: () => void }) {
   const { scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events, securitySnapshot, versionDiff, patternMatches } = data
   const verificationCandidates = signals.filter(isVerificationCandidate)
   const staticSignals = signals.filter((signal) => !isVerificationCandidate(signal))
@@ -400,7 +402,7 @@ function ScanDetailView({ data, health, onRefresh, onDelete }: { data: DetailDat
             <h2 className="font-display truncate text-2xl font-bold tracking-tight text-slate-950 sm:text-3xl">{scan.package_name ?? scan.filename}</h2>
             <div className="mt-3 flex flex-wrap gap-x-5 gap-y-2 font-mono text-xs text-slate-500"><span>SHA256 {shortHash(scan.artifact_sha256)}</span><span>versionCode {scan.version_code ?? "—"}</span><span>minSdk {scan.min_sdk ?? "—"}</span></div>
           </div>
-          <div className="w-full max-w-lg space-y-3"><Progress value={scanProgress(scan.status)} label="扫描进度" /><div className="flex flex-wrap gap-2"><ReportLink scanId={scan.id} format="html" label="HTML" /><ReportLink scanId={scan.id} format="json" label="JSON" /><ReportLink scanId={scan.id} format="sarif" label="SARIF" /><Button variant="danger" size="sm" onClick={onDelete} disabled={!["final", "failed"].includes(scan.status)} title={["final", "failed"].includes(scan.status) ? "永久删除扫描及其独占文件" : "运行中的扫描不能删除"}><Trash2 className="h-3.5 w-3.5" />删除扫描</Button></div></div>
+          <div className="w-full max-w-lg space-y-3"><Progress value={scanProgress(scan.status)} label="扫描进度" /><div className="flex flex-wrap gap-2"><ReportLink scanId={scan.id} format="html" label="HTML" /><ReportLink scanId={scan.id} format="json" label="JSON" /><ReportLink scanId={scan.id} format="sarif" label="SARIF" /><Button variant="secondary" size="sm" onClick={onFreshRun} disabled={!["final", "failed"].includes(scan.status)} title={["final", "failed"].includes(scan.status) ? "只复用原始 APK，创建不继承历史结果的独立扫描" : "当前扫描结束后才能全新重扫"}><ScanSearch className="h-3.5 w-3.5" />全新重扫</Button><Button variant="danger" size="sm" onClick={onDelete} disabled={!["final", "failed"].includes(scan.status)} title={["final", "failed"].includes(scan.status) ? "永久删除扫描及其独占文件" : "运行中的扫描不能删除"}><Trash2 className="h-3.5 w-3.5" />删除扫描</Button></div></div>
         </div>
       </section>
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
@@ -1240,6 +1242,35 @@ function formatAuditContent(value: unknown) {
   if (value === null || value === undefined) return "内容不可用"
   if (typeof value === "string") return value
   return JSON.stringify(value, null, 2)
+}
+
+function FreshRunDialog({ scan, onOpenChange, onCreated }: { scan: Scan | null; onOpenChange: (open: boolean) => void; onCreated: (scan: Scan) => Promise<void> }) {
+  const [creating, setCreating] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => setError(null), [scan?.id])
+  async function create() {
+    if (!scan) return
+    setCreating(true)
+    setError(null)
+    try {
+      await onCreated(await api.freshRun(scan.id))
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "创建全新扫描失败")
+    } finally {
+      setCreating(false)
+    }
+  }
+  return (
+    <Dialog open={Boolean(scan)} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogTitle className="text-xl font-bold text-slate-950">从头重新扫描这个 APK？</DialogTitle>
+        <DialogDescription className="mt-2 text-sm leading-6 text-slate-600">平台会复用经过 SHA-256 校验的原始 APK，但创建新的 Scan ID 和空白工作区。旧任务、Finding、Evidence、Agent 会话、版本 PoC 回放和模式卡都不会进入新扫描；原扫描完整保留，便于对照。</DialogDescription>
+        {scan && <div className="mt-5 rounded-xl border border-cyan-200 bg-cyan-50 p-4"><p className="font-semibold text-cyan-950">{scan.package_name ?? scan.filename}</p><p className="mt-1 font-mono text-xs text-cyan-800">SHA256 {shortHash(scan.artifact_sha256)}</p></div>}
+        {error && <p role="alert" className="mt-4 text-sm text-rose-700">{error}</p>}
+        <div className="mt-6 flex justify-end gap-2"><Button variant="ghost" onClick={() => onOpenChange(false)} disabled={creating}>取消</Button><Button onClick={create} disabled={creating}>{creating ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <ScanSearch className="h-4 w-4" />}{creating ? "正在创建" : "确认全新重扫"}</Button></div>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 function DeleteScanDialog({ scan, onOpenChange, onDeleted }: { scan: Scan | null; onOpenChange: (open: boolean) => void; onDeleted: (scanId: string, warnings: string[]) => Promise<void> }) {

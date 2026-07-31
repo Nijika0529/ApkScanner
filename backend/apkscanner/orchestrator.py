@@ -1185,18 +1185,37 @@ class ScanOrchestrator:
                 entries=entries,
                 code_index=result.code_index,
             )
-            version_diff = self.security_evolution.build_version_diff(
-                session,
-                scan=scan,
-                snapshot=security_snapshot,
+            fresh_run = (scan.stats or {}).get("fresh_run")
+            isolated_fresh_run = (
+                isinstance(fresh_run, dict)
+                and fresh_run.get("mode") == "isolated"
             )
-            pattern_matches = self.security_evolution.apply_diff_and_patterns(
-                session,
-                scan=scan,
-                entries=entries,
-                tasks=tasks,
-                diff=version_diff,
-            )
+            if isolated_fresh_run:
+                version_diff = None
+                pattern_matches = []
+                add_event(
+                    session,
+                    scan.id,
+                    "planning.fresh_run.isolated",
+                    "本轮为独立全新扫描，已禁用历史 PoC 回放与 Finding 模式卡注入",
+                    {
+                        "source_scan_id": fresh_run.get("source_scan_id"),
+                        "reuse_apk_only": True,
+                    },
+                )
+            else:
+                version_diff = self.security_evolution.build_version_diff(
+                    session,
+                    scan=scan,
+                    snapshot=security_snapshot,
+                )
+                pattern_matches = self.security_evolution.apply_diff_and_patterns(
+                    session,
+                    scan=scan,
+                    entries=entries,
+                    tasks=tasks,
+                    diff=version_diff,
+                )
             for replay_task in (task for task in tasks if task.task_type == "version_replay"):
                 for entry_id in replay_task.target_entry_ids:
                     coverage_item = entry_coverage.get(entry_id)

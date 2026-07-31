@@ -1215,6 +1215,120 @@ def test_batch_rerun_only_queues_incomplete_tasks(
         assert submitted == [scan.id]
 
 
+def test_fresh_scan_run_reuses_only_the_verified_apk(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    submitted: list[str] = []
+
+    async def submit(scan_id: str) -> None:
+        submitted.append(scan_id)
+
+    monkeypatch.setattr(app.state.orchestrator, "submit", submit)
+    apk_sha256, apk_path = app.state.store.put_bytes(
+        "artifacts",
+        b"independent-fresh-run-apk",
+        suffix=".apk",
+    )
+    with TestClient(app) as client:
+        with app.state.database.session_factory() as session:
+            source = Scan(
+                status="final",
+                filename="copilot.apk",
+                artifact_sha256=apk_sha256,
+                artifact_path=str(apk_path),
+                package_name="com.vivo.ai.copilot",
+                stats={
+                    "investigator": "opencode",
+                    "agent_control": {"enabled": True, "backend": "opencode"},
+                },
+            )
+            session.add(source)
+            session.flush()
+            entry = EntryPoint(
+                scan=source,
+                kind="deep_link",
+                name="copilot://discoveryactivity/",
+                owner_component="com.vivo.ai.copilot.DiscoveryActivity",
+                exported=True,
+            )
+            task = InvestigationTask(
+                scan=source,
+                task_type="deep_link",
+                status="completed",
+                result={"result": "supported_static"},
+            )
+            finding = Finding(
+                scan=source,
+                dedupe_key="old-static-risk",
+                rule_id="AGENT",
+                source="opencode",
+                title="Old result",
+                description="Must not be copied",
+                masvs="MASVS-PLATFORM",
+                severity="high",
+                status="supported_static",
+            )
+            evidence = Evidence(
+                scan_id=source.id,
+                kind="static.jadx",
+                sha256="a" * 64,
+                path=str(settings.data_dir / "old-evidence.json"),
+            )
+            session.add_all([entry, task, finding, evidence])
+            session.commit()
+            source_id = source.id
+
+        response = client.post(
+            f"/api/v1/scans/{source_id}/fresh-run",
+            headers={"X-APKScanner-Request": "console"},
+        )
+
+        assert response.status_code == 202
+        payload = response.json()
+        assert payload["id"] != source_id
+        assert payload["status"] == "queued"
+        assert payload["artifact_sha256"] == apk_sha256
+        assert payload["package_name"] is None
+        assert payload["stats"]["fresh_run"] == {
+            "source_scan_id": source_id,
+            "mode": "isolated",
+            "reuse_apk_only": True,
+            "inherit_tasks": False,
+            "inherit_findings": False,
+            "inherit_evidence": False,
+            "inherit_agent_sessions": False,
+            "inherit_version_replays": False,
+            "inherit_pattern_matches": False,
+        }
+
+        fresh_id = payload["id"]
+        with app.state.database.session_factory() as session:
+            fresh = session.get(Scan, fresh_id)
+            assert fresh is not None
+            assert fresh.artifact_path == str(apk_path)
+            assert list(
+                session.scalars(
+                    select(EntryPoint).where(EntryPoint.scan_id == fresh_id)
+                )
+            ) == []
+            assert list(
+                session.scalars(
+                    select(InvestigationTask).where(
+                        InvestigationTask.scan_id == fresh_id
+                    )
+                )
+            ) == []
+            assert list(
+                session.scalars(select(Finding).where(Finding.scan_id == fresh_id))
+            ) == []
+            assert list(
+                session.scalars(select(Evidence).where(Evidence.scan_id == fresh_id))
+            ) == []
+        assert submitted == [fresh_id]
+
+
 def test_manual_task_rerun_is_not_blocked_by_automatic_attempt_budget(
     settings,
     monkeypatch,

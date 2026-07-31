@@ -256,6 +256,102 @@ async def create_scan(
     return scan
 
 
+@router.post(
+    "/scans/{scan_id}/fresh-run",
+    response_model=ScanSummary,
+    status_code=202,
+)
+async def create_fresh_scan_run(
+    scan_id: str,
+    request: Request,
+    session: Session = Depends(get_session),
+    store: ArtifactStore = Depends(get_store),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> Scan:
+    source = require_scan(session, scan_id)
+    if source.status not in {ScanStatus.FINAL.value, ScanStatus.FAILED.value}:
+        raise HTTPException(409, "Wait for the current scan run to finish before starting a fresh run")
+    try:
+        artifact_path = store.verify_content_addressed(
+            "artifacts",
+            source.artifact_path,
+            source.artifact_sha256,
+        )
+    except (OSError, ValueError) as exc:
+        raise HTTPException(409, f"The original APK artifact is unavailable: {exc}") from exc
+
+    source_stats = dict(source.stats or {})
+    source_control = source_stats.get("agent_control")
+    if not isinstance(source_control, dict):
+        source_control = {}
+    requested_backend = str(
+        source_control.get("backend")
+        or source_stats.get("investigator")
+        or "configured"
+    )
+    try:
+        resolved_backend = orchestrator.resolve_investigator(requested_backend)
+    except ValueError:
+        resolved_backend = orchestrator.resolve_investigator()
+    agent_enabled = bool(source_control.get("enabled", resolved_backend != "none"))
+    investigator = resolved_backend if agent_enabled else "none"
+    fresh_run = Scan(
+        status=ScanStatus.QUEUED.value,
+        filename=source.filename,
+        artifact_sha256=source.artifact_sha256,
+        artifact_path=str(artifact_path),
+        stats={
+            "upload_bytes": artifact_path.stat().st_size,
+            "investigator": investigator,
+            "agent_control": {
+                "enabled": investigator != "none",
+                "backend": resolved_backend,
+            },
+            "fresh_run": {
+                "source_scan_id": source.id,
+                "mode": "isolated",
+                "reuse_apk_only": True,
+                "inherit_tasks": False,
+                "inherit_findings": False,
+                "inherit_evidence": False,
+                "inherit_agent_sessions": False,
+                "inherit_version_replays": False,
+                "inherit_pattern_matches": False,
+            },
+        },
+    )
+    session.add(fresh_run)
+    session.flush()
+    add_event(
+        session,
+        fresh_run.id,
+        "scan.fresh_run.created",
+        "已基于原始 APK 创建独立全新扫描；未继承旧任务、结论、证据或 Agent 会话",
+        {
+            "source_scan_id": source.id,
+            "artifact_sha256": source.artifact_sha256,
+            "reuse_apk_only": True,
+        },
+    )
+    add_event(
+        session,
+        source.id,
+        "scan.fresh_run.spawned",
+        "已从该扫描创建一个不继承历史结果的全新扫描",
+        {"fresh_scan_id": fresh_run.id},
+    )
+    session.commit()
+    session.refresh(fresh_run)
+
+    task = asyncio.create_task(
+        orchestrator.submit(fresh_run.id),
+        name=f"fresh-scan-{fresh_run.id}",
+    )
+    request.app.state.background_tasks.add(task)
+    task.add_done_callback(request.app.state.background_tasks.discard)
+    return fresh_run
+
+
 @router.get("/scans", response_model=list[ScanSummary])
 def list_scans(
     limit: int = Query(50, ge=1, le=200),
