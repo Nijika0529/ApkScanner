@@ -24,6 +24,7 @@ from . import __version__
 from .agent_audit import AGENT_AUDIT_KINDS, build_agent_audits
 from .artifacts import ArtifactStore, ArtifactTooLargeError
 from .benchmark import BenchmarkEvaluator
+from .capabilities import CapabilityInvocation, CapabilityRegistry
 from .db import Database
 from .enums import FindingStatus, ScanStatus, TaskStatus
 from .finding_policy import partition_findings
@@ -72,6 +73,7 @@ from .schemas import (
     VersionDiffOut,
     VulnerabilityPatternOut,
 )
+from .supervisor import CampaignPlan, SupervisorService
 
 router = APIRouter(prefix="/api/v1")
 reports = ReportBuilder()
@@ -87,6 +89,14 @@ def get_store(request: Request) -> ArtifactStore:
 
 def get_orchestrator(request: Request) -> ScanOrchestrator:
     return request.app.state.orchestrator
+
+
+def get_capability_registry(request: Request) -> CapabilityRegistry:
+    return request.app.state.capability_registry
+
+
+def get_supervisor(request: Request) -> SupervisorService:
+    return request.app.state.supervisor
 
 
 @router.post("/internal/tasks/{task_id}/proof-replay")
@@ -106,6 +116,74 @@ def execute_live_proof_replay(
         raise HTTPException(403, str(exc)) from exc
     except (TimeoutError, ValueError) as exc:
         raise HTTPException(409, str(exc)) from exc
+
+
+@router.get("/capabilities/catalog")
+def capability_catalog(
+    registry: CapabilityRegistry = Depends(get_capability_registry),
+) -> list[dict[str, Any]]:
+    return registry.catalog()
+
+
+@router.post("/capabilities/reload")
+def reload_capabilities(
+    registry: CapabilityRegistry = Depends(get_capability_registry),
+) -> dict[str, Any]:
+    try:
+        registry.reload()
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"capabilities": registry.catalog()}
+
+
+@router.post("/capabilities/{capability_id}/invoke")
+def invoke_capability(
+    capability_id: str,
+    invocation: CapabilityInvocation,
+    registry: CapabilityRegistry = Depends(get_capability_registry),
+) -> dict[str, Any]:
+    try:
+        return registry.invoke(capability_id, invocation.input).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(404, "Capability not found") from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.get("/supervisor/snapshot")
+def supervisor_snapshot(
+    supervisor: SupervisorService = Depends(get_supervisor),
+) -> dict[str, Any]:
+    return supervisor.snapshot()
+
+
+@router.post("/supervisor/campaigns/validate")
+def validate_campaign(
+    plan: CampaignPlan,
+    supervisor: SupervisorService = Depends(get_supervisor),
+) -> dict[str, Any]:
+    return supervisor.validate_plan(plan)
+
+
+@router.post("/supervisor/campaigns/launch", status_code=202)
+async def launch_campaign(
+    plan: CampaignPlan,
+    request: Request,
+    supervisor: SupervisorService = Depends(get_supervisor),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> dict[str, Any]:
+    try:
+        result = supervisor.launch(plan)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    for scan_id in result["scan_ids"]:
+        task = asyncio.create_task(
+            orchestrator.submit(scan_id),
+            name=f"campaign-scan-{scan_id}",
+        )
+        request.app.state.background_tasks.add(task)
+        task.add_done_callback(request.app.state.background_tasks.discard)
+    return result
 
 
 def get_session(database: Database = Depends(get_database)):

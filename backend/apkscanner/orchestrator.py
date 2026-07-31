@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 
 from sqlalchemy import select, update
 
+from .adb_gateway import AdbGatewayRequest, AdbGatewayResponse
 from .agent_events import AgentCancelledError, AgentRuntimeEvent
 from .agent_prompt import developer_instructions, investigation_prompt
 from .artifacts import ArtifactStore
@@ -179,11 +180,15 @@ class ScanOrchestrator:
 
             class ProofReplayHandler(BaseHTTPRequestHandler):
                 def do_POST(self) -> None:  # noqa: N802
-                    match = re.fullmatch(
+                    proof_match = re.fullmatch(
                         r"/api/v1/internal/tasks/([a-f0-9-]{36})/proof-replay",
                         self.path,
                     )
-                    if match is None:
+                    adb_match = re.fullmatch(
+                        r"/api/v1/internal/tasks/([a-f0-9-]{36})/adb",
+                        self.path,
+                    )
+                    if proof_match is None and adb_match is None:
                         self._respond(404, {"detail": "not found"})
                         return
                     try:
@@ -192,15 +197,25 @@ class ScanOrchestrator:
                         self._respond(400, {"detail": "invalid Content-Length"})
                         return
                     if length <= 0 or length > 2_000_000:
-                        self._respond(413, {"detail": "invalid proof replay size"})
+                        self._respond(413, {"detail": "invalid gateway request size"})
                         return
                     try:
-                        replay = AgentProofReplay.model_validate_json(self.rfile.read(length))
-                        response = orchestrator.execute_live_proof_replay(
-                            match.group(1),
-                            self.headers.get("X-APKScanner-Proof-Token", ""),
-                            replay,
-                        )
+                        body = self.rfile.read(length)
+                        if proof_match is not None:
+                            replay = AgentProofReplay.model_validate_json(body)
+                            response = orchestrator.execute_live_proof_replay(
+                                proof_match.group(1),
+                                self.headers.get("X-APKScanner-Proof-Token", ""),
+                                replay,
+                            )
+                        else:
+                            assert adb_match is not None
+                            request = AdbGatewayRequest.model_validate_json(body)
+                            response = orchestrator.execute_live_adb(
+                                adb_match.group(1),
+                                self.headers.get("X-APKScanner-ADB-Token", ""),
+                                request,
+                            )
                     except PermissionError as exc:
                         self._respond(403, {"detail": str(exc)})
                         return
@@ -227,7 +242,7 @@ class ScanOrchestrator:
                 def log_message(self, _format: str, *args: Any) -> None:
                     return
 
-            server = ThreadingHTTPServer(("127.0.0.1", 0), ProofReplayHandler)
+            server = ThreadingHTTPServer(("0.0.0.0", 0), ProofReplayHandler)
             server.daemon_threads = True
             thread = threading.Thread(
                 target=server.serve_forever,
@@ -240,6 +255,56 @@ class ScanOrchestrator:
             self._live_proof_server_thread = thread
             self._live_proof_base_url = f"http://127.0.0.1:{server.server_address[1]}"
             return self._live_proof_base_url
+
+    def execute_live_adb(
+        self,
+        task_id: str,
+        token: str,
+        request: AdbGatewayRequest,
+    ) -> dict[str, Any]:
+        with self._live_proof_lock:
+            context = self._live_proof_contexts.get(task_id)
+        if context is None or not secrets.compare_digest(context.token, token):
+            raise PermissionError("ADB gateway is not active for this task")
+        if context.device is None:
+            raise ValueError("this task does not own an ADB device")
+        with context.lock:
+            self._raise_if_cancelled(context.cancel_event)
+            if context.budget.expired:
+                raise TimeoutError("task time budget is exhausted")
+            timeout = min(request.timeout_seconds, max(1, context.budget.remaining(120)))
+            result = context.device.execute_gateway(request.args, timeout=timeout)
+            self._record_commands(
+                context.scan_id,
+                context.task_id,
+                [
+                    (
+                        "agent.adb.gateway",
+                        result,
+                        {
+                            "source": "codex_gateway",
+                            "round_index": context.round_index,
+                            "gateway_policy": "task_scoped_v1",
+                        },
+                    )
+                ],
+                context.evidence_summaries,
+            )
+            self._materialize_live_evidence(context, context.evidence_summaries)
+            self._record_exploration_event(
+                context.scan_id,
+                context.task_id,
+                "model.tool.adb.completed",
+                "Codex 通过任务级网关完成一条 ADB 命令",
+                {
+                    "source": "platform",
+                    "round_index": context.round_index,
+                    "exit_code": result.exit_code,
+                    "command": request.args[:4],
+                    "device_serial": context.device.serial,
+                },
+            )
+            return AdbGatewayResponse.from_command(result).model_dump(mode="json")
 
     def execute_live_proof_replay(
         self,
@@ -1971,6 +2036,7 @@ class ScanOrchestrator:
         task_device: AdbDeviceAdapter | None = None
         device_lease_owned = False
         device_lease_acquired = False
+        task_gateway_token = secrets.token_urlsafe(48)
 
         def current_device_capability() -> dict[str, Any]:
             capability = dict(device_capability)
@@ -2114,6 +2180,13 @@ class ScanOrchestrator:
                     if critic_turn
                     else target_code_context
                 )
+                gateway_available = bool(
+                    not critic_turn
+                    and phase not in {"rescue_review", "rescue_exploration"}
+                    and self.settings.codex_isolation == "docker"
+                    and device_lease_owned
+                    and task_device is not None
+                )
                 platform_context = {
                     "phase": phase,
                     "round_index": round_index,
@@ -2163,9 +2236,22 @@ class ScanOrchestrator:
                         else None
                     ),
                     "proof_replay": {
-                        "available": False,
+                        "available": gateway_available,
                         "command": "apkscanner-proof <proof-replay.json>",
-                        "mode": "docker_gateway_pending",
+                        "mode": (
+                            "task_scoped_docker_gateway"
+                            if gateway_available
+                            else "unavailable_without_device_lease"
+                        ),
+                    },
+                    "adb_gateway": {
+                        "available": gateway_available,
+                        "command": "adb <allowed-arguments>",
+                        "mode": (
+                            "task_scoped_fixed_serial"
+                            if gateway_available
+                            else "unavailable_without_device_lease"
+                        ),
                     },
                 }
                 agent_workspace = self._materialize_agent_evidence(
@@ -2203,6 +2289,56 @@ class ScanOrchestrator:
                     capability=capability,
                 )
                 proof_token: str | None = None
+                gateway_environment: dict[str, str] | None = None
+                if gateway_available:
+                    endpoint = self._ensure_live_proof_endpoint()
+                    port = urlsplit(endpoint).port
+                    if port is None:
+                        raise RuntimeError("internal Agent gateway has no TCP port")
+                    agent_runtime_workspace = agent_workspace
+                    prepare_workspace = getattr(
+                        investigator,
+                        "prepare_session_workspace",
+                        None,
+                    )
+                    if callable(prepare_workspace):
+                        agent_runtime_workspace = prepare_workspace(
+                            scan=scan,
+                            task=task,
+                            workspace=agent_workspace,
+                            phase=phase,
+                        )
+                    proof_token = task_gateway_token
+                    self._register_live_proof_context(
+                        _LiveProofContext(
+                            token=proof_token,
+                            scan_id=scan_id,
+                            task_id=task_id,
+                            package_name=package_name or "",
+                            workspace=agent_runtime_workspace,
+                            entries=entries,
+                            default_entry_id=entries[0].id,
+                            hypotheses=hypothesis_context,
+                            budget=budget,
+                            evidence_summaries=evidence_summaries,
+                            cancel_event=cancel_event,
+                            round_index=round_index,
+                            device=task_device,
+                        )
+                    )
+                    docker_base = f"http://apkscanner-host:{port}"
+                    gateway_environment = {
+                        "APKSCANNER_ADB_TASK_ID": task_id,
+                        "APKSCANNER_ADB_GATEWAY_URL": (
+                            f"{docker_base}/api/v1/internal/tasks/{task_id}/adb"
+                        ),
+                        "APKSCANNER_ADB_TOKEN": proof_token,
+                        "APKSCANNER_PROOF_TASK_ID": task_id,
+                        "APKSCANNER_PROOF_REPLAY_URL": (
+                            f"{docker_base}/api/v1/internal/tasks/{task_id}/proof-replay"
+                        ),
+                        "APKSCANNER_PROOF_TOKEN": proof_token,
+                    }
 
                 def on_runtime_event(event: AgentRuntimeEvent) -> None:
                     record = {
@@ -2256,6 +2392,7 @@ class ScanOrchestrator:
                     "timeout_seconds": remaining,
                     "event_callback": on_runtime_event,
                     "cancel_event": cancel_event,
+                    "gateway_environment": gateway_environment,
                 }
                 try:
                     result = investigator.investigate(**investigation_kwargs)

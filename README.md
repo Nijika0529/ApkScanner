@@ -30,6 +30,15 @@ finding without platform evidence IDs.
 - One keyless keeper container per scan. Each `task + attempt + role` receives a distinct Unix UID,
   HOME, `CODEX_HOME`, TMPDIR, and writable workspace, while JADX/Apktool/archive inputs are mounted
   read-only.
+- Worker Protocol v3 keeps one SDK process and non-ephemeral Codex Thread per task/attempt/role,
+  reuses the primary Thread across exploration and final evaluation, emits heartbeats, and writes a
+  redacted host-only event spool.
+- A task-scoped container `adb` wrapper and Proof client reach the host control plane through an
+  authenticated gateway. The platform fixes the leased serial, rejects transport escape and
+  platform-owned mutations, and records accepted commands as Evidence.
+- A versioned Capability Registry supports built-ins, SHA-256-pinned Python scripts, and explicitly
+  bound MCP adapters. Supervisor REST endpoints expose snapshots, event timelines, plan validation,
+  and bounded Campaign launch without exposing Docker, SQLite, ADB server, or provider credentials.
 - The executable OpenCode runtime, critic/fallback routes, and Node worker have been removed;
   historical report-read compatibility remains.
 - Responsive React review console, human Finding decisions, live events, JSON/HTML/SARIF exports.
@@ -199,9 +208,16 @@ Host mode is diagnostics-only and requires both `APKSCANNER_CODEX_ISOLATION=host
 `APKSCANNER_ALLOW_HOST_CODEX=true`. It has no container, UID, or resource boundary. Do not override
 `APKSCANNER_CODEX_BIN` unless the external binary has been verified against the pinned SDK.
 
-The implemented Worker Protocol v2 still starts one ephemeral Thread per physical invocation;
-scan containers and same-role workspaces are reused, but persistent Thread/resume, the in-container
-ADB/Proof gateway, and MCP/script entry points are next-stage work. See
+Worker Protocol v3 uses one persistent, non-ephemeral Thread for each role session. Primary turns
+reuse that Thread; a replacement worker attempts `thread_resume` from its private `CODEX_HOME`.
+ADB and Proof credentials are issued only to a primary turn while its task owns the device lease;
+Critic and Rescue roles receive neither token. Extension manifests live under
+`$APKSCANNER_DATA_DIR/capabilities/`, and hash-pinned scripts under
+`$APKSCANNER_DATA_DIR/capability-scripts/`. Python entries run in short-lived Docker sidecars with
+no network by default, a read-only root filesystem, and all Linux capabilities dropped. MCP
+manifests remain unavailable until an application
+adapter explicitly binds them. Control-plane endpoints are under `/api/v1/capabilities/*` and
+`/api/v1/supervisor/*`. See
 [`docs/codex-docker-architecture.zh-CN.md`](docs/codex-docker-architecture.zh-CN.md). The retired
 OpenCode design remains only for historical reference in
 [`docs/opencode-deepseek.zh-CN.md`](docs/opencode-deepseek.zh-CN.md).

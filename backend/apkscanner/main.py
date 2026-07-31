@@ -11,11 +11,13 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .api import router
 from .artifacts import ArtifactStore
+from .capabilities import CapabilityRegistry
 from .config import Settings
 from .db import Database
 from .enums import ScanStatus
 from .models import Scan
 from .orchestrator import ScanOrchestrator
+from .supervisor import SupervisorService
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -25,6 +27,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     database.create_all()
     store = ArtifactStore(app_settings)
     orchestrator = ScanOrchestrator(app_settings, database, store)
+    capability_registry = CapabilityRegistry(orchestrator)
+    supervisor = SupervisorService(orchestrator, capability_registry)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -71,6 +75,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.database = database
     app.state.store = store
     app.state.orchestrator = orchestrator
+    app.state.capability_registry = capability_registry
+    app.state.supervisor = supervisor
     app.state.background_tasks = set()
     app.add_middleware(
         TrustedHostMiddleware,

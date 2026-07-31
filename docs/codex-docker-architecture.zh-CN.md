@@ -27,12 +27,12 @@
 2. `CURRENT` Codex 内部使用 `Sandbox.full_access`，配置语义等价于 `sandbox_mode = "danger-full-access"`；Docker 是外层安全边界。
 3. `CURRENT` Agent 默认具备文件读写、Bash、补丁、实时 Web Search 和公网访问能力；企业出口收敛仍为后续门禁。
 4. `CURRENT` 默认按一次完整 `scan_id` 创建一个长生命周期扫描容器，而不是为每个小探索任务创建容器；活跃容器数量因此约等于活跃扫描数量。
-5. `PARTIAL` 容器内每个 `task_id + attempt + role` 已使用独立数字 UID/GID、`0700` 可写目录、`HOME`、`CODEX_HOME`、`TMPDIR` 和 Worker 进程；持久 Codex Thread 留在 Phase 4。
+5. `CURRENT` 容器内每个 `task_id + attempt + role` 使用独立数字 UID/GID、`0700` 可写目录、`HOME`、`CODEX_HOME`、`TMPDIR` 和持久 Worker 进程。
 6. `CURRENT` 完整 JADX、apktool 和 archive 结果通过扫描级只读 bind mount 共享，不复制到各任务工作区。
-7. `TARGET` 同一 primary AgentSession 在自动探索、PoC 修正和最终裁决之间复用同一 Codex Thread；Critic/Rescue 使用新的 UID、工作区和 Thread。
-8. `TARGET` ADB 设备仍由 Orchestrator 独占分配。容器进程只能通过任务级 ADB Gateway 使用分配到的 serial。
+7. `CURRENT` 同一 primary AgentSession 在自动探索、PoC 修正和最终裁决之间复用同一 Codex Thread；Critic/Rescue 使用新的 UID、工作区和 Thread。
+8. `CURRENT` ADB 设备由 Orchestrator 独占分配。容器进程只能通过任务级 ADB Gateway 使用分配到的 serial。
 9. `TARGET` 原始 ADB、Agent 文本、Agent 自建日志和 Agent 自报“PoC 成功”均不能直接生成 `reproduced_blackbox`；最终证明仍由平台 Proof/Oracle 完成。
-10. `PARTIAL` Agent 运行事件已实时归一化、脱敏并带去重键；追加式持久化与崩溃恢复留在 Phase 4。不保存隐藏思维链原文。
+10. `PARTIAL` Agent 运行事件已实时归一化、脱敏并带去重键，Protocol v3 envelope 追加写入 host-only spool 并投影到 ScanEvent；数据库级 spool 重放与显式 `event.gap` 仍待完成。不保存隐藏思维链原文。
 11. `CURRENT` 所有调查角色只使用 Codex。现在由 DeepSeek V4 Flash 承担 primary、Critic、Rescue 和 finalizer；V4 Pro 原生支持后只替换相应 `ProviderProfile`，不再保留 OpenCode 运行时、Worker、fallback 或 critic 路由。
 12. `CURRENT` 主实现使用 Python `openai-codex` SDK；开发前已更新并审查 `/work/codex`。TypeScript SDK 只保留契约对比 spike，不作为本次迁移目标。
 13. `CURRENT` 本地单用户版本直接连接 DeepSeek，不实现 Provider Gateway。长期 Key 仅注入对应 Codex 进程并从子 shell 过滤，但明确接受 full-access 同 UID 进程可能读取该 Key 的开发风险。
@@ -105,41 +105,51 @@ Docker 容器共享宿主内核，镜像层在并发扫描间复用。`--memory`
 | 工作区挂载 | `/agent-workspaces/<key>/workspace` 按 session UID 读写 | 增加持久 Thread 状态与 crash recovery | `PARTIAL` |
 | 反编译目录 | `/scan-input/{jadx,apktool,archive}` 扫描级只读挂载 | 保持 canonical 只读共享 | `CURRENT` |
 | 容器生命周期 | 一个无密钥 keeper 容器覆盖整个 scan；session 用 UID `docker exec` | 增加 orphan reconcile、优雅 stop 和 generation 恢复 | `PARTIAL` |
-| Thread | 每次调用 `thread_start()`；Docker `ephemeral=True` | 主线程持久化并复用，支持兼容恢复 | `TARGET` |
+| Thread | Protocol v3 长生命周期 Worker；`ephemeral=False`；同 task/attempt/role 复用并用 `thread_resume` 恢复 | 增加配置指纹 lineage 和数据库 Session/Turn 投影 | `PARTIAL` |
 | Provider | 冻结 ProviderProfile、catalog SHA-256 与配置指纹进入审计 | 保持单一可信配置源 | `CURRENT` |
 | DeepSeek | V4 Flash + Responses + `model_provider=deepseek` 已配置；缺真实 Key smoke | 使用真实开发凭据完成计费 smoke | `PARTIAL` |
 | Reasoning effort | profile 支持 `low/high/max`，默认 `high` | 后续按评测调整 phase route | `CURRENT` |
 | Web Search | `web_search=live` 已冻结配置；缺真实 Provider smoke | 验证事件与引用行为 | `PARTIAL` |
 | Bash 公网 | Docker bridge 公网可用，无宿主端口/设备/socket 挂载 | 企业部署增加受控 egress，阻断元数据/未授权内网 | `PARTIAL` |
-| ADB | Codex Docker 无 serial 和设备通道 | 任务级 ADB Gateway 强绑定 serial | `TARGET` |
-| Proof Replay | 只对旧 host Agent 路径开放 | Codex 扫描容器通过内部 Proof Gateway 调用 | `TARGET` |
+| ADB | 容器 `adb` wrapper 通过任务 token 调用宿主 Gateway；serial 固定、危险命令拒绝、结果写 Evidence | 增加更细的目标/命令 scope 与配额 | `CURRENT` |
+| Proof Replay | primary 在持有 device lease 时获得任务级 Proof Gateway；Critic/Rescue 不下发 token | 保持平台 Oracle 为唯一黑盒证明准入 | `CURRENT` |
 | PoC | 平台已有受控源码构建器 | Agent 写源码；平台构建/签名/执行仍是证明主路径 | `PARTIAL` |
-| 事件 | notification 已归一化、脱敏、带 schema version/去重键和无事件 watchdog | 增量持久化、heartbeat、spool 和崩溃恢复 | `PARTIAL` |
+| 事件 | notification 已归一化、脱敏；Worker 序列、heartbeat、host-only spool、无事件 watchdog 已实现 | 增加数据库唯一序列、spool 重放和 crash gap | `PARTIAL` |
 | 结构化结果 | 每次 Turn 有 `output_schema` | 保留并增加 phase 语义校验和一次同线程修复 | `PARTIAL` |
 | Agent 路由 | 所有 phase 只走 Codex；无 OpenCode/fallback 可执行路径 | 保持历史报告只读兼容 | `CURRENT` |
-| 能力入口 | 业务入口写死在 Orchestrator | Capability Registry 发现并生成 typed `TestEntrySeed` | `TARGET` |
-| 平台监督 | 无统一机器控制接口 | 版本化 Control API/MCP，支持提案、校验、启动和观察 Campaign | `FUTURE` |
-| Codex 测试 | SDK/catalog/事件/协议/挂载有测试；真实双 UID Docker 测试通过 | 增加 fake Responses、恢复、ADB/Proof 与真实 Provider smoke | `PARTIAL` |
+| 能力入口 | Manifest Registry 已支持 built-in、SHA-256 固定 Python script 和显式绑定 MCP Adapter | 增加容器 sidecar、schema engine、Evidence mapper 与能力提案审批 | `PARTIAL` |
+| 平台监督 | REST 提供 snapshot、catalog/invoke、Campaign validate/launch 和已有 SSE 事件线 | 增加 SupervisorSession/RBAC、CampaignRun 持久化、MCP 薄适配和幂等键 | `PARTIAL` |
+| Codex 测试 | SDK/catalog/协议/挂载、真实双 UID、真实持久 Thread open/close、容器到 ADB Gateway 真机测试通过 | 缺真实 DeepSeek Key 的计费 Turn、Web Search 和完整 PoC/Proof smoke | `PARTIAL` |
 
 ### 3.1 2026-07-31 实施检查点
 
-- 工作分支：`feature/codex-docker-migration`；尚未提交或推送；
-- Phase 0、Phase 1 已达到本轮完成条件；
-- Phase 2 已完成固定工具镜像、扫描级 keeper、只读 scan input、多 UID session、按 UID
-  cancel/reap 和资源参数，尚缺 SBOM、orphan reconcile 与 restart recovery；
-- Phase 3 已完成 custom DeepSeek Responses provider、官方 model catalog、full-access、effort、
-  Web Search、exec-only Key 注入和脱敏；当前进程未提供 `DEEPSEEK_API_KEY`，因此真实计费
-  smoke 尚未执行；
-- Phase 4 以后尚未完成：Worker 仍为 Protocol v2、每次物理调用新建 ephemeral Thread；
-- ADB/Proof Gateway、Capability Registry、MCP/Python 入口和监督 Agent API 尚未进入实现。
+- 工作分支：`feature/codex-docker-migration`；首个迁移提交 `6c3e238` 已推送，后续实现继续在同一分支；
+- Phase 0—3 已完成固定工具镜像、扫描级 keeper、只读 scan input、多 UID session、资源参数、
+  DeepSeek Responses Provider、官方 model catalog、full-access、effort、Web Search 和 exec-only Key 注入；
+- Phase 4 已切换 Worker Protocol v3：worker/session 长驻、`ephemeral=False`、primary 多 Turn
+  Thread 复用、heartbeat、interrupt、host-only NDJSON spool 和兼容 `thread_resume`；
+- Phase 5 已实现任务级 ADB/Proof Gateway：容器通过 `apkscanner-host:host-gateway` 到达随机内部端口，
+  token 不进入 Prompt/审计/容器全局环境，serial 由设备 lease 固定，ADB 命令输出生成 Evidence；
+- Capability Registry 已实现 built-in、hash-pinned Python script 和显式 MCP binding；监督 REST 已提供
+  snapshot、catalog/invoke、Campaign validate/launch，作为未来独立监督 Agent 的窄控制面；
+- Worker 镜像 `apk-scanner-codex-worker:0.2.0` 标记 SDK `0.144.4` / Protocol `3`，真实 Docker
+  UID/Thread 和 Pixel 4 ADB Gateway 集成测试通过；
+- `vulntest.apk` 已在 Pixel 4 Android 13/API 33 完成一次静态+ADB 扫描：5 个动态入口任务均获取独占
+  lease、安装/清理成功，ContentProvider 通过 adb-shell 返回示例凭据，但因没有普通 App UID Proof，
+  平台正确地没有生成最终 Finding；当前进程未提供 `DEEPSEEK_API_KEY`，真实 DeepSeek Turn/自动 PoC
+  smoke 仍未执行。
 
 当前关键代码位置：
 
-- `backend/apkscanner/codex_runner.py`：Codex facade、当前 Docker 启动和一次性进程消费；
-- `backend/apkscanner/codex_worker.py`：当前一次请求、一次 Thread、一次 Turn 的 worker；
+- `backend/apkscanner/codex_runner.py`：Codex facade、持久 session 缓存、Thread 恢复和 Docker Turn；
+- `backend/apkscanner/codex_worker.py`：Protocol v3 命令循环、长生命周期 Thread、heartbeat 和 interrupt；
+- `backend/apkscanner/codex_protocol.py`：宿主持久协议 client、事件 spool、timeout/cancel；
+- `backend/apkscanner/adb_gateway.py`：容器 adb wrapper、策略模型和有界响应；
 - `backend/apkscanner/orchestrator.py`：任务阶段、工作区物化、设备租约、Agent 审计和 Proof；
 - `backend/apkscanner/agent_events.py`：当前 SDK notification 归一化基础；
-- `backend/apkscanner/worker_protocol.py`：当前单请求 NDJSON 消费器；
+- `backend/apkscanner/worker_protocol.py`：旧 v2 单请求兼容读取器；
+- `backend/apkscanner/capabilities.py`：Capability Manifest/Registry、Python/MCP adapter；
+- `backend/apkscanner/supervisor.py`：TestEntrySeed、CampaignPlan 与监督服务；
 - `backend/apkscanner/poc.py`：平台管理的 PoC 校验、构建、签名和制品记录；
 - `backend/apkscanner/device.py`：设备池、优先级队列、任务级独占租约；
 - `Dockerfile.worker`：当前 Codex Worker 镜像。
@@ -1638,7 +1648,7 @@ class CapabilityAdapter(Protocol):
 | runtime | 具体实现 | 信任与隔离 |
 | --- | --- | --- |
 | `python` package | allowlisted entry point，运行在固定 capability runner/独立进程 | 包版本和 wheel/hash 固定；不能 import 任意 workspace 文件 |
-| `python` script | 用户通过 CLI/API 显式注册绝对路径、manifest 和 SHA-256；JSON stdin/stdout | 每次 hash 校验；默认独立 UID/sidecar；文件变更后需重新确认 |
+| `python` script | 用户把脚本放入专用 `capability-scripts/`，以相对路径、manifest 和 SHA-256 注册；JSON stdin/stdout | 每次 hash 校验；当前用无网络、只读 rootfs、无 capability 的短生命周期 Docker sidecar；文件变更后需重新确认 |
 | `mcp` | 平台管理 MCP server 配置；只暴露 manifest allowlist 中的 server/tool | server/tool schema、权限、side effect、凭据和超时逐项映射；不做自动发现即执行 |
 | `command` | 固定 argv 模板和 JSON 协议 | 无 shell 字符串；可变参数逐字段校验 |
 | `http` | 固定 origin/path/method 的 typed client | 禁止任意 URL；认证、重试、速率和 SSRF 由 adapter 管理 |

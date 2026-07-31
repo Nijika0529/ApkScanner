@@ -1669,6 +1669,15 @@ class AdbDeviceAdapter:
             cancel_event=self._active_cancel_event if respect_cancellation else None,
         )
 
+    def execute_gateway(self, args: list[str], timeout: int = 30) -> CommandResult:
+        """Execute a policy-validated command on this adapter's fixed serial."""
+
+        from .adb_gateway import validate_adb_args
+
+        validate_adb_args(args)
+        with self._lease:
+            return self._adb(args, timeout=max(1, min(120, timeout)))
+
     def _adb_budget(
         self, args: list[str], budget: TimeBudget | None, cap: int
     ) -> CommandResult:
@@ -1732,6 +1741,16 @@ class AdbDevicePool:
 
     def wake_waiters(self) -> None:
         self.scheduler.wake_waiters()
+
+    def snapshot(self) -> dict[str, Any]:
+        state = self.scheduler.snapshot()
+        return {
+            "configured": self.configured,
+            "capacity": len(self.adapters),
+            "serials": list(self.serials),
+            "active": state["active"],
+            "waiting": state["waiting"],
+        }
 
     def capability(self, *, non_blocking: bool = False) -> dict[str, Any]:
         if not self.configured:

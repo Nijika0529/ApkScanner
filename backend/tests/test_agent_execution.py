@@ -23,8 +23,8 @@ def test_default_profiles_are_frozen_versioned_and_hashable(settings) -> None:  
     assert frozen.execution.container_scope == "scan"
     assert frozen.execution.workspace_write is True
     assert frozen.execution.web_search == "live"
-    assert frozen.execution.adb == "disabled"
-    assert frozen.execution.proof_replay == "disabled"
+    assert frozen.execution.adb == "task_gateway"
+    assert frozen.execution.proof_replay == "task_gateway"
     assert frozen.provider.backend == "codex"
     assert frozen.provider.provider == "deepseek"
     assert frozen.provider.model == "deepseek-v4-flash"

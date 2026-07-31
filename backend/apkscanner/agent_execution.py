@@ -50,8 +50,8 @@ class AgentExecutionProfile(_FrozenContract):
     apply_patch: Literal[True] = True
     web_search: Literal["disabled", "cached", "live"] = "live"
     shell_network: Literal["disabled", "public_egress"] = "public_egress"
-    adb: Literal["disabled", "task_gateway"] = "disabled"
-    proof_replay: Literal["disabled", "task_gateway"] = "disabled"
+    adb: Literal["disabled", "task_gateway"] = "task_gateway"
+    proof_replay: Literal["disabled", "task_gateway"] = "task_gateway"
     subagents: Literal[False] = False
     mcp_allowlist: tuple[str, ...] = ()
     container_resource_class: Literal["scan_standard", "scan_large"] = "scan_standard"

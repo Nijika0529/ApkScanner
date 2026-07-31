@@ -24,15 +24,16 @@ from .agent_events import (
 from .agent_prompt import developer_instructions, investigation_prompt
 from .agent_workspace import AgentWorkspaceManager
 from .codex_executor import CodexDockerExecutor
+from .codex_protocol import (
+    PersistentWorkerCancelled,
+    PersistentWorkerClient,
+    PersistentWorkerError,
+    PersistentWorkerTimeout,
+)
 from .codex_sdk_baseline import PINNED_SDK_VERSION, runtime_capability
 from .config import Settings
 from .models import EntryPoint, InvestigationTask, Scan
 from .schemas import AGENT_RESULT_JSON_SCHEMA, AgentInvestigationResult
-from .worker_protocol import (
-    WorkerCancelledError,
-    WorkerTimeoutError,
-    consume_worker_process,
-)
 
 
 @dataclass(slots=True)
@@ -43,6 +44,14 @@ class CodexRunResult:
     usage: dict[str, Any]
 
 
+@dataclass(slots=True)
+class _ActiveDockerSession:
+    workspace: Any
+    container: Any
+    client: PersistentWorkerClient
+    role: str
+
+
 class CodexInvestigator:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -50,6 +59,8 @@ class CodexInvestigator:
         self.executor = CodexDockerExecutor(settings)
         self._deep_capability: dict[str, Any] | None = None
         self._capability_lock = threading.Lock()
+        self._session_lock = threading.RLock()
+        self._sessions: dict[tuple[str, str, int, str], _ActiveDockerSession] = {}
 
     def capability(self, *, deep: bool = False) -> dict[str, Any]:
         capability = runtime_capability()
@@ -120,6 +131,7 @@ class CodexInvestigator:
         timeout_seconds: int | None = None,
         event_callback: AgentEventCallback | None = None,
         cancel_event: threading.Event | None = None,
+        gateway_environment: dict[str, str] | None = None,
     ) -> CodexRunResult:
         from openai_codex import ApprovalMode, Sandbox
         from openai_codex.generated.v2_all import ReasoningEffort
@@ -142,6 +154,7 @@ class CodexInvestigator:
                 timeout_seconds=timeout_seconds,
                 event_callback=event_callback,
                 cancel_event=cancel_event,
+                gateway_environment=gateway_environment,
             )
         if cancel_event is not None and cancel_event.is_set():
             raise AgentCancelledError("Codex investigation was cancelled before dispatch")
@@ -282,7 +295,7 @@ class CodexInvestigator:
                 "available": False,
                 "detail": f"build the worker image first: {image}",
             }
-        if inspected.stdout.strip() != f"{PINNED_SDK_VERSION}|2":
+        if inspected.stdout.strip() != f"{PINNED_SDK_VERSION}|3":
             return {
                 **capability,
                 "available": False,
@@ -307,6 +320,7 @@ class CodexInvestigator:
         timeout_seconds: int | None,
         event_callback: AgentEventCallback | None,
         cancel_event: threading.Event | None,
+        gateway_environment: dict[str, str] | None,
     ) -> CodexRunResult:
         capability = self._docker_capability(
             {
@@ -328,38 +342,15 @@ class CodexInvestigator:
             if phase in {"rescue_review", "rescue_exploration"}
             else "primary"
         )
-        sessions_root = self.workspaces.prepare_scan(scan.id)
-        agent_session = self.workspaces.prepare_session(
-            scan_id=scan.id,
-            task_id=task.id,
-            attempt=task.attempts,
-            role=role,
+        active = self._prepare_active_session(
+            scan=scan,
+            task=task,
             source_workspace=workspace,
-            context={"phase": phase},
-        )
-        container = self.executor.ensure_scan_container(
-            scan_id=scan.id,
+            phase=phase,
+            role=role,
             scan_workspace=scan_workspace,
-            sessions_root=sessions_root,
+            gateway_environment=gateway_environment if role == "primary" else None,
         )
-        payload = {
-            "schema_version": "1.0",
-            "prompt": prompt,
-            "developer_instructions": developer_instructions(direct_tool_access=True),
-            "model": self.settings.codex_model,
-            "model_provider": self.settings.codex_provider,
-            "reasoning_effort": self.settings.codex_reasoning_effort,
-            "provider_base_url": self.settings.deepseek_base_url,
-            "model_catalog_path": "/opt/apk-scanner/config/deepseek-models.json",
-            "workspace_path": agent_session.container_workspace,
-            "output_schema": AGENT_RESULT_JSON_SCHEMA,
-        }
-        process = self.executor.start_worker(container=container, session=agent_session)
-
-        def stop_session() -> None:
-            self._kill_process_group(process)
-            self.executor.kill_session(container, agent_session)
-
         effective_worker_timeout = min(
             (
                 self.settings.task_timeout_seconds
@@ -369,27 +360,24 @@ class CodexInvestigator:
             self.settings.codex_turn_timeout_seconds,
         )
         try:
-            result, _stderr = consume_worker_process(
-                process,
-                payload=payload,
+            result = active.client.turn(
+                prompt=prompt,
+                output_schema=AGENT_RESULT_JSON_SCHEMA,
                 timeout_seconds=effective_worker_timeout,
                 no_event_timeout_seconds=self.settings.codex_no_event_timeout_seconds,
                 event_callback=event_callback,
-                on_timeout=stop_session,
                 cancel_event=cancel_event,
-                on_cancel=stop_session,
-                on_error_cleanup=stop_session,
             )
-        except WorkerCancelledError as exc:
+        except PersistentWorkerCancelled as exc:
             raise AgentCancelledError(
                 "containerized Codex investigation was cancelled by the user"
             ) from exc
-        except WorkerTimeoutError as exc:
+        except PersistentWorkerTimeout as exc:
             raise TimeoutError(
-                "containerized Codex investigation exceeded its timeout: "
-                f"{exc}"
+                "containerized Codex investigation exceeded its timeout: " f"{exc}"
             ) from exc
-        except RuntimeError as exc:
+        except PersistentWorkerError as exc:
+            self._discard_session(scan.id, task.id, task.attempts, role)
             raise RuntimeError(f"containerized Codex worker failed: {exc}") from exc
         return CodexRunResult(
             thread_id=str(result["thread_id"]),
@@ -398,11 +386,186 @@ class CodexInvestigator:
             usage=result.get("usage") or {},
         )
 
+    def prepare_session_workspace(
+        self,
+        *,
+        scan: Scan,
+        task: InvestigationTask,
+        workspace: Path,
+        phase: str,
+    ) -> Path:
+        """Prepare and return the writable workspace used by a Docker Agent."""
+
+        if self.settings.codex_isolation != "docker":
+            return workspace
+        role = self._role_for_phase(phase)
+        session = self.workspaces.prepare_session(
+            scan_id=scan.id,
+            task_id=task.id,
+            attempt=task.attempts,
+            role=role,
+            source_workspace=workspace,
+            context={"phase": phase},
+        )
+        return session.workspace
+
+    def _prepare_active_session(
+        self,
+        *,
+        scan: Scan,
+        task: InvestigationTask,
+        source_workspace: Path,
+        phase: str,
+        role: str,
+        scan_workspace: Path,
+        gateway_environment: dict[str, str] | None,
+    ) -> _ActiveDockerSession:
+        key = (scan.id, task.id, task.attempts, role)
+        with self._session_lock:
+            existing = self._sessions.get(key)
+            if existing is not None and existing.client.process.poll() is None:
+                self.workspaces.prepare_session(
+                    scan_id=scan.id,
+                    task_id=task.id,
+                    attempt=task.attempts,
+                    role=role,
+                    source_workspace=source_workspace,
+                    context={"phase": phase},
+                )
+                return existing
+            if existing is not None:
+                self._sessions.pop(key, None)
+                existing.client.kill()
+            sessions_root = self.workspaces.prepare_scan(scan.id)
+            agent_session = self.workspaces.prepare_session(
+                scan_id=scan.id,
+                task_id=task.id,
+                attempt=task.attempts,
+                role=role,
+                source_workspace=source_workspace,
+                context={"phase": phase},
+            )
+            container = self.executor.ensure_scan_container(
+                scan_id=scan.id,
+                scan_workspace=scan_workspace,
+                sessions_root=sessions_root,
+            )
+            process = self.executor.start_worker(container=container, session=agent_session)
+
+            def stop_session() -> None:
+                self._kill_process_group(process)
+                self.executor.kill_session(container, agent_session)
+
+            session_id = f"{task.id}:a{task.attempts}:{role}"
+            spool = self.settings.data_dir / "runtime" / "events" / f"{agent_session.workspace_key}.ndjson"
+            client = PersistentWorkerClient(
+                process,
+                session_id=session_id,
+                event_spool=spool,
+                cleanup=stop_session,
+            )
+            configuration = {
+            "developer_instructions": developer_instructions(direct_tool_access=True),
+            "model": self.settings.codex_model,
+            "model_provider": self.settings.codex_provider,
+            "reasoning_effort": self.settings.codex_reasoning_effort,
+            "provider_base_url": self.settings.deepseek_base_url,
+            "model_catalog_path": "/opt/apk-scanner/config/deepseek-models.json",
+            "workspace_path": agent_session.container_workspace,
+        }
+            thread_file = agent_session.root / "thread.json"
+            resume_thread_id = self._read_thread_id(thread_file)
+            try:
+                thread_id = client.open_session(
+                    configuration=configuration,
+                    gateway_environment=gateway_environment,
+                    resume_thread_id=resume_thread_id,
+                )
+            except Exception:
+                client.kill()
+                if resume_thread_id is None:
+                    raise
+                with suppress(OSError):
+                    thread_file.unlink()
+                process = self.executor.start_worker(
+                    container=container,
+                    session=agent_session,
+                )
+
+                def stop_replacement_session() -> None:
+                    self._kill_process_group(process)
+                    self.executor.kill_session(container, agent_session)
+
+                client = PersistentWorkerClient(
+                    process,
+                    session_id=session_id,
+                    event_spool=spool,
+                    cleanup=stop_replacement_session,
+                )
+                try:
+                    thread_id = client.open_session(
+                        configuration=configuration,
+                        gateway_environment=gateway_environment,
+                    )
+                except Exception:
+                    client.kill()
+                    raise
+            thread_file.write_text(
+                json.dumps({"schema_version": "1.0", "thread_id": thread_id}),
+                encoding="utf-8",
+            )
+            thread_file.chmod(0o600)
+            active = _ActiveDockerSession(agent_session, container, client, role)
+            self._sessions[key] = active
+            return active
+
+    def _discard_session(self, scan_id: str, task_id: str, attempt: int, role: str) -> None:
+        with self._session_lock:
+            active = self._sessions.pop((scan_id, task_id, attempt, role), None)
+        if active is not None:
+            active.client.kill()
+
+    @staticmethod
+    def _read_thread_id(path: Path) -> str | None:
+        if not path.is_file():
+            return None
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            thread_id = value.get("thread_id") if isinstance(value, dict) else None
+            return thread_id if isinstance(thread_id, str) and thread_id else None
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    @staticmethod
+    def _role_for_phase(phase: str) -> str:
+        return (
+            "critic"
+            if phase == "adversarial_review"
+            else "rescue"
+            if phase in {"rescue_review", "rescue_exploration"}
+            else "primary"
+        )
+
     def close_scan(self, scan_id: str) -> None:
+        with self._session_lock:
+            sessions = [
+                self._sessions.pop(key)
+                for key in list(self._sessions)
+                if key[0] == scan_id
+            ]
+        for active in sessions:
+            with suppress(Exception):
+                active.client.close()
         self.executor.close_scan(scan_id)
         self.workspaces.forget_scan(scan_id)
 
     def shutdown(self) -> None:
+        with self._session_lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        for active in sessions:
+            with suppress(Exception):
+                active.client.close()
         self.executor.shutdown()
 
     @staticmethod

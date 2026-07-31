@@ -122,6 +122,8 @@ class CodexDockerExecutor:
             "--cpus",
             str(self.settings.codex_cpu_limit),
             "--network=bridge",
+            "--add-host",
+            "apkscanner-host:host-gateway",
             "--tmpfs",
             f"/tmp:rw,nosuid,nodev,size={self.settings.codex_tmpfs_size}",
             "--mount",

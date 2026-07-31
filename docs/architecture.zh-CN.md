@@ -44,8 +44,9 @@ scheme、host/authority 和 port；额外参数有数量、键名、类型和长
 启动瞬间解析出的配置，避免一次审计调用途中切换模型；新配置只影响未启动或重新分析的任务。
 
 一个任务以 `task_id + attempt` 作为平台逻辑探索运行。当前 Worker Protocol v2 的每次物理
-模型调用使用新的 Codex thread；下一轮会重新装载完整静态上下文、累计 Evidence 和已执行
-测试。扫描级 Docker 容器及同 role 工作区会复用，Web 将物理调用聚合到同一任务时间线。
+每个 `task + attempt + role` 使用一个持久 Codex Worker 和非 ephemeral Thread；primary 的
+下一轮会复用同一 Thread，同时重新装载累计 Evidence 和已执行测试。Critic/Rescue 使用独立
+UID、工作区和 Thread。扫描级 Docker 容器继续复用，Web 将物理 Turn 聚合到同一任务时间线。
 持久 Thread/resume 按专项架构文档的 Phase 4 实施。
 
 静态阶段结束即发布 preliminary report，并继续动态任务。外部工具、MobSF 请求和每个任务都有超时；超过 4 小时 preliminary 目标或 24 小时整单预算会写入事件及 coverage gap。

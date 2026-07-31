@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from apkscanner.agent_workspace import AgentWorkspaceManager
 from apkscanner.codex_executor import CodexDockerExecutor, ScanContainer
+from apkscanner.codex_protocol import PersistentWorkerClient
 
 SCAN_ID = "00000000-0000-0000-0000-000000000101"
 TASK_ID = "00000000-0000-0000-0000-000000000102"
@@ -237,4 +238,70 @@ def test_real_scan_container_shares_input_but_isolates_session_uids(settings) ->
         assert (primary.workspace / "primary.txt").read_text(encoding="utf-8") == "primary"
         assert (critic.workspace / "critic.txt").read_text(encoding="utf-8") == "critic"
     finally:
+        executor.close_scan(SCAN_ID)
+
+
+@pytest.mark.skipif(
+    os.getenv("APKSCANNER_RUN_DOCKER_TESTS") != "1"
+    or os.geteuid() != 0
+    or shutil.which("docker") is None,
+    reason="requires APKSCANNER_RUN_DOCKER_TESTS=1, root, and Docker",
+)
+def test_real_worker_protocol_opens_persistent_codex_thread(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-only-key-without-provider-request")
+    configured = replace(
+        settings,
+        codex_docker_image="apk-scanner-codex-worker:0.2.0",
+        codex_uid_min=21_400,
+        codex_uid_max=21_410,
+    )
+    source = configured.data_dir / "source"
+    source.mkdir()
+    scan_workspace = configured.data_dir / "workspaces" / SCAN_ID
+    (scan_workspace / "jadx").mkdir(parents=True)
+    manager = AgentWorkspaceManager(configured)
+    session = manager.prepare_session(
+        scan_id=SCAN_ID,
+        task_id=TASK_ID,
+        attempt=1,
+        role="primary",
+        source_workspace=source,
+    )
+    executor = CodexDockerExecutor(configured)
+    container = executor.ensure_scan_container(
+        scan_id=SCAN_ID,
+        scan_workspace=scan_workspace,
+        sessions_root=session.root.parent,
+    )
+    process = executor.start_worker(container=container, session=session)
+
+    def cleanup() -> None:
+        executor.kill_session(container, session)
+
+    client = PersistentWorkerClient(
+        process,
+        session_id=f"{TASK_ID}:a1:primary",
+        event_spool=configured.data_dir / "runtime" / "events" / "real.ndjson",
+        cleanup=cleanup,
+    )
+    try:
+        thread_id = client.open_session(
+            configuration={
+                "developer_instructions": "Analyze only the assigned APK.",
+                "model": "deepseek-v4-flash",
+                "model_provider": "deepseek",
+                "reasoning_effort": "high",
+                "provider_base_url": "https://api.deepseek.com/",
+                "model_catalog_path": "/opt/apk-scanner/config/deepseek-models.json",
+                "workspace_path": session.container_workspace,
+            },
+            gateway_environment={},
+        )
+        assert thread_id
+        assert process.poll() is None
+    finally:
+        client.close()
         executor.close_scan(SCAN_ID)

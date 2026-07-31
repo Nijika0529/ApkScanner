@@ -20,7 +20,7 @@ ARG ANDROID_BUILD_TOOLS_SHA1="936a0d6bd5ae3e2118a7567dddbc95ff67ed46e9"
 
 LABEL io.apkscanner.version="0.2.0" \
       io.apkscanner.sdk-version="0.144.4" \
-      io.apkscanner.worker-protocol="2" \
+      io.apkscanner.worker-protocol="3" \
       io.apkscanner.agent-backend="codex" \
       io.apkscanner.model-provider="deepseek" \
       io.apkscanner.jadx-version="1.5.6" \
