@@ -63,6 +63,134 @@ class Scan(Base):
     )
 
 
+class AdbDeviceRecord(Base):
+    """Persistent operator-managed membership of the runtime ADB pool."""
+
+    __tablename__ = "adb_devices"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    serial: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    label: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    state: Mapped[str] = mapped_column(String(32), default="ready", index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    api_level: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    android_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ApplicationRecord(Base):
+    """Stable application identity independent from any one uploaded APK."""
+
+    __tablename__ = "applications"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    package_name: Mapped[str] = mapped_column(String(512), unique=True, index=True)
+    display_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ApplicationRelease(Base):
+    """Identity and analysis-profile snapshot for one scan in an app version line."""
+
+    __tablename__ = "application_releases"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    application_id: Mapped[str] = mapped_column(
+        ForeignKey("applications.id", ondelete="CASCADE"), index=True
+    )
+    scan_id: Mapped[str] = mapped_column(
+        ForeignKey("scans.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    signer_digest: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    identity_status: Mapped[str] = mapped_column(String(32), default="unverified", index=True)
+    version_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    version_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    artifact_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    snapshot_hash: Mapped[str] = mapped_column(String(64), index=True)
+    analysis_profile: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class VulnerabilityCase(Base):
+    """Human-maintained vulnerability identity spanning application releases."""
+
+    __tablename__ = "vulnerability_cases"
+    __table_args__ = (
+        UniqueConstraint("application_id", "case_key", name="uq_vulnerability_case_key"),
+        UniqueConstraint(
+            "application_id",
+            "fingerprint_version",
+            "fingerprint",
+            name="uq_vulnerability_case_fingerprint",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    application_id: Mapped[str] = mapped_column(
+        ForeignKey("applications.id", ondelete="CASCADE"), index=True
+    )
+    case_key: Mapped[str] = mapped_column(String(128), index=True)
+    fingerprint_version: Mapped[str] = mapped_column(String(32), default="case-v1")
+    fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    identity_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    title: Mapped[str] = mapped_column(String(1024))
+    description: Mapped[str] = mapped_column(Text, default="")
+    harm: Mapped[str] = mapped_column(Text)
+    severity: Mapped[str] = mapped_column(String(16), index=True)
+    cwe: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    masvs: Mapped[str] = mapped_column(String(128), default="MASVS-PLATFORM")
+    minimum_proof: Mapped[str] = mapped_column(String(32), default="dynamic")
+    lifecycle: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    source_scan_id: Mapped[str | None] = mapped_column(
+        ForeignKey("scans.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    source_finding_id: Mapped[str | None] = mapped_column(
+        ForeignKey("findings.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class VulnerabilityOccurrence(Base):
+    """One case's machine observation on one concrete APK scan."""
+
+    __tablename__ = "vulnerability_occurrences"
+    __table_args__ = (
+        UniqueConstraint("case_id", "scan_id", name="uq_vulnerability_occurrence_scan"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    case_id: Mapped[str] = mapped_column(
+        ForeignKey("vulnerability_cases.id", ondelete="CASCADE"), index=True
+    )
+    scan_id: Mapped[str] = mapped_column(
+        ForeignKey("scans.id", ondelete="CASCADE"), index=True
+    )
+    finding_id: Mapped[str | None] = mapped_column(
+        ForeignKey("findings.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    analysis_status: Mapped[str] = mapped_column(String(32), default="inconclusive", index=True)
+    proof_level: Mapped[str] = mapped_column(String(32), default="none")
+    match_quality: Mapped[str] = mapped_column(String(32), default="strong")
+    match_reason: Mapped[str] = mapped_column(Text, default="")
+    observed_identity_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class EntryPoint(Base):
     __tablename__ = "entry_points"
 
@@ -380,6 +508,31 @@ class BenchmarkEvaluation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     scan: Mapped[Scan] = relationship(back_populates="benchmark_evaluations")
+
+
+class InvestigationBrief(Base):
+    """A first-class contract for non-standard or app-internal investigations."""
+
+    __tablename__ = "investigation_briefs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scan_id: Mapped[str | None] = mapped_column(
+        ForeignKey("scans.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    schema_version: Mapped[str] = mapped_column(String(16), default="1.0")
+    name: Mapped[str] = mapped_column(String(256))
+    objective: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), default="draft", index=True)
+    scope: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    attacker_model: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    preconditions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    plan: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    evaluation_contract: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
 
 
 class CoverageItem(Base):

@@ -36,7 +36,7 @@ import { MarkdownContent } from "./components/MarkdownContent"
 import { Badge, Button, Card, Dialog, DialogContent, DialogDescription, DialogTitle, Progress, Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui"
 import { cn, formatDate, shortHash, statusLabel } from "./lib"
 import { markdownToPlainText } from "./markdown"
-import type { AgentAudit, BenchmarkEvaluation, CoverageItem, EntryPoint, Finding, Health, InvestigationTask, InvestigatorChoice, PatternMatch, Scan, ScanEvent, SecurityHypothesis, SecuritySnapshot, VersionDiff } from "./types"
+import type { AdbDevice, AgentAudit, BenchmarkEvaluation, CoverageItem, EntryPoint, Finding, Health, InvestigationTask, InvestigatorChoice, PatternMatch, Scan, ScanEvent, SecurityHypothesis, SecuritySnapshot, VersionDiff } from "./types"
 
 const severityTone = {
   critical: "danger",
@@ -48,7 +48,6 @@ const severityTone = {
 
 const DETAIL_REFRESH_EVENTS = [
   "static.started",
-  "static.mobsf_failed",
   "static.completed",
   "scan.preliminary_ready",
   "scan.preliminary_sla_missed",
@@ -307,7 +306,7 @@ function App() {
         </header>
         <div className="mx-auto max-w-[1500px] p-4 sm:p-6 lg:p-8">
           {error && <div role="alert" className="mb-6 flex items-start gap-3 rounded-xl border border-rose-500/35 bg-rose-500/10 p-4 text-sm text-rose-800"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /><span>{error}</span><button className="ml-auto" onClick={() => setError(null)} aria-label="关闭错误"><X className="h-4 w-4" /></button></div>}
-          {loading && !detail ? <LoadingState /> : detail ? <ScanDetailView data={detail} health={health} onRefresh={() => refreshDetail(detail.scan.id)} onDelete={() => setDeleteTarget(detail.scan)} onFreshRun={() => setFreshRunTarget(detail.scan)} /> : <EmptyState onUpload={() => setUploadOpen(true)} />}
+          {loading && !detail ? <LoadingState /> : detail ? <ScanDetailView data={detail} health={health} onRefresh={() => refreshDetail(detail.scan.id)} onDelete={() => setDeleteTarget(detail.scan)} onFreshRun={() => setFreshRunTarget(detail.scan)} onVersionCreated={onUploaded} /> : <EmptyState onUpload={() => setUploadOpen(true)} />}
         </div>
       </main>
       <UploadDialog open={uploadOpen} onOpenChange={setUploadOpen} onUploaded={onUploaded} health={health} />
@@ -351,7 +350,7 @@ function Sidebar({ scans, selectedId, health, onSelect, onUpload }: { scans: Sca
   )
 }
 
-function ScanDetailView({ data, health, onRefresh, onDelete, onFreshRun }: { data: DetailData; health: Health | null; onRefresh: () => Promise<void>; onDelete: () => void; onFreshRun: () => void }) {
+function ScanDetailView({ data, health, onRefresh, onDelete, onFreshRun, onVersionCreated }: { data: DetailData; health: Health | null; onRefresh: () => Promise<void>; onDelete: () => void; onFreshRun: () => void; onVersionCreated: (scan: Scan) => Promise<void> }) {
   const { scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events, securitySnapshot, versionDiff, patternMatches } = data
   const verificationCandidates = signals.filter(isVerificationCandidate)
   const staticSignals = signals.filter((signal) => !isVerificationCandidate(signal))
@@ -392,7 +391,7 @@ function ScanDetailView({ data, health, onRefresh, onDelete, onFreshRun }: { dat
           <TabsContent value="findings"><Findings findings={findings} verificationCandidates={verificationCandidates} scanStatus={scan.status} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="proof-backlog"><ProofBacklog signals={verificationCandidates} tasks={tasks} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="signals"><Signals signals={staticSignals} onRefresh={onRefresh} /></TabsContent>
-          <TabsContent value="versions"><VersionEvolution snapshot={securitySnapshot} diff={versionDiff} matches={patternMatches} entries={entries} /></TabsContent>
+          <TabsContent value="versions"><VersionEvolution scan={scan} snapshot={securitySnapshot} diff={versionDiff} matches={patternMatches} entries={entries} onCreated={onVersionCreated} /></TabsContent>
           <TabsContent value="coverage"><CoverageMatrix coverage={coverage} /></TabsContent>
           <TabsContent value="tasks"><Tasks scan={scan} tasks={tasks} entries={entries} audits={audits} events={events} health={health} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="proofs"><HypothesisPipeline scanId={scan.id} scanStatus={scan.status} hypotheses={hypotheses} evaluations={evaluations} entries={entries} onRefresh={onRefresh} /></TabsContent>
@@ -407,9 +406,63 @@ function Overview({ scan, events, health, coverage }: { scan: Scan; events: Scan
   const baselines = coverage.filter((item) => item.control_id.endsWith("-BASELINE"))
   return <div className="grid gap-6 xl:grid-cols-[1.35fr_.65fr]">
     <div><SectionTitle icon={Activity} title="扫描活动" description="平台事件与证据生成轨迹" /><ol className="mt-4 space-y-1">{events.slice().reverse().map((event, index) => <li key={event.id} className="relative flex gap-4 py-3"><div className="relative flex w-5 justify-center"><span className={cn("mt-1.5 h-2.5 w-2.5 rounded-full border-2", index === 0 ? "border-cyan-300 bg-cyan-600" : "border-slate-300 bg-slate-100")} />{index < events.length - 1 && <span className="absolute left-1/2 top-6 h-[calc(100%-10px)] w-px -translate-x-1/2 bg-slate-100" />}</div><div className="min-w-0"><p className="text-sm text-slate-800">{event.message}</p><p className="mt-1 text-xs text-slate-600">{formatDate(event.created_at)} · {event.event_type}</p></div></li>)}{!events.length && <EmptyRow text="扫描事件尚未生成" />}</ol></div>
-    <div className="space-y-6"><div><SectionTitle icon={ListChecks} title="MASVS 基线" description="APK-only 初始覆盖" /><div className="mt-4 space-y-3">{baselines.map((item) => <div key={item.id} className="rounded-xl border border-slate-200 bg-slate-50 p-3"><div className="mb-2 flex items-center justify-between gap-3"><span className="text-xs font-semibold text-slate-700">{item.domain.replace("MASVS-", "")}</span><Badge tone={statusTone(item.status)}>{statusLabel(item.status)}</Badge></div><p className="text-xs leading-relaxed text-slate-500">{item.gap_reason ?? item.title}</p></div>)}</div></div><div><SectionTitle icon={ServerCog} title="运行能力" description="缺失能力会形成覆盖缺口" /><div className="mt-4 grid grid-cols-2 gap-2">{health?.capabilities.map((item) => <div key={item.name} title={item.detail ?? undefined} className="flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-xs"><span className={cn("h-2 w-2 rounded-full", item.busy ? "bg-amber-400" : item.available ? "bg-emerald-400" : "bg-slate-300")} /><span className="truncate text-slate-600">{item.name}{item.busy ? " · 忙碌" : ""}</span></div>)}</div></div></div>
+    <div className="space-y-6"><DevicePoolPanel /><div><SectionTitle icon={ListChecks} title="MASVS 基线" description="APK-only 初始覆盖" /><div className="mt-4 space-y-3">{baselines.map((item) => <div key={item.id} className="rounded-xl border border-slate-200 bg-slate-50 p-3"><div className="mb-2 flex items-center justify-between gap-3"><span className="text-xs font-semibold text-slate-700">{item.domain.replace("MASVS-", "")}</span><Badge tone={statusTone(item.status)}>{statusLabel(item.status)}</Badge></div><p className="text-xs leading-relaxed text-slate-500">{item.gap_reason ?? item.title}</p></div>)}</div></div><div><SectionTitle icon={ServerCog} title="运行能力" description="缺失能力会形成覆盖缺口" /><div className="mt-4 grid grid-cols-2 gap-2">{health?.capabilities.map((item) => <div key={item.name} title={item.detail ?? undefined} className="flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-xs"><span className={cn("h-2 w-2 rounded-full", item.busy ? "bg-amber-400" : item.available ? "bg-emerald-400" : "bg-slate-300")} /><span className="truncate text-slate-600">{item.name}{item.busy ? " · 忙碌" : ""}</span></div>)}</div></div></div>
     {scan.error && <p className="text-rose-700">{scan.error}</p>}
   </div>
+}
+
+function DevicePoolPanel() {
+  const [devices, setDevices] = useState<AdbDevice[]>([])
+  const [serial, setSerial] = useState("")
+  const [label, setLabel] = useState("")
+  const [busy, setBusy] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const refresh = useCallback(async (probe = false) => {
+    try {
+      setDevices(await api.devices(probe))
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "读取设备池失败")
+    }
+  }, [])
+  useEffect(() => {
+    void refresh()
+    const timer = window.setInterval(() => void refresh(), 15_000)
+    return () => window.clearInterval(timer)
+  }, [refresh])
+  async function connect(event: FormEvent) {
+    event.preventDefault()
+    if (!serial.trim()) return
+    setBusy("connect")
+    setError(null)
+    try {
+      await api.connectDevice(serial.trim(), label.trim())
+      setSerial("")
+      setLabel("")
+      await refresh()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "连接设备失败")
+    } finally {
+      setBusy(null)
+    }
+  }
+  async function operate(device: AdbDevice, action: "drain" | "reconnect" | "remove") {
+    setBusy(`${device.serial}:${action}`)
+    setError(null)
+    try {
+      if (action === "drain") await api.drainDevice(device.serial)
+      if (action === "reconnect") await api.reconnectDevice(device.serial)
+      if (action === "remove") await api.removeDevice(device.serial)
+      await refresh()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "设备操作失败")
+    } finally {
+      setBusy(null)
+    }
+  }
+  return <div><SectionTitle icon={Smartphone} title="动态 ADB 设备池" description="扫描运行中也可扩容；每台设备一次只归属一个任务" />
+    <form className="mt-3 grid gap-2 sm:grid-cols-[1fr_1fr_auto]" onSubmit={connect}><input className="field" value={serial} onChange={(event) => setSerial(event.target.value)} placeholder="serial 或 host:port" aria-label="ADB serial" /><input className="field" value={label} onChange={(event) => setLabel(event.target.value)} placeholder="备注（可选）" aria-label="设备备注" /><Button type="submit" size="sm" disabled={busy !== null || !serial.trim()}>{busy === "connect" ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}接入</Button></form>
+    <div className="mt-3 space-y-2">{devices.map((device) => <div key={device.id} className="rounded-lg border border-slate-200 bg-slate-50 p-3"><div className="flex flex-wrap items-center justify-between gap-2"><div className="min-w-0"><p className="truncate font-mono text-xs font-semibold text-slate-800">{device.serial}</p><p className="mt-1 text-[11px] text-slate-500">{device.label ?? "未命名"} · Android {device.android_version ?? "?"} / API {device.api_level ?? "?"}</p></div><Badge tone={device.busy ? "warning" : device.available ? "good" : device.state === "draining" ? "warning" : "neutral"}>{device.busy ? "任务占用" : device.state === "draining" ? "排空中" : device.available ? "可分配" : statusLabel(device.state)}</Badge></div><div className="mt-2 flex flex-wrap gap-1"><Button variant="ghost" size="sm" onClick={() => void operate(device, "drain")} disabled={busy !== null || device.state === "draining"}>排空</Button><Button variant="ghost" size="sm" onClick={() => void operate(device, "reconnect")} disabled={busy !== null || device.busy}>重连</Button><Button variant="danger" size="sm" onClick={() => void operate(device, "remove")} disabled={busy !== null || device.busy}>移除</Button></div>{device.last_error && <p className="mt-2 text-[11px] leading-4 text-rose-700">{device.last_error}</p>}</div>)}{!devices.length && <p className="rounded-lg border border-dashed border-slate-300 p-3 text-xs text-slate-500">当前没有设备。接入 Android 16 / API 36+ 后即可加入队列。</p>}</div>
+    <div className="mt-2 flex gap-2"><Button variant="ghost" size="sm" onClick={() => void refresh(true)} disabled={busy !== null}><RefreshCw className="h-3.5 w-3.5" />主动探测</Button><span className="self-center text-[11px] text-slate-500">排空会停止新租约，正在运行的任务完成后才可移除。</span></div>{error && <p role="alert" className="mt-2 text-xs text-rose-700">{error}</p>}</div>
 }
 
 function EntryPoints({ entries }: { entries: EntryPoint[] }) {
@@ -419,15 +472,34 @@ function EntryPoints({ entries }: { entries: EntryPoint[] }) {
   return <div><div className="mb-5 flex flex-col gap-3 sm:flex-row"><label className="flex-1"><span className="sr-only">搜索入口</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索组件、URI 或 authority" className="field" /></label><label><span className="sr-only">入口类型</span><select value={kind} onChange={(event) => setKind(event.target.value)} className="field sm:w-48"><option value="all">全部入口</option><option value="activity">Activity</option><option value="service">Service</option><option value="receiver">Receiver</option><option value="provider">Provider</option><option value="deep_link">Deep Link</option></select></label></div><div className="overflow-x-auto rounded-xl border border-slate-200"><table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-slate-50 text-xs text-slate-500"><tr><th className="px-4 py-3 font-medium">类型</th><th className="px-4 py-3 font-medium">入口</th><th className="px-4 py-3 font-medium">可达性</th><th className="px-4 py-3 font-medium">权限</th><th className="px-4 py-3 font-medium">判定依据</th></tr></thead><tbody className="divide-y divide-slate-200">{filtered.map((entry) => <tr key={entry.id} className="hover:bg-slate-100"><td className="px-4 py-3"><EntryIcon kind={entry.kind} /></td><td className="max-w-md px-4 py-3"><p className="truncate font-mono text-xs text-slate-800" title={entry.name}>{entry.name}</p>{entry.owner_component && entry.owner_component !== entry.name && <p className="mt-1 truncate text-xs text-slate-600">handler · {entry.owner_component}</p>}</td><td className="px-4 py-3"><Badge tone={entry.exported ? "warning" : "good"}>{entry.exported ? "外部可达" : "私有"}</Badge></td><td className="px-4 py-3 text-xs text-slate-600">{entry.permission ?? "无"}{entry.permission_protection && <span className="block text-slate-600">{entry.permission_protection}</span>}</td><td className="px-4 py-3 text-xs text-slate-500">{entry.exported_reason}</td></tr>)}</tbody></table>{!filtered.length && <EmptyRow text="没有匹配的入口" />}</div></div>
   }
 
-function VersionEvolution({ snapshot, diff, matches, entries }: { snapshot: SecuritySnapshot | null; diff: VersionDiff | null; matches: PatternMatch[]; entries: EntryPoint[] }) {
+function VersionEvolution({ scan, snapshot, diff, matches, entries, onCreated }: { scan: Scan; snapshot: SecuritySnapshot | null; diff: VersionDiff | null; matches: PatternMatch[]; entries: EntryPoint[]; onCreated: (scan: Scan) => Promise<void> }) {
+  const [nextApk, setNextApk] = useState<File | null>(null)
+  const [uploading, setUploading] = useState(false)
+  const [uploadError, setUploadError] = useState<string | null>(null)
   const entryNames = new Map(entries.map((entry) => [entry.id, entry.name]))
   const counts = diff?.summary.counts && typeof diff.summary.counts === "object"
     ? diff.summary.counts as Record<string, number>
     : {}
+  async function uploadSuccessor(event: FormEvent) {
+    event.preventDefault()
+    if (!nextApk) return
+    setUploading(true)
+    setUploadError(null)
+    try {
+      const created = await api.upload(nextApk, "configured", scan.id)
+      setNextApk(null)
+      await onCreated(created)
+    } catch (reason) {
+      setUploadError(reason instanceof Error ? reason.message : "创建后继版本扫描失败")
+    } finally {
+      setUploading(false)
+    }
+  }
   return <div className="space-y-5">
     <div className="rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-sm leading-relaxed text-cyan-950">
-      安全快照只记录稳定的入口、权限、关键 API、校验与敏感汇点事实。同签名历史版本才会自动成为 Diff 和 PoC 回放基线。
+      安全快照只记录稳定的入口、权限、关键 API、校验与敏感汇点事实。建议显式上传后继版本；同签名历史版本的自动选择仅保留为兼容路径。
     </div>
+    <form className="rounded-xl border border-violet-200 bg-violet-50 p-4" onSubmit={uploadSuccessor}><div className="flex flex-col gap-3 sm:flex-row sm:items-end"><label className="min-w-0 flex-1"><span className="mb-2 block text-sm font-semibold text-violet-950">上传后继 APK，并显式使用当前 Scan 作为基线</span><input type="file" accept=".apk,application/vnd.android.package-archive" className="field" onChange={(event) => setNextApk(event.target.files?.[0] ?? null)} disabled={uploading || scan.status !== "final"} /></label><Button type="submit" disabled={!nextApk || uploading || scan.status !== "final"}>{uploading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <UploadCloud className="h-4 w-4" />}{uploading ? "正在创建" : "比较并复验新版本"}</Button></div><p className="mt-2 text-xs leading-5 text-violet-800">目标版本完成静态分析后才校验包名和签名；身份不连续时记录拒绝事件，不执行旧 PoC 回放。</p>{uploadError && <p role="alert" className="mt-2 text-xs text-rose-700">{uploadError}</p>}</form>
     <div className="grid gap-3 md:grid-cols-3">
       <Metric label="快照" value={snapshot ? "已生成" : "等待静态分析"} icon={Fingerprint} tone="cyan" />
       <Metric label="PoC 回放候选" value={diff?.replay_candidates.length ?? 0} icon={RefreshCw} tone="violet" />
@@ -673,12 +745,11 @@ function Tasks({ scan, tasks, entries, audits, events, health, onRefresh }: { sc
   const [controlError, setControlError] = useState<string | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<InvestigationTask | null>(null)
   const [cancelTarget, setCancelTarget] = useState<InvestigationTask | null>(null)
-  async function retry(task: InvestigationTask) {
-    setRetrying(task.id)
+  async function retry(task: InvestigationTask, contextMode: "continue" | "independent") {
+    setRetrying(`${task.id}:${contextMode}`)
     setControlError(null)
     try {
-      if (task.status === "timed_out") await api.continueTask(task.id)
-      else await api.retryTask(task.id)
+      await api.reanalyzeTask(task.id, contextMode)
       await onRefresh()
     } catch (reason) {
       setControlError(reason instanceof Error ? reason.message : "重新分析失败")
@@ -763,6 +834,7 @@ function Tasks({ scan, tasks, entries, audits, events, health, onRefresh }: { sc
         const session = task.thread_id ?? textValue(lastSession?.data.thread_id) ?? textValue(lastSession?.data.session_id)
         const continuation = recordValue(task.result.manual_continuation)
         const continuationNumber = numberValue(continuation?.continuation_number)
+        const independent = recordValue(task.result.independent_reanalysis)
         return (
           <article key={task.id} className={cn("overflow-hidden rounded-xl border bg-white shadow-sm", visualState.card)}>
             <div className={cn("flex flex-col gap-2 border-b px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-5", visualState.banner)}>
@@ -783,6 +855,7 @@ function Tasks({ scan, tasks, entries, audits, events, health, onRefresh }: { sc
                     {backend && <Badge tone="info">{backend}{model ? ` · ${model}` : ""}</Badge>}
                     {Boolean(auditCounts.get(task.id)) && <Badge tone="info">AI 调用 {auditCounts.get(task.id)}</Badge>}
                     {continuationNumber && <Badge tone="warning">深度续跑 {continuationNumber}</Badge>}
+                    {independent && <Badge tone="info">独立复核 · 不继承上下文</Badge>}
                   </div>
                   <p className="mt-2 truncate font-mono text-xs text-slate-500">{task.target_entry_ids.map((id) => names.get(id) ?? id).join(" · ")}</p>
                   {latest ? (
@@ -805,7 +878,8 @@ function Tasks({ scan, tasks, entries, audits, events, health, onRefresh }: { sc
                 <div className="flex shrink-0 items-center gap-3 text-xs text-slate-600">
                   <span>attempt {task.attempts}</span>
                   <Button variant="ghost" size="sm" onClick={() => void updateTaskControl(task, !taskAgentEnabled(task))} disabled={!masterEnabled || ["running", "cancel_requested"].includes(task.status) || controlSaving === task.id} title={!masterEnabled ? "先开启扫描级 AI 总开关" : "覆盖本任务的 AI 使用设置"}>{controlSaving === task.id ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Bot className="h-3.5 w-3.5" />}AI {taskAgentEnabled(task) ? "开" : "关"}</Button>
-                  {isTerminalTask(task.status) && <Button variant={task.status === "timed_out" ? "primary" : "secondary"} size="sm" onClick={() => retry(task)} disabled={retrying === task.id}>{retrying === task.id ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}{task.status === "timed_out" ? "继续深度探索" : "重新分析"}</Button>}
+                  {isTerminalTask(task.status) && <Button variant={task.status === "timed_out" ? "primary" : "secondary"} size="sm" onClick={() => retry(task, "continue")} disabled={retrying !== null}>{retrying === `${task.id}:continue` ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}{task.status === "timed_out" ? "继续深度探索" : "沿用入口重跑"}</Button>}
+                  {isTerminalTask(task.status) && <Button variant="secondary" size="sm" onClick={() => retry(task, "independent")} disabled={retrying !== null} title="新建任务，只复用 APK、Manifest、JADX/Smali 等静态产物；不读取原任务 Evidence、结论、Thread 或版本回放">{retrying === `${task.id}:independent` ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <ScanSearch className="h-3.5 w-3.5" />}独立复核</Button>}
                   {["queued", "awaiting_device", "running", "cancel_requested"].includes(task.status) && <Button variant="danger" size="sm" onClick={() => setCancelTarget(task)} disabled={task.status === "cancel_requested"}>{task.status === "cancel_requested" ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <X className="h-3.5 w-3.5" />}{task.status === "queued" ? "取消等待" : task.status === "cancel_requested" ? "正在停止" : "停止分析"}</Button>}
                   {["blocked_device", "completed", "not_reproduced", "inconclusive", "timed_out", "failed", "canceled", "cancel_requested"].includes(task.status) && <Button variant="danger" size="sm" onClick={() => setDeleteTarget(task)}><Trash2 className="h-3.5 w-3.5" />删除</Button>}
                 </div>

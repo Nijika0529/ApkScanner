@@ -10,7 +10,7 @@ import shutil
 import threading
 import uuid
 import zipfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager, suppress
 from copy import deepcopy
@@ -42,8 +42,8 @@ from .enums import (
 from .evidence import EvidenceRecorder
 from .finding_policy import partition_findings
 from .manifest import parse_manifest
-from .mobsf import MobSFAdapter
 from .models import (
+    AdbDeviceRecord,
     AgentRuntimeEventRecord,
     CoverageItem,
     EntryPoint,
@@ -128,14 +128,41 @@ class ScanOrchestrator:
         self.evidence = EvidenceRecorder(store)
         self.hypothesis_ledger = HypothesisLedger(database)
         configured_serials = settings.configured_adb_serials
+        with self.database.session_factory() as session:
+            records = {
+                item.serial: item
+                for item in session.scalars(select(AdbDeviceRecord))
+            }
+            for serial in configured_serials:
+                if serial not in records:
+                    record = AdbDeviceRecord(
+                        serial=serial,
+                        label="environment bootstrap",
+                        state="ready",
+                        enabled=True,
+                        metadata_json={"source": "environment"},
+                    )
+                    session.add(record)
+                    records[serial] = record
+            session.commit()
+            enabled_records = [item for item in records.values() if item.enabled]
         self.devices = [
-            AdbDeviceAdapter(settings, self.runner, serial=serial) for serial in configured_serials
+            AdbDeviceAdapter(settings, self.runner, serial=item.serial)
+            for item in enabled_records
         ]
-        self.device = self.devices[0] if self.devices else AdbDeviceAdapter(settings, self.runner)
+        # Compatibility handle for integrations that customize the first
+        # adapter. Scheduling always goes through the mutable pool below.
+        self.device = (
+            self.devices[0]
+            if self.devices
+            else AdbDeviceAdapter(settings, self.runner)
+        )
         self.device_pool = AdbDevicePool(self.devices)
+        for item in enabled_records:
+            if item.state == "draining":
+                self.device_pool.drain(item.serial)
         self.poc_builder = PocBuilder(settings, self.runner, store)
         self.security_evolution = SecurityEvolutionService()
-        self.mobsf = MobSFAdapter(settings)
         self.codex = CodexInvestigator(settings)
         self.investigators = {"codex": self.codex}
         self._running: set[str] = set()
@@ -152,11 +179,214 @@ class ScanOrchestrator:
         # One task owns one ADB device for its complete multi-round
         # investigation. The global semaphore prevents scans from collectively
         # exceeding the configured device pool.
-        self._investigation_concurrency = max(
-            1,
-            len(configured_serials),
-        )
+        self._investigation_concurrency = settings.investigation_max_concurrency
         self._investigation_slots = threading.BoundedSemaphore(self._investigation_concurrency)
+
+    @staticmethod
+    def _validate_adb_serial(serial: str) -> str:
+        serial = serial.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,254}", serial):
+            raise ValueError("ADB serial contains unsupported characters")
+        return serial
+
+    def list_adb_devices(self, *, probe: bool = False) -> list[dict[str, Any]]:
+        pool = self.device_pool.snapshot()
+        active = dict(pool.get("active") or {})
+        draining = set(pool.get("draining") or [])
+        adapters = {str(item.serial): item for item in self.device_pool.adapters}
+        with self.database.session_factory() as session:
+            records = list(
+                session.scalars(select(AdbDeviceRecord).order_by(AdbDeviceRecord.created_at))
+            )
+            output: list[dict[str, Any]] = []
+            changed = False
+            for record in records:
+                adapter = adapters.get(record.serial)
+                capability: dict[str, Any] = {}
+                if adapter is not None:
+                    capability = adapter.capability(
+                        non_blocking=(not probe or record.serial in active)
+                    )
+                    if probe and not capability.get("busy") and capability.get("available"):
+                        api_text = str(capability.get("api_level") or "")
+                        record.api_level = int(api_text) if api_text.isdigit() else None
+                        record.android_version = str(
+                            capability.get("android_version") or ""
+                        ) or None
+                        record.last_error = None
+                        record.last_seen_at = now()
+                        record.state = (
+                            "draining" if record.serial in draining else "ready"
+                        )
+                        changed = True
+                    elif probe and not capability.get("busy"):
+                        record.last_error = str(
+                            capability.get("detail") or "ADB device is unavailable"
+                        )[:4000]
+                        record.state = "unavailable"
+                        changed = True
+                output.append(
+                    {
+                        "id": record.id,
+                        "serial": record.serial,
+                        "label": record.label,
+                        "state": (
+                            "draining"
+                            if record.serial in draining
+                            else "busy"
+                            if record.serial in active
+                            else record.state
+                        ),
+                        "enabled": record.enabled,
+                        "api_level": record.api_level,
+                        "android_version": record.android_version,
+                        "available": bool(capability.get("available")),
+                        "busy": record.serial in active,
+                        "active_task_id": active.get(record.serial),
+                        "last_error": record.last_error,
+                        "last_seen_at": record.last_seen_at,
+                        "created_at": record.created_at,
+                        "updated_at": record.updated_at,
+                    }
+                )
+            if changed:
+                session.commit()
+            return output
+
+    def connect_adb_device(
+        self,
+        serial: str,
+        *,
+        label: str | None = None,
+        connect: bool = True,
+    ) -> dict[str, Any]:
+        serial = self._validate_adb_serial(serial)
+        if self.device_pool.is_active(serial):
+            raise RuntimeError("Device is active; wait for the owning task before reconnecting it")
+        if not self.runner.available("adb"):
+            raise RuntimeError("adb is not installed on the host")
+        if connect and ":" in serial:
+            result = self.runner.run(["adb", "connect", serial], timeout=30)
+            combined = f"{result.stdout}\n{result.stderr}".strip().lower()
+            if result.exit_code != 0 or "failed" in combined or "unable" in combined:
+                raise RuntimeError(combined or "adb connect failed")
+        adapter = AdbDeviceAdapter(self.settings, self.runner, serial=serial)
+        capability = adapter.capability(non_blocking=False)
+        if not capability.get("available"):
+            raise RuntimeError(str(capability.get("detail") or "ADB device is unavailable"))
+        api_text = str(capability.get("api_level") or "")
+        api_level = int(api_text) if api_text.isdigit() else None
+        if api_level is None or api_level < 36:
+            raise RuntimeError("Only Android 16 / API 36 or newer devices are accepted")
+        with self.database.session_factory() as session:
+            record = session.scalar(
+                select(AdbDeviceRecord).where(AdbDeviceRecord.serial == serial)
+            )
+            if record is None:
+                record = AdbDeviceRecord(serial=serial)
+                session.add(record)
+            record.label = label.strip() if label and label.strip() else record.label
+            record.enabled = True
+            record.state = "ready"
+            record.api_level = api_level
+            record.android_version = str(capability.get("android_version") or "") or None
+            record.last_error = None
+            record.last_seen_at = now()
+            record.metadata_json = {
+                **dict(record.metadata_json or {}),
+                "source": "runtime_api",
+            }
+            session.commit()
+            record_id = record.id
+        self.device_pool.add(adapter)
+        self.device_pool.restore(serial)
+        self.device_pool.wake_waiters()
+        self._record_device_pool_event(
+            "device.pool.connected",
+            "运行时 ADB 设备已加入探索队列",
+            {"serial": serial, "api_level": api_level},
+        )
+        return next(item for item in self.list_adb_devices() if item["id"] == record_id)
+
+    def drain_adb_device(self, serial: str) -> dict[str, Any]:
+        serial = self._validate_adb_serial(serial)
+        if not self.device_pool.drain(serial):
+            raise KeyError(serial)
+        with self.database.session_factory() as session:
+            record = session.scalar(
+                select(AdbDeviceRecord).where(AdbDeviceRecord.serial == serial)
+            )
+            if record is None:
+                raise KeyError(serial)
+            record.state = "draining"
+            session.commit()
+            record_id = record.id
+        self._record_device_pool_event(
+            "device.pool.draining",
+            "ADB 设备已停止接收新任务，等待当前 lease 释放",
+            {"serial": serial, "active": self.device_pool.is_active(serial)},
+        )
+        return next(item for item in self.list_adb_devices() if item["id"] == record_id)
+
+    def reconnect_adb_device(self, serial: str) -> dict[str, Any]:
+        serial = self._validate_adb_serial(serial)
+        if self.device_pool.is_active(serial):
+            raise RuntimeError("Device is active; drain it and wait for the task to release it")
+        if ":" in serial:
+            result = self.runner.run(["adb", "connect", serial], timeout=30)
+            if result.exit_code != 0:
+                raise RuntimeError(result.stderr.strip() or "adb reconnect failed")
+        return self.connect_adb_device(serial, connect=False)
+
+    def remove_adb_device(self, serial: str) -> None:
+        serial = self._validate_adb_serial(serial)
+        if self.device_pool.is_active(serial):
+            raise RuntimeError("Device is active; drain it and wait for the task to release it")
+        if not self.device_pool.remove(serial):
+            raise KeyError(serial)
+        with self.database.session_factory() as session:
+            record = session.scalar(
+                select(AdbDeviceRecord).where(AdbDeviceRecord.serial == serial)
+            )
+            if record is None:
+                raise KeyError(serial)
+            session.delete(record)
+            session.commit()
+        self._record_device_pool_event(
+            "device.pool.removed",
+            "ADB 设备已从运行时队列移除",
+            {"serial": serial},
+        )
+
+    def _record_device_pool_event(
+        self,
+        event_type: str,
+        message: str,
+        data: dict[str, Any],
+    ) -> None:
+        with self.database.session_factory() as session:
+            scan_ids = list(
+                session.scalars(
+                    select(Scan.id).where(
+                        Scan.status.in_(
+                            {
+                                ScanStatus.INVESTIGATING.value,
+                                ScanStatus.PRELIMINARY_READY.value,
+                            }
+                        )
+                    )
+                )
+            )
+            for scan_id in scan_ids:
+                add_event(
+                    session,
+                    scan_id,
+                    event_type,
+                    message,
+                    {**data, "source": "platform"},
+                )
+            if scan_ids:
+                session.commit()
 
     def _register_live_proof_context(
         self,
@@ -657,7 +887,7 @@ class ScanOrchestrator:
                     evidence_summaries=context.evidence_summaries,
                     round_index=context.round_index,
                     poc_artifacts=artifacts,
-                    device=context.device or self.device,
+                    device=context.device,
                 )
             new_evidence = context.evidence_summaries[before:]
             self._materialize_live_evidence(context, new_evidence)
@@ -1116,21 +1346,6 @@ class ScanOrchestrator:
             preliminary_budget = TimeBudget.from_seconds(preliminary_remaining)
             result = self.inspector.inspect(Path(scan.artifact_path), scan.id, preliminary_budget)
             findings, coverage = self.rules.evaluate(result)
-            mobsf_result = None
-            mobsf_error = None
-            if self.mobsf.configured:
-                if preliminary_budget.expired:
-                    mobsf_error = (
-                        "MobSF skipped because the preliminary-report budget was exhausted"
-                    )
-                else:
-                    try:
-                        mobsf_result = self.mobsf.scan(
-                            Path(scan.artifact_path), preliminary_budget.remaining()
-                        )
-                        findings.extend(mobsf_result.findings)
-                    except Exception as exc:  # optional external scanner surface
-                        mobsf_error = str(exc)
             static_review_surfaces = self.rules.static_review_surfaces(
                 result.manifest,
                 findings,
@@ -1140,6 +1355,7 @@ class ScanOrchestrator:
                     result,
                     surface_name=surface.name,
                     locations=surface.locations,
+                    attack_chains=surface.attack_chains,
                 )
                 for finding in findings:
                     if (
@@ -1155,15 +1371,38 @@ class ScanOrchestrator:
             scan.min_sdk = result.manifest.min_sdk
             scan.target_sdk = result.manifest.target_sdk
             scan.signing = result.signing
-            scan.tool_versions = {
-                **result.tool_versions,
-                "mobsf": self.mobsf.capability(),
-            }
+            scan.tool_versions = result.tool_versions
             scan.stats = {
                 **scan.stats,
                 **result.file_inventory,
                 "workspace": str(result.workspace),
                 "static_finding_count": len(findings),
+                "attack_chain_inventory": {
+                    "total": len(result.attack_chains),
+                    "review_required": sum(
+                        item.get("review_required") is not False
+                        for item in result.attack_chains
+                    ),
+                    "families": dict(
+                        Counter(
+                            str(item.get("family") or "unknown")
+                            for item in result.attack_chains
+                        )
+                    ),
+                    "kinds": dict(
+                        Counter(
+                            str(item.get("chain_kind") or "unknown")
+                            for item in result.attack_chains
+                        )
+                    ),
+                    "engine_versions": sorted(
+                        {
+                            str(item.get("engine_version"))
+                            for item in result.attack_chains
+                            if item.get("engine_version")
+                        }
+                    ),
+                },
                 "preliminary_deadline": preliminary_deadline.isoformat(),
                 "decompilation": {
                     key: value
@@ -1242,6 +1481,7 @@ class ScanOrchestrator:
                         "static_review_rule_ids": surface.rule_ids,
                         "static_review_hypotheses": surface.hypotheses,
                         "static_review_locations": surface.locations,
+                        "static_review_attack_chains": surface.attack_chains,
                         "decompilation": {
                             "status": code_context.get(
                                 "status",
@@ -1318,30 +1558,6 @@ class ScanOrchestrator:
                         gap_reason=item.gap_reason,
                     )
                 )
-            session.add(
-                CoverageItem(
-                    scan_id=scan.id,
-                    control_id="ENGINE-MOBSF",
-                    domain="ENGINE",
-                    title="MobSF broad static analysis",
-                    status=(
-                        "covered"
-                        if mobsf_result is not None
-                        else "tool_failed"
-                        if mobsf_error
-                        else "not_tested"
-                    ),
-                    stages={"static": "completed" if mobsf_result is not None else "not_tested"},
-                    gap_reason=(
-                        mobsf_error
-                        or (
-                            None
-                            if mobsf_result is not None
-                            else "MobSF is optional and was not configured; built-in rules were used."
-                        )
-                    ),
-                )
-            )
             entry_coverage: dict[str, CoverageItem] = {}
             for entry in entries:
                 coverage_item = CoverageItem(
@@ -1379,24 +1595,6 @@ class ScanOrchestrator:
                     value=payload,
                     summary=self._static_tool_evidence_summary(tool, payload),
                     metadata=metadata,
-                )
-            if mobsf_result is not None:
-                self.evidence.json(
-                    session,
-                    scan_id=scan.id,
-                    task_id=None,
-                    kind="static.mobsf",
-                    value=mobsf_result.report,
-                    summary=f"MobSF produced {len(mobsf_result.findings)} normalized findings",
-                    metadata=mobsf_result.metadata,
-                )
-            elif mobsf_error:
-                add_event(
-                    session,
-                    scan.id,
-                    "static.mobsf_failed",
-                    "MobSF failed; built-in static analysis continued",
-                    {"error": mobsf_error},
                 )
             planner = InvestigationPlanner(
                 android_version=self.settings.device_android_version,
@@ -1747,7 +1945,6 @@ class ScanOrchestrator:
             if event is None:
                 return False
             event.set()
-            self.device.scheduler.wake_waiters()
             self.device_pool.wake_waiters()
             return True
 
@@ -1931,54 +2128,29 @@ class ScanOrchestrator:
         cancel_event: threading.Event,
     ):  # noqa: ANN201
         try:
-            if len(self.device_pool.serials) <= 1:
-                with self.device.task_lease(
+            with self.device_pool.task_lease(
+                task_id,
+                priority=priority,
+                cancel_event=cancel_event,
+                on_queued=lambda position: self._mark_task_awaiting_device(
+                    scan_id, task_id, position
+                ),
+                on_acquired=lambda waited, adapter: self._record_device_acquired(
+                    scan_id,
                     task_id,
-                    priority=priority,
-                    cancel_event=cancel_event,
-                    on_queued=lambda position: self._mark_task_awaiting_device(
-                        scan_id, task_id, position
-                    ),
-                    on_acquired=lambda waited: self._record_device_acquired(
-                        scan_id,
-                        task_id,
-                        waited,
-                        self.device.serial,
-                    ),
-                    on_released=lambda held: self._record_device_released(
-                        scan_id,
-                        task_id,
-                        held,
-                        self.device.serial,
-                    ),
-                ) as lease:
-                    self._raise_if_cancelled(cancel_event)
-                    yield {**lease, "serial": self.device.serial, "device": self.device}
-                    self._raise_if_cancelled(cancel_event)
-            else:
-                with self.device_pool.task_lease(
+                    waited,
+                    adapter.serial,
+                ),
+                on_released=lambda held, adapter: self._record_device_released(
+                    scan_id,
                     task_id,
-                    priority=priority,
-                    cancel_event=cancel_event,
-                    on_queued=lambda position: self._mark_task_awaiting_device(
-                        scan_id, task_id, position
-                    ),
-                    on_acquired=lambda waited, adapter: self._record_device_acquired(
-                        scan_id,
-                        task_id,
-                        waited,
-                        adapter.serial,
-                    ),
-                    on_released=lambda held, adapter: self._record_device_released(
-                        scan_id,
-                        task_id,
-                        held,
-                        adapter.serial,
-                    ),
-                ) as lease:
-                    self._raise_if_cancelled(cancel_event)
-                    yield lease
-                    self._raise_if_cancelled(cancel_event)
+                    held,
+                    adapter.serial,
+                ),
+            ) as lease:
+                self._raise_if_cancelled(cancel_event)
+                yield lease
+                self._raise_if_cancelled(cancel_event)
         except DeviceLeaseCancelledError as exc:
             raise AgentCancelledError(str(exc)) from exc
 
@@ -2079,9 +2251,13 @@ class ScanOrchestrator:
                 return
             persisted_task_result = dict(task.result or {})
             continuation_context = dict(persisted_task_result.get("manual_continuation") or {})
+            independent_context = dict(
+                persisted_task_result.get("independent_reanalysis") or {}
+            )
             manual_dispatch = bool(
                 persisted_task_result.get("manual_rerun")
                 or persisted_task_result.get("manual_continuation")
+                or independent_context
             )
             agent_backend = self.resolve_task_investigator(scan, task)
             task.status = TaskStatus.RUNNING.value
@@ -2114,6 +2290,10 @@ class ScanOrchestrator:
                     "hypotheses": list(task.hypotheses),
                     "continuation_number": continuation_context.get("continuation_number"),
                     "reusing_task_evidence": bool(continuation_context),
+                    "context_mode": (
+                        "independent" if independent_context else "continue"
+                    ),
+                    "origin_task_id": independent_context.get("origin_task_id"),
                     "investigation_concurrency": self._investigation_concurrency,
                 },
             )
@@ -2393,6 +2573,21 @@ class ScanOrchestrator:
                         "tests_per_round": self.settings.agent_tests_per_round,
                     },
                     "continuation": continuation_context or None,
+                    "context_policy": (
+                        {
+                            "mode": "independent",
+                            "origin_task_id": independent_context.get("origin_task_id"),
+                            "static_artifacts_reused": True,
+                            "task_evidence_reused": False,
+                            "agent_thread_reused": False,
+                            "version_replays_reused": False,
+                        }
+                        if independent_context
+                        else {
+                            "mode": "continue",
+                            "task_evidence_reused": bool(continuation_context),
+                        }
+                    ),
                     "threat_model": task_threat_model,
                     "security_hypotheses": self.hypothesis_ledger.task_context(task_id),
                     "platform_proven_hypotheses": (
@@ -4455,7 +4650,9 @@ class ScanOrchestrator:
         poc_artifacts: dict[str, PocBuildResult] | None = None,
         device: AdbDeviceAdapter | None = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
-        active_device = device or self.device
+        if device is None:
+            return [], ["No task-scoped ADB device lease is available."]
+        active_device = device
         poc_artifacts = poc_artifacts or {}
         entries_by_id = {entry.id: entry for entry in entries}
         indexed = [
@@ -4595,6 +4792,8 @@ class ScanOrchestrator:
                             test_case_id=test_case_id,
                         )
                     self._record_commands(scan_id, task_id, probe.commands, evidence_summaries)
+                    if probe.stage == "poc_incompatible":
+                        raise RuntimeError(str(probe.summary.get("error") or probe.stage))
                 except Exception as exc:
                     execution_error = exc
 

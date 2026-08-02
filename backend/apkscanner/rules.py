@@ -52,6 +52,7 @@ class StaticReviewSurfaceDraft:
     rule_ids: list[str]
     hypotheses: list[str]
     locations: list[dict[str, Any]]
+    attack_chains: list[dict[str, Any]] = field(default_factory=list)
 
 
 CODE_RULES = (
@@ -212,6 +213,7 @@ CODE_RULES = (
 STATIC_REVIEW_FAMILIES: dict[str, dict[str, Any]] = {
     "web_content_boundary": {
         "rule_ids": {
+            "CHAIN-ANDROID-WEBVIEW-DATAFLOW",
             "CODE-WEBVIEW-JS-BRIDGE",
             "CODE-WEBVIEW-FILE-ACCESS",
             "CODE-WEBVIEW-UNIVERSAL-FILE-ACCESS",
@@ -272,7 +274,10 @@ STATIC_REVIEW_FAMILIES: dict[str, dict[str, Any]] = {
         ],
     },
     "external_file_ingress_boundary": {
-        "rule_ids": {"CODE-UNTRUSTED-DISPLAY-NAME"},
+        "rule_ids": {
+            "CHAIN-ANDROID-FILE-INGRESS",
+            "CODE-UNTRUSTED-DISPLAY-NAME",
+        },
         "title": "External file metadata and destination path boundary",
         "severity": Severity.HIGH.value,
         "priority": 95,
@@ -282,6 +287,49 @@ STATIC_REVIEW_FAMILIES: dict[str, dict[str, Any]] = {
             "An untrusted ContentProvider controls the display name or relative destination of an imported file.",
             "Path normalization permits traversal, absolute paths, symlink escape, or overwrite of an existing private file.",
             "The resulting write can alter sensitive state or feed a later executable/plugin loading path.",
+        ],
+    },
+    "capability_delegation_boundary": {
+        "rule_ids": {"CHAIN-ANDROID-CAPABILITY-DELEGATION"},
+        "title": "PendingIntent, nested Intent, and URI grant capability boundary",
+        "severity": Severity.HIGH.value,
+        "priority": 98,
+        "path_hints": (
+            "pendingintent",
+            "notification",
+            "intent",
+            "router",
+            "provider",
+            "share",
+        ),
+        "preferred_only": False,
+        "hypotheses": [
+            "A PendingIntent delegates more mutable, replayable, or redirectable authority than its intended recipient requires.",
+            "A nested or serialized Intent reaches an internal component launch without complete destination and flag sanitization.",
+            "An attacker-controlled content URI or ClipData item gains or propagates read, write, prefix, or persisted access across an unintended trust boundary.",
+        ],
+    },
+    "runtime_ipc_boundary": {
+        "rule_ids": {
+            "CHAIN-ANDROID-RUNTIME-IPC",
+            "CODE-DYNAMIC-RECEIVER",
+        },
+        "title": "Runtime receiver and local socket ingress boundary",
+        "severity": Severity.HIGH.value,
+        "priority": 95,
+        "path_hints": (
+            "receiver",
+            "broadcast",
+            "socket",
+            "server",
+            "http",
+            "ipc",
+        ),
+        "preferred_only": False,
+        "hypotheses": [
+            "A context-registered receiver accepts broadcasts from an ordinary third-party app without a non-exported flag or strong sender permission.",
+            "Receiver-controlled extras can cross into a persistent, privileged, filesystem, component-launch, or WebView sink.",
+            "A TCP loopback or Unix-domain listener is reachable without binding its peer to an authenticated application identity and exposes sensitive commands or data.",
         ],
     },
     "persistent_security_policy_boundary": {
@@ -346,6 +394,7 @@ class BuiltinRuleEngine:
         findings = self._manifest_rules(result.manifest)
         findings.extend(self._file_rules(result))
         findings.extend(self._code_rules(result.searchable_roots))
+        findings.extend(self._attack_chain_rules(result.attack_chains))
         coverage = self._coverage(result, findings)
         return findings, coverage
 
@@ -360,19 +409,31 @@ class BuiltinRuleEngine:
         for family, config in STATIC_REVIEW_FAMILIES.items():
             locations: list[dict[str, Any]] = []
             present_rule_ids: list[str] = []
+            attack_chains: list[dict[str, Any]] = []
             for rule_id in sorted(config["rule_ids"]):
                 finding = by_rule.get(rule_id)
                 if finding is None:
                     continue
+                is_chain_finding = bool(finding.metadata.get("attack_chains"))
                 accepted = [
                     location
                     for location in finding.locations
                     if self._location_belongs_to_package(location, package_prefix)
+                    or (
+                        is_chain_finding
+                        and location.get("analysis_scope")
+                        in {"manifest", "resource_config"}
+                    )
                 ]
                 if not accepted:
                     continue
                 present_rule_ids.append(rule_id)
                 locations.extend(accepted)
+                attack_chains.extend(
+                    item
+                    for item in finding.metadata.get("attack_chains", [])
+                    if isinstance(item, dict)
+                )
             if not locations:
                 continue
             unique_locations = list(
@@ -415,6 +476,12 @@ class BuiltinRuleEngine:
                     rule_ids=present_rule_ids,
                     hypotheses=list(config["hypotheses"]),
                     locations=unique_locations[:12],
+                    attack_chains=list(
+                        {
+                            str(item.get("fingerprint") or index): item
+                            for index, item in enumerate(attack_chains)
+                        }.values()
+                    ),
                 )
             )
         return surfaces
@@ -672,6 +739,129 @@ class BuiltinRuleEngine:
                     confidence=Confidence.LOW.value,
                     cwe=cwe,
                     locations=locations,
+                )
+            )
+        return findings
+
+    @staticmethod
+    def _attack_chain_rules(
+        attack_chains: list[dict[str, Any]],
+    ) -> list[FindingDraft]:
+        configs = {
+            "capability_delegation_boundary": {
+                "rule_id": "CHAIN-ANDROID-CAPABILITY-DELEGATION",
+                "title": "Android capability delegation chain requires review",
+                "description": (
+                    "A bounded app-class reference path connects PendingIntent, nested Intent, "
+                    "or content-URI capability handling to delegation or dispatch behavior. This "
+                    "is an explainable investigation seed, not an exploitation verdict."
+                ),
+                "remediation": (
+                    "Use explicit immutable PendingIntents, sanitize nested Intents, narrowly "
+                    "scope URI grants, and bind authorization to the real caller and operation."
+                ),
+                "cwe": "CWE-926",
+            },
+            "external_file_ingress_boundary": {
+                "rule_id": "CHAIN-ANDROID-FILE-INGRESS",
+                "title": "External file ingress reaches a filesystem or archive boundary",
+                "description": (
+                    "A bounded app-class reference path connects ACTION_SEND, SAF, content URI, "
+                    "or FileProvider input to file writing or archive processing. The path and "
+                    "provider behavior require semantic and ordinary-app validation."
+                ),
+                "remediation": (
+                    "Ignore provider-controlled filenames, generate private destinations, reject "
+                    "links, and verify canonical containment for every extracted or copied item."
+                ),
+                "cwe": "CWE-22",
+            },
+            "runtime_ipc_boundary": {
+                "rule_id": "CHAIN-ANDROID-RUNTIME-IPC",
+                "title": "Runtime receiver or local server creates an IPC ingress surface",
+                "description": (
+                    "The APK contains a context-registered receiver or local TCP/Unix-domain "
+                    "server. Export flags, sender permissions, peer authentication, and reachable "
+                    "privileged handlers require validation."
+                ),
+                "remediation": (
+                    "Keep receivers non-exported unless required, enforce signature permissions, "
+                    "and authenticate local socket peers before parsing commands or returning data."
+                ),
+                "cwe": "CWE-306",
+            },
+            "web_content_boundary": {
+                "rule_id": "CHAIN-ANDROID-WEBVIEW-DATAFLOW",
+                "title": "External Android input reaches a WebView boundary",
+                "description": (
+                    "A bounded app-class reference path connects Intent, URI, shared content, or "
+                    "WebView navigation input to WebView content or native bridge APIs. Origin "
+                    "checks and runtime navigation must be verified."
+                ),
+                "remediation": (
+                    "Parse and compare complete trusted origins, reject local and active-content "
+                    "schemes, minimize bridges, and authorize every native bridge method."
+                ),
+                "cwe": "CWE-749",
+            },
+        }
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for item in attack_chains:
+            if item.get("review_required") is False:
+                continue
+            family = str(item.get("family") or "")
+            if family in configs:
+                grouped.setdefault(family, []).append(item)
+        findings: list[FindingDraft] = []
+        for family, candidates in grouped.items():
+            config = configs[family]
+            locations: list[dict[str, Any]] = []
+            for candidate in candidates:
+                locations.extend(
+                    item
+                    for item in candidate.get("locations", [])
+                    if isinstance(item, dict)
+                )
+            unique_locations = list(
+                {
+                    (
+                        str(item.get("root") or ""),
+                        str(item.get("path") or ""),
+                        int(item.get("line") or 0),
+                        str(item.get("marker") or ""),
+                    ): item
+                    for item in locations
+                }.values()
+            )
+            severity = max(
+                (str(item.get("severity") or Severity.MEDIUM.value) for item in candidates),
+                key=lambda value: {
+                    Severity.INFO.value: 0,
+                    Severity.LOW.value: 1,
+                    Severity.MEDIUM.value: 2,
+                    Severity.HIGH.value: 3,
+                    Severity.CRITICAL.value: 4,
+                }.get(value, 0),
+            )
+            findings.append(
+                FindingDraft(
+                    rule_id=str(config["rule_id"]),
+                    title=str(config["title"]),
+                    description=str(config["description"]),
+                    remediation=str(config["remediation"]),
+                    masvs="MASVS-PLATFORM",
+                    severity=severity,
+                    confidence=Confidence.LOW.value,
+                    cwe=str(config["cwe"]),
+                    locations=unique_locations[:50],
+                    metadata={
+                        "candidate_only": True,
+                        "analysis_engine": str(
+                            candidates[0].get("engine_version")
+                            or "bounded-android-chain-v1"
+                        ),
+                        "attack_chains": candidates,
+                    },
                 )
             )
         return findings

@@ -1,4 +1,5 @@
 import type {
+  AdbDevice,
   AgentAudit,
   BenchmarkEvaluation,
   CoverageItem,
@@ -47,6 +48,20 @@ async function optionalRequest<T>(path: string, signal?: AbortSignal): Promise<T
 
 export const api = {
   health: () => request<Health>("/api/v1/health"),
+  devices: (probe = false) =>
+    request<AdbDevice[]>(`/api/v1/devices?probe=${probe ? "true" : "false"}`),
+  connectDevice: (serial: string, label?: string) =>
+    request<AdbDevice>("/api/v1/devices", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ serial, label: label || null, connect: true }),
+    }),
+  drainDevice: (serial: string) =>
+    request<AdbDevice>(`/api/v1/devices/${encodeURIComponent(serial)}/drain`, { method: "POST" }),
+  reconnectDevice: (serial: string) =>
+    request<AdbDevice>(`/api/v1/devices/${encodeURIComponent(serial)}/reconnect`, { method: "POST" }),
+  removeDevice: (serial: string) =>
+    request<{ serial: string; deleted: true }>(`/api/v1/devices/${encodeURIComponent(serial)}`, { method: "DELETE" }),
   scans: () => request<Scan[]>("/api/v1/scans"),
   scan: (id: string, signal?: AbortSignal) =>
     request<Scan>(`/api/v1/scans/${id}`, { signal }),
@@ -80,10 +95,11 @@ export const api = {
     request<AgentAudit[]>(`/api/v1/scans/${id}/agent-audits`, { signal }),
   events: (id: string, signal?: AbortSignal) =>
     request<ScanEvent[]>(`/api/v1/scans/${id}/events`, { signal }),
-  upload: async (file: File, investigator: InvestigatorChoice = "configured") => {
+  upload: async (file: File, investigator: InvestigatorChoice = "configured", baselineScanId?: string) => {
     const form = new FormData()
     form.append("apk", file)
     form.append("investigator", investigator)
+    if (baselineScanId) form.append("baseline_scan_id", baselineScanId)
     return request<Scan>("/api/v1/scans", { method: "POST", body: form })
   },
   review: (findingId: string, status: "accepted" | "false_positive" | "candidate", note: string) =>
@@ -94,6 +110,12 @@ export const api = {
     }),
   retryTask: (taskId: string) =>
     request<InvestigationTask>(`/api/v1/tasks/${taskId}/rerun`, { method: "POST" }),
+  reanalyzeTask: (taskId: string, contextMode: "continue" | "independent") =>
+    request<InvestigationTask>(`/api/v1/tasks/${taskId}/reanalyses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ context_mode: contextMode }),
+    }),
   continueTask: (taskId: string) =>
     request<InvestigationTask>(`/api/v1/tasks/${taskId}/continue`, { method: "POST" }),
   updateScanAgentControl: (scanId: string, enabled: boolean, backend: "codex" | "none") =>

@@ -16,7 +16,6 @@ v1 产品是一个单用户、仅限本机（localhost）的 Web 应用。它接
 - 私有 APK ground-truth 评测：只对平台确认的最终 Finding 计分，默认要求动态证明，并用 F0.5 重罚不匹配真值的高危结论。
 - 所有扫描全局只运行一个入口调查任务；该任务从设备准备、多轮 Agent/PoC 回放到清理始终独占 ADB。
 - 远程 ADB 适配器、可选普通 App UID Probe 快速路径、Agent 专用 PoC、客观 Oracle、`pm clear` 清理和 App Link 状态检查/重置。
-- 可选的 MobSF 上传/报告归一化，缺失时显式标注降级覆盖。
 - 官方 `openai-codex==0.144.4` + DeepSeek Responses 集成：严格 JSON Schema、完整事件线、无子 Agent fan-out、全权限 Codex sandbox 和证据支撑的结果降级。
 - 每个扫描一个无密钥 keeper 容器；每个 `task + attempt + role` 使用独立 Unix UID、HOME、`CODEX_HOME`、TMPDIR 和可写工作区，同时只读挂载 JADX/Apktool/archive 输入。
 - OpenCode 可执行运行时、critic、fallback 和 Node Worker 已删除；仅保留历史报告读取兼容与退役设计文档。
@@ -179,12 +178,8 @@ Worker Protocol v3 已为每个 `task + attempt + role` 保持持久、非 ephem
 OpenCode 设计仅供历史追溯：
 [`docs/opencode-deepseek.zh-CN.md`](docs/opencode-deepseek.zh-CN.md)。
 
-添加 MobSF 广度扫描：
-
-```bash
-export APKSCANNER_MOBSF_URL=https://mobsf.internal.example
-export APKSCANNER_MOBSF_API_KEY=...
-```
+动态设备池、独立复核、Android 16 PoC、稳定漏洞案例和特殊 Investigation Brief 的已实现接口见
+[`docs/runtime-control-and-evolution.zh-CN.md`](docs/runtime-control-and-evolution.zh-CN.md)。
 
 ## 执行流水线
 
@@ -195,7 +190,6 @@ APK 上传
   → 生成组件级代码索引；区分 JADX 全局部分失败与目标类源码可用性
   → Manifest 解析：枚举 Activity、Service、Receiver、Provider、Deep Link
   → 内置规则引擎：17+ 条面向 MASVS 的发现
-  → 可选 MobSF 广度静态扫描
   → 发布 preliminary 报告
   → InvestigationPlanner 创建任务（每个导出组件一个，每个 Deep Link handler 一个）
   → 按风险优先级逐个进入入口探索：
@@ -282,7 +276,6 @@ source/control/sink/reachable path/boundary/counterevidence/proof gaps 证据元
 | `APKSCANNER_CODEX_BIN` | 内置 SDK 运行时 | 显式测试过的 Codex 二进制覆盖 |
 | `APKSCANNER_DEEPSEEK_BASE_URL` | DeepSeek 默认地址 | 可选的可信 HTTP(S) 网关 |
 | `DEEPSEEK_API_KEY` | 未设置 | DeepSeek 凭据；只在 UID worker 的 exec 环境中注入 |
-| `APKSCANNER_MOBSF_URL` / `APKSCANNER_MOBSF_API_KEY` | 未设置 | 可选 MobSF API |
 | `APKSCANNER_ANDROID_VERSION` | `16` | 报告的动态基线 Android 版本 |
 | `APKSCANNER_ANDROID_API` | `36` | 平台托管 PoC 构建使用的 Android SDK API |
 | `APKSCANNER_DEVICE_MIN_API` / `APKSCANNER_DEVICE_MAX_API` | `36` / `99` | 可接受的云真机 API 范围；默认只接受 Android 16 及以上 |
@@ -355,7 +348,6 @@ ApkScanner/
       codex_executor.py              # 扫描级容器与 UID exec 管理
       agent_workspace.py             # Agent 工作区、权限和 UID 租约
       agent_execution.py             # 冻结执行/Provider/Phase 契约
-      mobsf.py                       # MobSF 广度扫描集成
       evidence.py / artifacts.py     # 证据记录与内容寻址存储
       reports.py                     # 报告生成（JSON/HTML/SARIF）
     tests/                           # pytest 测试套件
@@ -372,7 +364,6 @@ ApkScanner/
 
 ## 扩展方式
 
-- **广度引擎**：在 `MobSFAdapter` 或新的静态 Adapter 中归一化为 `FindingDraft`，同时增加引擎覆盖。
 - **漏洞类型**：在 `InvestigationPlanner` 中增加 Task 类型/假设，在平台请求校验器中增加对应的最小安全动作集。
 - **设备供应商**：保持 `prepare → reset/authenticate/probe → cleanup` 和 Evidence 输出契约，替换 ADB 租约实现。
 - **新判定级别**：先定义所需的不可伪造 Evidence 条件，再扩展 Agent Schema 和报告层，不能仅改 prompt。

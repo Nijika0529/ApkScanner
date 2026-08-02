@@ -255,6 +255,39 @@ def test_device_pool_assigns_two_tasks_to_distinct_devices() -> None:
     }
 
 
+def test_device_pool_can_expand_and_drain_without_interrupting_an_active_lease() -> None:
+    scheduler = DevicePoolScheduler(("device-a",))
+    release = threading.Event()
+    acquired = threading.Event()
+
+    def hold() -> None:
+        with scheduler.lease(
+            "task-a",
+            priority=90,
+            cancel_event=threading.Event(),
+        ):
+            acquired.set()
+            assert release.wait(timeout=5)
+
+    worker = threading.Thread(target=hold)
+    worker.start()
+    assert acquired.wait(timeout=5)
+    assert scheduler.drain_serial("device-a") is True
+    assert scheduler.snapshot()["active"] == {"device-a": "task-a"}
+    scheduler.add_serial("device-b")
+    with scheduler.lease(
+        "task-b",
+        priority=80,
+        cancel_event=threading.Event(),
+    ) as lease:
+        assert lease["serial"] == "device-b"
+    assert scheduler.remove_serial("device-a") is False
+    release.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert scheduler.remove_serial("device-a") is True
+
+
 def test_health_capability_does_not_enter_an_active_device_session(settings) -> None:  # noqa: ANN001
     class NoAdbRunner:
         @staticmethod
@@ -771,7 +804,7 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
             if "apkscanner_request_id" in argv:
                 cls.request_id = argv[argv.index("apkscanner_request_id") + 1]
             if "getprop" in argv:
-                stdout = "33\n"
+                stdout = "36\n"
             elif "APKSCANNER_POC:V" in argv:
                 stdout = (
                     f'I/APKSCANNER_POC: {{"request_id":"{cls.request_id}",'
@@ -834,8 +867,8 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
     assert logcat_poll_timeouts == [1]
     assert by_kind["blackbox.poc_logcat"]["poc_success"] is True
     assert by_kind["blackbox.poc_logcat"]["poc_claimed_security_impact"] is True
-    assert by_kind["blackbox.device_profile"]["device_api"] == "33"
-    assert by_kind["blackbox.device_profile"]["device_api_matches_poc_target"] is False
+    assert by_kind["blackbox.device_profile"]["device_api"] == "36"
+    assert by_kind["blackbox.device_profile"]["device_api_matches_poc_target"] is True
     assert by_kind["blackbox.device_profile"]["device_api_satisfies_poc_min"] is True
     assert by_kind["blackbox.device_profile"]["poc_runtime_compatible"] is True
     assert "blackbox.poc_pre_uninstall" in by_kind

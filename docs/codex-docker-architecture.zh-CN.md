@@ -6,7 +6,7 @@
 >
 > 适用范围：APK Scanner 的 Agent 调查、PoC 制作、ADB 探索、Proof Replay、结构化裁决和审计链路
 >
-> 关联文档：[总体扫描架构](architecture.zh-CN.md)、[OpenCode + DeepSeek 历史现状](opencode-deepseek.zh-CN.md)、[项目总结](project-brief.zh-CN.md)
+> 关联文档：[总体扫描架构](architecture.zh-CN.md)、[Android 平台攻击链静态分析](android-attack-chain-analysis.zh-CN.md)、[OpenCode + DeepSeek 历史现状](opencode-deepseek.zh-CN.md)、[项目总结](project-brief.zh-CN.md)
 
 本文是 Codex Docker 执行子系统的规范性文档。它不把设计目标描述成已经完成的能力，所有条目使用以下状态：
 

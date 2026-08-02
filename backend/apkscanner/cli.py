@@ -164,7 +164,6 @@ def capabilities_command(args: argparse.Namespace) -> int:
         "tools": discover_tools(orchestrator.runner),
         "codex": orchestrator.codex.capability(deep=args.deep),
         "device": orchestrator.device_pool.capability(),
-        "mobsf": orchestrator.mobsf.capability(),
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0

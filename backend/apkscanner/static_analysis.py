@@ -11,12 +11,13 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .android_chains import AndroidAttackChainAnalyzer
 from .config import Settings
 from .manifest import ManifestDocument, aapt2_xmltree_to_xml, parse_manifest
 from .permissions import ensure_private_directory
 from .tools import CommandResult, TimeBudget, ToolRunner, discover_tools
 
-CODE_INDEX_CONTEXT_VERSION = "component-one-hop-v1"
+CODE_INDEX_CONTEXT_VERSION = "component-one-hop-android-chains-v3"
 
 
 class InvalidApkError(ValueError):
@@ -34,6 +35,7 @@ class StaticAnalysisResult:
     searchable_roots: list[Path] = field(default_factory=list)
     decompilation: dict[str, Any] = field(default_factory=dict)
     code_index: dict[str, dict[str, Any]] = field(default_factory=dict)
+    attack_chains: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ApkInspector:
@@ -117,13 +119,6 @@ class ApkInspector:
                 tool_results["apktool_no_resources"] = self._serialize_result(fallback)
                 if fallback.exit_code == 0 and decoded_dir.is_dir():
                     searchable_roots.append(decoded_dir)
-
-        if manifest_path is None and self.runner.available("apkanalyzer"):
-            result = self._run(["apkanalyzer", "manifest", "print", str(apk_path)], budget, 120)
-            tool_results["apkanalyzer"] = self._serialize_result(result)
-            if result.exit_code == 0 and result.stdout.lstrip().startswith("<"):
-                manifest_path = workspace / "AndroidManifest.xml"
-                manifest_path.write_text(result.stdout, encoding="utf-8")
 
         if manifest_path is None and self.runner.available("aapt2"):
             result = self._run(
@@ -211,6 +206,10 @@ class ApkInspector:
             archive_dir=archive_dir,
             decompilation=decompilation,
         )
+        attack_chains = AndroidAttackChainAnalyzer().analyze(
+            manifest,
+            searchable_roots,
+        )
         (workspace / "code_index.json").write_text(
             json.dumps(
                 {
@@ -218,6 +217,7 @@ class ApkInspector:
                     "context_version": CODE_INDEX_CONTEXT_VERSION,
                     "decompilation": decompilation,
                     "components": code_index,
+                    "attack_chains": attack_chains,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -252,6 +252,7 @@ class ApkInspector:
             searchable_roots=searchable_roots,
             decompilation=decompilation,
             code_index=code_index,
+            attack_chains=attack_chains,
         )
 
     @staticmethod
@@ -300,6 +301,7 @@ class ApkInspector:
             or metadata.get("analysis_profile") != analysis_profile
             or index_payload.get("context_version") != CODE_INDEX_CONTEXT_VERSION
             or not isinstance(index_payload.get("components"), dict)
+            or not isinstance(index_payload.get("attack_chains"), list)
         ):
             return None
         manifest_relative = metadata.get("manifest_relative_path")
@@ -353,6 +355,7 @@ class ApkInspector:
             searchable_roots=searchable_roots,
             decompilation=decompilation,
             code_index=dict(index_payload["components"]),
+            attack_chains=list(index_payload["attack_chains"]),
         )
 
     @staticmethod
@@ -800,6 +803,7 @@ class ApkInspector:
         *,
         surface_name: str,
         locations: list[dict[str, Any]],
+        attack_chains: list[dict[str, Any]] | None = None,
     ) -> None:
         anchors: list[dict[str, Any]] = []
         seen: set[Path] = set()
@@ -853,6 +857,7 @@ class ApkInspector:
             "target_source_has_decompiler_errors": False,
             "global_decompilation_status": result.decompilation.get("status"),
             "anchors": anchors,
+            "attack_chains": list(attack_chains or []),
         }
 
     @staticmethod
@@ -1081,6 +1086,7 @@ class ApkInspector:
                     "context_version": CODE_INDEX_CONTEXT_VERSION,
                     "decompilation": result.decompilation,
                     "components": result.code_index,
+                    "attack_chains": result.attack_chains,
                 },
                 ensure_ascii=False,
                 indent=2,

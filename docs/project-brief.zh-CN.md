@@ -106,7 +106,7 @@ Agent 可以提出假设、阅读反编译内容、使用 ADB、构建 PoC、修
 ```mermaid
 flowchart TD
     A[APK 上传] --> B[安全 Intake<br/>ZIP 限制、SHA-256、签名、包信息]
-    B --> C[静态分析<br/>Manifest、Apktool/Smali、可选 JADX/MobSF]
+    B --> C[静态分析<br/>Manifest、Apktool/Smali、JADX]
     C --> D[Security IR 与安全快照]
     D --> E[攻击面与语义种子规划]
     E --> F[静态关闭<br/>禁用/不可直接导出/强权限保护]
@@ -163,7 +163,6 @@ APK、反编译内容、资源字符串、日志和网页内容都被视为不�
 - 自定义权限及保护等级；
 - Apktool、Smali、资源和 archive；
 - 可选 JADX；
-- 可选 MobSF。
 
 JADX 只是便利视图。JADX 局部失败是正常情况，平台会继续使用 Manifest、Smali、资源和 archive，不会因为“JADX 不完整”自动给出信息不足。
 

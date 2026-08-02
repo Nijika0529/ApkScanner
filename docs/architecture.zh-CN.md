@@ -14,7 +14,7 @@ v1 的固定边界是：单 APK、单用户、按测试策略复位、无源码�
 
 ```mermaid
 flowchart LR
-    A[APK intake] --> B[ZIP/签名/Manifest/JADX·apktool/MobSF]
+    A[APK intake] --> B[ZIP/签名/Manifest/JADX·Apktool]
     B --> C[版本化 Security IR]
     C --> D[入口枚举与平台任务规划]
     D --> E[普通应用 UID 黑盒：可选 Probe / Agent PoC]
@@ -49,7 +49,7 @@ scheme、host/authority 和 port；额外参数有数量、键名、类型和长
 UID、工作区和 Thread。扫描级 Docker 容器继续复用，Web 将物理 Turn 聚合到同一任务时间线。
 持久 Thread/resume 按专项架构文档的 Phase 4 实施。
 
-静态阶段结束即发布 preliminary report，并继续动态任务。外部工具、MobSF 请求和每个任务都有超时；超过 4 小时 preliminary 目标或 24 小时整单预算会写入事件及 coverage gap。
+静态阶段结束即发布 preliminary report，并继续动态任务。外部工具和每个任务都有超时；超过 4 小时 preliminary 目标或 24 小时整单预算会写入事件及 coverage gap。
 
 JADX 的非零退出码不直接等同于反编译不可用。平台把结果归一化为完整成功、部分成功、部分超时或工具失败，并生成 `code_index.json`：逐个组件记录目标类是否位于失败列表、可用 Java/Smali 路径、文件 SHA-256 和有界源码片段。Codex 接收目标级物化上下文，并在 personal-lab profile 下通过 `/scan-input/*` 读取完整的只读反编译根。历史扫描在任务重试时可从已有 workspace 与 `static.jadx` Evidence 懒生成索引，不会为了补上下文再次运行 JADX。
 
@@ -83,7 +83,6 @@ Web 健康检查使用真正的非阻塞锁；设备繁忙时读取最近一次�
 | Codex host worker | 当前任务 attempt workspace、主机工具和模型网络 | 仅作为双开关启用的个人诊断模式；full-access sandbox，没有容器/UID/资源边界，不能作为默认部署 |
 | 云真机 | 目标 APK、可选 Probe APK、Agent PoC、测试账号 | 配置声明目标 Android/API；串行 lease；任务前后 `pm clear`；不声称完整快照复位 |
 | Probe APK | 可选的普通 App UID 通用入口快速执行器 | 只接受最初发送者为 shell/root 的调度；复杂 Binder/AIDL/漏洞链改用 Agent 专用 PoC；仍只允许安装在专用测试设备 |
-| MobSF | 上传 APK并返回广度扫描报告 | 可选、显式 URL/API Key；失败不阻断内置基线，但标为 tool gap |
 
 APK、反编译代码、资源、日志、网页和工具输出都属于不可信数据。Codex developer
 instructions 明确禁止服从这些内容中的指令。每个 `task_id + attempt + role` 获得独立 UID
@@ -227,7 +226,6 @@ Web 只允许删除已经 `final` 或 `failed` 的扫描；任务进入重试队
 
 ## 扩展方式
 
-- 广度引擎：在 `MobSFAdapter` 或新的静态 adapter 中归一化为 `FindingDraft`，同时增加 engine coverage。
 - 漏洞类型：在 `InvestigationPlanner` 增加 task 类型/假设，在平台请求校验器增加对应的最小安全动作集。
 - 设备供应商：保持 `prepare → reset/authenticate/probe → cleanup` 和 Evidence 输出契约，替换 ADB lease 实现。
 - 新判定级别：先定义所需的不可伪造 Evidence 条件，再扩展 Agent schema 和报告层，不能只改 prompt。

@@ -267,4 +267,21 @@ export interface Health {
   capabilities: Capability[]
 }
 
+export interface AdbDevice {
+  id: string
+  serial: string
+  label: string | null
+  state: string
+  enabled: boolean
+  api_level: number | null
+  android_version: string | null
+  available: boolean
+  busy: boolean
+  active_task_id: string | null
+  last_error: string | null
+  last_seen_at: string | null
+  created_at: string
+  updated_at: string
+}
+
 export type InvestigatorChoice = "configured" | "codex" | "none"

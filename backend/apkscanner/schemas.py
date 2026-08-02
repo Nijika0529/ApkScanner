@@ -108,6 +108,53 @@ class VersionDiffOut(ApiModel):
     created_at: datetime
 
 
+class RegressionCaseCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    case_key: StrictStr = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    harm: StrictStr = Field(min_length=1, max_length=10_000)
+    minimum_proof: Literal["static", "dynamic"] = "dynamic"
+
+
+class VulnerabilityOccurrenceOut(ApiModel):
+    id: str
+    case_id: str
+    scan_id: str
+    finding_id: str | None
+    analysis_status: str
+    proof_level: str
+    match_quality: str
+    match_reason: str
+    observed_identity_json: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+class VulnerabilityCaseOut(ApiModel):
+    id: str
+    application_id: str
+    case_key: str
+    fingerprint_version: str
+    fingerprint: str
+    identity_json: dict[str, Any]
+    title: str
+    description: str
+    harm: str
+    severity: str
+    cwe: str | None
+    masvs: str
+    minimum_proof: str
+    lifecycle: str
+    source_scan_id: str | None
+    source_finding_id: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
 class VulnerabilityPatternOut(ApiModel):
     id: str
     schema_version: str
@@ -180,6 +227,10 @@ class InvestigationTaskOut(ApiModel):
     started_at: datetime | None
     completed_at: datetime | None
     created_at: datetime
+
+
+class TaskReanalysisRequest(BaseModel):
+    context_mode: Literal["continue", "independent"]
 
 
 class CoverageItemOut(ApiModel):
@@ -259,6 +310,33 @@ class HealthResponse(BaseModel):
     default_investigator: Literal["codex", "none"] = "codex"
     enabled_investigators: list[Literal["codex"]] = Field(default_factory=list)
     capabilities: list[Capability]
+
+
+class AdbDeviceConnectRequest(BaseModel):
+    serial: StrictStr = Field(
+        min_length=1,
+        max_length=255,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    label: StrictStr | None = Field(default=None, max_length=255)
+    connect: StrictBool = True
+
+
+class AdbDeviceOut(BaseModel):
+    id: str
+    serial: str
+    label: str | None
+    state: str
+    enabled: bool
+    api_level: int | None
+    android_version: str | None
+    available: bool
+    busy: bool
+    active_task_id: str | None
+    last_error: str | None
+    last_seen_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
 
 
 class ScanDeleteResult(BaseModel):
@@ -866,6 +944,61 @@ class BenchmarkEvaluationOut(ApiModel):
     ground_truth: dict[str, Any]
     result: dict[str, Any]
     created_at: datetime
+
+
+class EvaluationContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    success_criteria: list[StrictStr] = Field(min_length=1, max_length=64)
+    required_evidence_kinds: list[StrictStr] = Field(default_factory=list, max_length=64)
+    inconclusive_conditions: list[StrictStr] = Field(min_length=1, max_length=64)
+    forbidden_shortcuts: list[StrictStr] = Field(default_factory=list, max_length=64)
+
+
+class InvestigationBriefCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scan_id: StrictStr | None = Field(default=None, pattern=r"^[a-f0-9-]{36}$")
+    name: StrictStr = Field(min_length=1, max_length=256)
+    objective: StrictStr = Field(min_length=1, max_length=10_000)
+    scope: dict[str, Any] = Field(default_factory=dict)
+    attacker_model: dict[str, Any] = Field(default_factory=dict)
+    preconditions: list[StrictStr] = Field(default_factory=list, max_length=64)
+    plan: dict[str, Any]
+    evaluation_contract: EvaluationContract
+
+
+class InvestigationBriefOut(ApiModel):
+    id: str
+    scan_id: str | None
+    schema_version: str
+    name: str
+    objective: str
+    status: str
+    scope: dict[str, Any]
+    attacker_model: dict[str, Any]
+    preconditions: list[str]
+    plan: dict[str, Any]
+    evaluation_contract: dict[str, Any]
+    result: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+class InvestigationCriterionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    criterion: StrictStr = Field(min_length=1, max_length=2000)
+    passed: StrictBool
+    evidence_ids: list[StrictStr] = Field(default_factory=list, max_length=128)
+
+
+class InvestigationBriefEvaluation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    verdict: Literal["passed", "failed", "inconclusive"]
+    criteria: list[InvestigationCriterionResult] = Field(min_length=1, max_length=64)
+    note: StrictStr = Field(min_length=1, max_length=10_000)
 
 
 def _inline_local_json_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:

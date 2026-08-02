@@ -8,9 +8,12 @@ from collections.abc import Iterable
 from typing import Any
 
 from sqlalchemy import desc, select
+from sqlalchemy.exc import IntegrityError
 
 from .enums import FindingStatus, TaskStatus
 from .models import (
+    ApplicationRecord,
+    ApplicationRelease,
     EntryPoint,
     Evidence,
     Finding,
@@ -21,6 +24,8 @@ from .models import (
     SecurityHypothesis,
     SecuritySnapshot,
     VersionDiff,
+    VulnerabilityCase,
+    VulnerabilityOccurrence,
     VulnerabilityPattern,
 )
 from .repository import add_event
@@ -143,6 +148,7 @@ class SecurityEvolutionService:
             select(SecuritySnapshot).where(SecuritySnapshot.scan_id == scan.id)
         )
         if existing is not None:
+            self.ensure_application_release(session, scan=scan, snapshot=existing)
             return existing
         entry_facts: list[dict[str, Any]] = []
         for entry in entries:
@@ -160,6 +166,53 @@ class SecurityEvolutionService:
                 "deep_links": entry.deep_links,
                 "authorities": (entry.metadata_json or {}).get("authorities"),
                 "grant_uri_permissions": (entry.metadata_json or {}).get("grant_uri_permissions"),
+                "static_surface": (
+                    {
+                        "family": (entry.metadata_json or {}).get("static_review_family"),
+                        "rule_ids": sorted(
+                            str(value)
+                            for value in (
+                                (entry.metadata_json or {}).get("static_review_rule_ids") or []
+                            )
+                        ),
+                        "chain_fingerprints": sorted(
+                            str(item.get("fingerprint"))
+                            for item in (
+                                (entry.metadata_json or {}).get(
+                                    "static_review_attack_chains"
+                                )
+                                or []
+                            )
+                            if isinstance(item, dict) and item.get("fingerprint")
+                        ),
+                        "chain_kinds": sorted(
+                            {
+                                str(item.get("chain_kind"))
+                                for item in (
+                                    (entry.metadata_json or {}).get(
+                                        "static_review_attack_chains"
+                                    )
+                                    or []
+                                )
+                                if isinstance(item, dict) and item.get("chain_kind")
+                            }
+                        ),
+                        "chain_engine_versions": sorted(
+                            {
+                                str(item.get("engine_version"))
+                                for item in (
+                                    (entry.metadata_json or {}).get(
+                                        "static_review_attack_chains"
+                                    )
+                                    or []
+                                )
+                                if isinstance(item, dict) and item.get("engine_version")
+                            }
+                        ),
+                    }
+                    if entry.kind == "static_surface"
+                    else None
+                ),
             }
             code_fact = {
                 "direct_hash": hashlib.sha256(normalized.encode()).hexdigest(),
@@ -229,7 +282,128 @@ class SecurityEvolutionService:
         )
         session.add(snapshot)
         session.flush()
+        self.ensure_application_release(session, scan=scan, snapshot=snapshot)
         return snapshot
+
+    @staticmethod
+    def ensure_application_release(
+        session,  # noqa: ANN001
+        *,
+        scan: Scan,
+        snapshot: SecuritySnapshot,
+    ) -> ApplicationRelease:
+        existing = session.scalar(
+            select(ApplicationRelease).where(ApplicationRelease.scan_id == scan.id)
+        )
+        if existing is None:
+            application = session.scalar(
+                select(ApplicationRecord).where(
+                    ApplicationRecord.package_name == snapshot.package_name
+                )
+            )
+            if application is None:
+                application = ApplicationRecord(package_name=snapshot.package_name)
+                try:
+                    with session.begin_nested():
+                        session.add(application)
+                        session.flush()
+                except IntegrityError:
+                    application = session.scalar(
+                        select(ApplicationRecord).where(
+                            ApplicationRecord.package_name == snapshot.package_name
+                        )
+                    )
+                    if application is None:
+                        raise
+            prior_signers = {
+                value
+                for value in session.scalars(
+                    select(ApplicationRelease.signer_digest).where(
+                        ApplicationRelease.application_id == application.id,
+                        ApplicationRelease.signer_digest.is_not(None),
+                    )
+                )
+                if value
+            }
+            if snapshot.signer_digest is None:
+                identity_status = "unverified"
+            elif not prior_signers or snapshot.signer_digest in prior_signers:
+                identity_status = "verified"
+            else:
+                identity_status = "signer_changed"
+            release = ApplicationRelease(
+                application_id=application.id,
+                scan_id=scan.id,
+                signer_digest=snapshot.signer_digest,
+                identity_status=identity_status,
+                version_name=snapshot.version_name,
+                version_code=snapshot.version_code,
+                artifact_sha256=scan.artifact_sha256,
+                snapshot_hash=snapshot.snapshot_hash,
+                analysis_profile={
+                    "cache_key": (snapshot.payload or {})
+                    .get("static_inventory", {})
+                    .get("analysis_profile")
+                },
+            )
+            session.add(release)
+            session.flush()
+            add_event(
+                session,
+                scan.id,
+                "version.release.linked",
+                "当前 APK 已关联到稳定应用版本线",
+                {
+                    "application_id": application.id,
+                    "release_id": release.id,
+                    "identity_status": identity_status,
+                },
+            )
+        else:
+            release = existing
+            application = session.get(ApplicationRecord, release.application_id)
+            if application is None:
+                raise RuntimeError("application release references a missing application")
+        target_stable_keys = {
+            str(item.get("stable_key"))
+            for item in (snapshot.payload or {}).get("entries", [])
+            if isinstance(item, dict) and item.get("stable_key")
+        }
+        for case in session.scalars(
+            select(VulnerabilityCase).where(
+                VulnerabilityCase.application_id == application.id,
+                VulnerabilityCase.lifecycle == "active",
+            )
+        ):
+            if session.scalar(
+                select(VulnerabilityOccurrence.id).where(
+                    VulnerabilityOccurrence.case_id == case.id,
+                    VulnerabilityOccurrence.scan_id == scan.id,
+                )
+            ):
+                continue
+            expected_keys = set((case.identity_json or {}).get("entry_stable_keys") or [])
+            mapped = bool(expected_keys) and expected_keys <= target_stable_keys
+            session.add(
+                VulnerabilityOccurrence(
+                    case_id=case.id,
+                    scan_id=scan.id,
+                    analysis_status=("pending_revalidation" if mapped else "unmappable"),
+                    proof_level="none",
+                    match_quality="strong" if mapped else "unmapped",
+                    match_reason=(
+                        "stable entry identity is present in the target release"
+                        if mapped
+                        else "the source entry identity is absent or ambiguous"
+                    ),
+                    observed_identity_json={
+                        "entry_stable_keys": sorted(expected_keys & target_stable_keys),
+                        "snapshot_hash": snapshot.snapshot_hash,
+                    },
+                )
+            )
+        session.flush()
+        return release
 
     def build_version_diff(
         self,
@@ -266,8 +440,26 @@ class SecurityEvolutionService:
             if (item.payload or {}).get("identity", {}).get("artifact_sha256")
             != scan.artifact_sha256
         ]
-        baseline = self._select_baseline(history, snapshot)
+        requested_baseline = dict((scan.stats or {}).get("version_baseline") or {}).get(
+            "scan_id"
+        )
+        baseline = (
+            next(
+                (item for item in history if item.scan_id == requested_baseline),
+                None,
+            )
+            if requested_baseline
+            else self._select_baseline(history, snapshot)
+        )
         if baseline is None:
+            if requested_baseline:
+                add_event(
+                    session,
+                    scan.id,
+                    "version.baseline.rejected",
+                    "显式基线与目标包名、签名或制品身份不兼容，未执行自动回放",
+                    {"baseline_scan_id": requested_baseline},
+                )
             return None
         existing = session.scalar(
             select(VersionDiff).where(
@@ -320,6 +512,22 @@ class SecurityEvolutionService:
             baseline_scan_id=baseline.scan_id,
             target_scan_id=scan.id,
             summary={
+                "baseline_selection": (
+                    "explicit" if requested_baseline else "automatic_legacy"
+                ),
+                "identity_result": {
+                    "package_match": baseline.package_name == snapshot.package_name,
+                    "signer_match": baseline.signer_digest == snapshot.signer_digest,
+                    "automatic_replay_allowed": True,
+                },
+                "analysis_profile": {
+                    "baseline": (baseline.payload or {})
+                    .get("static_inventory", {})
+                    .get("analysis_profile"),
+                    "target": (snapshot.payload or {})
+                    .get("static_inventory", {})
+                    .get("analysis_profile"),
+                },
                 "baseline_version_name": baseline.version_name,
                 "baseline_version_code": baseline.version_code,
                 "target_version_name": snapshot.version_name,
@@ -483,12 +691,53 @@ class SecurityEvolutionService:
                 changes.append("guards_added")
             if old["code"]["direct_hash"] != new["code"]["direct_hash"]:
                 changes.append("code_changed")
+            old_chain_fingerprints = set(
+                (old_manifest.get("static_surface") or {}).get("chain_fingerprints") or []
+            )
+            new_chain_fingerprints = set(
+                (new_manifest.get("static_surface") or {}).get("chain_fingerprints") or []
+            )
+            old_chain_engines = set(
+                (old_manifest.get("static_surface") or {}).get("chain_engine_versions")
+                or []
+            )
+            new_chain_engines = set(
+                (new_manifest.get("static_surface") or {}).get("chain_engine_versions")
+                or []
+            )
+            chain_engine_changed = bool(
+                old_chain_engines
+                and new_chain_engines
+                and old_chain_engines != new_chain_engines
+            )
+            if chain_engine_changed:
+                # Fingerprints intentionally include the engine version. Comparing
+                # them across engines would make an analyzer upgrade look like an
+                # application security regression.
+                added_chain_fingerprints: list[str] = []
+                removed_chain_fingerprints: list[str] = []
+                changes.append("attack_chain_engine_changed")
+            else:
+                added_chain_fingerprints = sorted(
+                    new_chain_fingerprints - old_chain_fingerprints
+                )
+                removed_chain_fingerprints = sorted(
+                    old_chain_fingerprints - new_chain_fingerprints
+                )
+            if added_chain_fingerprints:
+                changes.append("candidate_attack_chains_added")
+            if removed_chain_fingerprints:
+                changes.append("candidate_attack_chains_removed")
             category = (
                 "security_weakened"
                 if any(
                     item in changes
                     for item in ("export_weakened", "permission_removed", "guards_removed")
                 )
+                else "security_surface_expanded"
+                if added_chain_fingerprints
+                else "security_surface_reduced"
+                if removed_chain_fingerprints
                 else "security_hardened"
                 if any(item in changes for item in ("guards_added", "permission_added"))
                 else "implementation_changed"
@@ -502,6 +751,8 @@ class SecurityEvolutionService:
                     "changes": changes,
                     "removed_guards": removed_guards,
                     "added_guards": added_guards,
+                    "added_chain_fingerprints": added_chain_fingerprints,
+                    "removed_chain_fingerprints": removed_chain_fingerprints,
                 }
             )
         for item in baseline:
@@ -658,7 +909,11 @@ class SecurityEvolutionService:
                     "version_diff": relevant[:100],
                 }
                 categories = {str(item.get("category")) for item in relevant}
-                if categories & {"security_weakened", "entry_added"}:
+                if categories & {
+                    "security_weakened",
+                    "security_surface_expanded",
+                    "entry_added",
+                }:
                     task.priority = max(task.priority, 100)
                 elif "implementation_changed" in categories:
                     task.priority = max(task.priority, 92)

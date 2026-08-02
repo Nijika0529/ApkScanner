@@ -27,6 +27,7 @@ class Settings:
     scan_deadline_seconds: int = 24 * 60 * 60
     task_timeout_seconds: int = 4 * 60 * 60
     task_max_attempts: int = 2
+    investigation_max_concurrency: int = 3
     agent_max_rounds: int = 3
     agent_tests_per_round: int = 8
     agent_permission_profile: str = "personal_lab"
@@ -74,9 +75,6 @@ class Settings:
     device_max_api: int = 99
     device_install_policy: str = "install_or_reuse"
     device_reset_policy: str = "per_round"
-    mobsf_url: str | None = None
-    mobsf_api_key: str | None = None
-    mobsf_timeout_seconds: int = 900
     frontend_dist: Path | None = None
 
     @classmethod
@@ -105,6 +103,9 @@ class Settings:
             scan_deadline_seconds=int(os.getenv("APKSCANNER_SCAN_DEADLINE", 86_400)),
             task_timeout_seconds=int(os.getenv("APKSCANNER_TASK_TIMEOUT", 14_400)),
             task_max_attempts=int(os.getenv("APKSCANNER_TASK_MAX_ATTEMPTS", 2)),
+            investigation_max_concurrency=max(
+                1, min(3, int(os.getenv("APKSCANNER_INVESTIGATION_MAX_CONCURRENCY", 3)))
+            ),
             agent_max_rounds=max(
                 1, min(5, int(os.getenv("APKSCANNER_AGENT_MAX_ROUNDS", 3)))
             ),
@@ -233,9 +234,6 @@ class Settings:
             device_reset_policy=os.getenv(
                 "APKSCANNER_DEVICE_RESET_POLICY", "per_round"
             ).lower(),
-            mobsf_url=os.getenv("APKSCANNER_MOBSF_URL"),
-            mobsf_api_key=os.getenv("APKSCANNER_MOBSF_API_KEY"),
-            mobsf_timeout_seconds=int(os.getenv("APKSCANNER_MOBSF_TIMEOUT", 900)),
             frontend_dist=Path(frontend).resolve() if frontend else None,
         )
         settings.validate_codex_configuration()
@@ -243,6 +241,13 @@ class Settings:
 
     def validate_codex_configuration(self) -> None:
         from .agent_execution import frozen_agent_configuration
+
+        if self.device_android_api < 36 or self.device_min_api < 36:
+            raise ValueError("APKScanner dynamic validation requires Android API 36 or newer")
+        if self.poc_compile_api is not None and self.poc_compile_api < 36:
+            raise ValueError("APKSCANNER_POC_COMPILE_API must be at least 36")
+        if self.poc_target_api is not None and self.poc_target_api < 36:
+            raise ValueError("APKSCANNER_POC_TARGET_API must be at least 36")
 
         if self.investigator_backend not in {"codex", "none"}:
             raise ValueError("APKSCANNER_INVESTIGATOR_BACKEND must be codex or none")

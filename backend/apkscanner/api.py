@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -29,11 +30,14 @@ from .db import Database
 from .enums import FindingStatus, ScanStatus, TaskStatus
 from .finding_policy import partition_findings
 from .models import (
+    ApplicationRecord,
+    ApplicationRelease,
     BenchmarkEvaluation,
     CoverageItem,
     EntryPoint,
     Evidence,
     Finding,
+    InvestigationBrief,
     InvestigationTask,
     PatternMatch,
     Scan,
@@ -41,12 +45,16 @@ from .models import (
     SecurityHypothesis,
     SecuritySnapshot,
     VersionDiff,
+    VulnerabilityCase,
+    VulnerabilityOccurrence,
     VulnerabilityPattern,
 )
 from .orchestrator import ScanOrchestrator
 from .reports import ReportBuilder
 from .repository import add_event, now
 from .schemas import (
+    AdbDeviceConnectRequest,
+    AdbDeviceOut,
     AgentAuditOut,
     AgentProofReplay,
     BenchmarkEvaluationOut,
@@ -59,8 +67,12 @@ from .schemas import (
     FindingOut,
     FindingReview,
     HealthResponse,
+    InvestigationBriefCreate,
+    InvestigationBriefEvaluation,
+    InvestigationBriefOut,
     InvestigationTaskOut,
     PatternMatchOut,
+    RegressionCaseCreate,
     ScanAgentControl,
     ScanDeleteResult,
     ScanDetail,
@@ -70,7 +82,10 @@ from .schemas import (
     SecuritySnapshotOut,
     TaskAgentControl,
     TaskDeleteResult,
+    TaskReanalysisRequest,
     VersionDiffOut,
+    VulnerabilityCaseOut,
+    VulnerabilityOccurrenceOut,
     VulnerabilityPatternOut,
 )
 from .supervisor import CampaignPlan, SupervisorService
@@ -97,6 +112,11 @@ def get_capability_registry(request: Request) -> CapabilityRegistry:
 
 def get_supervisor(request: Request) -> SupervisorService:
     return request.app.state.supervisor
+
+
+def get_session(database: Database = Depends(get_database)):
+    with database.session_factory() as session:
+        yield session
 
 
 @router.post("/internal/tasks/{task_id}/proof-replay")
@@ -186,9 +206,194 @@ async def launch_campaign(
     return result
 
 
-def get_session(database: Database = Depends(get_database)):
-    with database.session_factory() as session:
-        yield session
+@router.get("/investigation-briefs", response_model=list[InvestigationBriefOut])
+def list_investigation_briefs(
+    scan_id: str | None = Query(default=None),
+    session: Session = Depends(get_session),
+) -> list[InvestigationBrief]:
+    statement = select(InvestigationBrief).order_by(desc(InvestigationBrief.created_at))
+    if scan_id is not None:
+        statement = statement.where(InvestigationBrief.scan_id == scan_id)
+    return list(session.scalars(statement))
+
+
+@router.post(
+    "/investigation-briefs",
+    response_model=InvestigationBriefOut,
+    status_code=201,
+)
+def create_investigation_brief(
+    payload: InvestigationBriefCreate,
+    session: Session = Depends(get_session),
+) -> InvestigationBrief:
+    try:
+        plan = CampaignPlan.model_validate(payload.plan)
+    except ValueError as exc:
+        raise HTTPException(422, f"Invalid entry plan: {exc}") from exc
+    if payload.scan_id is not None and session.get(Scan, payload.scan_id) is None:
+        raise HTTPException(404, "Scan not found")
+    brief = InvestigationBrief(
+        scan_id=payload.scan_id,
+        name=payload.name,
+        objective=payload.objective,
+        status="draft",
+        scope=payload.scope,
+        attacker_model=payload.attacker_model,
+        preconditions=list(payload.preconditions),
+        plan=plan.model_dump(mode="json"),
+        evaluation_contract=payload.evaluation_contract.model_dump(mode="json"),
+        result={},
+    )
+    session.add(brief)
+    session.flush()
+    if brief.scan_id:
+        add_event(
+            session,
+            brief.scan_id,
+            "investigation.brief.created",
+            "已创建带评判契约的特殊调查入口",
+            {"brief_id": brief.id, "name": brief.name},
+        )
+    session.commit()
+    session.refresh(brief)
+    return brief
+
+
+@router.post("/investigation-briefs/{brief_id}/validate")
+def validate_investigation_brief(
+    brief_id: str,
+    session: Session = Depends(get_session),
+    supervisor: SupervisorService = Depends(get_supervisor),
+) -> dict[str, Any]:
+    brief = session.get(InvestigationBrief, brief_id)
+    if brief is None:
+        raise HTTPException(404, "Investigation brief not found")
+    plan = CampaignPlan.model_validate(brief.plan)
+    validation = supervisor.validate_plan(plan)
+    brief.status = "validated" if validation["valid"] else "draft"
+    brief.result = {**dict(brief.result or {}), "validation": validation}
+    session.commit()
+    return {
+        **validation,
+        "brief_id": brief.id,
+        "evaluation_contract": brief.evaluation_contract,
+    }
+
+
+@router.post(
+    "/investigation-briefs/{brief_id}/launch",
+    response_model=InvestigationBriefOut,
+    status_code=202,
+)
+async def launch_investigation_brief(
+    brief_id: str,
+    request: Request,
+    session: Session = Depends(get_session),
+    supervisor: SupervisorService = Depends(get_supervisor),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> InvestigationBrief:
+    brief = session.get(InvestigationBrief, brief_id)
+    if brief is None:
+        raise HTTPException(404, "Investigation brief not found")
+    if brief.status == "running":
+        raise HTTPException(409, "Investigation brief is already running")
+    plan = CampaignPlan.model_validate(brief.plan)
+    validation = supervisor.validate_plan(plan)
+    if not validation["valid"]:
+        raise HTTPException(409, "Investigation brief has unavailable or invalid entries")
+    result = supervisor.launch(plan)
+    brief.status = "running" if result["scan_ids"] else "completed"
+    brief.result = {
+        "launch": result,
+        "evaluation_contract": brief.evaluation_contract,
+        "verdict": "pending" if result["scan_ids"] else "requires_evaluation",
+    }
+    if brief.scan_id:
+        add_event(
+            session,
+            brief.scan_id,
+            "investigation.brief.launched",
+            "特殊调查入口已交给监督控制面执行",
+            {"brief_id": brief.id, "generated_scan_ids": result["scan_ids"]},
+        )
+    session.commit()
+    for scan_id in result["scan_ids"]:
+        task = asyncio.create_task(
+            orchestrator.submit(scan_id),
+            name=f"brief-scan-{scan_id}",
+        )
+        request.app.state.background_tasks.add(task)
+        task.add_done_callback(request.app.state.background_tasks.discard)
+    session.refresh(brief)
+    return brief
+
+
+@router.post(
+    "/investigation-briefs/{brief_id}/evaluate",
+    response_model=InvestigationBriefOut,
+)
+def evaluate_investigation_brief(
+    brief_id: str,
+    payload: InvestigationBriefEvaluation,
+    session: Session = Depends(get_session),
+) -> InvestigationBrief:
+    brief = session.get(InvestigationBrief, brief_id)
+    if brief is None:
+        raise HTTPException(404, "Investigation brief not found")
+    contract = dict(brief.evaluation_contract or {})
+    expected_criteria = set(contract.get("success_criteria") or [])
+    submitted = {item.criterion: item for item in payload.criteria}
+    if set(submitted) != expected_criteria:
+        raise HTTPException(422, "Every success criterion must be evaluated exactly once")
+    evidence_ids = {
+        evidence_id
+        for item in payload.criteria
+        for evidence_id in item.evidence_ids
+    }
+    evidence = list(
+        session.scalars(select(Evidence).where(Evidence.id.in_(evidence_ids)))
+    ) if evidence_ids else []
+    if len(evidence) != len(evidence_ids):
+        raise HTTPException(422, "Evaluation references unknown Evidence IDs")
+    launch = dict((brief.result or {}).get("launch") or {})
+    allowed_scan_ids = set(launch.get("scan_ids") or [])
+    if brief.scan_id:
+        allowed_scan_ids.add(brief.scan_id)
+    if any(item.scan_id not in allowed_scan_ids for item in evidence):
+        raise HTTPException(422, "Evaluation Evidence is outside the brief scope")
+    observed_kinds = {item.kind for item in evidence}
+    required_kinds = set(contract.get("required_evidence_kinds") or [])
+    missing_kinds = sorted(required_kinds - observed_kinds)
+    if payload.verdict == "passed" and (
+        missing_kinds or not all(item.passed for item in payload.criteria)
+    ):
+        raise HTTPException(
+            409,
+            "A passed verdict requires every criterion and every required Evidence kind",
+        )
+    brief.status = "completed"
+    brief.result = {
+        **dict(brief.result or {}),
+        "verdict": payload.verdict,
+        "evaluation": {
+            **payload.model_dump(mode="json"),
+            "evidence_ids": sorted(evidence_ids),
+            "observed_evidence_kinds": sorted(observed_kinds),
+            "missing_evidence_kinds": missing_kinds,
+            "evaluated_at": now().isoformat(),
+        },
+    }
+    if brief.scan_id:
+        add_event(
+            session,
+            brief.scan_id,
+            "investigation.brief.evaluated",
+            f"特殊调查已按 Evaluation Contract 完成：{payload.verdict}",
+            {"brief_id": brief.id, "verdict": payload.verdict},
+        )
+    session.commit()
+    session.refresh(brief)
+    return brief
 
 
 def require_scan(session: Session, scan_id: str) -> Scan:
@@ -224,11 +429,74 @@ def _transition_task(
     return result.rowcount == 1
 
 
+@router.get("/devices", response_model=list[AdbDeviceOut])
+def list_adb_devices(
+    probe: bool = Query(default=False),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> list[dict[str, Any]]:
+    return orchestrator.list_adb_devices(probe=probe)
+
+
+@router.post("/devices", response_model=AdbDeviceOut, status_code=201)
+def connect_adb_device(
+    control: AdbDeviceConnectRequest,
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> dict[str, Any]:
+    try:
+        return orchestrator.connect_adb_device(
+            control.serial,
+            label=control.label,
+            connect=control.connect,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.post("/devices/{serial}/drain", response_model=AdbDeviceOut)
+def drain_adb_device(
+    serial: str,
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> dict[str, Any]:
+    try:
+        return orchestrator.drain_adb_device(serial)
+    except KeyError as exc:
+        raise HTTPException(404, "ADB device not found") from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.post("/devices/{serial}/reconnect", response_model=AdbDeviceOut)
+def reconnect_adb_device(
+    serial: str,
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> dict[str, Any]:
+    try:
+        return orchestrator.reconnect_adb_device(serial)
+    except KeyError as exc:
+        raise HTTPException(404, "ADB device not found") from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.delete("/devices/{serial}")
+def remove_adb_device(
+    serial: str,
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> dict[str, Any]:
+    try:
+        orchestrator.remove_adb_device(serial)
+    except KeyError as exc:
+        raise HTTPException(404, "ADB device not found") from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"serial": serial, "deleted": True}
+
+
 @router.get("/health", response_model=HealthResponse)
 def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> HealthResponse:
     tool_versions = {
         name: orchestrator.runner.version(name)
-        for name in ("aapt2", "apksigner", "apktool", "apkanalyzer", "jadx", "adb")
+        for name in ("aapt2", "apksigner", "apktool", "jadx", "adb")
     }
     capabilities = [
         Capability(name=name, available=version is not None, version=version)
@@ -251,14 +519,6 @@ def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> Health
             busy=bool(device.get("busy")),
             version=device.get("android_version"),
             detail=device.get("detail"),
-        )
-    )
-    mobsf = orchestrator.mobsf.capability()
-    capabilities.append(
-        Capability(
-            name="mobsf",
-            available=bool(mobsf.get("available")),
-            detail=mobsf.get("detail"),
         )
     )
     poc_builder = orchestrator.poc_builder.capability()
@@ -287,6 +547,7 @@ async def create_scan(
     request: Request,
     apk: UploadFile = File(...),
     investigator: str = Form("configured"),
+    baseline_scan_id: str | None = Form(default=None),
     session: Session = Depends(get_session),
     store: ArtifactStore = Depends(get_store),
     orchestrator: ScanOrchestrator = Depends(get_orchestrator),
@@ -295,6 +556,13 @@ async def create_scan(
         resolved_investigator = orchestrator.resolve_investigator(investigator)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+    baseline: Scan | None = None
+    if baseline_scan_id:
+        baseline = session.get(Scan, baseline_scan_id)
+        if baseline is None:
+            raise HTTPException(404, "Baseline scan not found")
+        if baseline.status != ScanStatus.FINAL.value:
+            raise HTTPException(409, "Baseline scan must be final")
     filename = Path(apk.filename or "upload.apk").name
     if not filename.lower().endswith(".apk"):
         raise HTTPException(415, "Only a single installable .apk is supported in v1")
@@ -314,6 +582,15 @@ async def create_scan(
                 "enabled": resolved_investigator != "none",
                 "backend": resolved_investigator,
             },
+            "version_baseline": (
+                {
+                    "scan_id": baseline.id,
+                    "selection": "explicit",
+                    "artifact_sha256": baseline.artifact_sha256,
+                }
+                if baseline is not None
+                else None
+            ),
         },
     )
     session.add(scan)
@@ -559,6 +836,161 @@ def get_version_diff(
     return diff
 
 
+@router.post(
+    "/findings/{finding_id}/regression-case",
+    response_model=VulnerabilityCaseOut,
+    status_code=201,
+)
+def create_regression_case(
+    finding_id: str,
+    payload: RegressionCaseCreate,
+    session: Session = Depends(get_session),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> VulnerabilityCase:
+    finding = session.get(Finding, finding_id)
+    if finding is None:
+        raise HTTPException(404, "Finding not found")
+    scan = session.get(Scan, finding.scan_id)
+    snapshot = session.scalar(
+        select(SecuritySnapshot).where(SecuritySnapshot.scan_id == finding.scan_id)
+    )
+    if scan is None or snapshot is None:
+        raise HTTPException(409, "The source scan has no security snapshot")
+    release = session.scalar(
+        select(ApplicationRelease).where(ApplicationRelease.scan_id == scan.id)
+    )
+    if release is None:
+        release = orchestrator.security_evolution.ensure_application_release(
+            session,
+            scan=scan,
+            snapshot=snapshot,
+        )
+    stable_by_entry = {
+        str(item.get("entry_id")): str(item.get("stable_key"))
+        for item in (snapshot.payload or {}).get("entries", [])
+        if isinstance(item, dict) and item.get("entry_id") and item.get("stable_key")
+    }
+    identity = {
+        "namespace": "apkscanner-regression-case",
+        "version": "case-v1",
+        "rule_id": finding.rule_id,
+        "cwe": finding.cwe,
+        "entry_stable_keys": sorted(
+            stable_by_entry[item]
+            for item in finding.entry_point_ids
+            if item in stable_by_entry
+        ),
+        "title": " ".join(finding.title.lower().split()),
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    duplicate = session.scalar(
+        select(VulnerabilityCase).where(
+            VulnerabilityCase.application_id == release.application_id,
+            (
+                (VulnerabilityCase.case_key == payload.case_key)
+                | (VulnerabilityCase.fingerprint == fingerprint)
+            ),
+        )
+    )
+    if duplicate is not None:
+        raise HTTPException(409, "A regression case with this key or identity already exists")
+    case_record = VulnerabilityCase(
+        application_id=release.application_id,
+        case_key=payload.case_key,
+        fingerprint_version="case-v1",
+        fingerprint=fingerprint,
+        identity_json=identity,
+        title=finding.title,
+        description=finding.description,
+        harm=payload.harm,
+        severity=finding.severity,
+        cwe=finding.cwe,
+        masvs=finding.masvs,
+        minimum_proof=payload.minimum_proof,
+        lifecycle="active",
+        source_scan_id=scan.id,
+        source_finding_id=finding.id,
+    )
+    session.add(case_record)
+    session.flush()
+    proof_level = (
+        "dynamic"
+        if finding.status == FindingStatus.REPRODUCED_BLACKBOX.value
+        else "static"
+        if finding.status == FindingStatus.SUPPORTED_STATIC.value
+        else "none"
+    )
+    session.add(
+        VulnerabilityOccurrence(
+            case_id=case_record.id,
+            scan_id=scan.id,
+            finding_id=finding.id,
+            analysis_status=finding.status,
+            proof_level=proof_level,
+            match_quality="strong",
+            match_reason="explicitly promoted from the source finding by the operator",
+            observed_identity_json={
+                **identity,
+                "snapshot_hash": snapshot.snapshot_hash,
+            },
+        )
+    )
+    add_event(
+        session,
+        scan.id,
+        "version.regression_case.created",
+        "已将 Finding 提升为跨版本稳定漏洞案例",
+        {"case_id": case_record.id, "case_key": case_record.case_key},
+    )
+    session.commit()
+    session.refresh(case_record)
+    return case_record
+
+
+@router.get(
+    "/applications/{application_id}/regression-cases",
+    response_model=list[VulnerabilityCaseOut],
+)
+def list_regression_cases(
+    application_id: str,
+    session: Session = Depends(get_session),
+) -> list[VulnerabilityCase]:
+    if session.get(ApplicationRecord, application_id) is None:
+        raise HTTPException(404, "Application not found")
+    return list(
+        session.scalars(
+            select(VulnerabilityCase)
+            .where(VulnerabilityCase.application_id == application_id)
+            .order_by(VulnerabilityCase.created_at)
+        )
+    )
+
+
+@router.get(
+    "/scans/{scan_id}/regression-occurrences",
+    response_model=list[VulnerabilityOccurrenceOut],
+)
+def list_regression_occurrences(
+    scan_id: str,
+    session: Session = Depends(get_session),
+) -> list[VulnerabilityOccurrence]:
+    require_scan(session, scan_id)
+    return list(
+        session.scalars(
+            select(VulnerabilityOccurrence)
+            .where(VulnerabilityOccurrence.scan_id == scan_id)
+            .order_by(VulnerabilityOccurrence.created_at)
+        )
+    )
+
+
 @router.get(
     "/scans/{scan_id}/pattern-matches",
     response_model=list[PatternMatchOut],
@@ -747,7 +1179,10 @@ def list_coverage(scan_id: str, session: Session = Depends(get_session)) -> list
     return list(
         session.scalars(
             select(CoverageItem)
-            .where(CoverageItem.scan_id == scan_id)
+            .where(
+                CoverageItem.scan_id == scan_id,
+                CoverageItem.control_id != "ENGINE-MOBSF",
+            )
             .order_by(CoverageItem.domain, CoverageItem.control_id)
         )
     )
@@ -1004,6 +1439,65 @@ def _reset_timed_out_task_for_continuation(
     )
 
 
+def _create_independent_reanalysis(
+    session: Session,
+    task: InvestigationTask,
+) -> InvestigationTask:
+    requested_at = now()
+    original_preconditions = dict(task.preconditions or {})
+    for history_key in ("version_replays", "prior_findings", "history", "continuation"):
+        original_preconditions.pop(history_key, None)
+    independent = InvestigationTask(
+        scan_id=task.scan_id,
+        task_type=task.task_type,
+        status=TaskStatus.QUEUED.value,
+        priority=task.priority,
+        target_entry_ids=list(task.target_entry_ids),
+        hypotheses=list(task.hypotheses),
+        preconditions={
+            **original_preconditions,
+            "context_policy": {
+                "mode": "independent",
+                "reuse_static_artifacts": True,
+                "reuse_task_evidence": False,
+                "reuse_agent_thread": False,
+                "reuse_version_replays": False,
+            },
+        },
+        allowed_side_effects=list(task.allowed_side_effects),
+        device_profile=dict(task.device_profile or {}),
+        result={
+            "independent_reanalysis": {
+                "requested_at": requested_at.isoformat(),
+                "origin_task_id": task.id,
+                "context_mode": "independent",
+                "reuse_static_artifacts": True,
+                "reuse_task_evidence": False,
+                "reuse_agent_thread": False,
+                "reuse_version_replays": False,
+            }
+        },
+    )
+    session.add(independent)
+    session.flush()
+    add_event(
+        session,
+        task.scan_id,
+        "exploration.independent.requested",
+        "已创建不读取原任务上下文的独立复核任务",
+        {
+            "task_id": independent.id,
+            "origin_task_id": task.id,
+            "source": "platform",
+            "reuse_static_artifacts": True,
+            "reuse_task_evidence": False,
+            "reuse_agent_thread": False,
+            "reuse_version_replays": False,
+        },
+    )
+    return independent
+
+
 def _task_needs_supplemental_rerun(task: InvestigationTask) -> bool:
     if task.status in {
         TaskStatus.BLOCKED_DEVICE.value,
@@ -1089,6 +1583,52 @@ async def rerun_task(
     request.app.state.background_tasks.add(background)
     background.add_done_callback(request.app.state.background_tasks.discard)
     return task
+
+
+@router.post(
+    "/tasks/{task_id}/reanalyses",
+    response_model=InvestigationTaskOut,
+    status_code=202,
+)
+async def create_task_reanalysis(
+    task_id: str,
+    control: TaskReanalysisRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> InvestigationTask:
+    task = require_active_task(session, task_id)
+    if task.status in {
+        TaskStatus.QUEUED.value,
+        TaskStatus.AWAITING_DEVICE.value,
+        TaskStatus.RUNNING.value,
+        TaskStatus.CANCEL_REQUESTED.value,
+    }:
+        raise HTTPException(409, "Task is already queued or running")
+    scan = session.get(Scan, task.scan_id)
+    if scan is None:
+        raise HTTPException(404, "Scan not found")
+    if control.context_mode == "independent":
+        queued_task = _create_independent_reanalysis(session, task)
+    elif task.status == TaskStatus.TIMED_OUT.value:
+        _reset_timed_out_task_for_continuation(session, task)
+        queued_task = task
+    else:
+        _reset_task_for_manual_rerun(
+            session,
+            task,
+            reason="用户请求沿用该入口定义重新分析",
+        )
+        queued_task = task
+    _resume_scan(session, scan)
+    session.commit()
+    background = asyncio.create_task(
+        orchestrator.submit(task.scan_id),
+        name=f"reanalysis-{queued_task.id}",
+    )
+    request.app.state.background_tasks.add(background)
+    background.add_done_callback(request.app.state.background_tasks.discard)
+    return queued_task
 
 
 @router.post("/tasks/{task_id}/continue", response_model=InvestigationTaskOut, status_code=202)

@@ -23,7 +23,6 @@ finding without platform evidence IDs.
   PoC replay, review, and cleanup rounds.
 - Remote ADB adapter, optional ordinary-app-UID Probe fast path, Agent PoCs, objective Oracles, `pm clear` cleanup,
   and App Link state inspection/reset.
-- Optional MobSF upload/report normalization with explicit degraded coverage when absent.
 - Official `openai-codex==0.144.4` + DeepSeek Responses integration with strict JSON Schema,
   streamed events, a full-access Codex sandbox, no subagent fan-out, and evidence-backed result
   downgrades.
@@ -233,13 +232,6 @@ adapter explicitly binds them. Control-plane endpoints are under `/api/v1/capabi
 OpenCode design remains only for historical reference in
 [`docs/opencode-deepseek.zh-CN.md`](docs/opencode-deepseek.zh-CN.md).
 
-To add MobSF breadth:
-
-```bash
-export APKSCANNER_MOBSF_URL=https://mobsf.internal.example
-export APKSCANNER_MOBSF_API_KEY=...
-```
-
 ## Environment variables
 
 | Variable | Default | Purpose |
@@ -280,7 +272,6 @@ export APKSCANNER_MOBSF_API_KEY=...
 | `APKSCANNER_CODEX_BIN` | bundled SDK runtime | Explicit tested Codex binary override |
 | `APKSCANNER_DEEPSEEK_BASE_URL` | DeepSeek default | Optional trusted HTTP(S) gateway |
 | `DEEPSEEK_API_KEY` | unset | DeepSeek credential inherited only by the UID worker exec |
-| `APKSCANNER_MOBSF_URL` / `APKSCANNER_MOBSF_API_KEY` | unset | Optional MobSF API |
 | `APKSCANNER_ANDROID_VERSION` | `16` | Reported dynamic baseline |
 | `APKSCANNER_ANDROID_API` | `36` | Expected audit-device API and default PoC compile/target API |
 | `APKSCANNER_DEVICE_MIN_API` / `APKSCANNER_DEVICE_MAX_API` | `21` / `99` | Compatible cloud-device API range |

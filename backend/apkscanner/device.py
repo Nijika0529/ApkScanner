@@ -135,7 +135,8 @@ class DevicePoolScheduler:
     """Priority queue that assigns one complete task to one free device."""
 
     def __init__(self, serials: tuple[str, ...]) -> None:
-        self._serials = serials
+        self._serials = list(dict.fromkeys(serials))
+        self._draining: set[str] = set()
         self._condition = threading.Condition()
         self._queue: list[_DeviceWaiter] = []
         self._sequence = 0
@@ -177,6 +178,7 @@ class DevicePoolScheduler:
                             serial
                             for serial in self._serials
                             if serial not in self._active_by_serial
+                            and serial not in self._draining
                         ),
                         None,
                     )
@@ -206,10 +208,49 @@ class DevicePoolScheduler:
         with self._condition:
             self._condition.notify_all()
 
+    def add_serial(self, serial: str) -> None:
+        with self._condition:
+            if serial not in self._serials:
+                self._serials.append(serial)
+            self._draining.discard(serial)
+            self._condition.notify_all()
+
+    def drain_serial(self, serial: str) -> bool:
+        with self._condition:
+            if serial not in self._serials:
+                return False
+            self._draining.add(serial)
+            self._condition.notify_all()
+            return True
+
+    def restore_serial(self, serial: str) -> bool:
+        with self._condition:
+            if serial not in self._serials:
+                return False
+            self._draining.discard(serial)
+            self._condition.notify_all()
+            return True
+
+    def remove_serial(self, serial: str) -> bool:
+        with self._condition:
+            if serial in self._active_by_serial:
+                return False
+            try:
+                self._serials.remove(serial)
+            except ValueError:
+                return False
+            self._draining.discard(serial)
+            self._condition.notify_all()
+            return True
+
+    def is_active(self, serial: str) -> bool:
+        with self._condition:
+            return serial in self._active_by_serial
+
     def snapshot(self) -> dict[str, Any]:
         with self._condition:
             waiting = sorted(self._queue)
-            return {
+            snapshot = {
                 "capacity": len(self._serials),
                 "active": dict(self._active_by_serial),
                 "waiting": [
@@ -221,6 +262,9 @@ class DevicePoolScheduler:
                     for index, waiter in enumerate(waiting, start=1)
                 ],
             }
+            if self._draining:
+                snapshot["draining"] = sorted(self._draining)
+            return snapshot
 
     def _position(self, target: _DeviceWaiter) -> int:
         return sorted(self._queue).index(target) + 1
@@ -945,9 +989,12 @@ class AdbDeviceAdapter:
             actual_api = device_api.stdout.strip()
             common["device_api"] = actual_api or None
             common["device_api_matches_poc_target"] = actual_api == str(built_target_api)
+            device_api_number = -1
+            built_target_api_number = -1
             try:
                 device_api_number = int(actual_api)
                 minimum_api_number = int(common["poc_min_api"])
+                built_target_api_number = int(built_target_api)
             except (TypeError, ValueError):
                 common["device_api_satisfies_poc_min"] = None
                 common["poc_runtime_compatible"] = None
@@ -959,6 +1006,23 @@ class AdbDeviceAdapter:
                 # minSdk boundary.
                 common["poc_runtime_compatible"] = device_api_number >= minimum_api_number
             commands.append(("blackbox.device_profile", device_api, dict(common)))
+            if (
+                device_api.exit_code != 0
+                or common.get("poc_runtime_compatible") is not True
+                or device_api_number < 36
+                or built_target_api_number < 36
+            ):
+                return DeviceProbeResult(
+                    stage="poc_incompatible",
+                    commands=commands,
+                    summary={
+                        **common,
+                        "error": (
+                            "PoC/runtime profile is incompatible; Android API 36+ and "
+                            "targetSdkVersion 36+ are required"
+                        ),
+                    },
+                )
             target_uid_result = self._adb_budget(
                 [
                     "shell",
@@ -1901,23 +1965,59 @@ class AdbDevicePool:
     """Assign each investigation one exclusive adapter for its complete task."""
 
     def __init__(self, adapters: list[AdbDeviceAdapter]) -> None:
-        self.adapters = tuple(adapter for adapter in adapters if adapter.serial is not None)
-        self._by_serial = {str(adapter.serial): adapter for adapter in self.adapters}
+        self._lock = threading.RLock()
+        self._by_serial = {
+            str(adapter.serial): adapter for adapter in adapters if adapter.serial is not None
+        }
         self.scheduler = DevicePoolScheduler(tuple(self._by_serial))
 
     @property
+    def adapters(self) -> tuple[AdbDeviceAdapter, ...]:
+        with self._lock:
+            return tuple(self._by_serial.values())
+
+    @property
     def configured(self) -> bool:
-        return bool(self.adapters) and all(
-            adapter.runner.available("adb") for adapter in self.adapters
+        state = self.scheduler.snapshot()
+        draining = set(state.get("draining", []))
+        assignable = [item for item in self.adapters if item.serial not in draining]
+        return bool(assignable) and all(
+            adapter.runner.available("adb") for adapter in assignable
         )
 
     @property
     def capacity(self) -> int:
-        return len(self.adapters) if self.configured else 1
+        state = self.scheduler.snapshot()
+        return max(0, len(self.adapters) - len(state.get("draining", [])))
 
     @property
     def serials(self) -> tuple[str, ...]:
-        return tuple(self._by_serial)
+        with self._lock:
+            return tuple(self._by_serial)
+
+    def add(self, adapter: AdbDeviceAdapter) -> None:
+        if adapter.serial is None:
+            raise ValueError("ADB adapter serial is required")
+        serial = str(adapter.serial)
+        with self._lock:
+            self._by_serial[serial] = adapter
+            self.scheduler.add_serial(serial)
+
+    def drain(self, serial: str) -> bool:
+        return self.scheduler.drain_serial(serial)
+
+    def restore(self, serial: str) -> bool:
+        return self.scheduler.restore_serial(serial)
+
+    def remove(self, serial: str) -> bool:
+        if not self.scheduler.remove_serial(serial):
+            return False
+        with self._lock:
+            self._by_serial.pop(serial, None)
+        return True
+
+    def is_active(self, serial: str) -> bool:
+        return self.scheduler.is_active(serial)
 
     @staticmethod
     def package_safe(package_name: str) -> bool:
@@ -1933,19 +2033,32 @@ class AdbDevicePool:
             "capacity": len(self.adapters),
             "serials": list(self.serials),
             "active": state["active"],
+            "draining": state.get("draining", []),
             "waiting": state["waiting"],
         }
 
     def capability(self, *, non_blocking: bool = False) -> dict[str, Any]:
         if not self.configured:
+            snapshot = self.scheduler.snapshot()
             return {
                 "available": False,
-                "detail": "No ADB device serial is configured",
+                "detail": (
+                    "All ADB devices are draining"
+                    if snapshot.get("draining") and self.serials
+                    else "No ADB device serial is configured"
+                ),
                 "serials": list(self.serials),
+                "draining": snapshot.get("draining", []),
             }
         snapshot = self.scheduler.snapshot()
         active_serials = set(snapshot["active"])
-        available = [adapter for adapter in self.adapters if adapter.serial not in active_serials]
+        draining_serials = set(snapshot.get("draining", []))
+        available = [
+            adapter
+            for adapter in self.adapters
+            if adapter.serial not in active_serials
+            and adapter.serial not in draining_serials
+        ]
         if non_blocking and not available:
             return {
                 # The pool is healthy but temporarily has no free lease. Callers
@@ -1998,7 +2111,8 @@ class AdbDevicePool:
             on_queued=on_queued,
         ) as metadata:
             serial = str(metadata["serial"])
-            adapter = self._by_serial[serial]
+            with self._lock:
+                adapter = self._by_serial[serial]
             acquired_at = time.monotonic()
             session_started = False
             try:

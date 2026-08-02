@@ -63,7 +63,10 @@ class ReportBuilder:
         coverage = list(
             session.scalars(
                 select(CoverageItem)
-                .where(CoverageItem.scan_id == scan.id)
+                .where(
+                    CoverageItem.scan_id == scan.id,
+                    CoverageItem.control_id != "ENGINE-MOBSF",
+                )
                 .order_by(CoverageItem.domain, CoverageItem.control_id)
             )
         )

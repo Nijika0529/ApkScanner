@@ -6,6 +6,8 @@ from datetime import UTC, datetime, timedelta
 
 from apkscanner.db import Database
 from apkscanner.models import (
+    ApplicationRecord,
+    ApplicationRelease,
     EntryPoint,
     Evidence,
     Finding,
@@ -13,8 +15,11 @@ from apkscanner.models import (
     ProofAttempt,
     Scan,
     SecurityHypothesis,
+    VulnerabilityCase,
+    VulnerabilityOccurrence,
 )
 from apkscanner.versioning import SecurityEvolutionService
+from sqlalchemy import select
 
 
 def _scan(version: str, artifact: str) -> Scan:
@@ -360,3 +365,170 @@ def test_version_diff_tracks_security_resources_and_ignores_exact_reruns(setting
             )
             is None
         )
+
+
+def test_version_diff_prioritizes_new_candidate_attack_chains(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    service = SecurityEvolutionService()
+
+    def surface(scan: Scan, fingerprints: list[str]) -> EntryPoint:
+        return EntryPoint(
+            scan=scan,
+            kind="static_surface",
+            name="static://capability_delegation_boundary",
+            owner_component="static://capability_delegation_boundary",
+            exported=False,
+            metadata_json={
+                "static_review_family": "capability_delegation_boundary",
+                "static_review_rule_ids": ["CHAIN-ANDROID-CAPABILITY-DELEGATION"],
+                "static_review_attack_chains": [
+                    {
+                        "fingerprint": fingerprint,
+                        "chain_kind": "nested_intent_redirection",
+                    }
+                    for fingerprint in fingerprints
+                ],
+            },
+        )
+
+    code_index = {
+        "static://capability_delegation_boundary": {
+            "status": "static_signal_source_available",
+            "anchors": [{"content": "Intent nested; startActivity(nested);"}],
+        }
+    }
+    with database.session_factory() as session:
+        baseline = _scan("20", "f")
+        old_surface = surface(baseline, [])
+        session.add_all([baseline, old_surface])
+        session.flush()
+        service.build_snapshot(
+            session,
+            scan=baseline,
+            entries=[old_surface],
+            code_index=code_index,
+        )
+
+        target = _scan("21", "0")
+        new_surface = surface(target, ["a" * 64])
+        session.add_all([target, new_surface])
+        session.flush()
+        snapshot = service.build_snapshot(
+            session,
+            scan=target,
+            entries=[new_surface],
+            code_index=code_index,
+        )
+        diff = service.build_version_diff(session, scan=target, snapshot=snapshot)
+
+        assert diff is not None
+        delta = next(item for item in diff.deltas if item.get("target_entry_id"))
+        assert delta["category"] == "security_surface_expanded"
+        assert delta["changes"] == ["candidate_attack_chains_added"]
+        assert delta["added_chain_fingerprints"] == ["a" * 64]
+
+
+def test_attack_chain_engine_upgrade_is_not_an_app_security_regression() -> None:
+    def fact(entry_id: str, engine: str, fingerprint: str) -> dict:
+        return {
+            "entry_id": entry_id,
+            "stable_key": "static_surface:static://web_content_boundary",
+            "manifest": {
+                "kind": "static_surface",
+                "name": "static://web_content_boundary",
+                "owner_component": "static://web_content_boundary",
+                "exported": False,
+                "permission": None,
+                "permission_protection": None,
+                "static_surface": {
+                    "chain_fingerprints": [fingerprint],
+                    "chain_engine_versions": [engine],
+                },
+            },
+            "code": {"direct_hash": "same", "guards": [], "sinks": []},
+        }
+
+    deltas = SecurityEvolutionService._diff_entries(
+        [fact("old", "bounded-android-chain-v1", "a" * 64)],
+        [fact("new", "bounded-android-chain-v2", "b" * 64)],
+        [
+            {
+                "baseline_entry_id": "old",
+                "target_entry_id": "new",
+                "baseline_key": "static_surface:static://web_content_boundary",
+                "target_key": "static_surface:static://web_content_boundary",
+                "reason": "stable_entry_identity",
+                "score": 100,
+            }
+        ],
+    )
+
+    assert deltas[0]["category"] == "implementation_changed"
+    assert deltas[0]["changes"] == ["attack_chain_engine_changed"]
+    assert deltas[0]["added_chain_fingerprints"] == []
+    assert deltas[0]["removed_chain_fingerprints"] == []
+
+
+def test_application_release_and_regression_occurrence_are_stable_across_scans(
+    settings,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    service = SecurityEvolutionService()
+    with database.session_factory() as session:
+        baseline = _scan("30", "1")
+        baseline_entry = _entry(baseline)
+        session.add_all([baseline, baseline_entry])
+        session.flush()
+        baseline_snapshot = service.build_snapshot(
+            session,
+            scan=baseline,
+            entries=[baseline_entry],
+            code_index=_code_index(),
+        )
+        release = session.scalar(
+            select(ApplicationRelease).where(ApplicationRelease.scan_id == baseline.id)
+        )
+        assert release is not None
+        assert release.identity_status == "verified"
+        stable_key = baseline_snapshot.payload["entries"][0]["stable_key"]
+        case = VulnerabilityCase(
+            application_id=release.application_id,
+            case_key="LOCAL-30",
+            fingerprint="a" * 64,
+            identity_json={"entry_stable_keys": [stable_key]},
+            title="Provider authorization bypass",
+            harm="An untrusted app can read protected data.",
+            severity="high",
+            minimum_proof="dynamic",
+        )
+        session.add(case)
+        session.flush()
+
+        target = _scan("31", "2")
+        target_entry = _entry(target)
+        session.add_all([target, target_entry])
+        session.flush()
+        service.build_snapshot(
+            session,
+            scan=target,
+            entries=[target_entry],
+            code_index=_code_index(),
+        )
+        occurrence = session.scalar(
+            select(VulnerabilityOccurrence).where(
+                VulnerabilityOccurrence.case_id == case.id,
+                VulnerabilityOccurrence.scan_id == target.id,
+            )
+        )
+        assert occurrence is not None
+        assert occurrence.analysis_status == "pending_revalidation"
+        assert occurrence.proof_level == "none"
+        assert occurrence.match_quality == "strong"
+        applications = list(session.scalars(select(ApplicationRecord)))
+        releases = list(session.scalars(select(ApplicationRelease)))
+        assert len(applications) == 1
+        assert len(releases) == 2

@@ -137,7 +137,7 @@ public final class MainActivity extends android.app.Activity {}""",
     return project
 
 
-def test_poc_builder_falls_back_to_highest_installed_compile_platform(
+def test_poc_builder_requires_the_exact_android_16_compile_platform(
     settings,
     tmp_path,
 ) -> None:  # noqa: ANN001
@@ -152,7 +152,7 @@ def test_poc_builder_falls_back_to_highest_installed_compile_platform(
         ArtifactStore(settings),
     )
 
-    assert builder._android_jar() == sdk / "platforms" / "android-34" / "android.jar"
+    assert builder._android_jar() is None
 
 
 def test_poc_builder_accepts_only_source_projects_under_workspace(
@@ -640,7 +640,7 @@ def test_source_build_makes_fallback_request_id_effectively_final(
     assert "final String requestId = requestIdCandidate;" in text
 
 
-def test_poc_builder_uses_legacy_dx_when_d8_is_unavailable(
+def test_poc_builder_rejects_legacy_dx_when_d8_is_unavailable(
     settings,
     tmp_path,
 ) -> None:  # noqa: ANN001
@@ -649,8 +649,7 @@ def test_poc_builder_uses_legacy_dx_when_d8_is_unavailable(
     platform = sdk / "platforms" / "android-23"
     build_tools.mkdir(parents=True)
     platform.mkdir(parents=True)
-    dx = build_tools / "dx"
-    dx.write_text("#!/bin/sh\n", encoding="utf-8")
+    (build_tools / "dx").write_text("#!/bin/sh\n", encoding="utf-8")
     (platform / "android.jar").write_bytes(b"android")
     configured = replace(
         settings,
@@ -660,7 +659,7 @@ def test_poc_builder_uses_legacy_dx_when_d8_is_unavailable(
 
     builder = PocBuilder(configured, ToolRunner(), ArtifactStore(configured))
 
-    assert builder._dex_tool() == ("dx", dx)
+    assert builder._dex_tool() is None
 
 
 def test_poc_builder_sorts_build_tools_as_versions_and_honors_pin(
@@ -682,7 +681,7 @@ def test_poc_builder_sorts_build_tools_as_versions_and_honors_pin(
     assert pinned_builder._tool_candidates("aapt2") == [sdk / "build-tools" / "9.0.0" / "aapt2"]
 
 
-def test_poc_sdk_roles_are_separate_and_legacy_dx_raises_minimum(
+def test_poc_sdk_roles_require_android_16_target_and_d8(
     settings,
     tmp_path,
 ) -> None:  # noqa: ANN001
@@ -691,7 +690,7 @@ def test_poc_sdk_roles_are_separate_and_legacy_dx_raises_minimum(
     platform = sdk / "platforms" / "android-36"
     tool_dir.mkdir(parents=True)
     platform.mkdir(parents=True)
-    for name in ("aapt2", "apksigner", "zipalign", "dx"):
+    for name in ("aapt2", "apksigner", "zipalign", "d8"):
         (tool_dir / name).write_text("#!/bin/sh\n", encoding="utf-8")
     (platform / "android.jar").write_bytes(b"android")
     configured = replace(
@@ -706,11 +705,11 @@ def test_poc_sdk_roles_are_separate_and_legacy_dx_raises_minimum(
     builder = PocBuilder(configured, ToolRunner(), ArtifactStore(configured))
 
     assert builder._compile_api() == 36
-    assert builder._target_api() == 35
-    assert builder._effective_min_api() == 26
+    assert builder._target_api() == 36
+    assert builder._effective_min_api() == 21
 
 
-def test_legacy_compile_platform_lowers_target_to_avoid_queries_visibility(
+def test_legacy_compile_platform_is_not_used_for_android_16_pocs(
     settings,
     tmp_path,
 ) -> None:  # noqa: ANN001
@@ -732,13 +731,10 @@ def test_legacy_compile_platform_lowers_target_to_avoid_queries_visibility(
 
     builder = PocBuilder(configured, ToolRunner(), ArtifactStore(configured))
 
-    assert builder._compile_api() == 23
-    assert builder._effective_min_api() == 26
-    assert builder._target_api() == 29
-    assert any(
-        "package-visibility" in warning
-        for warning in builder.capability()["configuration_warnings"]
-    )
+    assert builder._compile_api() is None
+    assert builder._effective_min_api() == 21
+    assert builder._target_api() == 36
+    assert builder.capability()["source_build_available"] is False
 
 
 def test_poc_builder_retries_only_aapt2_resource_table_compatibility_errors(
@@ -821,6 +817,8 @@ def test_personal_lab_ingests_an_agent_built_prebuilt_apk(
         def run(argv, **_kwargs):  # noqa: ANN001, ANN205
             stdout = (
                 "package: name='io.apkscanner.poc.providerprobe'\n"
+                "sdkVersion:'26'\n"
+                "targetSdkVersion:'36'\n"
                 "launchable-activity: name='io.apkscanner.poc.providerprobe.MainActivity'\n"
                 if "badging" in argv
                 else "Verified"
@@ -1351,6 +1349,7 @@ def test_poc_execution_is_correlated_into_the_hypothesis_proof(
         orchestrator.device,
         "execute_poc",
         lambda *_args, test_case_id=None, **_kwargs: SimpleNamespace(
+            stage="poc_executed",
             commands=[
                 (
                     "blackbox.poc_launch",
@@ -1382,6 +1381,7 @@ def test_poc_execution_is_correlated_into_the_hypothesis_proof(
         evidence_summaries=evidence,
         round_index=1,
         poc_artifacts={orchestrator._poc_request_key(request): artifact},
+        device=orchestrator.device,
     )
     assert not gaps
     assert len(executed) == 1

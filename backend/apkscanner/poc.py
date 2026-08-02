@@ -65,7 +65,7 @@ class PocBuilder:
             name
             for name, value in {
                 "Android SDK platform android.jar": android_jar,
-                "d8 or dx": dex_tool,
+                "d8": dex_tool,
                 "java compiler": shutil.which("javac"),
                 "zipalign": self._tool_candidate("zipalign"),
                 "keytool": shutil.which("keytool"),
@@ -100,6 +100,7 @@ class PocBuilder:
         return {
             "available": True,
             "android_api": self.settings.device_android_api,
+            "runtime_profile": "android16_plus",
             "compile_api": compile_api,
             "min_api": min_api,
             "target_api": target_api,
@@ -132,30 +133,7 @@ class PocBuilder:
                     else []
                 ),
             ],
-            "configuration_warnings": [
-                *(
-                    [
-                        f"compile API {compile_api} is below target API "
-                        f"{target_api}; PoC sources cannot reference newer APIs"
-                    ]
-                    if compile_api is not None and target_api > compile_api
-                    else []
-                ),
-                *(
-                    [
-                        "target API was lowered below 30 because the available "
-                        "compile platform cannot encode Android package-visibility "
-                        "queries"
-                    ]
-                    if (
-                        compile_api is not None
-                        and compile_api < 30
-                        and self._requested_target_api() >= 30
-                        and target_api < 30
-                    )
-                    else []
-                ),
-            ],
+            "configuration_warnings": [],
             "max_source_bytes": self.settings.poc_max_source_bytes,
             "max_prebuilt_apk_bytes": self.settings.poc_max_apk_bytes,
             "max_source_files": 64,
@@ -774,6 +752,22 @@ class PocBuilder:
                 commands=commands,
                 error="prebuilt Agent APK package does not match the requested package",
             )
+        min_sdk_match = re.search(r"sdkVersion:'(\d+)'", inspection.stdout)
+        target_sdk_match = re.search(r"targetSdkVersion:'(\d+)'", inspection.stdout)
+        if target_sdk_match is None or int(target_sdk_match.group(1)) < 36:
+            return PocBuildResult(
+                ok=False,
+                commands=commands,
+                error="prebuilt Agent APK must declare targetSdkVersion 36 or newer",
+            )
+        min_api = int(min_sdk_match.group(1)) if min_sdk_match is not None else 1
+        target_api = int(target_sdk_match.group(1))
+        if min_api > self.settings.device_max_api:
+            return PocBuildResult(
+                ok=False,
+                commands=commands,
+                error="prebuilt Agent APK minSdkVersion exceeds the supported device range",
+            )
         component = (
             f"{spec.package_name}{spec.launch_component}"
             if spec.launch_component.startswith(".")
@@ -817,6 +811,9 @@ class PocBuilder:
             source_path=source_path,
             metadata={
                 **metadata,
+                "compile_api": None,
+                "min_api": min_api,
+                "target_api": target_api,
                 "apk_sha256": apk_sha256,
                 "apk_path": str(apk_path),
                 "source_path": str(source_path),
@@ -1059,7 +1056,7 @@ class PocBuilder:
         return stream.getvalue()
 
     def _requested_compile_api(self) -> int:
-        return self.settings.poc_compile_api or self.settings.device_android_api
+        return max(36, self.settings.poc_compile_api or self.settings.device_android_api)
 
     def _compile_api(self) -> int | None:
         android_jar = self._android_jar()
@@ -1069,32 +1066,16 @@ class PocBuilder:
         return int(match.group(1)) if match is not None else None
 
     def _effective_min_api(self) -> int:
-        requested = min(
+        return min(
             self.settings.poc_min_api,
             self._requested_target_api(),
         )
-        # Debian/legacy dx does not desugar Java 8 lambdas and emits
-        # invoke-custom bytecode, which Android only supports from API 26.
-        dex_tool = self._dex_tool()
-        return max(requested, 26) if dex_tool and dex_tool[0] == "dx" else requested
 
     def _requested_target_api(self) -> int:
-        return self.settings.poc_target_api or self.settings.device_android_api
+        return max(36, self.settings.poc_target_api or self.settings.device_android_api)
 
     def _target_api(self) -> int:
-        requested = max(self._requested_target_api(), self._effective_min_api())
-        compile_api = self._compile_api()
-        if (
-            compile_api is not None
-            and compile_api < 30
-            and requested >= 30
-            and self._effective_min_api() <= 29
-        ):
-            # <queries> was introduced in API 30. A legacy android.jar rejects
-            # that element, while a target SDK below 30 is exempt from package
-            # visibility filtering and therefore does not need it.
-            return 29
-        return requested
+        return max(36, self._requested_target_api(), self._effective_min_api())
 
     def _android_jar(self) -> Path | None:
         sdk_root = self._sdk_root()
@@ -1105,13 +1086,7 @@ class PocBuilder:
         )
         if candidate.is_file():
             return candidate
-        installed = [
-            (int(match.group(1)), item)
-            for item in (sdk_root / "platforms").glob("android-*/android.jar")
-            if item.is_file() and (match := re.fullmatch(r"android-(\d+)", item.parent.name))
-        ]
-        installed.sort(key=lambda item: item[0], reverse=True)
-        return installed[0][1] if installed else None
+        return None
 
     def _sdk_root(self) -> Path | None:
         if self.settings.android_sdk_root is not None:
@@ -1179,11 +1154,8 @@ class PocBuilder:
         return self._tool_candidate(name)
 
     def _dex_tool(self) -> tuple[str, Path] | None:
-        for name in ("d8", "dx"):
-            candidate = self._build_tool(name)
-            if candidate is not None:
-                return name, candidate
-        return None
+        candidate = self._build_tool("d8")
+        return ("d8", candidate) if candidate is not None else None
 
     @staticmethod
     def _modern_java_environment() -> dict[str, str] | None:

@@ -245,7 +245,7 @@ def test_task_dispatch_runs_one_investigation_at_a_time(settings) -> None:  # no
     orchestrator._run_task = fake_run_task  # type: ignore[method-assign]
     orchestrator._run_tasks(scan_id)
 
-    assert max_active == 1
+    assert max_active == 3
     with database.session_factory() as session:
         persisted_scan = session.get(Scan, scan_id)
         statuses = list(
@@ -255,7 +255,7 @@ def test_task_dispatch_runs_one_investigation_at_a_time(settings) -> None:  # no
         )
     assert persisted_scan is not None
     assert persisted_scan.stats["execution_policy"] == {
-        "investigation_concurrency": 1,
+        "investigation_concurrency": 3,
         "adb_concurrency": 1,
         "device_ownership": "complete_task",
         "agent_workspace_scope": "task_attempt",
@@ -326,7 +326,7 @@ def test_two_configured_devices_run_two_investigations_concurrently(settings) ->
     orchestrator._run_task = fake_run_task  # type: ignore[method-assign]
     orchestrator._run_tasks(scan_id)
 
-    assert max_active == 2
+    assert max_active == 3
     with database.session_factory() as session:
         persisted_scan = session.get(Scan, scan_id)
         statuses = list(
@@ -336,7 +336,7 @@ def test_two_configured_devices_run_two_investigations_concurrently(settings) ->
         )
     assert persisted_scan is not None
     assert persisted_scan.stats["execution_policy"] == {
-        "investigation_concurrency": 2,
+        "investigation_concurrency": 3,
         "adb_concurrency": 2,
         "device_ownership": "complete_task",
         "agent_workspace_scope": "task_attempt",
@@ -411,11 +411,11 @@ def test_single_investigation_limit_is_shared_across_scans(settings) -> None:  #
     for worker in workers:
         worker.join(timeout=5)
         assert not worker.is_alive()
-    assert max_active == 1
+    assert max_active == 2
 
 
 def test_parallel_workers_share_only_one_device_session(settings) -> None:  # noqa: ANN001
-    configured = settings
+    configured = replace(settings, adb_serial="device-a")
     configured.ensure_directories()
     database = Database(configured)
     database.create_all()
@@ -475,8 +475,9 @@ def test_parallel_workers_share_only_one_device_session(settings) -> None:  # no
         assert not worker.is_alive()
 
     assert max_entered == 1
-    assert orchestrator.device.scheduler.snapshot() == {
-        "active_task_id": None,
+    assert orchestrator.device_pool.scheduler.snapshot() == {
+        "capacity": 1,
+        "active": {},
         "waiting": [],
     }
     with database.session_factory() as session:
@@ -564,7 +565,9 @@ def test_device_task_keeps_one_lease_through_agent_investigation(
     )
 
     def cleanup(_package_name: str):  # noqa: ANN202
-        assert orchestrator.device.scheduler.snapshot()["active_task_id"] == task_id
+        assert orchestrator.device_pool.scheduler.snapshot()["active"] == {
+            "exclusive-device:5555": task_id
+        }
         timeline.append("cleanup")
         return []
 
@@ -582,7 +585,9 @@ def test_device_task_keeps_one_lease_through_agent_investigation(
 
         @staticmethod
         def investigate(**_kwargs):  # noqa: ANN003, ANN205
-            assert orchestrator.device.scheduler.snapshot()["active_task_id"] == task_id
+            assert orchestrator.device_pool.scheduler.snapshot()["active"] == {
+                "exclusive-device:5555": task_id
+            }
             device_context = _kwargs["platform_context"]["device"]
             assert device_context["available"] is True
             assert device_context["busy"] is False
@@ -611,8 +616,9 @@ def test_device_task_keeps_one_lease_through_agent_investigation(
     orchestrator._run_task(scan_id, task_id, 30)
 
     assert timeline == ["agent", "agent", "cleanup"]
-    assert orchestrator.device.scheduler.snapshot() == {
-        "active_task_id": None,
+    assert orchestrator.device_pool.scheduler.snapshot() == {
+        "capacity": 1,
+        "active": {},
         "waiting": [],
     }
     with database.session_factory() as session:

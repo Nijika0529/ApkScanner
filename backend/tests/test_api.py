@@ -101,6 +101,148 @@ def test_in_memory_sqlite_is_shared_with_app_worker_threads(settings) -> None:  
     assert response.json() == []
 
 
+def test_independent_task_reanalysis_creates_a_context_free_sibling(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    app = create_app(settings)
+
+    async def no_submit(_scan_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(app.state.orchestrator, "submit", no_submit)
+    with app.state.database.session_factory() as session:
+        scan = Scan(
+            status="final",
+            filename="independent.apk",
+            artifact_sha256="a" * 64,
+            artifact_path=str(settings.data_dir / "independent.apk"),
+        )
+        entry = EntryPoint(
+            scan=scan,
+            kind="activity",
+            name="com.example.Entry",
+            exported=True,
+        )
+        session.add_all([scan, entry])
+        session.flush()
+        original = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="completed",
+            target_entry_ids=[entry.id],
+            hypotheses=["A chain may be exploitable."],
+            preconditions={
+                "items": ["guest"],
+                "version_replays": [{"old": "proof"}],
+            },
+            result={"summary": "old conclusion"},
+            thread_id="old-thread",
+            attempts=2,
+        )
+        session.add(original)
+        session.commit()
+        task_id = original.id
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/v1/tasks/{task_id}/reanalyses",
+            headers={"X-APKScanner-Request": "console"},
+            json={"context_mode": "independent"},
+        )
+
+    assert response.status_code == 202
+    sibling = response.json()
+    assert sibling["id"] != task_id
+    assert sibling["attempts"] == 0
+    assert sibling["thread_id"] is None
+    assert "version_replays" not in sibling["preconditions"]
+    policy = sibling["result"]["independent_reanalysis"]
+    assert policy["origin_task_id"] == task_id
+    assert policy["reuse_task_evidence"] is False
+    with app.state.database.session_factory() as session:
+        original = session.get(InvestigationTask, task_id)
+        assert original is not None
+        assert original.status == "completed"
+        assert original.result == {"summary": "old conclusion"}
+
+
+def test_investigation_brief_requires_an_explicit_evaluation_contract(
+    settings,
+) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    with app.state.database.session_factory() as session:
+        scan = Scan(
+            status="final",
+            filename="brief.apk",
+            artifact_sha256="b" * 64,
+            artifact_path=str(settings.data_dir / "brief.apk"),
+        )
+        session.add(scan)
+        session.commit()
+        scan_id = scan.id
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/investigation-briefs",
+            headers={"X-APKScanner-Request": "console"},
+            json={
+                "scan_id": scan_id,
+                "name": "AST parser boundary",
+                "objective": "Determine whether untrusted syntax reaches a privileged action.",
+                "scope": {"surface": "parser"},
+                "attacker_model": {"identity": "untrusted_app"},
+                "preconditions": ["guest"],
+                "plan": {
+                    "schema_version": "1.0",
+                    "name": "AST parser boundary",
+                    "entries": [
+                        {
+                            "id": "clone_source",
+                            "kind": "scan_clone",
+                            "scan_id": scan_id,
+                            "input": {},
+                            "depends_on": [],
+                        }
+                    ],
+                    "max_parallel_scans": 1,
+                    "total_budget_seconds": 3600,
+                },
+                "evaluation_contract": {
+                    "success_criteria": ["A privileged action is observed."],
+                    "required_evidence_kinds": ["dynamic.probe"],
+                    "inconclusive_conditions": ["The app state cannot be prepared."],
+                    "forbidden_shortcuts": ["Model text without platform Evidence"],
+                },
+            },
+        )
+        assert created.status_code == 201
+        brief = created.json()
+        assert brief["status"] == "draft"
+        validated = client.post(
+            f"/api/v1/investigation-briefs/{brief['id']}/validate",
+            headers={"X-APKScanner-Request": "console"},
+        )
+        assert validated.status_code == 200
+        assert validated.json()["valid"] is True
+        rejected = client.post(
+            f"/api/v1/investigation-briefs/{brief['id']}/evaluate",
+            headers={"X-APKScanner-Request": "console"},
+            json={
+                "verdict": "passed",
+                "criteria": [
+                    {
+                        "criterion": "A privileged action is observed.",
+                        "passed": True,
+                        "evidence_ids": [],
+                    }
+                ],
+                "note": "No platform evidence is available.",
+            },
+        )
+        assert rejected.status_code == 409
+
+
 @pytest.mark.parametrize(
     "suffix",
     [
