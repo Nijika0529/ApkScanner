@@ -139,12 +139,14 @@ Docker 容器共享宿主内核，镜像层在并发扫描间复用。`--memory`
   token 不进入 Prompt/审计/容器全局环境，serial 由设备 lease 固定，ADB 命令输出生成 Evidence；
 - Capability Registry 已实现 built-in、hash-pinned Python script 和显式 MCP binding；监督 REST 已提供
   snapshot、catalog/invoke、Campaign validate/launch，作为未来独立监督 Agent 的窄控制面；
-- Worker 镜像 `apk-scanner-codex-worker:0.2.0` 标记 SDK `0.144.4` / Protocol `3`，真实 Docker
+- Worker 镜像 `apk-scanner-codex-worker:0.2.0` 标记 SDK `0.144.4` / Protocol `3` / Worker
+  revision `20260802.1`，真实 Docker
   UID/Thread 和 Pixel 4 ADB Gateway 集成测试通过；
-- `vulntest.apk` 已在 Pixel 4 Android 13/API 33 完成真实 DeepSeek/Codex 自动 PoC smoke：Codex 在独立
+- `vulntest.apk` 曾在 Pixel 4 Android 13/API 33 完成真实 DeepSeek/Codex 自动 PoC smoke：Codex 在独立
   UID 工作区读取宿主机反编译结果、生成源码 PoC，经平台构建/签名/安装后，以普通 App UID 触发
-  DeepLink/WebView JS Bridge；平台从中性 Home 基线回读目标包 UI，观察到秘密文本并签发
-  `reproduced_blackbox` 收据；
+  DeepLink/WebView JS Bridge；平台从中性 Home 基线回读目标包 UI 并观察到秘密文本。该历史扫描在
+  旧策略下签发过 `reproduced_blackbox`，但当前策略已把 API 35 以下 Evidence 强制降为
+  `compatibility_smoke_only/inconclusive`，不得用于 Android 16 漏洞、修复或回归结论；
 - 真机 smoke 同时修复了三项边界缺陷：Proof 客户端重复拼接完整 URL、Windows ADB 桥接下
   `uiautomator dump /dev/tty` 无法返回 XML、以及模型最终 JSON 前带说明文字时的严格尾部对象提取；
 - 平台现强制源码 PoC 读取 `apkscanner_request_id` 并输出 `success`、
@@ -171,6 +173,13 @@ Docker 容器共享宿主内核，镜像层在并发扫描间复用。`--memory`
   `features.shell_snapshot=false`，保留逐命令环境过滤，并在 terminal task/scan 清理时防御性删除该
   生成目录；既有 v4—v12 测试扫描产生的含密钥快照已定向删除，回归检查确认整个 `.data`、keeper
   环境与 Git diff 均不含 key material。
+- 2026-08-03 的真实 Key 回归发现宿主 Protocol v3 已更新而同标签 Docker Worker 仍为旧命令 schema；
+  平台现额外校验 `io.apkscanner.worker-revision`，陈旧镜像会在计费请求前失败。重建后真实
+  DeepSeek Responses Turn 成功，形成持久 Thread、47 号 `turn.result`、11 组工具生命周期事件和
+  本地结构化校验，测试目录凭据模式命中为 0。
+- 同轮 Pixel 4 API 33 smoke 验证：容器 ADB Gateway 固定 serial 正常；Probe APK 使用
+  compileSdk/targetSdk 36、minSdk 26，可安装并以普通 App UID 查询测试 Provider（`rowCount=1`）。
+  设备能力同时明确返回 `android16_verdict_eligible=false`，所以这只是工具链兼容性证据。
 
 当前关键代码位置：
 
@@ -569,6 +578,7 @@ docker run --init
 - 镜像存在；
 - `io.apkscanner.sdk-version` 精确匹配项目 pin；
 - `io.apkscanner.worker-protocol` 在控制面支持范围内；
+- `io.apkscanner.worker-revision` 精确匹配宿主命令 schema；
 - 镜像架构与宿主兼容；
 - 必需 entrypoint 和非 root 用户存在。
 - 扫描 UID 池、目录权限、不同 UID 的文件和 `/proc/<pid>/environ` 互读测试通过；

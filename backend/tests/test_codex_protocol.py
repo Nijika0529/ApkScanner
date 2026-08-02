@@ -10,6 +10,7 @@ import pytest
 from apkscanner.codex_protocol import (
     PersistentWorkerCancelled,
     PersistentWorkerClient,
+    PersistentWorkerError,
 )
 
 FAKE_WORKER = r"""
@@ -42,7 +43,12 @@ for line in sys.stdin:
             "type":"event", "request_id":request_id,
             "event":{"event_type":"model.turn.started","message":"started","data":{}}
         })
-        if command["prompt"] == "block":
+        if command["prompt"] == "worker-error":
+            emit({
+                "type":"worker.error", "request_id":request_id,
+                "error":{"code":"invalid_command","detail":"schema mismatch"}
+            })
+        elif command["prompt"] == "block":
             time.sleep(30)
         else:
             emit({
@@ -133,6 +139,22 @@ def test_persistent_worker_cancellation_interrupts_or_kills_session(tmp_path: Pa
             )
     finally:
         client.kill()
+
+
+def test_worker_error_surfaces_its_detail_instead_of_an_unknown_envelope(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    client.open_session(configuration={}, gateway_environment={})
+    try:
+        with pytest.raises(PersistentWorkerError, match="schema mismatch"):
+            client.turn(
+                prompt="worker-error",
+                timeout_seconds=5,
+                no_event_timeout_seconds=5,
+                event_callback=None,
+                cancel_event=None,
+            )
+    finally:
+        client.close()
 
 
 def test_replacement_worker_replays_prior_spool_events_once(tmp_path: Path) -> None:

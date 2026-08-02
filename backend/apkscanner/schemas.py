@@ -289,7 +289,7 @@ class AgentAuditOut(BaseModel):
     turn_id: str | None
     usage: dict[str, Any]
     artifacts: dict[str, AgentAuditArtifact]
-    integrity: Literal["verified", "failed"]
+    integrity: Literal["verified", "failed", "not_checked"]
     integrity_errors: list[str]
     started_at: datetime
     completed_at: datetime | None
@@ -331,6 +331,8 @@ class AdbDeviceOut(BaseModel):
     api_level: int | None
     android_version: str | None
     available: bool
+    android16_verdict_eligible: bool
+    compatibility_smoke_only: bool
     busy: bool
     active_task_id: str | None
     last_error: str | None

@@ -464,6 +464,12 @@ class AdbDeviceAdapter:
             "root": root.exit_code == 0 and root.stdout.strip() == "0",
             "serial": self.serial,
             "detail": detail,
+            "android16_verdict_eligible": bool(
+                ready and actual_api_number is not None and actual_api_number >= 36
+            ),
+            "compatibility_smoke_only": bool(
+                ready and actual_api_number is not None and actual_api_number < 36
+            ),
         }
         self._last_capability = dict(result)
         self._last_capability_at = time.monotonic()
@@ -1005,12 +1011,21 @@ class AdbDeviceAdapter:
                 # compatibility checks; this flag only captures the hard
                 # minSdk boundary.
                 common["poc_runtime_compatible"] = device_api_number >= minimum_api_number
+            android16_verdict_eligible = device_api_number >= 36
+            common["android16_verdict_eligible"] = android16_verdict_eligible
+            common["compatibility_smoke_only"] = bool(
+                self.settings.allow_legacy_device_smoke
+                and not android16_verdict_eligible
+            )
             commands.append(("blackbox.device_profile", device_api, dict(common)))
             if (
                 device_api.exit_code != 0
                 or common.get("poc_runtime_compatible") is not True
-                or device_api_number < 36
                 or built_target_api_number < 36
+                or (
+                    device_api_number < 36
+                    and not self.settings.allow_legacy_device_smoke
+                )
             ):
                 return DeviceProbeResult(
                     stage="poc_incompatible",
@@ -1018,8 +1033,9 @@ class AdbDeviceAdapter:
                     summary={
                         **common,
                         "error": (
-                            "PoC/runtime profile is incompatible; Android API 36+ and "
-                            "targetSdkVersion 36+ are required"
+                            "PoC/runtime profile is incompatible; targetSdkVersion 36+ "
+                            "is required and devices below API 36 are permitted only in "
+                            "explicit non-verdict smoke mode"
                         ),
                     },
                 )

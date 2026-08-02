@@ -69,6 +69,9 @@ const DETAIL_REFRESH_EVENTS = [
   "task.cancelled_after_deletion",
   "task.deleted",
   "exploration.update",
+  "device.pool.connected",
+  "device.pool.draining",
+  "device.pool.removed",
 ] as const
 
 function statusTone(status: string): "neutral" | "good" | "warning" | "danger" | "info" {
@@ -115,6 +118,8 @@ function App() {
   const [freshRunTarget, setFreshRunTarget] = useState<Scan | null>(null)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const detailRequestRef = useRef(0)
+  const liveRequestRef = useRef(0)
+  const latestEventIdRef = useRef(0)
   const selectedIdRef = useRef<string | null>(selectedId)
 
   const loadScans = useCallback(async () => {
@@ -150,6 +155,7 @@ function App() {
       ])
       if (signal?.aborted || requestId !== detailRequestRef.current) return false
       const data = { scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events, securitySnapshot, versionDiff, patternMatches }
+      latestEventIdRef.current = events.at(-1)?.id ?? 0
       setDetail(data)
       setScans((items) => items.map((item) => item.id === scan.id ? scan : item))
       return true
@@ -160,6 +166,37 @@ function App() {
       throw reason
     } finally {
       if (!signal?.aborted && requestId === detailRequestRef.current) setLoading(false)
+    }
+  }, [])
+
+  const refreshMutableDetail = useCallback(async (id: string, signal?: AbortSignal) => {
+    const requestId = ++liveRequestRef.current
+    try {
+      const [scan, findings, signals, coverage, tasks, audits, hypotheses] = await Promise.all([
+        api.scan(id, signal),
+        api.findings(id, signal),
+        api.signals(id, signal),
+        api.coverage(id, signal),
+        api.tasks(id, signal),
+        api.agentAudits(id, signal),
+        api.hypotheses(id, signal),
+      ])
+      if (signal?.aborted || requestId !== liveRequestRef.current) return
+      setDetail((current) => current?.scan.id === id ? {
+        ...current,
+        scan,
+        findings,
+        signals,
+        coverage,
+        tasks,
+        audits,
+        hypotheses,
+      } : current)
+      setScans((items) => items.map((item) => item.id === scan.id ? scan : item))
+    } catch (reason) {
+      if (!signal?.aborted && requestId === liveRequestRef.current && !isAbortError(reason)) {
+        throw reason
+      }
     }
   }, [])
 
@@ -206,37 +243,57 @@ function App() {
     const controller = new AbortController()
     setDetail(null)
     setLoading(true)
-    const source = new EventSource(`/api/v1/scans/${selectedId}/events/stream`)
+    let source: EventSource | null = null
     let refreshTimer: ReturnType<typeof setTimeout> | undefined
-    let initialRefreshPending = true
-    let refreshQueuedDuringInitial = false
-    const refresh = () => {
-      if (initialRefreshPending) {
-        refreshQueuedDuringInitial = true
-        return
-      }
+    let pendingFullRefresh = false
+    const refresh = (full = false) => {
+      pendingFullRefresh = pendingFullRefresh || full
       if (refreshTimer) clearTimeout(refreshTimer)
       refreshTimer = setTimeout(
-        () => void refreshDetail(selectedId, {
-          signal: controller.signal,
-          reportError: false,
-        }),
-        200,
+        () => {
+          const runFullRefresh = pendingFullRefresh
+          pendingFullRefresh = false
+          if (runFullRefresh) api.invalidateScanCache(selectedId)
+          void (runFullRefresh
+            ? refreshDetail(selectedId, { signal: controller.signal, reportError: false })
+            : refreshMutableDetail(selectedId, controller.signal).catch(() => undefined))
+        },
+        650,
       )
     }
-    source.onmessage = refresh
-    DETAIL_REFRESH_EVENTS.forEach((eventType) => source.addEventListener(eventType, refresh))
-    source.addEventListener("end", () => source.close())
+    const receive = (raw: Event) => {
+      if (!(raw instanceof MessageEvent) || typeof raw.data !== "string") return
+      let event: ScanEvent
+      try {
+        event = JSON.parse(raw.data) as ScanEvent
+      } catch {
+        return
+      }
+      latestEventIdRef.current = Math.max(latestEventIdRef.current, event.id)
+      setDetail((current) => {
+        if (current?.scan.id !== selectedId) return current
+        const merged = current.events.some((item) => item.id === event.id)
+          ? current.events
+          : [...current.events, event].slice(-500)
+        return { ...current, events: merged }
+      })
+      const full = ["static.completed", "scan.final", "scan.failed"].includes(event.event_type)
+      refresh(full)
+    }
     void refreshDetail(selectedId, { signal: controller.signal }).finally(() => {
-      initialRefreshPending = false
-      if (refreshQueuedDuringInitial && !controller.signal.aborted) refresh()
+      if (controller.signal.aborted) return
+      source = new EventSource(
+        `/api/v1/scans/${selectedId}/events/stream?after=${latestEventIdRef.current}`,
+      )
+      DETAIL_REFRESH_EVENTS.forEach((eventType) => source?.addEventListener(eventType, receive))
+      source.addEventListener("end", () => source?.close())
     })
     return () => {
       if (refreshTimer) clearTimeout(refreshTimer)
       controller.abort()
-      source.close()
+      source?.close()
     }
-  }, [selectedId, refreshDetail])
+  }, [selectedId, refreshDetail, refreshMutableDetail])
 
   async function onUploaded(scan: Scan) {
     setUploadOpen(false)
@@ -352,6 +409,26 @@ function Sidebar({ scans, selectedId, health, onSelect, onUpload }: { scans: Sca
 
 function ScanDetailView({ data, health, onRefresh, onDelete, onFreshRun, onVersionCreated }: { data: DetailData; health: Health | null; onRefresh: () => Promise<void>; onDelete: () => void; onFreshRun: () => void; onVersionCreated: (scan: Scan) => Promise<void> }) {
   const { scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events, securitySnapshot, versionDiff, patternMatches } = data
+  const [fullAudits, setFullAudits] = useState<AgentAudit[] | null>(null)
+  const [auditLoading, setAuditLoading] = useState(false)
+  const [auditLoadError, setAuditLoadError] = useState<string | null>(null)
+  useEffect(() => {
+    setFullAudits(null)
+    setAuditLoading(false)
+    setAuditLoadError(null)
+  }, [scan.id])
+  const loadFullAudits = useCallback(async () => {
+    if (auditLoading) return
+    setAuditLoading(true)
+    setAuditLoadError(null)
+    try {
+      setFullAudits(await api.agentAudits(scan.id, undefined, true))
+    } catch (reason) {
+      setAuditLoadError(reason instanceof Error ? reason.message : "完整审计加载失败")
+    } finally {
+      setAuditLoading(false)
+    }
+  }, [auditLoading, scan.id])
   const verificationCandidates = signals.filter(isVerificationCandidate)
   const staticSignals = signals.filter((signal) => !isVerificationCandidate(signal))
   const high = findings.filter((item) => ["critical", "high"].includes(item.severity)).length
@@ -382,7 +459,9 @@ function ScanDetailView({ data, health, onRefresh, onDelete, onFreshRun, onVersi
         <Metric label="覆盖项目" value={`${Math.round(coveragePercent)}%`} icon={Gauge} tone="emerald" />
       </div>
       <Card className="p-4 sm:p-6">
-        <Tabs defaultValue="overview">
+        <Tabs defaultValue="overview" onValueChange={(value) => {
+          if (value === "audits" && fullAudits === null) void loadFullAudits()
+        }}>
           <TabsList aria-label="扫描详情">
             <TabsTrigger value="overview">总览</TabsTrigger><TabsTrigger value="entries">攻击面 <span className="ml-1 text-xs text-slate-500">{entries.length}</span></TabsTrigger><TabsTrigger value="findings">已证实 Finding <span className="ml-1 text-xs text-slate-500">{findings.length}</span></TabsTrigger><TabsTrigger value="proof-backlog">待验证风险 <span className="ml-1 text-xs text-slate-500">{verificationCandidates.length}</span></TabsTrigger><TabsTrigger value="signals">静态线索 <span className="ml-1 text-xs text-slate-500">{staticSignals.length}</span></TabsTrigger><TabsTrigger value="versions">版本演进 <span className="ml-1 text-xs text-slate-500">{patternMatches.length}</span></TabsTrigger><TabsTrigger value="coverage">覆盖矩阵</TabsTrigger><TabsTrigger value="tasks">探索任务</TabsTrigger><TabsTrigger value="proofs">验证链 <span className="ml-1 text-xs text-slate-500">{hypotheses.length}</span></TabsTrigger><TabsTrigger value="audits">AI 审计 <span className="ml-1 text-xs text-slate-500">{audits.length}</span></TabsTrigger>
           </TabsList>
@@ -395,7 +474,7 @@ function ScanDetailView({ data, health, onRefresh, onDelete, onFreshRun, onVersi
           <TabsContent value="coverage"><CoverageMatrix coverage={coverage} /></TabsContent>
           <TabsContent value="tasks"><Tasks scan={scan} tasks={tasks} entries={entries} audits={audits} events={events} health={health} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="proofs"><HypothesisPipeline scanId={scan.id} scanStatus={scan.status} hypotheses={hypotheses} evaluations={evaluations} entries={entries} onRefresh={onRefresh} /></TabsContent>
-          <TabsContent value="audits"><AgentAudits audits={audits} tasks={tasks} entries={entries} /></TabsContent>
+          <TabsContent value="audits"><AgentAudits audits={fullAudits ?? audits} tasks={tasks} entries={entries} loading={auditLoading} loadError={auditLoadError} onReload={loadFullAudits} /></TabsContent>
         </Tabs>
       </Card>
     </div>
@@ -461,7 +540,7 @@ function DevicePoolPanel() {
   }
   return <div><SectionTitle icon={Smartphone} title="动态 ADB 设备池" description="扫描运行中也可扩容；每台设备一次只归属一个任务" />
     <form className="mt-3 grid gap-2 sm:grid-cols-[1fr_1fr_auto]" onSubmit={connect}><input className="field" value={serial} onChange={(event) => setSerial(event.target.value)} placeholder="serial 或 host:port" aria-label="ADB serial" /><input className="field" value={label} onChange={(event) => setLabel(event.target.value)} placeholder="备注（可选）" aria-label="设备备注" /><Button type="submit" size="sm" disabled={busy !== null || !serial.trim()}>{busy === "connect" ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}接入</Button></form>
-    <div className="mt-3 space-y-2">{devices.map((device) => <div key={device.id} className="rounded-lg border border-slate-200 bg-slate-50 p-3"><div className="flex flex-wrap items-center justify-between gap-2"><div className="min-w-0"><p className="truncate font-mono text-xs font-semibold text-slate-800">{device.serial}</p><p className="mt-1 text-[11px] text-slate-500">{device.label ?? "未命名"} · Android {device.android_version ?? "?"} / API {device.api_level ?? "?"}</p></div><Badge tone={device.busy ? "warning" : device.available ? "good" : device.state === "draining" ? "warning" : "neutral"}>{device.busy ? "任务占用" : device.state === "draining" ? "排空中" : device.available ? "可分配" : statusLabel(device.state)}</Badge></div><div className="mt-2 flex flex-wrap gap-1"><Button variant="ghost" size="sm" onClick={() => void operate(device, "drain")} disabled={busy !== null || device.state === "draining"}>排空</Button><Button variant="ghost" size="sm" onClick={() => void operate(device, "reconnect")} disabled={busy !== null || device.busy}>重连</Button><Button variant="danger" size="sm" onClick={() => void operate(device, "remove")} disabled={busy !== null || device.busy}>移除</Button></div>{device.last_error && <p className="mt-2 text-[11px] leading-4 text-rose-700">{device.last_error}</p>}</div>)}{!devices.length && <p className="rounded-lg border border-dashed border-slate-300 p-3 text-xs text-slate-500">当前没有设备。接入 Android 16 / API 36+ 后即可加入队列。</p>}</div>
+    <div className="mt-3 space-y-2">{devices.map((device) => <div key={device.id} className="rounded-lg border border-slate-200 bg-slate-50 p-3"><div className="flex flex-wrap items-center justify-between gap-2"><div className="min-w-0"><p className="truncate font-mono text-xs font-semibold text-slate-800">{device.serial}</p><p className="mt-1 text-[11px] text-slate-500">{device.label ?? "未命名"} · Android {device.android_version ?? "?"} / API {device.api_level ?? "?"}</p></div><div className="flex flex-wrap gap-1"><Badge tone={device.busy ? "warning" : device.available ? "good" : device.state === "draining" ? "warning" : "neutral"}>{device.busy ? "任务占用" : device.state === "draining" ? "排空中" : device.available ? "可分配" : statusLabel(device.state)}</Badge>{device.compatibility_smoke_only && <Badge tone="warning">仅兼容性冒烟 · 不可裁决</Badge>}</div></div><div className="mt-2 flex flex-wrap gap-1"><Button variant="ghost" size="sm" onClick={() => void operate(device, "drain")} disabled={busy !== null || device.state === "draining"}>排空</Button><Button variant="ghost" size="sm" onClick={() => void operate(device, "reconnect")} disabled={busy !== null || device.busy}>重连</Button><Button variant="danger" size="sm" onClick={() => void operate(device, "remove")} disabled={busy !== null || device.busy}>移除</Button></div>{device.last_error && <p className="mt-2 text-[11px] leading-4 text-rose-700">{device.last_error}</p>}</div>)}{!devices.length && <p className="rounded-lg border border-dashed border-slate-300 p-3 text-xs text-slate-500">当前没有设备。接入 Android 16 / API 36+ 后即可加入裁决队列。</p>}</div>
     <div className="mt-2 flex gap-2"><Button variant="ghost" size="sm" onClick={() => void refresh(true)} disabled={busy !== null}><RefreshCw className="h-3.5 w-3.5" />主动探测</Button><span className="self-center text-[11px] text-slate-500">排空会停止新租约，正在运行的任务完成后才可移除。</span></div>{error && <p role="alert" className="mt-2 text-xs text-rose-700">{error}</p>}</div>
 }
 
@@ -1061,15 +1140,19 @@ function ExplorationEventRow({ event, latest }: { event: ScanEvent; latest: bool
   )
 }
 
-function AgentAudits({ audits, tasks, entries }: { audits: AgentAudit[]; tasks: InvestigationTask[]; entries: EntryPoint[] }) {
+function AgentAudits({ audits, tasks, entries, loading, loadError, onReload }: { audits: AgentAudit[]; tasks: InvestigationTask[]; entries: EntryPoint[]; loading: boolean; loadError: string | null; onReload: () => Promise<void> }) {
   const tasksById = new Map(tasks.map((task) => [task.id, task]))
   const names = new Map(entries.map((entry) => [entry.id, entry.name]))
   if (!audits.length) return <EmptyRow text="本次扫描没有调用 AI，因此没有 AI 审计记录" />
   return (
     <div className="space-y-4">
       <div className="rounded-xl border border-cyan-200 bg-cyan-50 p-4 text-sm leading-6 text-cyan-950">
-        每次模型调用的精确输入、SDK 关键事件、结构化原始输出、测试裁决和证据校验均保存为不可变 Evidence。下方 SHA-256 用于核对审计内容完整性。
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <span>每次模型调用的精确输入、SDK 关键事件、结构化原始输出、测试裁决和证据校验均保存为不可变 Evidence。审计正文按需加载，避免拖慢扫描主页面。</span>
+          <Button variant="secondary" size="sm" onClick={() => void onReload()} disabled={loading}>{loading ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}{loading ? "正在校验" : "刷新完整审计"}</Button>
+        </div>
       </div>
+      {loadError && <p role="alert" className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">{loadError}</p>}
       {audits.map((audit) => {
         const task = audit.task_id ? tasksById.get(audit.task_id) : undefined
         const target = task?.target_entry_ids.map((id) => names.get(id) ?? id).join(" · ")
@@ -1083,7 +1166,7 @@ function AgentAudits({ audits, tasks, entries }: { audits: AgentAudit[]; tasks: 
                   <div className="flex flex-wrap items-center gap-2">
                     <h3 className="font-semibold text-slate-950">{auditPhaseLabel(audit.phase)}</h3>
                     <Badge tone={statusTone(audit.status)}>{statusLabel(audit.status)}</Badge>
-                    <Badge tone={audit.integrity === "verified" ? "good" : "danger"}>{audit.integrity === "verified" ? "SHA-256 已验证" : "完整性异常"}</Badge>
+                    <Badge tone={audit.integrity === "verified" ? "good" : audit.integrity === "failed" ? "danger" : "neutral"}>{audit.integrity === "verified" ? "SHA-256 已验证" : audit.integrity === "failed" ? "完整性异常" : "正文未加载"}</Badge>
                     <Badge tone={current ? "good" : "neutral"}>{current ? "当前最终调用" : "历史/过程调用"}</Badge>
                   </div>
                   <p className="mt-1 truncate text-sm text-slate-600">{target ?? audit.task_id ?? "未知任务"}</p>

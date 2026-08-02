@@ -46,6 +46,69 @@ async function optionalRequest<T>(path: string, signal?: AbortSignal): Promise<T
   return response.json() as Promise<T>
 }
 
+interface CacheEntry {
+  expiresAt: number
+  value: unknown
+}
+
+const getCache = new Map<string, CacheEntry>()
+const MAX_GET_CACHE_ENTRIES = 128
+
+function storeCachedValue(path: string, value: unknown, ttlMs: number) {
+  // Map insertion order gives us a small LRU approximation without another
+  // dependency. This prevents long review sessions from caching every scan.
+  getCache.delete(path)
+  getCache.set(path, { expiresAt: Date.now() + ttlMs, value })
+  while (getCache.size > MAX_GET_CACHE_ENTRIES) {
+    const oldest = getCache.keys().next().value
+    if (oldest === undefined) break
+    getCache.delete(oldest)
+  }
+}
+
+function cachedValue<T>(path: string): T | undefined {
+  const cached = getCache.get(path)
+  if (!cached) return undefined
+  if (cached.expiresAt <= Date.now()) {
+    getCache.delete(path)
+    return undefined
+  }
+  return cached.value as T
+}
+
+async function cachedRequest<T>(
+  path: string,
+  signal?: AbortSignal,
+  ttlMs = 60_000,
+): Promise<T> {
+  if (signal?.aborted) throw new DOMException("Aborted", "AbortError")
+  const cached = cachedValue<T>(path)
+  if (cached !== undefined) return cached
+  const value = await request<T>(path, { signal })
+  if (!signal?.aborted) storeCachedValue(path, value, ttlMs)
+  return value
+}
+
+async function cachedOptionalRequest<T>(
+  path: string,
+  signal?: AbortSignal,
+  ttlMs = 5_000,
+): Promise<T | null> {
+  if (signal?.aborted) throw new DOMException("Aborted", "AbortError")
+  const cached = getCache.get(path)
+  if (cached && cached.expiresAt > Date.now()) return cached.value as T | null
+  const value = await optionalRequest<T>(path, signal)
+  if (!signal?.aborted) storeCachedValue(path, value, ttlMs)
+  return value
+}
+
+function invalidateScanCache(scanId: string) {
+  const marker = `/api/v1/scans/${scanId}`
+  for (const key of getCache.keys()) {
+    if (key.startsWith(marker)) getCache.delete(key)
+  }
+}
+
 export const api = {
   health: () => request<Health>("/api/v1/health"),
   devices: (probe = false) =>
@@ -66,13 +129,13 @@ export const api = {
   scan: (id: string, signal?: AbortSignal) =>
     request<Scan>(`/api/v1/scans/${id}`, { signal }),
   entries: (id: string, signal?: AbortSignal) =>
-    request<EntryPoint[]>(`/api/v1/scans/${id}/entries`, { signal }),
+    cachedRequest<EntryPoint[]>(`/api/v1/scans/${id}/entries`, signal),
   securitySnapshot: (id: string, signal?: AbortSignal) =>
-    optionalRequest<SecuritySnapshot>(`/api/v1/scans/${id}/security-snapshot`, signal),
+    cachedOptionalRequest<SecuritySnapshot>(`/api/v1/scans/${id}/security-snapshot`, signal),
   versionDiff: (id: string, signal?: AbortSignal) =>
-    optionalRequest<VersionDiff>(`/api/v1/scans/${id}/version-diff`, signal),
+    cachedOptionalRequest<VersionDiff>(`/api/v1/scans/${id}/version-diff`, signal),
   patternMatches: (id: string, signal?: AbortSignal) =>
-    request<PatternMatch[]>(`/api/v1/scans/${id}/pattern-matches`, { signal }),
+    cachedRequest<PatternMatch[]>(`/api/v1/scans/${id}/pattern-matches`, signal, 10_000),
   findings: (id: string, signal?: AbortSignal) =>
     request<Finding[]>(`/api/v1/scans/${id}/findings`, { signal }),
   signals: (id: string, signal?: AbortSignal) =>
@@ -91,10 +154,11 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(spec),
     }),
-  agentAudits: (id: string, signal?: AbortSignal) =>
-    request<AgentAudit[]>(`/api/v1/scans/${id}/agent-audits`, { signal }),
-  events: (id: string, signal?: AbortSignal) =>
-    request<ScanEvent[]>(`/api/v1/scans/${id}/events`, { signal }),
+  agentAudits: (id: string, signal?: AbortSignal, includeArtifacts = false) =>
+    request<AgentAudit[]>(`/api/v1/scans/${id}/agent-audits?include_artifacts=${includeArtifacts ? "true" : "false"}`, { signal }),
+  events: (id: string, signal?: AbortSignal, after = 0, limit = 300) =>
+    request<ScanEvent[]>(`/api/v1/scans/${id}/events?after=${after}&limit=${limit}`, { signal }),
+  invalidateScanCache,
   upload: async (file: File, investigator: InvestigatorChoice = "configured", baselineScanId?: string) => {
     const form = new FormData()
     form.append("apk", file)

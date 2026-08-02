@@ -786,6 +786,74 @@ def test_missing_optional_probe_does_not_emit_a_failed_probe_broadcast(settings)
     assert not any("io.apkscanner.probe/.ProbeReceiver" in argv for argv in calls)
 
 
+def test_android13_device_runs_only_in_explicit_non_verdict_smoke_mode(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    class LegacyRunner:
+        request_id = ""
+
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @classmethod
+        def run(cls, argv, **_kwargs):  # noqa: ANN001, ANN206
+            if "apkscanner_request_id" in argv:
+                cls.request_id = argv[argv.index("apkscanner_request_id") + 1]
+            if "getprop" in argv:
+                stdout = "33\n"
+            elif "APKSCANNER_POC:V" in argv:
+                stdout = f'I/APKSCANNER_POC: {{"request_id":"{cls.request_id}","success":true}}'
+            else:
+                stdout = ""
+            return CommandResult(argv, 0, stdout, "")
+
+    apk = tmp_path / "legacy-smoke-poc.apk"
+    apk.write_bytes(b"APK")
+    spec = AgentPocSpec(
+        project_path="poc/test",
+        package_name="io.apkscanner.poc.legacysmoke",
+        launch_component=".MainActivity",
+        log_tag="APKSCANNER_POC",
+        timeout_seconds=5,
+    )
+    strict = AdbDeviceAdapter(
+        replace(settings, adb_serial="legacy-device"),
+        LegacyRunner(),  # type: ignore[arg-type]
+    )
+    rejected = strict.execute_poc(
+        apk,
+        spec,
+        target_package_name="com.example.target",
+        state="guest",
+        build_metadata={"compile_api": 36, "min_api": 21, "target_api": 36},
+    )
+    assert rejected.stage == "poc_incompatible"
+
+    smoke = AdbDeviceAdapter(
+        replace(
+            settings,
+            adb_serial="legacy-device",
+            device_min_api=33,
+            allow_legacy_device_smoke=True,
+        ),
+        LegacyRunner(),  # type: ignore[arg-type]
+    )
+    accepted = smoke.execute_poc(
+        apk,
+        spec,
+        target_package_name="com.example.target",
+        state="guest",
+        build_metadata={"compile_api": 36, "min_api": 21, "target_api": 36},
+    )
+    assert accepted.stage == "blackbox_poc"
+    metadata = accepted.commands[0][2]
+    assert metadata["device_api"] == "33"
+    assert metadata["android16_verdict_eligible"] is False
+    assert metadata["compatibility_smoke_only"] is True
+
+
 def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
     settings,
     tmp_path,

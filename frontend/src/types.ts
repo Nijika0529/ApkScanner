@@ -225,7 +225,7 @@ export interface AgentAudit {
   turn_id: string | null
   usage: Record<string, unknown>
   artifacts: Record<string, AgentAuditArtifact>
-  integrity: "verified" | "failed"
+  integrity: "verified" | "failed" | "not_checked"
   integrity_errors: string[]
   started_at: string
   completed_at: string | null
@@ -276,6 +276,8 @@ export interface AdbDevice {
   api_level: number | null
   android_version: string | null
   available: boolean
+  android16_verdict_eligible: boolean
+  compatibility_smoke_only: boolean
   busy: boolean
   active_task_id: string | null
   last_error: string | null

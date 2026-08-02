@@ -151,7 +151,11 @@ export APKSCANNER_INVESTIGATOR_BACKEND=codex
 export APKSCANNER_CODEX_ISOLATION=docker
 export APKSCANNER_CODEX_ENABLED=true
 scanctl capabilities --deep
+# 或由已验证过 Key 环境的启动脚本启动控制台：
+./start.sh
 ```
+
+`start.sh` 不读取 `.env`，也不包含默认 Key；调用者未设置 `DEEPSEEK_API_KEY` 时会立即拒绝启动。
 
 一次完整扫描只创建一个无密钥 keeper 容器，不会为每个小探索反复创建容器。每个
 `task + attempt + role` 分配不复用的 Unix UID 与私有 HOME、`CODEX_HOME`、TMPDIR、cache
@@ -279,6 +283,7 @@ source/control/sink/reachable path/boundary/counterevidence/proof gaps 证据元
 | `APKSCANNER_ANDROID_VERSION` | `16` | 报告的动态基线 Android 版本 |
 | `APKSCANNER_ANDROID_API` | `36` | 平台托管 PoC 构建使用的 Android SDK API |
 | `APKSCANNER_DEVICE_MIN_API` / `APKSCANNER_DEVICE_MAX_API` | `36` / `99` | 可接受的云真机 API 范围；默认只接受 Android 16 及以上 |
+| `APKSCANNER_ALLOW_LEGACY_DEVICE_SMOKE` | `false` | 允许低于 API 36 的本地兼容性冒烟；证据不可产出 Android 16 裁决 |
 | `APKSCANNER_DEVICE_INSTALL_POLICY` | `install_or_reuse` | 目标安装策略：`replace`、`install_or_reuse` 或 `reuse_installed` |
 | `APKSCANNER_DEVICE_RESET_POLICY` | `per_round` | `per_test`、`per_round` 或 `never`；单条测试可覆盖 |
 | `APKSCANNER_MAX_UPLOAD_BYTES` | 512 MiB | 上传大小限制 |

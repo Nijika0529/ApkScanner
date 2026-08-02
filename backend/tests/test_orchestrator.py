@@ -15,6 +15,7 @@ from apkscanner.agent_audit import build_agent_audits
 from apkscanner.agent_events import AgentCancelledError, AgentRuntimeEvent
 from apkscanner.artifacts import ArtifactStore
 from apkscanner.db import Database
+from apkscanner.device import AdbDeviceAdapter
 from apkscanner.models import (
     AgentRuntimeEventRecord,
     CoverageItem,
@@ -31,7 +32,7 @@ from apkscanner.orchestrator import ScanOrchestrator
 from apkscanner.planner import StaticEntryClosure
 from apkscanner.reports import ReportBuilder
 from apkscanner.schemas import AgentInvestigationResult
-from apkscanner.tools import CommandResult
+from apkscanner.tools import CommandResult, ToolRunner
 from sqlalchemy import select
 
 
@@ -245,7 +246,7 @@ def test_task_dispatch_runs_one_investigation_at_a_time(settings) -> None:  # no
     orchestrator._run_task = fake_run_task  # type: ignore[method-assign]
     orchestrator._run_tasks(scan_id)
 
-    assert max_active == 3
+    assert max_active == 1
     with database.session_factory() as session:
         persisted_scan = session.get(Scan, scan_id)
         statuses = list(
@@ -255,8 +256,10 @@ def test_task_dispatch_runs_one_investigation_at_a_time(settings) -> None:  # no
         )
     assert persisted_scan is not None
     assert persisted_scan.stats["execution_policy"] == {
-        "investigation_concurrency": 3,
-        "adb_concurrency": 1,
+        "concurrency_policy": "dynamic_adb_capacity",
+        "investigation_concurrency_at_start": 1,
+        "adb_concurrency": 0,
+        "static_only_minimum_lane": 1,
         "device_ownership": "complete_task",
         "agent_workspace_scope": "task_attempt",
     }
@@ -326,7 +329,7 @@ def test_two_configured_devices_run_two_investigations_concurrently(settings) ->
     orchestrator._run_task = fake_run_task  # type: ignore[method-assign]
     orchestrator._run_tasks(scan_id)
 
-    assert max_active == 3
+    assert max_active == 2
     with database.session_factory() as session:
         persisted_scan = session.get(Scan, scan_id)
         statuses = list(
@@ -336,12 +339,92 @@ def test_two_configured_devices_run_two_investigations_concurrently(settings) ->
         )
     assert persisted_scan is not None
     assert persisted_scan.stats["execution_policy"] == {
-        "investigation_concurrency": 3,
+        "concurrency_policy": "dynamic_adb_capacity",
+        "investigation_concurrency_at_start": 2,
         "adb_concurrency": 2,
+        "static_only_minimum_lane": 1,
         "device_ownership": "complete_task",
         "agent_workspace_scope": "task_attempt",
     }
     assert statuses == ["completed"] * 4
+
+
+def test_running_dispatch_expands_when_a_device_is_added(settings) -> None:  # noqa: ANN001
+    configured = replace(
+        settings,
+        adb_serial="initial-device",
+        adb_serials=("initial-device",),
+    )
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            status="preliminary_ready",
+            filename="live-expand.apk",
+            artifact_sha256="7" * 64,
+            artifact_path=str(settings.data_dir / "live-expand.apk"),
+        )
+        session.add(scan)
+        session.flush()
+        session.add_all(
+            [
+                InvestigationTask(
+                    scan_id=scan.id,
+                    task_type="component",
+                    status="queued",
+                    priority=100 - index,
+                )
+                for index in range(3)
+            ]
+        )
+        session.commit()
+        scan_id = scan.id
+
+    orchestrator = ScanOrchestrator(configured, database, ArtifactStore(configured))
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release_first = threading.Event()
+    active_lock = threading.Lock()
+    active = 0
+
+    def fake_run_task(
+        _scan_id: str,
+        task_id: str,
+        _timeout_seconds: int | None = None,
+    ) -> None:
+        nonlocal active
+        with active_lock:
+            active += 1
+            if active == 1:
+                first_started.set()
+            elif active == 2:
+                second_started.set()
+        if not second_started.is_set():
+            assert release_first.wait(timeout=5)
+        with database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            assert task is not None
+            task.status = "completed"
+            session.commit()
+        with active_lock:
+            active -= 1
+
+    orchestrator._run_task = fake_run_task  # type: ignore[method-assign]
+    worker = threading.Thread(target=orchestrator._run_tasks, args=(scan_id,))
+    worker.start()
+    assert first_started.wait(timeout=5)
+    orchestrator.device_pool.add(
+        AdbDeviceAdapter(
+            replace(configured, adb_serial="live-device"),
+            ToolRunner(),
+            serial="live-device",
+        )
+    )
+    assert second_started.wait(timeout=3)
+    release_first.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
 
 
 def test_single_investigation_limit_is_shared_across_scans(settings) -> None:  # noqa: ANN001

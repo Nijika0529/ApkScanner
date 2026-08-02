@@ -27,7 +27,6 @@ class Settings:
     scan_deadline_seconds: int = 24 * 60 * 60
     task_timeout_seconds: int = 4 * 60 * 60
     task_max_attempts: int = 2
-    investigation_max_concurrency: int = 3
     agent_max_rounds: int = 3
     agent_tests_per_round: int = 8
     agent_permission_profile: str = "personal_lab"
@@ -73,6 +72,7 @@ class Settings:
     proof_replay_base_url: str = "http://127.0.0.1:8000"
     device_min_api: int = 36
     device_max_api: int = 99
+    allow_legacy_device_smoke: bool = False
     device_install_policy: str = "install_or_reuse"
     device_reset_policy: str = "per_round"
     frontend_dist: Path | None = None
@@ -103,9 +103,6 @@ class Settings:
             scan_deadline_seconds=int(os.getenv("APKSCANNER_SCAN_DEADLINE", 86_400)),
             task_timeout_seconds=int(os.getenv("APKSCANNER_TASK_TIMEOUT", 14_400)),
             task_max_attempts=int(os.getenv("APKSCANNER_TASK_MAX_ATTEMPTS", 2)),
-            investigation_max_concurrency=max(
-                1, min(3, int(os.getenv("APKSCANNER_INVESTIGATION_MAX_CONCURRENCY", 3)))
-            ),
             agent_max_rounds=max(
                 1, min(5, int(os.getenv("APKSCANNER_AGENT_MAX_ROUNDS", 3)))
             ),
@@ -228,6 +225,9 @@ class Settings:
             ).rstrip("/"),
             device_min_api=max(1, int(os.getenv("APKSCANNER_DEVICE_MIN_API", 36))),
             device_max_api=max(1, int(os.getenv("APKSCANNER_DEVICE_MAX_API", 99))),
+            allow_legacy_device_smoke=_env_bool(
+                "APKSCANNER_ALLOW_LEGACY_DEVICE_SMOKE"
+            ),
             device_install_policy=os.getenv(
                 "APKSCANNER_DEVICE_INSTALL_POLICY", "install_or_reuse"
             ).lower(),
@@ -242,8 +242,13 @@ class Settings:
     def validate_codex_configuration(self) -> None:
         from .agent_execution import frozen_agent_configuration
 
-        if self.device_android_api < 36 or self.device_min_api < 36:
-            raise ValueError("APKScanner dynamic validation requires Android API 36 or newer")
+        if self.device_android_api < 36:
+            raise ValueError("APKScanner PoC target requires Android API 36 or newer")
+        if self.device_min_api < 36 and not self.allow_legacy_device_smoke:
+            raise ValueError(
+                "APKScanner verdict devices require Android API 36 or newer; "
+                "set APKSCANNER_ALLOW_LEGACY_DEVICE_SMOKE=true only for non-verdict smoke tests"
+            )
         if self.poc_compile_api is not None and self.poc_compile_api < 36:
             raise ValueError("APKSCANNER_POC_COMPILE_API must be at least 36")
         if self.poc_target_api is not None and self.poc_target_api < 36:

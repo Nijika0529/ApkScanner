@@ -164,7 +164,7 @@ class PersistentWorkerClient:
                 except Exception:
                     self.kill()
                 raise
-            if response.get("type") == "turn.error":
+            if response.get("type") in {"turn.error", "worker.error"}:
                 raise PersistentWorkerError(self._error_detail(response))
             if response.get("type") != "turn.result":
                 raise PersistentWorkerError("worker returned an unexpected terminal envelope")

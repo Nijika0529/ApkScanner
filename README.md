@@ -198,7 +198,12 @@ export APKSCANNER_INVESTIGATOR_BACKEND=codex
 export APKSCANNER_CODEX_ISOLATION=docker
 export APKSCANNER_CODEX_ENABLED=true
 scanctl capabilities --deep
+# Or start the console from the already-authorized environment:
+./start.sh
 ```
+
+`start.sh` contains no default credential and fails closed unless the caller exports
+`DEEPSEEK_API_KEY`.
 
 A complete scan owns one keyless keeper container instead of creating a container for every small
 exploration. Each `task + attempt + role` gets a non-reused Unix UID and private HOME,
@@ -274,7 +279,8 @@ OpenCode design remains only for historical reference in
 | `DEEPSEEK_API_KEY` | unset | DeepSeek credential inherited only by the UID worker exec |
 | `APKSCANNER_ANDROID_VERSION` | `16` | Reported dynamic baseline |
 | `APKSCANNER_ANDROID_API` | `36` | Expected audit-device API and default PoC compile/target API |
-| `APKSCANNER_DEVICE_MIN_API` / `APKSCANNER_DEVICE_MAX_API` | `21` / `99` | Compatible cloud-device API range |
+| `APKSCANNER_DEVICE_MIN_API` / `APKSCANNER_DEVICE_MAX_API` | `36` / `99` | Verdict-device API range; Android 16+ by default |
+| `APKSCANNER_ALLOW_LEGACY_DEVICE_SMOKE` | `false` | Permit a pre-API-36 compatibility smoke device; its evidence cannot produce an Android 16 verdict |
 | `APKSCANNER_DEVICE_INSTALL_POLICY` | `install_or_reuse` | `replace`, `install_or_reuse`, or `reuse_installed` target policy |
 | `APKSCANNER_DEVICE_RESET_POLICY` | `per_round` | `per_test`, `per_round`, or `never`; each requested test may override it |
 | `APKSCANNER_MAX_UPLOAD_BYTES` | 512 MiB | Intake limit |

@@ -83,6 +83,17 @@ def test_settings_reject_host_without_explicit_diagnostic_override(settings) -> 
         configured.validate_codex_configuration()
 
 
+def test_legacy_device_requires_explicit_non_verdict_smoke_mode(settings) -> None:  # noqa: ANN001
+    with pytest.raises(ValueError, match="ALLOW_LEGACY_DEVICE_SMOKE"):
+        replace(settings, device_min_api=33).validate_codex_configuration()
+
+    replace(
+        settings,
+        device_min_api=33,
+        allow_legacy_device_smoke=True,
+    ).validate_codex_configuration()
+
+
 def test_execution_contract_rejects_unknown_fields() -> None:
     with pytest.raises(ValidationError, match="Extra inputs"):
         AgentExecutionProfile.model_validate(

@@ -366,14 +366,23 @@ class HypothesisLedger:
         oracle_refuted = any(
             item.get("metadata", {}).get("oracle_refuted") is True for item in evidence
         )
-        harm_demonstrated = execution_demonstrated and impact_observed
+        android16_verdict_eligible = not any(
+            item.get("metadata", {}).get("android16_verdict_eligible") is False
+            for item in evidence
+        )
+        compatibility_smoke_only = not android16_verdict_eligible
+        harm_demonstrated = (
+            android16_verdict_eligible
+            and execution_demonstrated
+            and impact_observed
+        )
         status = (
             ProofAttemptStatus.FAILED.value
             if error
             else ProofAttemptStatus.PROVEN.value
             if harm_demonstrated
             else ProofAttemptStatus.REFUTED.value
-            if oracle_refuted
+            if oracle_refuted and android16_verdict_eligible
             else ProofAttemptStatus.INCONCLUSIVE.value
         )
         with self.database.session_factory() as session:
@@ -392,11 +401,15 @@ class HypothesisLedger:
                 "execution_demonstrated": execution_demonstrated,
                 "security_impact_observed": impact_observed,
                 "oracle_refuted": oracle_refuted,
+                "android16_verdict_eligible": android16_verdict_eligible,
+                "compatibility_smoke_only": compatibility_smoke_only,
                 "harm_demonstrated": harm_demonstrated,
                 "policy": (
                     "A model claim and successful reachability test are not proof of harm. "
                     "Harm requires both demonstrated execution and a platform Prover's "
-                    "security_impact_observed signal."
+                    "security_impact_observed signal on Android 16 / API 36 or newer. "
+                    "Legacy-device smoke evidence can validate the toolchain but cannot "
+                    "prove or refute the Android 16 hypothesis."
                 ),
             }
             attempt.evidence_ids = evidence_ids
@@ -411,7 +424,11 @@ class HypothesisLedger:
                         hypothesis.support_evidence_ids,
                         evidence_ids,
                     )
-                elif oracle_refuted and hypothesis.status != HypothesisStatus.PROVEN.value:
+                elif (
+                    oracle_refuted
+                    and android16_verdict_eligible
+                    and hypothesis.status != HypothesisStatus.PROVEN.value
+                ):
                     hypothesis.status = HypothesisStatus.CHALLENGED.value
                     hypothesis.refute_evidence_ids = self._merge_ids(
                         hypothesis.refute_evidence_ids,

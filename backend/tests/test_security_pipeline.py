@@ -629,6 +629,81 @@ def test_one_platform_proof_does_not_close_other_hypotheses(settings) -> None:  
     assert ledger.task_proof_result(task.id) is not None
 
 
+def test_legacy_device_smoke_cannot_prove_or_refute_android16_hypothesis(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    entry_id = "00000000-0000-0000-0000-000000000091"
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="legacy-smoke.apk",
+            artifact_sha256="8" * 64,
+            artifact_path=str(settings.data_dir / "legacy-smoke.apk"),
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            target_entry_ids=[entry_id],
+            hypotheses=["External input reaches a harmful sink on Android 16."],
+        )
+        session.add_all([scan, task])
+        session.commit()
+
+    ledger = HypothesisLedger(database)
+    hypothesis = ledger.ensure_task_hypotheses(task)[0]
+    proof_id = ledger.plan_proof(
+        task_id=task.id,
+        test_case_id="legacy-smoke",
+        request=AgentRequestedTest(
+            hypothesis_id=hypothesis.id,
+            entry_point_id=entry_id,
+            state="guest",
+            uri=None,
+            extras={},
+            rationale="Exercise the compatibility toolchain only.",
+        ),
+    )
+    ledger.start_proof(proof_id)
+    ledger.complete_proof(
+        proof_id,
+        [
+            {
+                "id": "legacy-probe",
+                "kind": "blackbox.probe_app",
+                "exit_code": 0,
+                "metadata": {
+                    "request_id": "legacy-request",
+                    "android16_verdict_eligible": False,
+                },
+            },
+            {
+                "id": "legacy-log",
+                "kind": "blackbox.logcat",
+                "exit_code": 0,
+                "metadata": {
+                    "request_id": "legacy-request",
+                    "request_observed": True,
+                    "probe_success": True,
+                    "security_impact_observed": True,
+                    "oracle_refuted": True,
+                    "android16_verdict_eligible": False,
+                },
+            },
+        ],
+    )
+
+    with database.session_factory() as session:
+        proof = session.get(ProofAttempt, proof_id)
+        persisted_hypothesis = session.get(SecurityHypothesis, hypothesis.id)
+        assert proof is not None
+        assert persisted_hypothesis is not None
+        assert proof.status == "inconclusive"
+        assert proof.harm_demonstrated is False
+        assert proof.oracle["android16_verdict_eligible"] is False
+        assert proof.oracle["compatibility_smoke_only"] is True
+        assert persisted_hypothesis.status == "inconclusive"
+
+
 def test_finalize_closes_each_hypothesis_from_its_own_receipt(settings) -> None:  # noqa: ANN001
     settings.ensure_directories()
     database = Database(settings)

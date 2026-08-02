@@ -95,4 +95,6 @@ RUN python -m pip install --no-cache-dir --no-deps --no-build-isolation .
 RUN ln -s /usr/local/lib/python3.13/site-packages/codex_cli_bin/bin/codex \
         /usr/local/bin/codex
 
+LABEL io.apkscanner.worker-revision="20260802.1"
+
 ENTRYPOINT ["python", "-m", "apkscanner.codex_worker"]

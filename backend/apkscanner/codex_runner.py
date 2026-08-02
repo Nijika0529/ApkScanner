@@ -30,7 +30,7 @@ from .codex_protocol import (
     PersistentWorkerError,
     PersistentWorkerTimeout,
 )
-from .codex_sdk_baseline import PINNED_SDK_VERSION, runtime_capability
+from .codex_sdk_baseline import PINNED_SDK_VERSION, WORKER_REVISION, runtime_capability
 from .config import Settings
 from .models import EntryPoint, InvestigationTask, Scan
 from .schemas import AGENT_RESULT_JSON_SCHEMA, AgentInvestigationResult
@@ -270,6 +270,7 @@ class CodexInvestigator:
                     (
                         '{{ index .Config.Labels "io.apkscanner.sdk-version" }}'
                         '|{{ index .Config.Labels "io.apkscanner.worker-protocol" }}'
+                        '|{{ index .Config.Labels "io.apkscanner.worker-revision" }}'
                     ),
                     image,
                 ],
@@ -287,7 +288,7 @@ class CodexInvestigator:
                 "available": False,
                 "detail": f"build the worker image first: {image}",
             }
-        if inspected.stdout.strip() != f"{PINNED_SDK_VERSION}|3":
+        if inspected.stdout.strip() != f"{PINNED_SDK_VERSION}|3|{WORKER_REVISION}":
             return {
                 **capability,
                 "available": False,

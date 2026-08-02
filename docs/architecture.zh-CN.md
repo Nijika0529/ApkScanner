@@ -61,6 +61,10 @@ JADX 的非零退出码不直接等同于反编译不可用。平台把结果归
 绑定同一个 serial。同一台设备上不会穿插其他 APK 的状态和日志，两台设备则可各运行一个
 完整任务。
 
+设备池容量在任务运行期间动态读取，运行中接入设备会自动增加可提交 worker，排空设备会停止新的
+lease。默认只有 API 36+ 设备具备裁决资格；显式 legacy smoke 设备只验证工具链，平台在 Proof 层
+强制把其结果保持为 inconclusive。
+
 设备池保留全局优先级队列，每台适配器内部继续保留命令互斥。实时 PoC Proof Context 保存
 任务实际获得的 Device Adapter，API 回放不能落到另一台手机。任务结果继续记录
 `requested_at`、`acquired_at`、`released_at`、`held_seconds` 和 `serial`，Web 展示当前

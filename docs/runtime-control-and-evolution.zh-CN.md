@@ -16,8 +16,10 @@
   `apksigner`。不回退旧 Platform，不使用 `dx`，`targetSdkVersion` 不得低于 36。
 - Agent 提交预构建 APK 时，平台通过 `aapt2 dump badging` 检查包名、入口、minSdk 和 targetSdk；
   targetSdk 缺失或低于 36即拒绝。
-- 真机执行前再次读取 `ro.build.version.sdk`。设备低于 API 36、PoC target 低于 36或无法确认
-  两者时，产生 `poc_incompatible`，不得伪装成“已执行但未复现”。
+- 真机执行前再次读取 `ro.build.version.sdk`。PoC target 低于 36 或无法确认运行时兼容性时，产生
+  `poc_incompatible`。默认拒绝 API 35 及以下；本地可显式开启 legacy smoke，但其全部 Evidence
+  都带 `android16_verdict_eligible=false`，只能验证安装、启动、ADB 和证据链，不能证明或反驳
+  Android 16 漏洞。
 
 ## 2. 重新分析的两个语义
 
@@ -45,22 +47,42 @@ Evidence、模型结论、Thread/Turn、版本 PoC 回放和历史 Finding。该
 
 ## 3. 动态 ADB 设备池
 
-探索 worker 固定上限为 3（`APKSCANNER_INVESTIGATION_MAX_CONCURRENCY` 可在 1..3 内降低），ADB
-设备数量只控制同一时刻能获得真机 lease 的任务数。每个任务从 prepare、Probe、Agent 多轮、PoC、
-Oracle 到 cleanup 全程独占同一 serial。
+探索 worker 不再有固定的 3 任务上限。可提交并发动态跟随当前未排空的 ADB 设备数量；没有设备时只
+保留一个静态分析 lane。运行中的 dispatcher 每 500ms 重新读取容量，因此中途接入第二台设备后会
+直接领取第二个任务。每个任务从 prepare、Probe、Agent 多轮、PoC、Oracle 到 cleanup 全程独占同一
+serial；跨扫描的最终 ADB 并发仍由全局 device lease 队列约束。
 
 设备成员持久化在 `adb_devices` 表，环境变量中的 serial 只作为首次启动 seed。运行时接口为：
 
 | 操作 | API | 语义 |
 | --- | --- | --- |
 | 列表/探测 | `GET /devices?probe=true` | 读取设备、API、占用任务和错误 |
-| 接入 | `POST /devices` | 可执行 `adb connect`，仅 API 36+ 通过后加入调度 |
+| 接入 | `POST /devices` | 可执行 `adb connect`；默认仅 API 36+，显式 legacy smoke 设备不可产出裁决 |
 | 排空 | `POST /devices/{serial}/drain` | 停止新 lease；不打断当前任务 |
 | 重连 | `POST /devices/{serial}/reconnect` | 活跃设备拒绝重连；探测成功后恢复调度 |
 | 移除 | `DELETE /devices/{serial}` | 活跃设备拒绝移除；删除持久成员关系 |
 
 新增设备会唤醒设备条件队列，因此扫描过程中等待的第二、第三个 worker 可以立即扩容。设备操作投影为
 `device.pool.*` 扫描事件；任务自身继续记录 queued/acquired/released 完整事件线。
+
+本地兼容性冒烟必须同时设置：
+
+```bash
+export APKSCANNER_DEVICE_MIN_API=33
+export APKSCANNER_ALLOW_LEGACY_DEVICE_SMOKE=true
+```
+
+`APKSCANNER_ANDROID_API`、PoC compileSdk 和 targetSdk 仍保持 36+。发布门禁、漏洞复现、平台缓解、
+版本“已修复/回归”结论仍只接受 API 36+ Proof。
+
+## 3.1 控制台事件性能契约
+
+- 历史事件默认只返回最近 300 条，`after + limit` 用于增量分页；SSE 从客户端当前 cursor 开始，
+  单批最多读取 200 条，不再从 0 重放整条时间线。
+- 浏览器直接把 SSE 事件合并到最多 500 条的本地窗口；数据刷新以 650ms debounce 合并，单条
+  `exploration.*` 不再触发 13 个详情接口。
+- Entry、快照、版本 Diff 和模式匹配使用有界 GET 缓存；`static.completed/scan.final` 会主动失效。
+- AI 审计列表默认只返回 Evidence 元数据；用户进入“AI 审计”页时才读取正文并做 SHA-256 校验。
 
 ## 4. 静态资产和版本演进
 

@@ -24,6 +24,8 @@ def build_agent_audits(
     session: Session,
     store: ArtifactStore,
     scan_id: str,
+    *,
+    include_artifacts: bool = True,
 ) -> list[dict[str, Any]]:
     evidence = list(
         session.scalars(
@@ -41,7 +43,15 @@ def build_agent_audits(
         if isinstance(audit_id, str):
             grouped[audit_id].append(item)
 
-    audits = [_build_audit(store, audit_id, items) for audit_id, items in grouped.items()]
+    audits = [
+        _build_audit(
+            store,
+            audit_id,
+            items,
+            include_artifacts=include_artifacts,
+        )
+        for audit_id, items in grouped.items()
+    ]
     return sorted(audits, key=lambda item: (item["started_at"], item["id"]))
 
 
@@ -49,6 +59,8 @@ def _build_audit(
     store: ArtifactStore,
     audit_id: str,
     evidence: list[Evidence],
+    *,
+    include_artifacts: bool,
 ) -> dict[str, Any]:
     first = evidence[0]
     metadata = first.metadata_json
@@ -56,11 +68,12 @@ def _build_audit(
     integrity_errors: list[str] = []
     for item in evidence:
         label = item.kind.removeprefix("agent.")
-        try:
-            content = store.read_json_artifact("evidence", item.path, item.sha256)
-        except (OSError, ValueError, TypeError) as exc:
-            content = None
-            integrity_errors.append(f"{item.id}: {exc}")
+        content = None
+        if include_artifacts:
+            try:
+                content = store.read_json_artifact("evidence", item.path, item.sha256)
+            except (OSError, ValueError, TypeError) as exc:
+                integrity_errors.append(f"{item.id}: {exc}")
         artifacts[label] = {
             "evidence_id": item.id,
             "sha256": item.sha256,
@@ -112,7 +125,13 @@ def _build_audit(
         "turn_id": response_object.get("turn_id"),
         "usage": response_object.get("usage") or {},
         "artifacts": artifacts,
-        "integrity": "failed" if integrity_errors else "verified",
+        "integrity": (
+            "failed"
+            if integrity_errors
+            else "verified"
+            if include_artifacts
+            else "not_checked"
+        ),
         "integrity_errors": integrity_errors,
         "started_at": first.created_at.isoformat(),
         "completed_at": terminal.isoformat() if terminal else None,

@@ -59,32 +59,6 @@ stop_existing() {
   rm -f "$PID_FILE"
 }
 
-cleanup_orphan_opencode_servers() {
-  local proc_dir pid parent_pid command_line process_cwd
-  local -a targets=()
-  for proc_dir in /proc/[1-9]*; do
-    [ -r "$proc_dir/status" ] || continue
-    pid="${proc_dir##*/}"
-    parent_pid="$(awk '/^PPid:/{print $2}' "$proc_dir/status" 2>/dev/null || true)"
-    [ "$parent_pid" = "1" ] || continue
-    command_line="$(tr '\0' ' ' <"$proc_dir/cmdline" 2>/dev/null || true)"
-    [[ "$command_line" == *"opencode"*"serve"* ]] || continue
-    process_cwd="$(readlink "$proc_dir/cwd" 2>/dev/null || true)"
-    case "$process_cwd/" in
-      "$DATA_DIR/workspaces/"*) targets+=("$pid") ;;
-    esac
-  done
-  [ "${#targets[@]}" -gt 0 ] || return 0
-  kill -TERM "${targets[@]}" 2>/dev/null || true
-  sleep 1
-  for pid in "${targets[@]}"; do
-    if kill -0 "$pid" 2>/dev/null; then
-      kill -KILL "$pid" 2>/dev/null || true
-    fi
-  done
-  echo "cleaned ${#targets[@]} orphaned OpenCode server(s) from this project"
-}
-
 detect_adb_serials() {
   local -a devices=()
   local attempt
@@ -108,15 +82,13 @@ detect_adb_serials() {
 # cannot replace a working process or silently leave FastAPI serving an old bundle.
 build_frontend
 stop_existing
-cleanup_orphan_opencode_servers
 
-export DEEPSEEK_API_KEY="DEEPSEEK_API_KEY_REMOVED"
-export APKSCANNER_OPENCODE_ENABLED="true"
-export APKSCANNER_INVESTIGATOR_BACKEND="opencode"
-export APKSCANNER_OPENCODE_ISOLATION="host"
-export APKSCANNER_OPENCODE_MODEL="deepseek-v4-flash"
-export APKSCANNER_OPENCODE_CRITIC_MODEL="deepseek-v4-pro"
-export APKSCANNER_OPENCODE_THINKING_EXPLORER="false"
+: "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY in the caller environment}"
+export APKSCANNER_CODEX_ENABLED="${APKSCANNER_CODEX_ENABLED:-true}"
+export APKSCANNER_INVESTIGATOR_BACKEND="${APKSCANNER_INVESTIGATOR_BACKEND:-codex}"
+export APKSCANNER_CODEX_ISOLATION="${APKSCANNER_CODEX_ISOLATION:-docker}"
+export APKSCANNER_CODEX_PROVIDER="${APKSCANNER_CODEX_PROVIDER:-deepseek}"
+export APKSCANNER_CODEX_MODEL="${APKSCANNER_CODEX_MODEL:-deepseek-v4-flash}"
 export APKSCANNER_AGENT_PERMISSION_PROFILE="personal_lab"
 export APKSCANNER_ADB_SERIALS="${APKSCANNER_ADB_SERIALS:-$(detect_adb_serials)}"
 export APKSCANNER_ADB_SERIAL="${APKSCANNER_ADB_SERIAL:-${APKSCANNER_ADB_SERIALS%%,*}}"
@@ -127,12 +99,11 @@ export APKSCANNER_TASK_TIMEOUT="${APKSCANNER_TASK_TIMEOUT:-3600}"
 
 nohup setsid env \
   DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
-  APKSCANNER_OPENCODE_ENABLED="$APKSCANNER_OPENCODE_ENABLED" \
+  APKSCANNER_CODEX_ENABLED="$APKSCANNER_CODEX_ENABLED" \
   APKSCANNER_INVESTIGATOR_BACKEND="$APKSCANNER_INVESTIGATOR_BACKEND" \
-  APKSCANNER_OPENCODE_ISOLATION="$APKSCANNER_OPENCODE_ISOLATION" \
-  APKSCANNER_OPENCODE_MODEL="$APKSCANNER_OPENCODE_MODEL" \
-  APKSCANNER_OPENCODE_CRITIC_MODEL="$APKSCANNER_OPENCODE_CRITIC_MODEL" \
-  APKSCANNER_OPENCODE_THINKING_EXPLORER="$APKSCANNER_OPENCODE_THINKING_EXPLORER" \
+  APKSCANNER_CODEX_ISOLATION="$APKSCANNER_CODEX_ISOLATION" \
+  APKSCANNER_CODEX_PROVIDER="$APKSCANNER_CODEX_PROVIDER" \
+  APKSCANNER_CODEX_MODEL="$APKSCANNER_CODEX_MODEL" \
   APKSCANNER_AGENT_PERMISSION_PROFILE="$APKSCANNER_AGENT_PERMISSION_PROFILE" \
   APKSCANNER_ADB_SERIAL="$APKSCANNER_ADB_SERIAL" \
   APKSCANNER_ADB_SERIALS="$APKSCANNER_ADB_SERIALS" \

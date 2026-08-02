@@ -176,11 +176,6 @@ class ScanOrchestrator:
         self._live_proof_base_url: str | None = None
         self._task_cancellations_lock = threading.Lock()
         self._shutting_down = threading.Event()
-        # One task owns one ADB device for its complete multi-round
-        # investigation. The global semaphore prevents scans from collectively
-        # exceeding the configured device pool.
-        self._investigation_concurrency = settings.investigation_max_concurrency
-        self._investigation_slots = threading.BoundedSemaphore(self._investigation_concurrency)
 
     @staticmethod
     def _validate_adb_serial(serial: str) -> str:
@@ -241,6 +236,16 @@ class ScanOrchestrator:
                         "api_level": record.api_level,
                         "android_version": record.android_version,
                         "available": bool(capability.get("available")),
+                        "android16_verdict_eligible": bool(
+                            capability.get("android16_verdict_eligible")
+                            if capability
+                            else record.api_level is not None and record.api_level >= 36
+                        ),
+                        "compatibility_smoke_only": bool(
+                            capability.get("compatibility_smoke_only")
+                            if capability
+                            else record.api_level is not None and record.api_level < 36
+                        ),
                         "busy": record.serial in active,
                         "active_task_id": active.get(record.serial),
                         "last_error": record.last_error,
@@ -276,8 +281,13 @@ class ScanOrchestrator:
             raise RuntimeError(str(capability.get("detail") or "ADB device is unavailable"))
         api_text = str(capability.get("api_level") or "")
         api_level = int(api_text) if api_text.isdigit() else None
-        if api_level is None or api_level < 36:
-            raise RuntimeError("Only Android 16 / API 36 or newer devices are accepted")
+        if api_level is None:
+            raise RuntimeError("Could not determine the Android API level")
+        if api_level < 36 and not self.settings.allow_legacy_device_smoke:
+            raise RuntimeError(
+                "Only Android 16 / API 36 or newer verdict devices are accepted; "
+                "legacy devices require explicit non-verdict smoke mode"
+            )
         with self.database.session_factory() as session:
             record = session.scalar(
                 select(AdbDeviceRecord).where(AdbDeviceRecord.serial == serial)
@@ -287,7 +297,7 @@ class ScanOrchestrator:
                 session.add(record)
             record.label = label.strip() if label and label.strip() else record.label
             record.enabled = True
-            record.state = "ready"
+            record.state = "ready" if api_level >= 36 else "compatibility_smoke"
             record.api_level = api_level
             record.android_version = str(capability.get("android_version") or "") or None
             record.last_error = None
@@ -295,6 +305,7 @@ class ScanOrchestrator:
             record.metadata_json = {
                 **dict(record.metadata_json or {}),
                 "source": "runtime_api",
+                "android16_verdict_eligible": api_level >= 36,
             }
             session.commit()
             record_id = record.id
@@ -304,7 +315,11 @@ class ScanOrchestrator:
         self._record_device_pool_event(
             "device.pool.connected",
             "运行时 ADB 设备已加入探索队列",
-            {"serial": serial, "api_level": api_level},
+            {
+                "serial": serial,
+                "api_level": api_level,
+                "android16_verdict_eligible": api_level >= 36,
+            },
         )
         return next(item for item in self.list_adb_devices() if item["id"] == record_id)
 
@@ -1746,15 +1761,18 @@ class ScanOrchestrator:
             session.commit()
 
     def _run_tasks(self, scan_id: str) -> None:
-        adb_concurrency = max(1, len(self.device_pool.serials))
+        adb_concurrency = self.device_pool.capacity
+        initial_concurrency = self._current_investigation_concurrency()
         with self.database.session_factory() as session:
             scan = session.get(Scan, scan_id)
             assert scan is not None
             scan.stats = {
                 **dict(scan.stats or {}),
                 "execution_policy": {
-                    "investigation_concurrency": self._investigation_concurrency,
+                    "concurrency_policy": "dynamic_adb_capacity",
+                    "investigation_concurrency_at_start": initial_concurrency,
                     "adb_concurrency": adb_concurrency,
+                    "static_only_minimum_lane": 1,
                     "device_ownership": "complete_task",
                     "agent_workspace_scope": "task_attempt",
                 },
@@ -1766,29 +1784,44 @@ class ScanOrchestrator:
                 (
                     "多设备探索池已启动：每个任务完整独占一台 ADB 设备"
                     if adb_concurrency > 1
+                    else "当前无 ADB 设备：保留一个静态分析 lane，接入设备后自动扩容"
+                    if adb_concurrency == 0
                     else "单任务探索已启动：每次只有一个任务完整占有 ADB"
                 ),
                 {
-                    "investigation_concurrency": self._investigation_concurrency,
+                    "concurrency_policy": "dynamic_adb_capacity",
+                    "investigation_concurrency": initial_concurrency,
                     "adb_concurrency": adb_concurrency,
                     "device_serials": list(self.device_pool.serials),
                     "device_ownership": "complete_task",
                 },
             )
             session.commit()
+            task_count = len(
+                list(
+                    session.scalars(
+                        select(InvestigationTask.id).where(
+                            InvestigationTask.scan_id == scan_id,
+                            InvestigationTask.status == TaskStatus.QUEUED.value,
+                        )
+                    )
+                )
+            )
         futures: set[Future[None]] = set()
         with ThreadPoolExecutor(
-            max_workers=self._investigation_concurrency,
+            # The executor is only a thread container. Submission is governed
+            # by the live ADB pool capacity below, so a newly attached device
+            # can expand the running scan without restarting the service.
+            max_workers=max(1, task_count),
             thread_name_prefix="investigation",
         ) as executor:
             while True:
-                while len(futures) < self._investigation_concurrency:
+                desired_concurrency = self._current_investigation_concurrency()
+                while len(futures) < desired_concurrency:
                     if not self._has_queued_tasks(scan_id):
                         break
-                    self._investigation_slots.acquire()
                     claimed = self._claim_next_task(scan_id)
                     if claimed is None:
-                        self._investigation_slots.release()
                         break
                     task_id, timeout_seconds = claimed
                     futures.add(
@@ -1803,10 +1836,15 @@ class ScanOrchestrator:
                     return
                 completed, futures = wait(
                     futures,
+                    timeout=0.5,
                     return_when=FIRST_COMPLETED,
                 )
                 for future in completed:
                     future.result()
+
+    def _current_investigation_concurrency(self) -> int:
+        """Follow live assignable ADB capacity, retaining one static-only lane."""
+        return max(1, self.device_pool.capacity)
 
     def _has_queued_tasks(self, scan_id: str) -> bool:
         with self.database.session_factory() as session:
@@ -1832,8 +1870,6 @@ class ScanOrchestrator:
             self._run_task(scan_id, task_id, timeout_seconds)
         except Exception as exc:
             self._mark_task_worker_failed(scan_id, task_id, exc)
-        finally:
-            self._investigation_slots.release()
 
     def _claim_next_task(self, scan_id: str) -> tuple[str, int] | None:
         with self.database.session_factory() as session:
@@ -2294,7 +2330,8 @@ class ScanOrchestrator:
                         "independent" if independent_context else "continue"
                     ),
                     "origin_task_id": independent_context.get("origin_task_id"),
-                    "investigation_concurrency": self._investigation_concurrency,
+                    "investigation_concurrency": self._current_investigation_concurrency(),
+                    "concurrency_policy": "dynamic_adb_capacity",
                 },
             )
             session.commit()
@@ -4653,6 +4690,11 @@ class ScanOrchestrator:
         if device is None:
             return [], ["No task-scoped ADB device lease is available."]
         active_device = device
+        device_profile = active_device.capability(non_blocking=False)
+        android16_verdict_eligible = bool(
+            device_profile.get("android16_verdict_eligible")
+        )
+        device_api_level = device_profile.get("api_level")
         poc_artifacts = poc_artifacts or {}
         entries_by_id = {entry.id: entry for entry in entries}
         indexed = [
@@ -4699,7 +4741,19 @@ class ScanOrchestrator:
                         (
                             kind,
                             result,
-                            {**dict(metadata), "test_case_id": case_id},
+                            {
+                                **dict(metadata),
+                                "test_case_id": case_id,
+                                "device_api": (
+                                    dict(metadata).get("device_api") or device_api_level
+                                ),
+                                "android16_verdict_eligible": (
+                                    android16_verdict_eligible
+                                ),
+                                "compatibility_smoke_only": (
+                                    not android16_verdict_eligible
+                                ),
+                            },
                         )
                         for kind, result, metadata in commands
                     ]
@@ -4769,6 +4823,12 @@ class ScanOrchestrator:
                                     "poc_build_evidence_id": artifact.metadata.get(
                                         "build_evidence_id"
                                     ),
+                                    "android16_verdict_eligible": (
+                                        android16_verdict_eligible
+                                    ),
+                                    "compatibility_smoke_only": (
+                                        not android16_verdict_eligible
+                                    ),
                                 },
                             )
                     else:
@@ -4791,6 +4851,7 @@ class ScanOrchestrator:
                             oracle=request.oracle,
                             test_case_id=test_case_id,
                         )
+                        probe.commands = tagged(probe.commands)
                     self._record_commands(scan_id, task_id, probe.commands, evidence_summaries)
                     if probe.stage == "poc_incompatible":
                         raise RuntimeError(str(probe.summary.get("error") or probe.stage))

@@ -1165,12 +1165,18 @@ def list_benchmark_evaluations(
 @router.get("/scans/{scan_id}/agent-audits", response_model=list[AgentAuditOut])
 def list_agent_audits(
     scan_id: str,
+    include_artifacts: bool = Query(default=True),
     session: Session = Depends(get_session),
     store: ArtifactStore = Depends(get_store),
 ) -> list[dict[str, Any]]:
     if session.get(Scan, scan_id) is None:
         raise HTTPException(404, "Scan not found")
-    return build_agent_audits(session, store, scan_id)
+    return build_agent_audits(
+        session,
+        store,
+        scan_id,
+        include_artifacts=include_artifacts,
+    )
 
 
 @router.get("/scans/{scan_id}/coverage", response_model=list[CoverageItemOut])
@@ -1192,16 +1198,24 @@ def list_coverage(scan_id: str, session: Session = Depends(get_session)) -> list
 def list_events(
     scan_id: str,
     after: int = Query(0, ge=0),
+    limit: int = Query(300, ge=1, le=2_000),
     session: Session = Depends(get_session),
 ) -> list[ScanEvent]:
     require_scan(session, scan_id)
-    return list(
-        session.scalars(
-            select(ScanEvent)
-            .where(ScanEvent.scan_id == scan_id, ScanEvent.id > after)
-            .order_by(ScanEvent.id)
+    statement = select(ScanEvent).where(ScanEvent.scan_id == scan_id)
+    if after:
+        return list(
+            session.scalars(
+                statement.where(ScanEvent.id > after)
+                .order_by(ScanEvent.id)
+                .limit(limit)
+            )
         )
+    latest = list(
+        session.scalars(statement.order_by(ScanEvent.id.desc()).limit(limit))
     )
+    latest.reverse()
+    return latest
 
 
 @router.get("/scans/{scan_id}/events/stream")
@@ -1209,12 +1223,19 @@ async def stream_events(
     scan_id: str,
     request: Request,
     database: Database = Depends(get_database),
+    after: int = Query(0, ge=0),
 ) -> StreamingResponse:
     with database.session_factory() as session:
         if session.get(Scan, scan_id) is None:
             raise HTTPException(404, "Scan not found")
     last_event_id = request.headers.get("last-event-id", "")
-    initial_cursor = int(last_event_id) if last_event_id.isdigit() else 0
+    initial_cursor = (
+        int(last_event_id)
+        if last_event_id.isdigit()
+        else after
+        if isinstance(after, int)
+        else 0
+    )
 
     async def generate():  # noqa: ANN202
         cursor = initial_cursor
@@ -1225,6 +1246,7 @@ async def stream_events(
                         select(ScanEvent)
                         .where(ScanEvent.scan_id == scan_id, ScanEvent.id > cursor)
                         .order_by(ScanEvent.id)
+                        .limit(200)
                     )
                 )
                 scan = session.get(Scan, scan_id)

@@ -412,7 +412,7 @@ async def test_event_stream_ends_if_scan_is_deleted(settings) -> None:  # noqa: 
     app = create_app(settings)
     with app.state.database.session_factory() as session:
         scan = Scan(
-            status="queued",
+            status="final",
             filename="stream-delete.apk",
             artifact_sha256="d" * 64,
             artifact_path=str(settings.data_dir / "missing-stream-delete.apk"),
@@ -443,6 +443,44 @@ async def test_event_stream_ends_if_scan_is_deleted(settings) -> None:  # noqa: 
     assert end_event == "event: end\ndata: {}\n\n"
     with pytest.raises(StopAsyncIteration):
         await asyncio.wait_for(anext(response.body_iterator), timeout=1)
+
+
+def test_event_history_is_bounded_and_supports_incremental_cursors(settings) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    with app.state.database.session_factory() as session:
+        scan = Scan(
+            status="final",
+            filename="event-window.apk",
+            artifact_sha256="e" * 64,
+            artifact_path=str(settings.data_dir / "event-window.apk"),
+        )
+        session.add(scan)
+        session.flush()
+        session.add_all(
+            [
+                api_module.ScanEvent(
+                    scan_id=scan.id,
+                    event_type="test.event",
+                    message=f"event {index}",
+                    data={"index": index},
+                )
+                for index in range(12)
+            ]
+        )
+        session.commit()
+        scan_id = scan.id
+
+    with TestClient(app) as client:
+        latest = client.get(f"/api/v1/scans/{scan_id}/events?limit=5")
+        assert latest.status_code == 200
+        latest_items = latest.json()
+        assert [item["data"]["index"] for item in latest_items] == [7, 8, 9, 10, 11]
+        cursor = latest_items[1]["id"]
+        incremental = client.get(
+            f"/api/v1/scans/{scan_id}/events?after={cursor}&limit=3"
+        )
+        assert incremental.status_code == 200
+        assert [item["data"]["index"] for item in incremental.json()] == [9, 10, 11]
 
 
 def test_completed_scan_can_be_deleted_with_its_unshared_files(settings) -> None:  # noqa: ANN001
@@ -1235,6 +1273,12 @@ def test_codex_audit_records_frozen_execution_and_provider_profiles(settings) ->
             "output_transport"
         ]
         assert recorded_transport == transport
+        summary = client.get(
+            f"/api/v1/scans/{scan.id}/agent-audits?include_artifacts=false"
+        ).json()[0]
+        assert summary["integrity"] == "not_checked"
+        assert summary["artifacts"]["request"]["content"] is None
+        assert summary["artifacts"]["response"]["content"] is None
 
 
 def test_scan_and_task_agent_controls_are_persisted(settings) -> None:  # noqa: ANN001
