@@ -350,7 +350,7 @@ class CodexInvestigator:
         try:
             result = active.client.turn(
                 prompt=prompt,
-                output_schema=AGENT_RESULT_JSON_SCHEMA,
+                result_contract="agent_investigation.v1",
                 timeout_seconds=effective_worker_timeout,
                 no_event_timeout_seconds=self.settings.codex_no_event_timeout_seconds,
                 event_callback=event_callback,
@@ -600,7 +600,7 @@ class CodexInvestigator:
         return Codex(config=config)
 
     @staticmethod
-    def _parse_response(response: str | None) -> AgentInvestigationResult:
+    def _parse_json_object(response: str | None) -> dict[str, Any]:
         if not response:
             raise ValueError("Codex returned no final response")
         text = response.strip()
@@ -627,7 +627,15 @@ class CodexInvestigator:
                 raise ValueError(
                     "Codex final response did not contain a complete trailing JSON object"
                 ) from direct_error
-        return AgentInvestigationResult.model_validate(value)
+        if not isinstance(value, dict):
+            raise ValueError("Codex final response must be a JSON object")
+        return value
+
+    @staticmethod
+    def _parse_response(response: str | None) -> AgentInvestigationResult:
+        return AgentInvestigationResult.model_validate(
+            CodexInvestigator._parse_json_object(response)
+        )
 
     @staticmethod
     def _developer_instructions() -> str:

@@ -70,7 +70,7 @@ class Settings:
     poc_min_api: int = 21
     poc_target_api: int | None = None
     proof_replay_base_url: str = "http://127.0.0.1:8000"
-    device_min_api: int = 21
+    device_min_api: int = 36
     device_max_api: int = 99
     device_install_policy: str = "install_or_reuse"
     device_reset_policy: str = "per_round"
@@ -225,7 +225,7 @@ class Settings:
                 "APKSCANNER_PROOF_REPLAY_BASE_URL",
                 "http://127.0.0.1:8000",
             ).rstrip("/"),
-            device_min_api=max(1, int(os.getenv("APKSCANNER_DEVICE_MIN_API", 21))),
+            device_min_api=max(1, int(os.getenv("APKSCANNER_DEVICE_MIN_API", 36))),
             device_max_api=max(1, int(os.getenv("APKSCANNER_DEVICE_MAX_API", 99))),
             device_install_policy=os.getenv(
                 "APKSCANNER_DEVICE_INSTALL_POLICY", "install_or_reuse"
@@ -287,6 +287,7 @@ class Settings:
         for path in (
             self.data_dir,
             self.data_dir / "artifacts",
+            self.data_dir / "static-cache",
             self.data_dir / "workspaces",
             self.data_dir / "evidence",
             self.data_dir / "reports",

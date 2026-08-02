@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
+import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -45,6 +48,29 @@ class ApkInspector:
         workspace = self.settings.data_dir / "workspaces" / scan_id
         ensure_private_directory(workspace)
         tool_versions = discover_tools(self.runner)
+        artifact_sha256 = self._file_sha256(apk_path)
+        analysis_profile = self._analysis_profile(tool_versions)
+        file_inventory = {
+            **file_inventory,
+            "static_cache_hit": False,
+            "analysis_profile": analysis_profile,
+        }
+        cache_dir = (
+            self.settings.data_dir
+            / "static-cache"
+            / artifact_sha256[:2]
+            / artifact_sha256
+            / analysis_profile
+        )
+        cached = self._restore_static_cache(
+            cache_dir=cache_dir,
+            workspace=workspace,
+            artifact_sha256=artifact_sha256,
+            analysis_profile=analysis_profile,
+            file_inventory=file_inventory,
+        )
+        if cached is not None:
+            return cached
         tool_results: dict[str, dict[str, Any]] = {}
         decoded_dir = workspace / "apktool"
         jadx_dir = workspace / "jadx"
@@ -199,6 +225,23 @@ class ApkInspector:
             encoding="utf-8",
         )
 
+        decompilation = {
+            **decompilation,
+            "cache_hit": False,
+            "analysis_profile": analysis_profile,
+        }
+        if self._static_result_cacheable(tool_results, decompilation):
+            self._publish_static_cache(
+                cache_dir=cache_dir,
+                workspace=workspace,
+                artifact_sha256=artifact_sha256,
+                analysis_profile=analysis_profile,
+                manifest_path=manifest_path,
+                tool_versions=tool_versions,
+                signing=signing,
+                decompilation=decompilation,
+            )
+
         return StaticAnalysisResult(
             manifest=manifest,
             workspace=workspace,
@@ -210,6 +253,168 @@ class ApkInspector:
             decompilation=decompilation,
             code_index=code_index,
         )
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _analysis_profile(tool_versions: dict[str, str | None]) -> str:
+        payload = {
+            "schema_version": "1.0",
+            "code_index_context_version": CODE_INDEX_CONTEXT_VERSION,
+            "tool_versions": {
+                key: value for key, value in tool_versions.items() if key != "adb"
+            },
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def _restore_static_cache(
+        self,
+        *,
+        cache_dir: Path,
+        workspace: Path,
+        artifact_sha256: str,
+        analysis_profile: str,
+        file_inventory: dict[str, Any],
+    ) -> StaticAnalysisResult | None:
+        metadata_path = cache_dir / "metadata.json"
+        index_path = cache_dir / "code_index.json"
+        if not metadata_path.is_file() or not index_path.is_file():
+            return None
+        if any((workspace / name).exists() for name in ("jadx", "apktool", "archive")):
+            return None
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            index_payload = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if (
+            metadata.get("artifact_sha256") != artifact_sha256
+            or metadata.get("analysis_profile") != analysis_profile
+            or index_payload.get("context_version") != CODE_INDEX_CONTEXT_VERSION
+            or not isinstance(index_payload.get("components"), dict)
+        ):
+            return None
+        manifest_relative = metadata.get("manifest_relative_path")
+        if not isinstance(manifest_relative, str):
+            return None
+        cached_manifest = (cache_dir / manifest_relative).resolve()
+        if not cached_manifest.is_relative_to(cache_dir.resolve()) or not cached_manifest.is_file():
+            return None
+        for name in ("jadx", "apktool", "archive"):
+            source = cache_dir / name
+            if source.is_dir():
+                shutil.copytree(source, workspace / name)
+        top_manifest = cache_dir / "AndroidManifest.xml"
+        if top_manifest.is_file():
+            shutil.copy2(top_manifest, workspace / "AndroidManifest.xml")
+        shutil.copy2(index_path, workspace / "code_index.json")
+        workspace_manifest = workspace / manifest_relative
+        if not workspace_manifest.is_file():
+            return None
+        manifest = parse_manifest(workspace_manifest.read_text(encoding="utf-8", errors="replace"))
+        decompilation = {
+            **dict(metadata.get("decompilation") or {}),
+            "cache_hit": True,
+            "analysis_profile": analysis_profile,
+        }
+        searchable_roots = [
+            path
+            for path in (workspace / "jadx", workspace / "apktool", workspace / "archive")
+            if path.is_dir()
+        ]
+        return StaticAnalysisResult(
+            manifest=manifest,
+            workspace=workspace,
+            tool_versions=dict(metadata.get("tool_versions") or {}),
+            tool_results={
+                "static_cache": {
+                    "argv": [],
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "timed_out": False,
+                    "cache_key": f"{artifact_sha256}:{analysis_profile}",
+                }
+            },
+            signing=dict(metadata.get("signing") or {}),
+            file_inventory={
+                **file_inventory,
+                "static_cache_hit": True,
+                "analysis_profile": analysis_profile,
+            },
+            searchable_roots=searchable_roots,
+            decompilation=decompilation,
+            code_index=dict(index_payload["components"]),
+        )
+
+    @staticmethod
+    def _static_result_cacheable(
+        tool_results: dict[str, dict[str, Any]],
+        decompilation: dict[str, Any],
+    ) -> bool:
+        if any(bool(item.get("timed_out")) for item in tool_results.values()):
+            return False
+        return str(decompilation.get("status")) in {
+            "complete_success",
+            "completed_without_java",
+            "not_available",
+        }
+
+    @staticmethod
+    def _publish_static_cache(
+        *,
+        cache_dir: Path,
+        workspace: Path,
+        artifact_sha256: str,
+        analysis_profile: str,
+        manifest_path: Path,
+        tool_versions: dict[str, str | None],
+        signing: dict[str, Any],
+        decompilation: dict[str, Any],
+    ) -> None:
+        if (cache_dir / "metadata.json").is_file():
+            return
+        cache_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = Path(tempfile.mkdtemp(prefix="static-cache-", dir=cache_dir.parent))
+        try:
+            for name in ("jadx", "apktool", "archive"):
+                source = workspace / name
+                if source.is_dir():
+                    shutil.copytree(source, temporary / name)
+            top_manifest = workspace / "AndroidManifest.xml"
+            if top_manifest.is_file():
+                shutil.copy2(top_manifest, temporary / "AndroidManifest.xml")
+            shutil.copy2(workspace / "code_index.json", temporary / "code_index.json")
+            relative_manifest = str(manifest_path.relative_to(workspace))
+            metadata = {
+                "schema_version": "1.0",
+                "artifact_sha256": artifact_sha256,
+                "analysis_profile": analysis_profile,
+                "manifest_relative_path": relative_manifest,
+                "tool_versions": tool_versions,
+                "signing": signing,
+                "decompilation": decompilation,
+            }
+            (temporary / "metadata.json").write_text(
+                json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2),
+                encoding="utf-8",
+            )
+            try:
+                os.replace(temporary, cache_dir)
+            except OSError:
+                if not (cache_dir / "metadata.json").is_file():
+                    raise
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
 
     def _run(self, argv: list[str], budget: TimeBudget | None, timeout_cap: int) -> CommandResult:
         timeout = timeout_cap if budget is None else budget.remaining(timeout_cap)
@@ -231,6 +436,10 @@ class ApkInspector:
         dex_files: list[str] = []
         duplicate_names: list[str] = []
         names_seen: set[str] = set()
+        archive_facts: list[dict[str, Any]] = []
+        security_resources: list[dict[str, Any]] = []
+        security_hash_budget = 128 * 1024 * 1024
+        security_hashed_bytes = 0
         with zipfile.ZipFile(apk_path) as archive:
             infos = archive.infolist()
             if len(infos) > self.settings.max_zip_entries:
@@ -256,6 +465,44 @@ class ApkInspector:
                     native_libraries.append(item.filename)
                 if re.fullmatch(r"classes\d*\.dex", PurePosixPath(item.filename).name):
                     dex_files.append(item.filename)
+                archive_facts.append(
+                    {
+                        "path": item.filename,
+                        "crc32": f"{item.CRC:08x}",
+                        "size": item.file_size,
+                        "compressed_size": item.compress_size,
+                    }
+                )
+            for item in infos:
+                if item.is_dir() or not self._is_security_resource(item.filename):
+                    continue
+                fact: dict[str, Any] = {
+                    "path": item.filename,
+                    "crc32": f"{item.CRC:08x}",
+                    "size": item.file_size,
+                    "compressed_size": item.compress_size,
+                    "content_sha256": None,
+                }
+                if (
+                    item.file_size <= 16 * 1024 * 1024
+                    and security_hashed_bytes + item.file_size <= security_hash_budget
+                ):
+                    digest = hashlib.sha256()
+                    with archive.open(item) as source:
+                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                    fact["content_sha256"] = digest.hexdigest()
+                    security_hashed_bytes += item.file_size
+                security_resources.append(fact)
+                if len(security_resources) >= 4000:
+                    break
+            archive_fingerprint = hashlib.sha256(
+                json.dumps(
+                    sorted(archive_facts, key=lambda value: value["path"]),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
             return {
                 "entry_count": len(infos),
                 "compressed_bytes": apk_path.stat().st_size,
@@ -264,7 +511,36 @@ class ApkInspector:
                 "native_libraries": sorted(native_libraries),
                 "duplicate_names": sorted(set(duplicate_names))[:200],
                 "has_assets": any(name.startswith("assets/") for name in names_seen),
+                "archive_fingerprint": archive_fingerprint,
+                "security_resources": sorted(
+                    security_resources,
+                    key=lambda value: value["path"],
+                ),
+                "security_resource_hash_bytes": security_hashed_bytes,
             }
+
+    @staticmethod
+    def _is_security_resource(name: str) -> bool:
+        path = PurePosixPath(name)
+        suffix = path.suffix.lower()
+        if name == "AndroidManifest.xml" or re.fullmatch(r"classes\d*\.dex", path.name):
+            return True
+        if name.startswith("lib/") and suffix == ".so":
+            return True
+        if name.startswith("res/xml/") or name.startswith("res/raw/"):
+            return True
+        return name.startswith("assets/") and suffix in {
+            ".conf",
+            ".html",
+            ".ini",
+            ".js",
+            ".json",
+            ".properties",
+            ".txt",
+            ".xml",
+            ".yaml",
+            ".yml",
+        }
 
     @staticmethod
     def _plaintext_manifest(apk_path: Path) -> str | None:

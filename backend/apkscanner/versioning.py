@@ -188,6 +188,17 @@ class SecurityEvolutionService:
                 "artifact_sha256": scan.artifact_sha256,
             },
             "entries": sorted(entry_facts, key=lambda item: item["stable_key"]),
+            "static_inventory": {
+                "analysis_profile": (scan.stats or {}).get("analysis_profile"),
+                "archive_fingerprint": (scan.stats or {}).get("archive_fingerprint"),
+                "dex_files": list((scan.stats or {}).get("dex_files") or []),
+                "native_libraries": list(
+                    (scan.stats or {}).get("native_libraries") or []
+                ),
+                "security_resources": list(
+                    (scan.stats or {}).get("security_resources") or []
+                ),
+            },
         }
         hash_payload = {
             "schema_version": payload["schema_version"],
@@ -198,6 +209,7 @@ class SecurityEvolutionService:
                 {key: value for key, value in item.items() if key != "entry_id"}
                 for item in payload["entries"]
             ],
+            "static_inventory": payload["static_inventory"],
         }
         semantic_hash = _digest(hash_payload)
         payload["semantic_hash"] = semantic_hash
@@ -226,6 +238,8 @@ class SecurityEvolutionService:
         scan: Scan,
         snapshot: SecuritySnapshot,
     ) -> VersionDiff | None:
+        if not snapshot.package_name or not snapshot.signer_digest:
+            return None
         history = list(
             session.scalars(
                 select(SecuritySnapshot)
@@ -238,7 +252,21 @@ class SecurityEvolutionService:
                 .order_by(desc(SecuritySnapshot.created_at))
             )
         )
-        baseline = history[0] if history else None
+        same_artifact_history = [
+            item
+            for item in history
+            if (item.payload or {}).get("identity", {}).get("artifact_sha256")
+            == scan.artifact_sha256
+        ]
+        if same_artifact_history:
+            return None
+        history = [
+            item
+            for item in history
+            if (item.payload or {}).get("identity", {}).get("artifact_sha256")
+            != scan.artifact_sha256
+        ]
+        baseline = self._select_baseline(history, snapshot)
         if baseline is None:
             return None
         existing = session.scalar(
@@ -253,6 +281,11 @@ class SecurityEvolutionService:
         target_entries = list((snapshot.payload or {}).get("entries", []))
         mapping = self._map_entries(base_entries, target_entries)
         deltas = self._diff_entries(base_entries, target_entries, mapping)
+        resource_deltas = self._diff_security_resources(
+            dict((baseline.payload or {}).get("static_inventory") or {}),
+            dict((snapshot.payload or {}).get("static_inventory") or {}),
+        )
+        deltas.extend(resource_deltas)
         replay_candidates: list[dict[str, Any]] = []
         seen_replays: set[tuple[str, str, str]] = set()
         for historical in history:
@@ -292,6 +325,7 @@ class SecurityEvolutionService:
                 "target_version_name": snapshot.version_name,
                 "target_version_code": snapshot.version_code,
                 "counts": dict(counts),
+                "resource_delta_count": len(resource_deltas),
                 "replay_candidate_count": len(replay_candidates),
             },
             entry_mapping=mapping,
@@ -301,6 +335,81 @@ class SecurityEvolutionService:
         session.add(diff)
         session.flush()
         return diff
+
+    @staticmethod
+    def _select_baseline(
+        history: list[SecuritySnapshot],
+        target: SecuritySnapshot,
+    ) -> SecuritySnapshot | None:
+        if not history:
+            return None
+
+        def numeric_version(value: str | None) -> int | None:
+            try:
+                return int(str(value))
+            except (TypeError, ValueError):
+                return None
+
+        target_code = numeric_version(target.version_code)
+        if target_code is not None:
+            older = [
+                item
+                for item in history
+                if (code := numeric_version(item.version_code)) is not None
+                and code < target_code
+            ]
+            if older:
+                return max(
+                    older,
+                    key=lambda item: (
+                        numeric_version(item.version_code) or -1,
+                        item.created_at,
+                    ),
+                )
+        return history[0]
+
+    @staticmethod
+    def _diff_security_resources(
+        baseline: dict[str, Any],
+        target: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        old_by_path = {
+            str(item.get("path")): item
+            for item in baseline.get("security_resources", [])
+            if isinstance(item, dict) and item.get("path")
+        }
+        new_by_path = {
+            str(item.get("path")): item
+            for item in target.get("security_resources", [])
+            if isinstance(item, dict) and item.get("path")
+        }
+        deltas: list[dict[str, Any]] = []
+        for path in sorted(old_by_path.keys() | new_by_path.keys()):
+            old = old_by_path.get(path)
+            new = new_by_path.get(path)
+            if old is None:
+                category = "security_resource_added"
+            elif new is None:
+                category = "security_resource_removed"
+            else:
+                old_digest = old.get("content_sha256") or old.get("crc32")
+                new_digest = new.get("content_sha256") or new.get("crc32")
+                if old_digest == new_digest and old.get("size") == new.get("size"):
+                    continue
+                category = "security_resource_changed"
+            deltas.append(
+                {
+                    "surface": "security_resource",
+                    "path": path,
+                    "baseline_entry_id": None,
+                    "target_entry_id": None,
+                    "category": category,
+                    "changes": [category],
+                    "baseline_fingerprint": old,
+                    "target_fingerprint": new,
+                }
+            )
+        return deltas
 
     @staticmethod
     def _map_entries(
@@ -527,6 +636,42 @@ class SecurityEvolutionService:
         for task in tasks:
             for entry_id in task.target_entry_ids:
                 tasks_by_entry.setdefault(entry_id, task)
+        if diff is not None:
+            entry_deltas: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            resource_deltas: list[dict[str, Any]] = []
+            for delta in diff.deltas:
+                target_entry_id = delta.get("target_entry_id")
+                if isinstance(target_entry_id, str):
+                    entry_deltas[target_entry_id].append(delta)
+                elif delta.get("surface") == "security_resource":
+                    resource_deltas.append(delta)
+            for task in tasks:
+                relevant = [
+                    delta
+                    for entry_id in task.target_entry_ids
+                    for delta in entry_deltas.get(entry_id, [])
+                ]
+                if not relevant:
+                    continue
+                task.preconditions = {
+                    **dict(task.preconditions or {}),
+                    "version_diff": relevant[:100],
+                }
+                categories = {str(item.get("category")) for item in relevant}
+                if categories & {"security_weakened", "entry_added"}:
+                    task.priority = max(task.priority, 100)
+                elif "implementation_changed" in categories:
+                    task.priority = max(task.priority, 92)
+            if resource_deltas and tasks:
+                resource_task = next(
+                    (item for item in tasks if item.task_type == "static_review"),
+                    max(tasks, key=lambda item: item.priority),
+                )
+                resource_task.preconditions = {
+                    **dict(resource_task.preconditions or {}),
+                    "security_resource_deltas": resource_deltas[:100],
+                }
+                resource_task.priority = max(resource_task.priority, 94)
         if diff is not None:
             for replay in diff.replay_candidates:
                 task = tasks_by_entry.get(str(replay.get("target_entry_id")))

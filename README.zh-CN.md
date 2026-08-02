@@ -240,6 +240,13 @@ source/control/sink/reachable path/boundary/counterevidence/proof gaps 证据元
 单次扫描唯一的 `occurrence_id`。扫描结束时会生成 `scan.seal` Evidence，对 APK、
 威胁模型、任务结果、Finding、Evidence 与 Coverage 账本做内容摘要，便于比较和审计。
 
+相同 APK 与相同静态工具链会复用内容寻址的 JADX/apktool/archive/代码索引缓存，但不会
+继承旧任务或安全结论。不同版本按 package、签名证书和 versionCode 建立安全语义 Diff，
+优先重放历史 PoC，并对 Manifest、DEX、native library、assets、`res/xml` 和 `res/raw`
+变化重新生成调查种子。完整规则见
+[版本安全演进规范](docs/version-security-evolution.md)，已知目标漏洞的盲测覆盖计划见
+[BlueClaw 检测计划](docs/blueclaw-detection-plan.zh-CN.md)。
+
 ## 环境变量
 
 | 变量 | 默认值 | 用途 |
@@ -278,7 +285,7 @@ source/control/sink/reachable path/boundary/counterevidence/proof gaps 证据元
 | `APKSCANNER_MOBSF_URL` / `APKSCANNER_MOBSF_API_KEY` | 未设置 | 可选 MobSF API |
 | `APKSCANNER_ANDROID_VERSION` | `16` | 报告的动态基线 Android 版本 |
 | `APKSCANNER_ANDROID_API` | `36` | 平台托管 PoC 构建使用的 Android SDK API |
-| `APKSCANNER_DEVICE_MIN_API` / `APKSCANNER_DEVICE_MAX_API` | `21` / `99` | 可接受的云真机 API 范围 |
+| `APKSCANNER_DEVICE_MIN_API` / `APKSCANNER_DEVICE_MAX_API` | `36` / `99` | 可接受的云真机 API 范围；默认只接受 Android 16 及以上 |
 | `APKSCANNER_DEVICE_INSTALL_POLICY` | `install_or_reuse` | 目标安装策略：`replace`、`install_or_reuse` 或 `reuse_installed` |
 | `APKSCANNER_DEVICE_RESET_POLICY` | `per_round` | `per_test`、`per_round` 或 `never`；单条测试可覆盖 |
 | `APKSCANNER_MAX_UPLOAD_BYTES` | 512 MiB | 上传大小限制 |

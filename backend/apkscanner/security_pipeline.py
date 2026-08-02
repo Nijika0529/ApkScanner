@@ -691,6 +691,47 @@ class HypothesisLedger:
                 )
             return receipts
 
+    def task_hypothesis_progress(self, task_id: str) -> dict[str, Any]:
+        """Return proof progress without making one proven claim task-terminal.
+
+        Platform harm receipts are the only facts that close a hypothesis during
+        live exploration. Model verdicts are persisted later by ``finalize`` and
+        must not cause the device loop to skip a different, still-open claim.
+        """
+
+        with self.database.session_factory() as session:
+            hypothesis_ids = list(
+                session.scalars(
+                    select(SecurityHypothesis.id)
+                    .where(SecurityHypothesis.task_id == task_id)
+                    .order_by(SecurityHypothesis.created_at)
+                )
+            )
+            proven_ids = set(
+                session.scalars(
+                    select(ProofAttempt.hypothesis_id).where(
+                        ProofAttempt.task_id == task_id,
+                        ProofAttempt.harm_demonstrated.is_(True),
+                    )
+                )
+            )
+        proven = [item for item in hypothesis_ids if item in proven_ids]
+        unresolved = [item for item in hypothesis_ids if item not in proven_ids]
+        return {
+            "schema_version": "1.0",
+            "total": len(hypothesis_ids),
+            "proven_count": len(proven),
+            "unresolved_count": len(unresolved),
+            "proven_hypothesis_ids": proven,
+            "unresolved_hypothesis_ids": unresolved,
+            "all_platform_proven": bool(hypothesis_ids) and not unresolved,
+        }
+
+    def task_all_hypotheses_proven(self, task_id: str) -> bool:
+        """Return true only when every issued hypothesis has a harm receipt."""
+
+        return bool(self.task_hypothesis_progress(task_id)["all_platform_proven"])
+
     def task_proven_severity(self, task_id: str) -> str | None:
         """Return the strongest persisted severity backed by a platform proof."""
 

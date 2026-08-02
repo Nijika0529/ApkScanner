@@ -116,7 +116,8 @@ class PersistentWorkerClient:
         self,
         *,
         prompt: str,
-        output_schema: dict[str, Any],
+        output_schema: dict[str, Any] | None = None,
+        result_contract: str = "agent_investigation.v1",
         timeout_seconds: int,
         no_event_timeout_seconds: int,
         event_callback: AgentEventCallback | None,
@@ -134,7 +135,8 @@ class PersistentWorkerClient:
                     "request_id": request_id,
                     "session_id": self.session_id,
                     "prompt": prompt,
-                    "output_schema": output_schema,
+                    "result_contract": result_contract,
+                    **({"output_schema": output_schema} if output_schema is not None else {}),
                 }
             )
             try:
@@ -169,6 +171,11 @@ class PersistentWorkerClient:
             result = response.get("result")
             if not isinstance(result, dict):
                 raise PersistentWorkerError("worker turn result is invalid")
+            returned_contract = result.get("result_contract")
+            if returned_contract is not None and returned_contract != result_contract:
+                raise PersistentWorkerError(
+                    "worker returned a result under a different contract"
+                )
             return result
 
     def close(self) -> None:

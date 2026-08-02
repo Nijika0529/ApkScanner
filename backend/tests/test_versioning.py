@@ -267,3 +267,96 @@ def test_proven_finding_becomes_pattern_but_match_stays_candidate(settings) -> N
         assert len(matches) == 1
         assert matches[0].status == "candidate_match"
         assert session.query(Finding).count() == 1
+
+
+def test_version_diff_tracks_security_resources_and_ignores_exact_reruns(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    service = SecurityEvolutionService()
+    with database.session_factory() as session:
+        baseline = _scan("10", "d")
+        baseline.created_at = datetime.now(UTC) - timedelta(seconds=10)
+        baseline.stats = {
+            "analysis_profile": "profile-1",
+            "archive_fingerprint": "old-archive",
+            "security_resources": [
+                {
+                    "path": "assets/security_rules.json",
+                    "size": 10,
+                    "crc32": "11111111",
+                    "content_sha256": "1" * 64,
+                }
+            ],
+        }
+        old_entry = _entry(baseline)
+        session.add_all([baseline, old_entry])
+        session.flush()
+        service.build_snapshot(
+            session,
+            scan=baseline,
+            entries=[old_entry],
+            code_index=_code_index(),
+        )
+
+        target = _scan("11", "e")
+        target.stats = {
+            "analysis_profile": "profile-1",
+            "archive_fingerprint": "new-archive",
+            "security_resources": [
+                {
+                    "path": "assets/security_rules.json",
+                    "size": 12,
+                    "crc32": "22222222",
+                    "content_sha256": "2" * 64,
+                },
+                {
+                    "path": "res/xml/network_security_config.xml",
+                    "size": 20,
+                    "crc32": "33333333",
+                    "content_sha256": "3" * 64,
+                },
+            ],
+        }
+        new_entry = _entry(target)
+        session.add_all([target, new_entry])
+        session.flush()
+        target_snapshot = service.build_snapshot(
+            session,
+            scan=target,
+            entries=[new_entry],
+            code_index=_code_index(),
+        )
+        diff = service.build_version_diff(
+            session,
+            scan=target,
+            snapshot=target_snapshot,
+        )
+        assert diff is not None
+        resource_deltas = [
+            item for item in diff.deltas if item.get("surface") == "security_resource"
+        ]
+        assert {item["category"] for item in resource_deltas} == {
+            "security_resource_added",
+            "security_resource_changed",
+        }
+        assert diff.summary["resource_delta_count"] == 2
+
+        exact_rerun = _scan("11", "e")
+        exact_entry = _entry(exact_rerun)
+        session.add_all([exact_rerun, exact_entry])
+        session.flush()
+        exact_snapshot = service.build_snapshot(
+            session,
+            scan=exact_rerun,
+            entries=[exact_entry],
+            code_index=_code_index(),
+        )
+        assert (
+            service.build_version_diff(
+                session,
+                scan=exact_rerun,
+                snapshot=exact_snapshot,
+            )
+            is None
+        )

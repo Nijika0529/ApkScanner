@@ -8,10 +8,19 @@ import threading
 from contextlib import suppress
 from typing import Any, Literal
 
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    model_validator,
+)
 
 from .agent_events import normalize_codex_notification
 from .codex_runner import CodexInvestigator, codex_config_overrides
+from .schemas import AGENT_RESULT_JSON_SCHEMA
 
 PROTOCOL_VERSION = "3.0"
 _ID = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
@@ -47,7 +56,27 @@ class SessionCommand(BaseCommand):
 
 class TurnCommand(BaseCommand):
     prompt: str = Field(min_length=1, max_length=10_000_000)
-    output_schema: dict[str, Any]
+    result_contract: Literal["agent_investigation.v1", "json_object.v1"] = (
+        "agent_investigation.v1"
+    )
+    output_schema: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def validate_result_contract(self) -> TurnCommand:
+        if self.result_contract == "agent_investigation.v1":
+            if self.output_schema is not None and self.output_schema != AGENT_RESULT_JSON_SCHEMA:
+                raise ValueError(
+                    "agent_investigation.v1 does not accept an arbitrary output schema"
+                )
+        elif not self.output_schema:
+            raise ValueError("json_object.v1 requires an explicit output schema")
+        return self
+
+    def resolved_output_schema(self) -> dict[str, Any]:
+        if self.result_contract == "agent_investigation.v1":
+            return AGENT_RESULT_JSON_SCHEMA
+        assert self.output_schema is not None
+        return self.output_schema
 
 
 class PersistentCodexWorker:
@@ -211,7 +240,7 @@ class PersistentCodexWorker:
                 cwd=config.workspace_path,
                 effort=ReasoningEffort(config.reasoning_effort),
                 model=config.model,
-                output_schema=command.output_schema,
+                output_schema=command.resolved_output_schema(),
                 sandbox=Sandbox.full_access,
             )
             with self.lock:
@@ -249,7 +278,11 @@ class PersistentCodexWorker:
             finally:
                 heartbeat_stop.set()
                 heartbeat.join(timeout=1)
-            parsed = CodexInvestigator._parse_response(turn.final_response)
+            parsed = (
+                CodexInvestigator._parse_response(turn.final_response).model_dump(mode="json")
+                if command.result_contract == "agent_investigation.v1"
+                else CodexInvestigator._parse_json_object(turn.final_response)
+            )
             usage = turn.usage.model_dump(mode="json") if turn.usage else {}
             self.emit(
                 {
@@ -261,7 +294,10 @@ class PersistentCodexWorker:
                     "event": {
                         "event_type": "model.output.validated",
                         "message": "Codex 结构化输出已通过本地校验",
-                        "data": {"turn_id": turn.id},
+                        "data": {
+                            "turn_id": turn.id,
+                            "result_contract": command.result_contract,
+                        },
                     },
                 }
             )
@@ -275,7 +311,8 @@ class PersistentCodexWorker:
                     "result": {
                         "thread_id": self.thread.id,
                         "turn_id": turn.id,
-                        "result": parsed.model_dump(mode="json"),
+                        "result": parsed,
+                        "result_contract": command.result_contract,
                         "usage": usage,
                     },
                 }

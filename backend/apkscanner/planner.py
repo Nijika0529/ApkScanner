@@ -72,8 +72,15 @@ class InvestigationPlan:
 
 
 class InvestigationPlanner:
-    def __init__(self, *, android_version: str, adb_configured: bool):
+    def __init__(
+        self,
+        *,
+        android_version: str,
+        adb_configured: bool,
+        android_api: int = 36,
+    ):
         self.android_version = android_version
+        self.android_api = android_api
         self.adb_configured = adb_configured
 
     def plan(self, scan_id: str, entries: list[EntryPoint]) -> list[InvestigationTask]:
@@ -261,6 +268,8 @@ class InvestigationPlanner:
             ],
             "device_profile": {
                 "android_version": self.android_version,
+                "api_level": self.android_api,
+                "minimum_validation_api": 36,
                 "root_capable": True,
                 "reset_capability": "pm_clear_only",
                 "configured": self.adb_configured,
@@ -359,6 +368,8 @@ class InvestigationPlanner:
             allowed_side_effects=[],
             device_profile={
                 "android_version": self.android_version,
+                "api_level": self.android_api,
+                "minimum_validation_api": 36,
                 "root_capable": False,
                 "reset_capability": "not_applicable",
                 "configured": self.adb_configured,

@@ -560,6 +560,75 @@ def test_platform_proof_result_is_independent_from_model_verdict(settings) -> No
     )
 
 
+def test_one_platform_proof_does_not_close_other_hypotheses(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    entry_id = "00000000-0000-0000-0000-000000000090"
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="multi-hypothesis.apk",
+            artifact_sha256="9" * 64,
+            artifact_path=str(settings.data_dir / "multi-hypothesis.apk"),
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            target_entry_ids=[entry_id],
+            hypotheses=[
+                "External input reaches the first sensitive sink.",
+                "External input independently reaches a second sensitive sink.",
+            ],
+        )
+        session.add_all([scan, task])
+        session.commit()
+
+    ledger = HypothesisLedger(database)
+    hypotheses = ledger.ensure_task_hypotheses(task)
+    proof_id = ledger.plan_proof(
+        task_id=task.id,
+        test_case_id="first-hypothesis-proof",
+        request=AgentRequestedTest(
+            hypothesis_id=hypotheses[0].id,
+            entry_point_id=entry_id,
+            state="guest",
+            uri=None,
+            extras={},
+            rationale="Prove only the first independent sink.",
+        ),
+    )
+    ledger.start_proof(proof_id)
+    ledger.complete_proof(
+        proof_id,
+        [
+            {
+                "id": "probe-first",
+                "kind": "blackbox.probe_app",
+                "exit_code": 0,
+                "metadata": {"request_id": "request-first"},
+            },
+            {
+                "id": "log-first",
+                "kind": "blackbox.logcat",
+                "exit_code": 0,
+                "metadata": {
+                    "request_id": "request-first",
+                    "request_observed": True,
+                    "probe_success": True,
+                    "security_impact_observed": True,
+                },
+            },
+        ],
+    )
+
+    progress = ledger.task_hypothesis_progress(task.id)
+    assert progress["proven_hypothesis_ids"] == [hypotheses[0].id]
+    assert progress["unresolved_hypothesis_ids"] == [hypotheses[1].id]
+    assert progress["all_platform_proven"] is False
+    assert ledger.task_all_hypotheses_proven(task.id) is False
+    assert ledger.task_proof_result(task.id) is not None
+
+
 def test_finalize_closes_each_hypothesis_from_its_own_receipt(settings) -> None:  # noqa: ANN001
     settings.ensure_directories()
     database = Database(settings)

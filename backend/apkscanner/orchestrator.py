@@ -1400,6 +1400,7 @@ class ScanOrchestrator:
                 )
             planner = InvestigationPlanner(
                 android_version=self.settings.device_android_version,
+                android_api=self.settings.device_android_api,
                 adb_configured=self.device_pool.configured,
             )
             investigation_plan = planner.plan_with_decisions(scan.id, entries)
@@ -2162,6 +2163,7 @@ class ScanOrchestrator:
         target_code_context = self._target_code_context(scan_id, entries)
         scope_plan = InvestigationPlanner(
             android_version=self.settings.device_android_version,
+            android_api=self.settings.device_android_api,
             adb_configured=self.device_pool.configured,
         ).plan_with_decisions(scan_id, scan_entries)
         static_closures_by_entry = {
@@ -2392,9 +2394,12 @@ class ScanOrchestrator:
                     },
                     "continuation": continuation_context or None,
                     "threat_model": task_threat_model,
-                    "security_hypotheses": hypothesis_context,
+                    "security_hypotheses": self.hypothesis_ledger.task_context(task_id),
                     "platform_proven_hypotheses": (
                         self.hypothesis_ledger.task_proven_hypotheses(task_id)
+                    ),
+                    "hypothesis_progress": (
+                        self.hypothesis_ledger.task_hypothesis_progress(task_id)
                     ),
                     "candidate_under_review": (None if blind_rescue else candidate_under_review),
                     "critic_scope": (
@@ -2773,7 +2778,7 @@ class ScanOrchestrator:
             if (
                 current_result is None
                 or not self._needs_rescue_review(current_result.result)
-                or self.hypothesis_ledger.task_proof_result(task_id) is not None
+                or self.hypothesis_ledger.task_all_hypotheses_proven(task_id)
                 or phase_counts.get("adversarial_review", 0) > 0
             ):
                 return current_result
@@ -3033,7 +3038,7 @@ class ScanOrchestrator:
                             coverage_gaps.extend(replay_gaps)
 
                     replay_proof_terminal = (
-                        self.hypothesis_ledger.task_proof_result(task_id) is not None
+                        self.hypothesis_ledger.task_all_hypotheses_proven(task_id)
                     )
                     initial_executed_test_count = len(executed_agent_tests)
                     agent_result, agent_error = invoke_agent(
@@ -3045,7 +3050,7 @@ class ScanOrchestrator:
                         agent_result is not None
                         and self._needs_adversarial_review(agent_result.result)
                         and not self._has_requested_test_work(agent_result.result)
-                        and self.hypothesis_ledger.task_proof_result(task_id) is None
+                        and not self.hypothesis_ledger.task_all_hypotheses_proven(task_id)
                         and not budget.expired
                     ):
                         candidate_payload = agent_result.result.model_dump(mode="json")
@@ -3055,7 +3060,10 @@ class ScanOrchestrator:
                             round_index=0,
                         )
                         proof_after_critic = self.hypothesis_ledger.task_proof_result(task_id)
-                        if critic_result is not None and proof_after_critic is None:
+                        proof_terminal_after_critic = (
+                            self.hypothesis_ledger.task_all_hypotheses_proven(task_id)
+                        )
+                        if critic_result is not None and not proof_terminal_after_critic:
                             critic_payload = critic_result.result.model_dump(mode="json")
                             material_objections = list(critic_payload.get("review_objections", []))
                             critic_requested_test_count = len(
@@ -3143,7 +3151,7 @@ class ScanOrchestrator:
                         agent_result is not None
                         and self._needs_adversarial_review(agent_result.result)
                         and not self._has_requested_test_work(agent_result.result)
-                        and self.hypothesis_ledger.task_proof_result(task_id) is None
+                        and not self.hypothesis_ledger.task_all_hypotheses_proven(task_id)
                         and budget.expired
                     ):
                         coverage_gaps.append(
@@ -3154,7 +3162,7 @@ class ScanOrchestrator:
                     while (
                         agent_result
                         and self._has_requested_test_work(agent_result.result)
-                        and self.hypothesis_ledger.task_proof_result(task_id) is None
+                        and not self.hypothesis_ledger.task_all_hypotheses_proven(task_id)
                         and prepared
                         and not budget.expired
                         and completed_rounds < self.settings.agent_max_rounds
@@ -3289,15 +3297,21 @@ class ScanOrchestrator:
                                 }
                                 break
                         completed_rounds += 1
-                        if self.hypothesis_ledger.task_proof_result(task_id) is not None:
+                        if self.hypothesis_ledger.task_all_hypotheses_proven(task_id):
+                            proof_progress = self.hypothesis_ledger.task_hypothesis_progress(
+                                task_id
+                            )
                             self._record_exploration_event(
                                 scan_id,
                                 task_id,
                                 "exploration.proof_terminal",
-                                "平台危害 Oracle 已形成终态，停止追加探索并进入最终结论",
+                                "所有漏洞假设均已获得平台危害回执，停止追加探索并进入最终结论",
                                 {
                                     "source": "platform",
                                     "round_index": completed_rounds,
+                                    "proven_hypothesis_ids": proof_progress[
+                                        "proven_hypothesis_ids"
+                                    ],
                                 },
                             )
                             break
@@ -3320,7 +3334,6 @@ class ScanOrchestrator:
                     if (
                         (len(executed_agent_tests) > initial_executed_test_count or debate_context)
                         and not replay_proof_terminal
-                        and self.hypothesis_ledger.task_proof_result(task_id) is None
                         and not budget.expired
                     ):
                         final_result, final_error = invoke_agent(

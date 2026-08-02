@@ -74,6 +74,18 @@ CODE_RULES = (
         "CWE-200",
     ),
     (
+        "CODE-WEBVIEW-UNIVERSAL-FILE-ACCESS",
+        re.compile(
+            r"setAllowUniversalAccessFromFileURLs\s*\(\s*true|"
+            r"->setAllowUniversalAccessFromFileURLs\(Z\)V"
+        ),
+        "WebView permits universal access from file URLs",
+        "Disable universal file URL access and load local content through WebViewAssetLoader.",
+        "MASVS-PLATFORM",
+        Severity.HIGH,
+        "CWE-200",
+    ),
+    (
         "CODE-TRUST-ALL-TLS",
         re.compile(r"X509TrustManager|ALLOW_ALL_HOSTNAME_VERIFIER|setHostnameVerifier"),
         "Potential custom TLS trust or hostname verification",
@@ -108,6 +120,56 @@ CODE_RULES = (
         "MASVS-CODE",
         Severity.MEDIUM,
         "CWE-78",
+    ),
+    (
+        "CODE-ARCHIVE-EXTRACTION",
+        re.compile(r"ZipInputStream|ZipEntry;->getName|java\.util\.zip\.ZipEntry"),
+        "Archive entry names reach an extraction workflow",
+        "Resolve every output path canonically beneath a dedicated extraction root before writing.",
+        "MASVS-CODE",
+        Severity.MEDIUM,
+        "CWE-22",
+    ),
+    (
+        "CODE-UNTRUSTED-DISPLAY-NAME",
+        re.compile(r"OpenableColumns\.DISPLAY_NAME|[\"']_display_name[\"']"),
+        "External content display names enter a file workflow",
+        "Discard directory components, generate server-side names, and enforce canonical containment.",
+        "MASVS-STORAGE",
+        Severity.MEDIUM,
+        "CWE-22",
+    ),
+    (
+        "CODE-PERSISTED-SECURITY-POLICY",
+        re.compile(
+            r"(?is)(?:risk|policy|rule|grant|approval).{0,240}"
+            r"(?:SharedPreferences|SQLiteDatabase|RoomDatabase)|"
+            r"(?:SharedPreferences|SQLiteDatabase|RoomDatabase).{0,240}"
+            r"(?:risk|policy|rule|grant|approval)"
+        ),
+        "Security policy or approval state is persisted client-side",
+        "Authenticate policy updates, bind approval records to caller and operation fingerprints, and prevent rollback or version lockout.",
+        "MASVS-AUTH",
+        Severity.MEDIUM,
+        "CWE-354",
+    ),
+    (
+        "CODE-EXTERNAL-CONTEXT-SOURCE",
+        re.compile(r"ClipboardManager|->getPrimaryClip\(|WifiInfo;->getSSID\("),
+        "Externally influenced context enters application logic",
+        "Label source trust and prevent clipboard, network labels, files, or notifications from becoming executable instructions.",
+        "MASVS-PLATFORM",
+        Severity.MEDIUM,
+        "CWE-74",
+    ),
+    (
+        "CODE-CLEARTEXT-ENDPOINT",
+        re.compile(r"(?i)(?:http|ws)://(?!127\.0\.0\.1|localhost)[^\s\"']+"),
+        "Code contains a non-local cleartext service endpoint",
+        "Require TLS for production traffic and reject cleartext endpoints in release configuration.",
+        "MASVS-NETWORK",
+        Severity.HIGH,
+        "CWE-319",
     ),
     (
         "CODE-DYNAMIC-RECEIVER",
@@ -152,6 +214,7 @@ STATIC_REVIEW_FAMILIES: dict[str, dict[str, Any]] = {
         "rule_ids": {
             "CODE-WEBVIEW-JS-BRIDGE",
             "CODE-WEBVIEW-FILE-ACCESS",
+            "CODE-WEBVIEW-UNIVERSAL-FILE-ACCESS",
         },
         "title": "WebView content and native bridge trust boundary",
         "severity": Severity.HIGH.value,
@@ -195,8 +258,61 @@ STATIC_REVIEW_FAMILIES: dict[str, dict[str, Any]] = {
             ),
         ],
     },
+    "archive_extraction_boundary": {
+        "rule_ids": {"CODE-ARCHIVE-EXTRACTION"},
+        "title": "Archive extraction and canonical path boundary",
+        "severity": Severity.HIGH.value,
+        "priority": 93,
+        "path_hints": ("zip", "archive", "migration", "transfer", "backup"),
+        "preferred_only": True,
+        "hypotheses": [
+            "An attacker-controlled archive entry name reaches a filesystem output path.",
+            "Canonical containment is absent, incomplete, or checked before a later path transformation.",
+            "A crafted archive can overwrite application-private configuration, code, or another sensitive file.",
+        ],
+    },
+    "external_file_ingress_boundary": {
+        "rule_ids": {"CODE-UNTRUSTED-DISPLAY-NAME"},
+        "title": "External file metadata and destination path boundary",
+        "severity": Severity.HIGH.value,
+        "priority": 95,
+        "path_hints": ("share", "file", "attachment", "import", "provider"),
+        "preferred_only": True,
+        "hypotheses": [
+            "An untrusted ContentProvider controls the display name or relative destination of an imported file.",
+            "Path normalization permits traversal, absolute paths, symlink escape, or overwrite of an existing private file.",
+            "The resulting write can alter sensitive state or feed a later executable/plugin loading path.",
+        ],
+    },
+    "persistent_security_policy_boundary": {
+        "rule_ids": {"CODE-PERSISTED-SECURITY-POLICY"},
+        "title": "Persisted security policy and approval integrity boundary",
+        "severity": Severity.HIGH.value,
+        "priority": 95,
+        "path_hints": ("risk", "policy", "rule", "grant", "approval", "auth"),
+        "preferred_only": True,
+        "hypotheses": [
+            "Locally persisted risk rules, approvals, or authorization state can be replaced without authenticity or rollback protection.",
+            "Caller, tool, arguments, version, and expiry are not cryptographically bound to the persisted decision.",
+            "Tampering can persistently disable enforcement, forge approval, or prevent a legitimate policy update.",
+        ],
+    },
+    "untrusted_context_boundary": {
+        "rule_ids": {"CODE-EXTERNAL-CONTEXT-SOURCE"},
+        "title": "External context trust and agent instruction boundary",
+        "severity": Severity.HIGH.value,
+        "priority": 91,
+        "path_hints": ("clipboard", "context", "wifi", "notification", "agent", "tool"),
+        "preferred_only": True,
+        "hypotheses": [
+            "Clipboard, notification, network label, external file, or remote content enters an Agent context without a trustworthy source label.",
+            "Untrusted context can select or parameterize a more privileged tool outside the initiating request scope.",
+            "The composed flow can disclose private data, create automation, or execute a privileged action without confirmation.",
+        ],
+    },
     "release_configuration_boundary": {
         "rule_ids": {
+            "CODE-CLEARTEXT-ENDPOINT",
             "CODE-NONPRODUCTION-ENDPOINT",
             "CODE-HARDCODED-SECRET",
         },

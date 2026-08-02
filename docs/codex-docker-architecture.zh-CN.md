@@ -115,7 +115,7 @@ Docker 容器共享宿主内核，镜像层在并发扫描间复用。`--memory`
 | Proof Replay | primary 在持有 device lease 时获得任务级 Proof Gateway；Critic/Rescue 不下发 token | 保持平台 Oracle 为唯一黑盒证明准入 | `CURRENT` |
 | PoC/Probe | Agent 写复杂协议 PoC；平台负责构建、签名、安装、执行、Oracle 和清理；简单无参数 Binder 事务由 shell-gated Probe 直接执行并读取 typed reply | 增加 Parcel 参数模板与更多 Oracle 类型 | `CURRENT` |
 | 事件 | notification 已归一化、脱敏；Worker 序列、heartbeat、host-only spool、数据库唯一记录、重放、watchdog 和 crash gap 已实现 | 增加跨进程 occurred/received 时间与运维指标 | `CURRENT` |
-| 结构化结果 | 每次 Turn 有闭合 `output_schema`；兼容提取响应末尾唯一 JSON 后仍执行完整 Pydantic/证据校验 | 增加一次同线程 schema 修复 | `PARTIAL` |
+| 结构化结果 | Worker 使用显式 `result_contract`；调查契约由平台固定 Schema，并在响应末尾 JSON 兼容提取后执行完整 Pydantic/证据校验 | 增加一次同线程 schema 修复 | `CURRENT` |
 | Agent 路由 | 所有 phase 只走 Codex；无 OpenCode/fallback 可执行路径 | 保持历史报告只读兼容 | `CURRENT` |
 | 能力入口 | Manifest Registry 已支持 built-in、SHA-256 固定 Python script 和显式绑定 MCP Adapter | 增加容器 sidecar、schema engine、Evidence mapper 与能力提案审批 | `PARTIAL` |
 | 平台监督 | REST 提供 snapshot、catalog/invoke、Campaign validate/launch 和已有 SSE 事件线 | 增加 SupervisorSession/RBAC、CampaignRun 持久化、MCP 薄适配和幂等键 | `PARTIAL` |
@@ -1896,6 +1896,8 @@ Codex 主路径只有同时满足以下条件才算完成：
 14. `SdkBaseline` 记录 `/work/codex` commit 和 Python runtime 契约；SDK 更新必须经过 Source Gate；
 15. Python/MCP 测试入口只能通过 Capability Registry，能够生成、校验、去重和审计 `TestEntrySeed`；
 16. README、总体架构、配置表、部署和回滚说明与实现一致。
+17. 动态验证设备默认拒绝 API 35 及以下；漏洞、平台缓解和修复结论均记录 Android 16/API 36+ 环境。
+18. 相同 APK 与同一分析工具链复用内容寻址静态缓存；新版本通过安全语义 Diff、历史 PoC 重放和独立当前版本 Proof 判断持续、修复、回归或新增，详见 [版本安全演进规范](version-security-evolution.md)。
 
 ## 28. 参考资料
 

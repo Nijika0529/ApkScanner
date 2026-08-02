@@ -28,6 +28,35 @@ def test_inspector_falls_back_to_plaintext_manifest(settings, fixture_apk) -> No
         assert stat.S_IMODE(result.workspace.stat().st_mode) == 0o700
 
 
+def test_exact_apk_reuses_content_addressed_static_analysis(settings, fixture_apk) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+
+    class NoToolsRunner:
+        @staticmethod
+        def available(_tool: str) -> bool:
+            return False
+
+        @staticmethod
+        def version(_tool: str) -> None:
+            return None
+
+    inspector = ApkInspector(settings, runner=NoToolsRunner())
+
+    first = inspector.inspect(fixture_apk, "scan-cache-source")
+    second = inspector.inspect(fixture_apk, "scan-cache-target")
+
+    assert first.file_inventory.get("static_cache_hit") is not True
+    assert second.file_inventory["static_cache_hit"] is True
+    assert second.decompilation["cache_hit"] is True
+    assert second.manifest.package_name == first.manifest.package_name
+    assert second.code_index == first.code_index
+    assert set(second.tool_results) == {"static_cache"}
+    assert (second.workspace / "archive").is_dir()
+    assert ApkInspector._static_result_cacheable(
+        {"jadx": {"timed_out": False}}, {"status": "partial_timeout"}
+    ) is False
+
+
 def test_inspector_keeps_smali_and_uses_aapt2_manifest_when_oem_resources_fail(
     settings,
     fixture_apk,
@@ -253,6 +282,70 @@ def test_high_value_code_signals_create_bounded_static_review_surfaces(
         and anchor["relationship"] == "inbound_reference"
         for anchor in shell_anchors
     )
+
+
+def test_special_attack_classes_seed_semantic_review_surfaces(tmp_path) -> None:
+    manifest = parse_manifest(
+        """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+        package="com.example.agent"><application /></manifest>"""
+    )
+    root = tmp_path / "jadx"
+    sources = {
+        "com/example/agent/CardWebView.java": (
+            "settings.setAllowUniversalAccessFromFileURLs(true);\n"
+        ),
+        "com/example/agent/ShareImporter.java": (
+            "cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);\n"
+        ),
+        "com/example/agent/BackupRestore.java": (
+            "ZipInputStream input; String name = entry.getName();\n"
+        ),
+        "com/example/agent/RiskPolicyStore.java": (
+            "SharedPreferences preferences; String riskRuleVersion;\n"
+        ),
+        "com/example/agent/ContextCollector.java": (
+            "ClipboardManager clipboard; clipboard.getPrimaryClip();\n"
+        ),
+        "com/example/agent/TraceUploader.java": (
+            'String endpoint = "http://trace.example.test/upload";\n'
+        ),
+    }
+    for relative, content in sources.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    result = StaticAnalysisResult(
+        manifest=manifest,
+        workspace=tmp_path,
+        tool_versions={},
+        tool_results={},
+        signing={},
+        file_inventory={},
+        searchable_roots=[root],
+        decompilation={"status": "complete_success", "output_usable": True},
+        code_index={},
+    )
+
+    engine = BuiltinRuleEngine()
+    findings, _coverage = engine.evaluate(result)
+    rule_ids = {item.rule_id for item in findings}
+    assert {
+        "CODE-WEBVIEW-UNIVERSAL-FILE-ACCESS",
+        "CODE-UNTRUSTED-DISPLAY-NAME",
+        "CODE-ARCHIVE-EXTRACTION",
+        "CODE-PERSISTED-SECURITY-POLICY",
+        "CODE-EXTERNAL-CONTEXT-SOURCE",
+        "CODE-CLEARTEXT-ENDPOINT",
+    } <= rule_ids
+    surfaces = {item.family for item in engine.static_review_surfaces(manifest, findings)}
+    assert {
+        "web_content_boundary",
+        "archive_extraction_boundary",
+        "external_file_ingress_boundary",
+        "persistent_security_policy_boundary",
+        "untrusted_context_boundary",
+        "release_configuration_boundary",
+    } <= surfaces
 
 
 def test_inspector_rejects_zip_path_traversal(settings, tmp_path) -> None:  # noqa: ANN001
