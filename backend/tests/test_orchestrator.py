@@ -16,6 +16,7 @@ from apkscanner.agent_events import AgentCancelledError, AgentRuntimeEvent
 from apkscanner.artifacts import ArtifactStore
 from apkscanner.db import Database
 from apkscanner.models import (
+    AgentRuntimeEventRecord,
     CoverageItem,
     EntryPoint,
     Evidence,
@@ -32,6 +33,64 @@ from apkscanner.reports import ReportBuilder
 from apkscanner.schemas import AgentInvestigationResult
 from apkscanner.tools import CommandResult
 from sqlalchemy import select
+
+
+def test_runtime_event_projection_is_idempotent_across_spool_replay(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    store = ArtifactStore(settings)
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="events.apk",
+            artifact_sha256="e" * 64,
+            artifact_path=str(settings.data_dir / "events.apk"),
+        )
+        task = InvestigationTask(scan=scan, task_type="component", status="running")
+        session.add_all([scan, task])
+        session.commit()
+
+    orchestrator = ScanOrchestrator(settings, database, store)
+    live = AgentRuntimeEvent(
+        event_type="model.turn.started",
+        message="Codex 开始处理本轮探索",
+        data={"turn_id": "turn-1"},
+        session_id="task:a1:primary",
+        protocol_stream_id="stream-1",
+        worker_sequence=3,
+        delivery_source="live",
+        protocol_record_key="task:a1:primary:stream-1:event:3",
+    )
+    replayed = replace(live, delivery_source="spool_replay")
+
+    assert orchestrator._record_agent_runtime_event(
+        scan.id,
+        task.id,
+        live,
+        phase="test_planning",
+        round_index=0,
+        agent_backend="codex",
+    )
+    assert not orchestrator._record_agent_runtime_event(
+        scan.id,
+        task.id,
+        replayed,
+        phase="test_planning",
+        round_index=0,
+        agent_backend="codex",
+    )
+
+    with database.session_factory() as session:
+        records = list(session.scalars(select(AgentRuntimeEventRecord)))
+        events = list(
+            session.scalars(
+                select(ScanEvent).where(ScanEvent.event_type == "exploration.model.turn.started")
+            )
+        )
+    assert len(records) == len(events) == 1
+    assert events[0].data["worker_sequence"] == 3
+    orchestrator.shutdown()
 
 
 def test_blocked_direct_entry_does_not_turn_a_finding_into_false_positive() -> None:
@@ -191,9 +250,7 @@ def test_task_dispatch_runs_one_investigation_at_a_time(settings) -> None:  # no
         persisted_scan = session.get(Scan, scan_id)
         statuses = list(
             session.scalars(
-                select(InvestigationTask.status).where(
-                    InvestigationTask.scan_id == scan_id
-                )
+                select(InvestigationTask.status).where(InvestigationTask.scan_id == scan_id)
             )
         )
     assert persisted_scan is not None
@@ -274,9 +331,7 @@ def test_two_configured_devices_run_two_investigations_concurrently(settings) ->
         persisted_scan = session.get(Scan, scan_id)
         statuses = list(
             session.scalars(
-                select(InvestigationTask.status).where(
-                    InvestigationTask.scan_id == scan_id
-                )
+                select(InvestigationTask.status).where(InvestigationTask.scan_id == scan_id)
             )
         )
     assert persisted_scan is not None
@@ -425,9 +480,7 @@ def test_parallel_workers_share_only_one_device_session(settings) -> None:  # no
         "waiting": [],
     }
     with database.session_factory() as session:
-        persisted = [
-            session.get(InvestigationTask, task_id) for task_id in task_ids
-        ]
+        persisted = [session.get(InvestigationTask, task_id) for task_id in task_ids]
         assert all(task is not None and task.status == "running" for task in persisted)
         assert all(
             (task.result.get("device_queue") or {}).get("released_at")
@@ -529,10 +582,7 @@ def test_device_task_keeps_one_lease_through_agent_investigation(
 
         @staticmethod
         def investigate(**_kwargs):  # noqa: ANN003, ANN205
-            assert (
-                orchestrator.device.scheduler.snapshot()["active_task_id"]
-                == task_id
-            )
+            assert orchestrator.device.scheduler.snapshot()["active_task_id"] == task_id
             device_context = _kwargs["platform_context"]["device"]
             assert device_context["available"] is True
             assert device_context["busy"] is False
@@ -711,26 +761,21 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
                 requested_tests = [request]
             elif phase == "exploration_round":
                 history = context["agent_round_history"]
-                planning = next(
-                    item for item in history if item["phase"] == "test_planning"
-                )
+                planning = next(item for item in history if item["phase"] == "test_planning")
                 validation = planning["test_validation"]
                 assert len(validation["submitted"]) == 1
                 assert validation["accepted"] == []
                 assert validation["executed"] == []
                 if rejection_mode == "platform_policy":
                     assert validation["model_rejected"] == []
-                    assert any(
-                        "outside this task" in gap for gap in validation["gaps"]
-                    )
+                    assert any("outside this task" in gap for gap in validation["gaps"])
                 else:
                     assert len(validation["model_rejected"]) == 1
                     assert validation["model_rejected"][0]["request"]["method"] == (
                         "bindOrTransact"
                     )
                     assert any(
-                        "schema validation failed" in gap
-                        and "only valid for provider call" in gap
+                        "schema validation failed" in gap and "only valid for provider call" in gap
                         for gap in validation["gaps"]
                     )
             elif phase == "rescue_review":
@@ -775,9 +820,155 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
         ]
         assert history[0]["test_validation"]["accepted"] == []
         if rejection_mode == "model_schema":
-            assert len(
-                history[0]["model_validation"]["rejected_requested_tests"]
-            ) == 1
+            assert len(history[0]["model_validation"]["rejected_requested_tests"]) == 1
+
+
+def test_agent_generated_poc_is_built_from_the_docker_session_workspace(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    configured = replace(
+        settings,
+        adb_serial="runtime-workspace-device:5555",
+        codex_enabled=True,
+        agent_max_rounds=1,
+    )
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="runtime-workspace.apk",
+            package_name="com.example.runtime",
+            artifact_sha256="7" * 64,
+            artifact_path=str(configured.data_dir / "runtime-workspace.apk"),
+            stats={"investigator": "codex"},
+        )
+        entry = EntryPoint(
+            scan=scan,
+            kind="activity",
+            name="com.example.runtime.MainActivity",
+            owner_component="com.example.runtime.MainActivity",
+            exported=True,
+        )
+        session.add_all([scan, entry])
+        session.flush()
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="queued",
+            target_entry_ids=[entry.id],
+        )
+        session.add(task)
+        session.commit()
+        scan_id = scan.id
+        task_id = task.id
+        entry_id = entry.id
+
+    orchestrator = ScanOrchestrator(configured, database, ArtifactStore(configured))
+    monkeypatch.setattr(
+        orchestrator.device.runner,
+        "available",
+        lambda executable: executable == "adb",
+    )
+    monkeypatch.setattr(
+        orchestrator.device,
+        "capability",
+        lambda *, non_blocking=False: {"available": True},
+    )
+    monkeypatch.setattr(
+        orchestrator.device,
+        "prepare",
+        lambda *_args, **_kwargs: [
+            ("device.install", CommandResult(["adb", "install"], 0, "", ""), {})
+        ],
+    )
+    monkeypatch.setattr(
+        orchestrator.device,
+        "probe",
+        lambda *_args, **_kwargs: SimpleNamespace(commands=[]),
+    )
+    monkeypatch.setattr(orchestrator.device, "cleanup", lambda _package: [])
+    monkeypatch.setattr(
+        orchestrator,
+        "_validated_agent_payload",
+        lambda payload, _evidence: (payload, "needs_dynamic_proof"),
+    )
+
+    runtime_workspace = configured.data_dir / "agent-sessions" / "runtime-workspace"
+    captured_build_workspaces = []
+
+    class FakeInvestigator:
+        @staticmethod
+        def capability(*, deep=False):  # noqa: ANN001, ANN205
+            return {"available": True, "version": "fake-sdk", "deep": deep}
+
+        @staticmethod
+        def prepare_session_workspace(**_kwargs):  # noqa: ANN003, ANN205
+            runtime_workspace.mkdir(parents=True, exist_ok=True)
+            return runtime_workspace
+
+        @staticmethod
+        def investigate(**kwargs):  # noqa: ANN003, ANN205
+            context = kwargs["platform_context"]
+            hypothesis_id = context["security_hypotheses"][0]["id"]
+            requested_tests = []
+            if context["phase"] == "test_planning":
+                generated = runtime_workspace / "poc" / "generated"
+                generated.mkdir(parents=True, exist_ok=True)
+                (generated / "written-by-agent.txt").write_text("present", encoding="utf-8")
+                requested_tests = [
+                    {
+                        "hypothesis_id": hypothesis_id,
+                        "entry_point_id": entry_id,
+                        "state": "guest",
+                        "uri": None,
+                        "extras": {},
+                        "operation": "auto",
+                        "oracle": {
+                            "kind": "log_contains",
+                            "expected_text": "security_impact_observed",
+                            "impact": "privileged_action",
+                        },
+                        "rationale": "Use the PoC generated in the writable session.",
+                        "poc": {
+                            "project_path": "poc/generated",
+                            "package_name": "io.apkscanner.poc.runtime",
+                            "launch_component": ".MainActivity",
+                            "log_tag": "APKSCANNER_POC",
+                            "timeout_seconds": 30,
+                        },
+                    }
+                ]
+            return SimpleNamespace(
+                thread_id="thread-runtime",
+                turn_id=f"turn-{context['phase']}",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                result=AgentInvestigationResult(
+                    summary="已检查隔离工作区中的动态验证项目。",
+                    result="supported_static",
+                    hypotheses_tested=[hypothesis_id],
+                    test_cases=[],
+                    evidence_ids=[],
+                    severity_proposal="info",
+                    confidence="low",
+                    coverage_gaps=[],
+                    followups=[],
+                    requested_tests=requested_tests,
+                ),
+            )
+
+    def capture_build(*, workspace, **_kwargs):  # noqa: ANN001, ANN202
+        captured_build_workspaces.append(workspace)
+        assert (workspace / "poc" / "generated" / "written-by-agent.txt").is_file()
+        return [], {}, ["capture-only build"]
+
+    orchestrator.investigators["codex"] = FakeInvestigator()
+    monkeypatch.setattr(orchestrator, "_build_requested_pocs", capture_build)
+    orchestrator._run_task(scan_id, task_id, 120)
+
+    assert captured_build_workspaces == [runtime_workspace]
 
 
 def test_blind_rescue_reopens_a_model_negative_before_closure(
@@ -861,9 +1052,7 @@ def test_blind_rescue_reopens_a_model_negative_before_closure(
                         "source": "EntryActivity attacker-controlled extra",
                         "control": "No caller validation",
                         "sink": "InternalDispatcher sensitive action",
-                        "reachable_path": (
-                            "EntryActivity -> RouteHelper -> InternalDispatcher"
-                        ),
+                        "reachable_path": ("EntryActivity -> RouteHelper -> InternalDispatcher"),
                         "boundary": "android_component_export_boundary",
                         "counterevidence": (
                             ["Initial analyst did not follow RouteHelper"]
@@ -878,14 +1067,10 @@ def test_blind_rescue_reopens_a_model_negative_before_closure(
             if phase == "rescue_review":
                 assert context["agent_round_history"] == []
                 assert context["candidate_under_review"] is None
-                assert context["blind_rescue"][
-                    "prior_model_conclusion_withheld"
-                ] is True
+                assert context["blind_rescue"]["prior_model_conclusion_withheld"] is True
             if phase == "rescue_exploration":
                 assert context["rescue"]["strategy"]["result"] == "supported_static"
-                assert context["rescue"][
-                    "prior_model_conclusion_withheld_during_review"
-                ] is True
+                assert context["rescue"]["prior_model_conclusion_withheld_during_review"] is True
             return SimpleNamespace(
                 thread_id=f"thread-{phase}",
                 turn_id=f"turn-{phase}",
@@ -903,9 +1088,7 @@ def test_blind_rescue_reopens_a_model_negative_before_closure(
                     objection_resolutions=[],
                     test_cases=[],
                     evidence_ids=[evidence_id],
-                    severity_proposal=(
-                        "high" if result == "supported_static" else "info"
-                    ),
+                    severity_proposal=("high" if result == "supported_static" else "info"),
                     confidence="high",
                     coverage_gaps=[],
                     followups=(
@@ -936,11 +1119,7 @@ def test_blind_rescue_reopens_a_model_negative_before_closure(
         assert rescue["outcome"] == "negative_closure_reopened"
         assert rescue["candidate_result"] == "refuted_static"
         arguments = list(
-            session.scalars(
-                select(HypothesisArgument).where(
-                    HypothesisArgument.task_id == task_id
-                )
-            )
+            session.scalars(select(HypothesisArgument).where(HypothesisArgument.task_id == task_id))
         )
         assert any(argument.role == "rescuer" for argument in arguments)
         assert not any(argument.role == "critic" for argument in arguments)
@@ -1090,20 +1269,14 @@ def test_positive_debate_is_single_pass_and_arbitrates_only_real_objections(
                     usage={"input_tokens": 1, "output_tokens": 1},
                     result=AgentInvestigationResult(
                         summary="Critic 已完成一次证据审查。",
-                        result=(
-                            "refuted_static"
-                            if critic_objects
-                            else "supported_static"
-                        ),
+                        result=("refuted_static" if critic_objects else "supported_static"),
                         hypotheses_tested=[],
                         hypothesis_assessments=[],
                         review_objections=objections,
                         objection_resolutions=[],
                         test_cases=[],
                         evidence_ids=[cited_id],
-                        severity_proposal=(
-                            "info" if critic_objects else "high"
-                        ),
+                        severity_proposal=("info" if critic_objects else "high"),
                         confidence="high",
                         coverage_gaps=[],
                         followups=[],
@@ -1112,9 +1285,9 @@ def test_positive_debate_is_single_pass_and_arbitrates_only_real_objections(
                 )
             if phase == "final_evaluation":
                 assert critic_objects
-                assert context["debate"]["critic"]["review_objections"][0][
-                    "objection_id"
-                ] == "OBJ-1"
+                assert (
+                    context["debate"]["critic"]["review_objections"][0]["objection_id"] == "OBJ-1"
+                )
                 return SimpleNamespace(
                     thread_id="thread-final",
                     turn_id="turn-final",
@@ -1211,13 +1384,9 @@ def test_positive_debate_is_single_pass_and_arbitrates_only_real_objections(
         policy = completed.result["debate_policy"]
         assert policy["phase_counts"]["adversarial_review"] == 1
         assert policy["phase_counts"].get("rescue_review", 0) == 0
-        assert policy["phase_counts"].get("final_evaluation", 0) == int(
-            critic_objects
-        )
+        assert policy["phase_counts"].get("final_evaluation", 0) == int(critic_objects)
         assert policy["outcome"] == (
-            "arbiter_completed"
-            if critic_objects
-            else "candidate_kept_without_arbiter"
+            "arbiter_completed" if critic_objects else "candidate_kept_without_arbiter"
         )
 
 
@@ -1284,7 +1453,7 @@ def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # no
     source.write_text("class ExportedProvider {}", encoding="utf-8")
     manifest = source.parents[3] / "AndroidManifest.xml"
     manifest.write_text(
-        "<manifest package=\"example\"><application /></manifest>",
+        '<manifest package="example"><application /></manifest>',
         encoding="utf-8",
     )
 
@@ -1329,18 +1498,14 @@ def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # no
     assert first_context["workspace_policy"]["decompiled_roots"] == {
         "container": ["/scan-input/jadx"]
     }
-    assert first_context["evidence"][0]["artifact"] == (
-        f"evidence/{evidence.id}.json"
-    )
+    assert first_context["evidence"][0]["artifact"] == (f"evidence/{evidence.id}.json")
     assert (first / first_context["evidence"][0]["artifact"]).is_file()
     materialized = "target_source/jadx/sources/example/ExportedProvider.java"
-    assert (first / materialized).read_text(encoding="utf-8") == (
-        "class ExportedProvider {}"
-    )
+    assert (first / materialized).read_text(encoding="utf-8") == ("class ExportedProvider {}")
     assert (
-        first_context["platform_context"]["target_code_context"]["components"][0][
-            "anchors"
-        ][0]["materialized_path"]
+        first_context["platform_context"]["target_code_context"]["components"][0]["anchors"][0][
+            "materialized_path"
+        ]
         == materialized
     )
 
@@ -1355,9 +1520,7 @@ def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # no
         [dict(evidence_summary)],
         platform_context=static_context,
     )
-    bounded_context = json.loads(
-        (bounded / "context.json").read_text(encoding="utf-8")
-    )
+    bounded_context = json.loads((bounded / "context.json").read_text(encoding="utf-8"))
     assert bounded.is_relative_to(settings.data_dir / "agent_context" / scan_id)
     assert not bounded.is_relative_to(settings.data_dir / "workspaces" / scan_id)
     assert bounded_context["workspace_policy"]["shared_scan_workspace_exposed"] is True
@@ -1369,13 +1532,13 @@ def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # no
         bounded_context["platform_context"]["bounded_manifest_path"]
         == "target_source/AndroidManifest.xml"
     )
-    assert bounded_context["platform_context"]["bounded_manifest"]["package_name"] == (
-        "example"
-    )
+    assert bounded_context["platform_context"]["bounded_manifest"]["package_name"] == ("example")
     assert (bounded / "target_source/AndroidManifest.xml").is_file()
 
 
-def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(settings, fixture_apk) -> None:  # noqa: ANN001
+def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(
+    settings, fixture_apk
+) -> None:  # noqa: ANN001
     settings.ensure_directories()
     database = Database(settings)
     database.create_all()
@@ -1412,33 +1575,30 @@ def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(setting
         assert seal is not None
         assert seal.kind == "scan.seal"
         assert seal.sha256 == scan.stats["seal"]["sha256"]
-        entries = list(
-            session.scalars(
-                select(EntryPoint).where(EntryPoint.scan_id == scan_id)
-            )
-        )
+        entries = list(session.scalars(select(EntryPoint).where(EntryPoint.scan_id == scan_id)))
         assert len(entries) == 9
         assert sum(entry.kind == "static_surface" for entry in entries) == 1
-        findings = list(
-            session.scalars(select(Finding).where(Finding.scan_id == scan_id))
-        )
+        findings = list(session.scalars(select(Finding).where(Finding.scan_id == scan_id)))
         assert len(findings) >= 5
-        assert all(
-            finding.metadata_json["identity"]["finding_id"] for finding in findings
+        assert all(finding.metadata_json["identity"]["finding_id"] for finding in findings)
+        tasks = list(
+            session.scalars(select(InvestigationTask).where(InvestigationTask.scan_id == scan_id))
         )
-        tasks = list(session.scalars(select(InvestigationTask).where(InvestigationTask.scan_id == scan_id)))
         assert tasks
         assert sum(task.task_type == "static_review" for task in tasks) == 1
         assert {task.status for task in tasks} == {"blocked_device"}
-        assert len(list(session.scalars(select(CoverageItem).where(CoverageItem.scan_id == scan_id)))) >= 16
+        assert (
+            len(list(session.scalars(select(CoverageItem).where(CoverageItem.scan_id == scan_id))))
+            >= 16
+        )
         report = ReportBuilder().build(session, scan)
         sarif = ReportBuilder().sarif(report)
         assert sarif["version"] == "2.1.0"
         assert report["scan"]["limitations"]
         html_report = ReportBuilder().html(report)
-        embedded = html_report.split(
-            '<script type="application/json" id="report-data">', 1
-        )[1].split("</script>", 1)[0]
+        embedded = html_report.split('<script type="application/json" id="report-data">', 1)[
+            1
+        ].split("</script>", 1)[0]
         assert json.loads(embedded)["scan"]["id"] == scan_id
         first_seal_id = seal.id
 
@@ -1514,9 +1674,7 @@ def test_isolated_fresh_run_does_not_load_version_or_pattern_history(
         assert persisted.stats["version_replay_candidate_count"] == 0
         assert persisted.stats["pattern_match_count"] == 0
         event_types = set(
-            session.scalars(
-                select(ScanEvent.event_type).where(ScanEvent.scan_id == scan_id)
-            )
+            session.scalars(select(ScanEvent.event_type).where(ScanEvent.scan_id == scan_id))
         )
         assert "planning.fresh_run.isolated" in event_types
 
@@ -1587,8 +1745,7 @@ def test_manual_continuation_gets_a_fresh_budget_after_scan_deadline(
             filename="late-continuation.apk",
             artifact_sha256="6" * 64,
             artifact_path=str(settings.data_dir / "missing.apk"),
-            created_at=datetime.now(UTC)
-            - timedelta(seconds=settings.scan_deadline_seconds + 60),
+            created_at=datetime.now(UTC) - timedelta(seconds=settings.scan_deadline_seconds + 60),
         )
         task = InvestigationTask(
             scan=scan,
@@ -1616,9 +1773,7 @@ def test_manual_continuation_gets_a_fresh_budget_after_scan_deadline(
     assert dispatched == [(scan_id, task_id, settings.task_timeout_seconds)]
 
 
-def test_orchestrator_persists_audit_evidence_for_every_ai_call(
-    settings, fixture_apk
-) -> None:  # noqa: ANN001
+def test_orchestrator_persists_audit_evidence_for_every_ai_call(settings, fixture_apk) -> None:  # noqa: ANN001
     configured = replace(settings, codex_enabled=True)
     configured.ensure_directories()
     database = Database(configured)
@@ -1649,26 +1804,19 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
             evidence = kwargs["evidence"]
             assert kwargs["platform_context"]["output_language"] == "zh-CN"
             entry_scope = kwargs["platform_context"]["entry_scope"]
-            assert entry_scope["policy"] == (
-                "seed_entry_with_scan_wide_chain_exploration"
-            )
+            assert entry_scope["policy"] == ("seed_entry_with_scan_wide_chain_exploration")
             assert entry_scope["seed_entry_point_ids"] == task.target_entry_ids
-            assert {
-                item["id"] for item in entry_scope["catalog"]
-            } == set(task.target_entry_ids)
-            assert all(
-                item["assigned_seed"] for item in entry_scope["catalog"]
-            )
+            assert {item["id"] for item in entry_scope["catalog"]} == set(task.target_entry_ids)
+            assert all(item["assigned_seed"] for item in entry_scope["catalog"])
             assert all(
                 item["name"] != "com.example.vulnerable.TrustedService"
                 for item in entry_scope["catalog"]
             )
-            representatives = kwargs["platform_context"]["threat_model"][
-                "attack_surface"
-            ]["representative_entries"]
+            representatives = kwargs["platform_context"]["threat_model"]["attack_surface"][
+                "representative_entries"
+            ]
             assert all(
-                item["name"] != "com.example.vulnerable.TrustedService"
-                for item in representatives
+                item["name"] != "com.example.vulnerable.TrustedService" for item in representatives
             )
             code_context = kwargs["platform_context"]["target_code_context"]
             assert code_context["schema_version"] == "1.0"
@@ -1704,25 +1852,23 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
 
     with database.session_factory() as session:
         tasks = list(
-            session.scalars(
-                select(InvestigationTask).where(InvestigationTask.scan_id == scan_id)
-            )
+            session.scalars(select(InvestigationTask).where(InvestigationTask.scan_id == scan_id))
         )
         audit_evidence = list(
             session.scalars(
                 select(Evidence).where(
                     Evidence.scan_id == scan_id,
-                        Evidence.kind.in_(
-                            {
-                                "agent.request",
-                                "agent.events",
-                                "agent.response",
-                                "agent.validation",
-                            }
-                        ),
-                    )
+                    Evidence.kind.in_(
+                        {
+                            "agent.request",
+                            "agent.events",
+                            "agent.response",
+                            "agent.validation",
+                        }
+                    ),
                 )
             )
+        )
         exploration_events = list(
             session.scalars(
                 select(ScanEvent).where(
@@ -1778,8 +1924,7 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
         for finding in proof_backlog
     )
     assert all(
-        finding.metadata_json["proof_backlog"]["automation_state"]
-        == "manual_or_poc_required"
+        finding.metadata_json["proof_backlog"]["automation_state"] == "manual_or_poc_required"
         for finding in proof_backlog
     )
     assert trusted_service is not None
@@ -1787,10 +1932,7 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(
     assert trusted_coverage is not None
     assert trusted_coverage.status == "covered"
     assert trusted_coverage.stages["agent"] == "not_applicable"
-    assert (
-        trusted_coverage.stages["indirect_chain"]
-        == "retained_for_scan_wide_seed_exploration"
-    )
+    assert trusted_coverage.stages["indirect_chain"] == "retained_for_scan_wide_seed_exploration"
     assert "普通第三方应用无法直接调用" in str(trusted_coverage.gap_reason)
     assert len(static_closure_events) == 1
     assert any(
@@ -1867,9 +2009,7 @@ def test_existing_scan_lazily_builds_target_code_context_from_partial_jadx(
     assert context["global_decompilation"]["status"] == "partial_success"
     assert context["components"][0]["status"] == "source_available"
     assert "class PartialProvider" in context["components"][0]["anchors"][0]["content"]
-    assert (
-        settings.data_dir / "workspaces" / scan_id / "code_index.json"
-    ).is_file()
+    assert (settings.data_dir / "workspaces" / scan_id / "code_index.json").is_file()
 
 
 def test_running_agent_is_interrupted_and_audited_as_cancelled(settings) -> None:  # noqa: ANN001
@@ -2005,11 +2145,7 @@ def test_cancellation_after_runtime_registration_is_acknowledged_before_task_loa
                     "requested": True,
                     "acknowledged": False,
                 },
-                **(
-                    {"deletion": {"soft_deleted": True}}
-                    if winning_status == "deleted"
-                    else {}
-                ),
+                **({"deletion": {"soft_deleted": True}} if winning_status == "deleted" else {}),
             }
             session.commit()
         assert orchestrator.request_task_cancellation(task_id) is True
@@ -2098,7 +2234,7 @@ def test_terminal_write_yields_to_cancel_or_delete_without_completion_side_effec
                     hypotheses_tested=[],
                     test_cases=[],
                     evidence_ids=[],
-                        severity_proposal="info",
+                    severity_proposal="info",
                     confidence="low",
                     coverage_gaps=["No device evidence"],
                     followups=[],
@@ -2117,11 +2253,7 @@ def test_terminal_write_yields_to_cancel_or_delete_without_completion_side_effec
                     "requested": True,
                     "acknowledged": False,
                 },
-                **(
-                    {"deletion": {"soft_deleted": True}}
-                    if winning_status == "deleted"
-                    else {}
-                ),
+                **({"deletion": {"soft_deleted": True}} if winning_status == "deleted" else {}),
             }
             session.commit()
 
@@ -2158,9 +2290,7 @@ def test_terminal_write_yields_to_cancel_or_delete_without_completion_side_effec
             is None
         )
         event_types = set(
-            session.scalars(
-                select(ScanEvent.event_type).where(ScanEvent.scan_id == scan_id)
-            )
+            session.scalars(select(ScanEvent.event_type).where(ScanEvent.scan_id == scan_id))
         )
         assert "exploration.conclusion.recorded" not in event_types
         assert "task.completed" not in event_types
@@ -2177,15 +2307,10 @@ def test_terminal_write_yields_to_cancel_or_delete_without_completion_side_effec
             is None
         )
         hypotheses = list(
-            session.scalars(
-                select(SecurityHypothesis).where(SecurityHypothesis.task_id == task_id)
-            )
+            session.scalars(select(SecurityHypothesis).where(SecurityHypothesis.task_id == task_id))
         )
         assert hypotheses
-        assert all(
-            "platform_result" not in hypothesis.metadata_json
-            for hypothesis in hypotheses
-        )
+        assert all("platform_result" not in hypothesis.metadata_json for hypothesis in hypotheses)
 
 
 @pytest.mark.parametrize(
@@ -2313,9 +2438,7 @@ def test_predispatch_cancellation_finishes_coverage_and_audit(settings) -> None:
         assert coverage.status == "partial"
         assert coverage.stages["agent"] == "cancelled"
         event_types = set(
-            session.scalars(
-                select(ScanEvent.event_type).where(ScanEvent.scan_id == scan_id)
-            )
+            session.scalars(select(ScanEvent.event_type).where(ScanEvent.scan_id == scan_id))
         )
         assert {"task.cancelled", "exploration.cancelled"} <= event_types
 
@@ -2602,9 +2725,7 @@ def test_platform_proof_overrides_refuting_arbiter_payload() -> None:
     assert overridden["severity_proposal"] == "high"
     assert overridden["platform_severity"] == "high"
     assert overridden["confidence"] == "high"
-    assert overridden["hypothesis_assessments"][0]["verdict"] == (
-        "reproduced_blackbox"
-    )
+    assert overridden["hypothesis_assessments"][0]["verdict"] == ("reproduced_blackbox")
     assert overridden["hypothesis_assessments"][0]["counterevidence"] == []
     assert overridden["hypothesis_assessments"][0]["proof_gaps"] == []
     assert overridden["objection_resolutions"][0]["disposition"] == "overruled"
@@ -2613,10 +2734,6 @@ def test_platform_proof_overrides_refuting_arbiter_payload() -> None:
 
 def test_negative_model_results_require_blind_rescue_review() -> None:
     for result in ("refuted_static", "not_reproduced"):
-        assert ScanOrchestrator._needs_rescue_review(
-            SimpleNamespace(result=result)
-        )
+        assert ScanOrchestrator._needs_rescue_review(SimpleNamespace(result=result))
     for result in ("supported_static", "reproduced_blackbox"):
-        assert not ScanOrchestrator._needs_rescue_review(
-            SimpleNamespace(result=result)
-        )
+        assert not ScanOrchestrator._needs_rescue_review(SimpleNamespace(result=result))

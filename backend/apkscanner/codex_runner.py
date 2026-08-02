@@ -687,15 +687,22 @@ def codex_config_overrides(
         f"model_providers.{provider}.request_max_retries=2",
         f"model_providers.{provider}.stream_max_retries=2",
         f"model_providers.{provider}.stream_idle_timeout_ms=900000",
-        'shell_environment_policy.inherit="core"',
+        # Codex applies `inherit` before `include_only`.  The ADB/Proof gateway
+        # variables are not part of its built-in `core` set, so `core` would
+        # discard them before the allowlist can retain them.  Its patterns use
+        # shell-style WildMatch (`*`/`?`), not regular expressions.  Start from
+        # the worker environment, permit task tokens through the default secret
+        # filter, then reduce everything to this explicit narrow allowlist.
+        'shell_environment_policy.inherit="all"',
+        "shell_environment_policy.ignore_default_excludes=true",
         (
             "shell_environment_policy.include_only="
-            '["^PATH$","^HOME$","^TMPDIR$","^LANG$","^LC_ALL$","^TERM$",'
-            '"^ANDROID_SERIAL$","^APKSCANNER_ADB_.*$","^APKSCANNER_PROOF_.*$",'
-            '"^HTTP_PROXY$","^HTTPS_PROXY$","^NO_PROXY$"]'
+            '["PATH","HOME","TMPDIR","TMP","TEMP","LANG","LC_ALL","LC_CTYPE",'
+            '"TERM","SHELL","USER","LOGNAME","ANDROID_SERIAL","APKSCANNER_ADB_*",'
+            '"APKSCANNER_PROOF_*","HTTP_PROXY","HTTPS_PROXY","NO_PROXY"]'
         ),
         (
-            'shell_environment_policy.exclude=["^DEEPSEEK_API_KEY$",'
-            '"^OPENAI_API_KEY$","^CODEX_API_KEY$"]'
+            'shell_environment_policy.exclude=["DEEPSEEK_API_KEY",'
+            '"OPENAI_API_KEY","CODEX_API_KEY"]'
         ),
     )

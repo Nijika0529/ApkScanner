@@ -502,6 +502,50 @@ def test_typed_provider_oracle_emits_platform_impact_signal() -> None:
     assert metadata["oracle"]["observation"]["row_count"] == 3
 
 
+def test_typed_binder_reply_oracle_emits_platform_impact_signal() -> None:
+    oracle = AgentOracleSpec(
+        kind="binder_reply",
+        expected_text="service-secret=hunter2",
+        impact="unauthorized_data_access",
+    )
+
+    metadata = AdbDeviceAdapter._evaluate_probe_oracle(
+        oracle,
+        probe_payload={
+            "success": True,
+            "binderTransactReturned": True,
+            "binderReplyType": "string",
+            "binderReply": "service-secret=hunter2",
+        },
+        output="",
+    )
+
+    assert metadata["security_impact_observed"] is True
+    assert metadata["oracle"]["matched"] is True
+    assert metadata["oracle"]["observation"]["actual_text"] == "service-secret=hunter2"
+
+
+def test_binder_reply_claim_requires_successful_platform_transaction() -> None:
+    oracle = AgentOracleSpec(
+        kind="binder_reply",
+        expected_text="service-secret=hunter2",
+        impact="unauthorized_data_access",
+    )
+
+    metadata = AdbDeviceAdapter._evaluate_probe_oracle(
+        oracle,
+        probe_payload={
+            "success": False,
+            "binderTransactReturned": False,
+            "binderReply": "service-secret=hunter2",
+        },
+        output="service-secret=hunter2",
+    )
+
+    assert metadata["security_impact_observed"] is False
+    assert metadata["oracle"]["matched"] is False
+
+
 def test_typed_provider_oracle_accepts_correlated_poc_row_count() -> None:
     oracle = AgentOracleSpec(
         kind="provider_rows",
@@ -767,6 +811,14 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
         expected_text="Imported secret",
         impact="unauthorized_data_access",
     )
+    logcat_poll_timeouts = []
+    original_poll_poc_logcat = adapter._poll_poc_logcat
+
+    def capture_poll_poc_logcat(**kwargs):  # noqa: ANN003, ANN202
+        logcat_poll_timeouts.append(kwargs["timeout_seconds"])
+        return original_poll_poc_logcat(**kwargs)
+
+    monkeypatch.setattr(adapter, "_poll_poc_logcat", capture_poll_poc_logcat)
 
     result = adapter.execute_poc(
         apk,
@@ -779,6 +831,7 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
     )
     by_kind = {kind: metadata for kind, _command_result, metadata in result.commands}
 
+    assert logcat_poll_timeouts == [1]
     assert by_kind["blackbox.poc_logcat"]["poc_success"] is True
     assert by_kind["blackbox.poc_logcat"]["poc_claimed_security_impact"] is True
     assert by_kind["blackbox.device_profile"]["device_api"] == "33"
@@ -835,7 +888,7 @@ def test_ui_hierarchy_retry_recovers_from_android_null_root(
     result, attempts = adapter._dump_ui_hierarchy_with_retry(budget=None, cap=10)
 
     assert result.exit_code == 0
-    assert "text=\"ready\"" in result.stdout
+    assert 'text="ready"' in result.stdout
     assert attempts == 2
 
 
@@ -1117,4 +1170,34 @@ def test_activity_deep_link_probe_preserves_uri_and_expected_component() -> None
         "component": "com.example.LinkActivity",
         "uri": "example://open/path?source=test",
         "extras": {":settings:fragment_args_key": "privacy"},
+    }
+
+
+def test_service_probe_serializes_binder_transaction_parameters() -> None:
+    entry = EntryPoint(
+        id="11111111-1111-1111-1111-111111111111",
+        scan_id="scan",
+        kind="service",
+        name="io.apkscanner.vulntest.CommandService",
+        owner_component="io.apkscanner.vulntest.CommandService",
+        exported=True,
+    )
+
+    request = AdbDeviceAdapter._probe_request(
+        entry,
+        "io.apkscanner.vulntest",
+        operation="binder_transact",
+        binder_transaction_code=1,
+        binder_reply_type="string",
+        binder_read_exception=True,
+    )
+
+    assert request == {
+        "kind": "service",
+        "package": "io.apkscanner.vulntest",
+        "component": "io.apkscanner.vulntest.CommandService",
+        "operation": "binder_transact",
+        "binder_transaction_code": 1,
+        "binder_reply_type": "string",
+        "binder_read_exception": True,
     }

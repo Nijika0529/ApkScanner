@@ -17,7 +17,13 @@ import json
 import sys
 import time
 
-print(json.dumps({"type":"worker.ready","protocol_version":"3.0"}), flush=True)
+sequence = 0
+def emit(value):
+    global sequence
+    sequence += 1
+    print(json.dumps({"sequence":sequence, **value}), flush=True)
+
+emit({"type":"worker.ready","protocol_version":"3.0"})
 thread_id = None
 turn_index = 0
 for line in sys.stdin:
@@ -26,31 +32,31 @@ for line in sys.stdin:
     request_id = command["request_id"]
     if kind in {"session.open", "session.resume"}:
         thread_id = command.get("thread_id") or "thread-persistent"
-        print(json.dumps({
+        emit({
             "type":"session.opened", "request_id":request_id,
             "thread_id":thread_id
-        }), flush=True)
+        })
     elif kind == "turn.start":
         turn_index += 1
-        print(json.dumps({
+        emit({
             "type":"event", "request_id":request_id,
             "event":{"event_type":"model.turn.started","message":"started","data":{}}
-        }), flush=True)
+        })
         if command["prompt"] == "block":
             time.sleep(30)
         else:
-            print(json.dumps({
+            emit({
                 "type":"turn.result", "request_id":request_id,
                 "result":{"thread_id":thread_id,"turn_id":f"turn-{turn_index}",
                 "result":{"result":"no_issue"},"usage":{}}
-            }), flush=True)
+            })
     elif kind == "turn.interrupt":
-        print(json.dumps({
+        emit({
             "type":"turn.error", "request_id":command["turn_request_id"],
             "error":{"detail":"interrupted"}
-        }), flush=True)
+        })
     elif kind == "session.close":
-        print(json.dumps({"type":"session.closed","request_id":request_id}), flush=True)
+        emit({"type":"session.closed","request_id":request_id})
     elif kind == "worker.shutdown":
         break
 """
@@ -127,3 +133,137 @@ def test_persistent_worker_cancellation_interrupts_or_kills_session(tmp_path: Pa
             )
     finally:
         client.kill()
+
+
+def test_replacement_worker_replays_prior_spool_events_once(tmp_path: Path) -> None:
+    first = _client(tmp_path)
+    first.open_session(configuration={}, gateway_environment={})
+    first.turn(
+        prompt="first",
+        output_schema={},
+        timeout_seconds=5,
+        no_event_timeout_seconds=5,
+        event_callback=None,
+        cancel_event=None,
+    )
+    first.close()
+
+    recovered = []
+    replacement = _client(tmp_path)
+    try:
+        replacement.open_session(configuration={}, gateway_environment={})
+        replacement.turn(
+            prompt="replacement",
+            output_schema={},
+            timeout_seconds=5,
+            no_event_timeout_seconds=5,
+            event_callback=recovered.append,
+            cancel_event=None,
+        )
+    finally:
+        replacement.close()
+
+    assert [event.delivery_source for event in recovered] == ["spool_replay", "live"]
+    assert recovered[0].protocol_stream_id != recovered[1].protocol_stream_id
+    assert len({event.protocol_record_key for event in recovered}) == 2
+
+
+def test_spool_replay_emits_explicit_worker_sequence_gap(tmp_path: Path) -> None:
+    spool = tmp_path / "events.ndjson"
+    records = [
+        {
+            "recorded_at": 1.0,
+            "session_id": "task:a1:primary",
+            "stream_id": "crashed-stream",
+            "worker_sequence": 1,
+            "envelope": {
+                "type": "worker.ready",
+                "protocol_version": "3.0",
+                "sequence": 1,
+            },
+        },
+        {
+            "recorded_at": 2.0,
+            "session_id": "task:a1:primary",
+            "stream_id": "crashed-stream",
+            "worker_sequence": 3,
+            "envelope": {
+                "type": "event",
+                "sequence": 3,
+                "event": {
+                    "event_type": "model.turn.completed",
+                    "message": "completed",
+                    "data": {},
+                },
+            },
+        },
+    ]
+    spool.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    events = []
+    client = _client(tmp_path)
+    try:
+        client.open_session(configuration={}, gateway_environment={})
+        client.turn(
+            prompt="recover-gap",
+            output_schema={},
+            timeout_seconds=5,
+            no_event_timeout_seconds=5,
+            event_callback=events.append,
+            cancel_event=None,
+        )
+    finally:
+        client.close()
+
+    gap = next(event for event in events if event.event_type == "event.gap")
+    assert gap.delivery_source == "spool_replay"
+    assert gap.data["reason"] == "worker_sequence_gap"
+    assert gap.data["missing_from"] == gap.data["missing_to"] == 2
+
+
+def test_spool_replay_marks_a_dispatched_turn_without_terminal_envelope(tmp_path: Path) -> None:
+    spool = tmp_path / "events.ndjson"
+    spool.write_text(
+        json.dumps(
+            {
+                "recorded_at": 1.0,
+                "session_id": "task:a1:primary",
+                "stream_id": "crashed-stream",
+                "direction": "host",
+                "worker_sequence": None,
+                "envelope": {
+                    "type": "turn.start",
+                    "request_id": "lost-turn",
+                    "session_id": "task:a1:primary",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    events = []
+    client = _client(tmp_path)
+    try:
+        client.open_session(configuration={}, gateway_environment={})
+        client.turn(
+            prompt="recover-incomplete",
+            output_schema={},
+            timeout_seconds=5,
+            no_event_timeout_seconds=5,
+            event_callback=events.append,
+            cancel_event=None,
+        )
+    finally:
+        client.close()
+
+    gap = next(
+        event
+        for event in events
+        if event.event_type == "event.gap" and event.data["reason"] == "incomplete_turn"
+    )
+    assert "lost-turn" in gap.data["detail"]
+    assert gap.protocol_stream_id == "crashed-stream"

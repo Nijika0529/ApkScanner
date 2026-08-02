@@ -410,3 +410,31 @@ class ScanEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     scan: Mapped[Scan] = relationship(back_populates="events")
+
+
+class AgentRuntimeEventRecord(Base):
+    """Idempotency ledger for live and spool-recovered Agent runtime events."""
+
+    __tablename__ = "agent_runtime_event_records"
+    __table_args__ = (
+        UniqueConstraint("record_key", name="uq_agent_runtime_event_record_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scan_id: Mapped[str] = mapped_column(
+        ForeignKey("scans.id", ondelete="CASCADE"),
+        index=True,
+    )
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("investigation_tasks.id", ondelete="CASCADE"),
+        index=True,
+    )
+    session_id: Mapped[str] = mapped_column(String(512), index=True)
+    protocol_stream_id: Mapped[str] = mapped_column(String(64), index=True)
+    worker_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    record_key: Mapped[str] = mapped_column(String(768), unique=True)
+    event_type: Mapped[str] = mapped_column(String(128), index=True)
+    message: Mapped[str] = mapped_column(Text)
+    data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    delivery_source: Mapped[str] = mapped_column(String(32), default="live", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

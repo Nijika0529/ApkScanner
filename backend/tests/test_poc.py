@@ -52,6 +52,32 @@ def test_live_proof_replay_requires_an_explicit_hypothesis() -> None:
         )
 
 
+def test_live_proof_replay_accepts_platform_binder_transaction_without_poc() -> None:
+    replay = AgentProofReplay(
+        hypothesis_id="11111111-2222-4333-8444-555555555555",
+        entry_point_id="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        operation="binder_transact",
+        binder_transaction_code=1,
+        binder_reply_type="string",
+        oracle=AgentOracleSpec(
+            kind="binder_reply",
+            expected_text="service-secret=hunter2",
+            impact="unauthorized_data_access",
+        ),
+        rationale="Read the exported Service reply through the platform Probe.",
+    )
+
+    assert replay.poc is None
+    assert replay.binder_read_exception is True
+
+    with pytest.raises(ValueError, match="requires poc"):
+        AgentProofReplay(
+            hypothesis_id=replay.hypothesis_id,
+            oracle=AgentOracleSpec(),
+            rationale="A non-Binder replay still needs an ordinary-app PoC.",
+        )
+
+
 def test_embedded_live_proof_endpoint_rejects_an_unregistered_task(settings) -> None:  # noqa: ANN001
     settings.ensure_directories()
     database = Database(settings)
@@ -202,7 +228,7 @@ def test_poc_builder_enforces_the_runtime_result_protocol(
         builder._validate_project(workspace, poc_spec(), oracle=oracle)
 
     source.write_text(
-        r'''package io.apkscanner.poc.providerprobe;
+        r"""package io.apkscanner.poc.providerprobe;
 public final class MainActivity extends android.app.Activity {
   void report(int rows) {
     String requestId = getIntent().getStringExtra("apkscanner_request_id");
@@ -210,7 +236,7 @@ public final class MainActivity extends android.app.Activity {
       + "\",\"success\":true,\"security_impact_observed\":true,\"row_count\":"
       + rows + "}");
   }
-}''',
+}""",
         encoding="utf-8",
     )
 
@@ -219,6 +245,28 @@ public final class MainActivity extends android.app.Activity {
         poc_spec(),
         oracle=oracle,
     )
+    assert validated == project
+
+
+def test_poc_builder_allows_platform_owned_ui_oracle_without_poc_self_report(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = write_poc_project(workspace)
+    builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
+
+    validated, *_rest = builder._validate_project(
+        workspace,
+        poc_spec(),
+        oracle=AgentOracleSpec(
+            kind="ui_text",
+            expected_text="target-owned secret",
+            impact="unauthorized_data_access",
+        ),
+    )
+
     assert validated == project
 
 
@@ -276,9 +324,7 @@ def test_poc_builder_uses_safe_manifest_package_as_source_of_truth(
     workspace.mkdir()
     write_poc_project(workspace)
     builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
-    mismatched = poc_spec().model_copy(
-        update={"package_name": "io.apkscanner.poc.modelguess"}
-    )
+    mismatched = poc_spec().model_copy(update={"package_name": "io.apkscanner.poc.modelguess"})
 
     _project, _sources, _manifest, effective = builder._validate_project(
         workspace,
@@ -311,19 +357,14 @@ package="io.apkscanner.poc.providerprobe">
         encoding="utf-8",
     )
     builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
-    mismatched = poc_spec().model_copy(
-        update={"launch_component": ".ModelGuessActivity"}
-    )
+    mismatched = poc_spec().model_copy(update={"launch_component": ".ModelGuessActivity"})
 
     _project, _sources, _manifest, effective = builder._validate_project(
         workspace,
         mismatched,
     )
 
-    assert (
-        effective.launch_component
-        == "io.apkscanner.poc.providerprobe.MainActivity"
-    )
+    assert effective.launch_component == "io.apkscanner.poc.providerprobe.MainActivity"
 
 
 def test_poc_builder_repairs_manifest_launcher_to_match_java_activity(
@@ -353,9 +394,7 @@ public final class MainActivity extends android.app.Activity {}""",
         package_name=effective.package_name,
         launch_component=effective.launch_component,
     )
-    activity = ElementTree.parse(built_manifest).getroot().find(
-        "application/activity"
-    )
+    activity = ElementTree.parse(built_manifest).getroot().find("application/activity")
 
     assert effective.launch_component == "io.apkscanner.poc.actual.MainActivity"
     assert activity is not None
@@ -396,10 +435,7 @@ android:exported="true">
     )
 
     assert effective.package_name == "io.apkscanner.poc.commandservice"
-    assert (
-        effective.launch_component
-        == "io.apkscanner.poc.providerprobe.MainActivity"
-    )
+    assert effective.launch_component == "io.apkscanner.poc.providerprobe.MainActivity"
 
 
 def test_poc_builder_uses_unique_java_log_tag_as_source_of_truth(
@@ -491,12 +527,7 @@ package="io.apkscanner.poc.providerprobe">
     activity = root.find("application/activity")
     assert root.find("queries") is not None
     assert activity is not None
-    assert (
-        activity.get(
-            "{http://schemas.android.com/apk/res/android}exported"
-        )
-        == "true"
-    )
+    assert activity.get("{http://schemas.android.com/apk/res/android}exported") == "true"
 
 
 def test_source_build_adds_target_visibility_without_overwriting_agent_queries(
@@ -525,13 +556,13 @@ package="io.apkscanner.poc.providerprobe">
     namespace = "{http://schemas.android.com/apk/res/android}"
     queries = root.find("queries")
     assert queries is not None
-    assert {
-        node.get(f"{namespace}name") for node in queries.findall("package")
-    } == {"io.existing.visible", "io.apkscanner.vulntest"}
-    assert {
-        node.get(f"{namespace}authorities")
-        for node in queries.findall("provider")
-    } == {"io.apkscanner.vulntest.secrets"}
+    assert {node.get(f"{namespace}name") for node in queries.findall("package")} == {
+        "io.existing.visible",
+        "io.apkscanner.vulntest",
+    }
+    assert {node.get(f"{namespace}authorities") for node in queries.findall("provider")} == {
+        "io.apkscanner.vulntest.secrets"
+    }
 
 
 def test_source_build_normalizes_manifest_sdk_values(tmp_path) -> None:
@@ -605,7 +636,7 @@ def test_source_build_makes_fallback_request_id_effectively_final(
 
     text = normalized[0].read_text(encoding="utf-8")
     assert "String requestIdCandidate = getIntentValue();" in text
-    assert "requestIdCandidate = \"unknown\";" in text
+    assert 'requestIdCandidate = "unknown";' in text
     assert "final String requestId = requestIdCandidate;" in text
 
 
@@ -648,9 +679,7 @@ def test_poc_builder_sorts_build_tools_as_versions_and_honors_pin(
 
     pinned = replace(configured, android_build_tools_version="9.0.0")
     pinned_builder = PocBuilder(pinned, ToolRunner(), ArtifactStore(pinned))
-    assert pinned_builder._tool_candidates("aapt2") == [
-        sdk / "build-tools" / "9.0.0" / "aapt2"
-    ]
+    assert pinned_builder._tool_candidates("aapt2") == [sdk / "build-tools" / "9.0.0" / "aapt2"]
 
 
 def test_poc_sdk_roles_are_separate_and_legacy_dx_raises_minimum(
@@ -739,8 +768,7 @@ def test_poc_builder_retries_only_aapt2_resource_table_compatibility_errors(
                     argv,
                     1,
                     "",
-                    "LoadedArsc.cpp:94 RES_TABLE_TYPE_TYPE entry offsets "
-                    "overlap actual entry data",
+                    "LoadedArsc.cpp:94 RES_TABLE_TYPE_TYPE entry offsets overlap actual entry data",
                 )
             if argv[0] == str(second):
                 return CommandResult(argv, 0, "", "")
@@ -813,9 +841,7 @@ def test_personal_lab_ingests_an_agent_built_prebuilt_apk(
         },
     )
     monkeypatch.setattr(builder, "_required_tool", lambda name: name)
-    spec = poc_spec().model_copy(
-        update={"prebuilt_apk_path": "poc/provider_probe/build/probe.apk"}
-    )
+    spec = poc_spec().model_copy(update={"prebuilt_apk_path": "poc/provider_probe/build/probe.apk"})
 
     result = builder.build(workspace, spec)
 
@@ -980,20 +1006,20 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
         build_attempts += 1
         captured.extend(requests)
         if build_attempts == 1:
-            return [], {}, [
-                "PoC source validation failed: missing structured runtime result"
-            ]
-        return requests, {
-            orchestrator._poc_request_key(requests[0]): (
-                changed_artifact if build_attempts >= 3 else artifact
-            )
-        }, []
+            return [], {}, ["PoC source validation failed: missing structured runtime result"]
+        return (
+            requests,
+            {
+                orchestrator._poc_request_key(requests[0]): (
+                    changed_artifact if build_attempts >= 3 else artifact
+                )
+            },
+            [],
+        )
 
     def execute(**kwargs):  # noqa: ANN003, ANN202
         replay_devices.append(kwargs["device"].serial)
-        kwargs["evidence_summaries"].append(
-            {"id": "evidence-live", "kind": "blackbox.poc_logcat"}
-        )
+        kwargs["evidence_summaries"].append({"id": "evidence-live", "kind": "blackbox.poc_logcat"})
         return [{"test_case_id": "agent-r1-1"}], []
 
     monkeypatch.setattr(orchestrator, "_build_requested_pocs", build)
@@ -1001,11 +1027,7 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
     monkeypatch.setattr(
         orchestrator.hypothesis_ledger,
         "task_proven_hypotheses",
-        lambda _task_id: (
-            {hypothesis.id: ["evidence-live"]}
-            if len(replay_devices) >= 2
-            else {}
-        ),
+        lambda _task_id: {hypothesis.id: ["evidence-live"]} if len(replay_devices) >= 2 else {},
     )
     evidence: list[dict] = []
     context = _LiveProofContext(
@@ -1045,9 +1067,7 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
         rationale="Replay the final working ordinary-app PoC.",
     )
 
-    context.hypotheses[0]["claim"] = (
-        "A third-party application can launch the activity."
-    )
+    context.hypotheses[0]["claim"] = "A third-party application can launch the activity."
     with pytest.raises(ValueError, match="reachability-only"):
         orchestrator.execute_live_proof_replay(
             task_id,
@@ -1084,25 +1104,17 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
             task_id,
             "secret-token",
             replay.model_copy(
-                update={
-                    "oracle": replay.oracle.model_copy(update={"impact": "none"})
-                }
+                update={"oracle": replay.oracle.model_copy(update={"impact": "none"})}
             ),
         )
-    rejected = orchestrator.execute_live_proof_replay(
-        task_id, "secret-token", replay
-    )
-    inconclusive = orchestrator.execute_live_proof_replay(
-        task_id, "secret-token", replay
-    )
+    rejected = orchestrator.execute_live_proof_replay(task_id, "secret-token", replay)
+    inconclusive = orchestrator.execute_live_proof_replay(task_id, "secret-token", replay)
     package_only = orchestrator.execute_live_proof_replay(
         task_id,
         "secret-token",
         replay.model_copy(
             update={
-                "poc": replay.poc.model_copy(
-                    update={"package_name": "io.apkscanner.poc.renamed"}
-                )
+                "poc": replay.poc.model_copy(update={"package_name": "io.apkscanner.poc.renamed"})
             }
         ),
     )
@@ -1114,12 +1126,8 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
             )
         }
     )
-    first = orchestrator.execute_live_proof_replay(
-        task_id, "secret-token", working_replay
-    )
-    second = orchestrator.execute_live_proof_replay(
-        task_id, "secret-token", working_replay
-    )
+    first = orchestrator.execute_live_proof_replay(task_id, "secret-token", working_replay)
+    second = orchestrator.execute_live_proof_replay(task_id, "secret-token", working_replay)
     unrelated_hypothesis_id = "11111111-2222-4333-8444-555555555555"
     context.hypotheses.append(
         {
@@ -1145,9 +1153,7 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
         task_id,
         "secret-token",
         working_replay.model_copy(
-            update={
-                "rationale": "Try one more materially different replay after the budget."
-            }
+            update={"rationale": "Try one more materially different replay after the budget."}
         ),
     )
 
@@ -1165,20 +1171,19 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
     assert replay_devices == ["device-b", "device-b"]
     assert first["evidence_ids"] == ["evidence-live"]
     assert first["deduplicated"] is False
-    first_unsigned = {
-        key: value
-        for key, value in first.items()
-        if key != "receipt_signature"
-    }
-    assert first["receipt_signature"] == hmac.new(
-        b"secret-token",
-        json.dumps(
-            first_unsigned,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode(),
-        hashlib.sha256,
-    ).hexdigest()
+    first_unsigned = {key: value for key, value in first.items() if key != "receipt_signature"}
+    assert (
+        first["receipt_signature"]
+        == hmac.new(
+            b"secret-token",
+            json.dumps(
+                first_unsigned,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode(),
+            hashlib.sha256,
+        ).hexdigest()
+    )
     assert second["deduplicated"] is True
     assert unrelated["result"] == "inconclusive"
     assert unrelated["executed"] is False
@@ -1279,9 +1284,7 @@ def test_live_proof_evidence_is_immediately_materialized(
     artifact = workspace / summary["artifact"]
     assert artifact.is_file()
     assert "proof output" in artifact.read_text(encoding="utf-8")
-    materialized = json.loads(
-        (workspace / "context.json").read_text(encoding="utf-8")
-    )
+    materialized = json.loads((workspace / "context.json").read_text(encoding="utf-8"))
     assert materialized["evidence"][0]["id"] == evidence_id
     assert materialized["evidence"][0]["artifact"] == summary["artifact"]
 
@@ -1342,9 +1345,7 @@ def test_poc_execution_is_correlated_into_the_hypothesis_proof(
     monkeypatch.setattr(
         orchestrator.device,
         "reset_session",
-        lambda *_args, **_kwargs: [
-            ("device.clear", CommandResult(["adb"], 0, "", ""), {})
-        ],
+        lambda *_args, **_kwargs: [("device.clear", CommandResult(["adb"], 0, "", ""), {})],
     )
     monkeypatch.setattr(
         orchestrator.device,

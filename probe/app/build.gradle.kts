@@ -8,11 +8,11 @@ android {
 
     defaultConfig {
         applicationId = "io.apkscanner.probe"
-        // Probe identity validation uses BroadcastReceiver.getSentFromUid().
-        minSdk = 36
+        // The receiver requires android.permission.DUMP, held by adb shell but not ordinary apps.
+        minSdk = 26
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.3.0"
     }
 
     buildTypes {

@@ -648,6 +648,10 @@ class AdbDeviceAdapter:
         operation: str = "auto",
         method: str | None = None,
         argument: str | None = None,
+        binder_transaction_code: int | None = None,
+        binder_interface_descriptor: str | None = None,
+        binder_reply_type: str | None = None,
+        binder_read_exception: bool | None = None,
         intent_action: str | None = None,
         categories: list[str] | None = None,
         oracle: AgentOracleSpec | None = None,
@@ -678,6 +682,10 @@ class AdbDeviceAdapter:
                     operation=operation,
                     method=method,
                     argument=argument,
+                    binder_transaction_code=binder_transaction_code,
+                    binder_interface_descriptor=binder_interface_descriptor,
+                    binder_reply_type=binder_reply_type,
+                    binder_read_exception=binder_read_exception,
                     intent_action=intent_action,
                     categories=categories,
                 )
@@ -756,16 +764,11 @@ class AdbDeviceAdapter:
                     )
                 )
             if probe_request:
-                log_result = self._adb_budget(
-                    ["logcat", "-d", "-t", "300", "-s", "APKSCANNER_PROBE:I"],
-                    budget,
-                    60,
+                log_result, matching_log, poll_attempts, poll_seconds = self._poll_probe_logcat(
+                    request_id=str(request_id),
+                    timeout_seconds=15,
+                    budget=budget,
                 )
-                matching_log = [
-                    line
-                    for line in log_result.stdout.splitlines()
-                    if request_id and request_id in line
-                ]
                 probe_payload = self._last_json_payload(matching_log)
                 oracle_metadata = self._evaluate_probe_oracle(
                     oracle,
@@ -782,6 +785,8 @@ class AdbDeviceAdapter:
                             "request_id": request_id,
                             "test_case_id": test_case_id,
                             "request_observed": bool(matching_log),
+                            "poll_attempts": poll_attempts,
+                            "poll_seconds": round(poll_seconds, 3),
                             "probe_success": any(
                                 '"success":true' in line.replace('\\"', '"')
                                 for line in matching_log
@@ -848,6 +853,34 @@ class AdbDeviceAdapter:
                 "command_count": len(commands),
             },
         )
+
+    def _poll_probe_logcat(
+        self,
+        *,
+        request_id: str,
+        timeout_seconds: int,
+        budget: TimeBudget | None,
+    ) -> tuple[CommandResult, list[str], int, float]:
+        """Wait for an asynchronous Probe result correlated to one request."""
+
+        started = time.monotonic()
+        deadline = started + max(timeout_seconds, 1)
+        attempts = 0
+        last = self._budget_exhausted(["adb", "-s", self.serial or "", "logcat"])
+        while True:
+            attempts += 1
+            remaining = max(1, int(deadline - time.monotonic()))
+            last = self._adb_budget(
+                ["logcat", "-d", "-t", "300", "-s", "APKSCANNER_PROBE:I"],
+                budget,
+                min(15, remaining),
+            )
+            matching = [line for line in last.stdout.splitlines() if request_id in line]
+            if matching or last.exit_code != 0:
+                return last, matching, attempts, time.monotonic() - started
+            if time.monotonic() >= deadline or (budget is not None and budget.expired):
+                return last, matching, attempts, time.monotonic() - started
+            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
 
     def execute_poc(
         self,
@@ -1037,11 +1070,9 @@ class AdbDeviceAdapter:
                             },
                         )
                     )
-                    ui_baseline, baseline_attempts = (
-                        self._dump_ui_hierarchy_with_retry(
-                            budget=budget,
-                            cap=45,
-                        )
+                    ui_baseline, baseline_attempts = self._dump_ui_hierarchy_with_retry(
+                        budget=budget,
+                        cap=45,
                     )
                     commands.append(
                         (
@@ -1104,7 +1135,13 @@ class AdbDeviceAdapter:
                         and oracle.kind in {"log_contains", "provider_rows"}
                         and oracle.impact != "none"
                     ),
-                    timeout_seconds=(spec.timeout_seconds if launch.exit_code == 0 else 1),
+                    timeout_seconds=(
+                        1
+                        if oracle is not None and oracle.kind == "ui_text"
+                        else spec.timeout_seconds
+                        if launch.exit_code == 0
+                        else 1
+                    ),
                     budget=budget,
                 )
                 normalized = [line.lower().replace(" ", "") for line in matching]
@@ -1378,9 +1415,7 @@ class AdbDeviceAdapter:
                 budget,
                 min(15, cap),
             )
-            stderr = "\n".join(
-                value for value in (dump.stderr, readback.stderr) if value
-            )
+            stderr = "\n".join(value for value in (dump.stderr, readback.stderr) if value)
             return CommandResult(
                 argv=dump.argv,
                 exit_code=readback.exit_code,
@@ -1457,6 +1492,10 @@ class AdbDeviceAdapter:
         operation: str = "auto",
         method: str | None = None,
         argument: str | None = None,
+        binder_transaction_code: int | None = None,
+        binder_interface_descriptor: str | None = None,
+        binder_reply_type: str | None = None,
+        binder_read_exception: bool | None = None,
         intent_action: str | None = None,
         categories: list[str] | None = None,
     ) -> dict[str, Any] | None:
@@ -1489,6 +1528,14 @@ class AdbDeviceAdapter:
             request["method"] = method
         if argument is not None:
             request["argument"] = argument
+        if operation == "binder_transact":
+            request["binder_transaction_code"] = binder_transaction_code
+            request["binder_reply_type"] = binder_reply_type
+            request["binder_read_exception"] = (
+                True if binder_read_exception is None else binder_read_exception
+            )
+            if binder_interface_descriptor is not None:
+                request["binder_interface_descriptor"] = binder_interface_descriptor
         if intent_action is not None:
             request["intent_action"] = intent_action
         if categories:
@@ -1566,6 +1613,30 @@ class AdbDeviceAdapter:
                 observation={"row_count": rows, "minimum_rows": oracle.minimum_rows or 1},
                 impact_observed=(matched and oracle.impact == "unauthorized_data_access"),
                 refutation_observed=success,
+            )
+        if oracle.kind == "binder_reply" and oracle.expected_text:
+            reply = probe_payload.get("binderReply") if isinstance(probe_payload, dict) else None
+            transact_returned = bool(
+                isinstance(probe_payload, dict)
+                and probe_payload.get("binderTransactReturned") is True
+            )
+            actual_text = str(reply).lower() if isinstance(reply, bool) else str(reply)
+            matched = success and transact_returned and actual_text == oracle.expected_text
+            return cls._oracle_metadata(
+                oracle,
+                matched=matched,
+                observation={
+                    "expected_text": oracle.expected_text,
+                    "actual_text": actual_text if reply is not None else None,
+                    "reply_type": (
+                        probe_payload.get("binderReplyType")
+                        if isinstance(probe_payload, dict)
+                        else None
+                    ),
+                    "transact_returned": transact_returned,
+                },
+                impact_observed=(matched and oracle.impact == "unauthorized_data_access"),
+                refutation_observed=success and transact_returned,
             )
         if oracle.kind == "log_contains" and oracle.expected_text:
             matched = oracle.expected_text in output

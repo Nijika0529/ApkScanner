@@ -10,10 +10,16 @@ import time
 import uuid
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from .agent_events import AgentEventCallback, redact_event_data, runtime_event_from_mapping
+from .agent_events import (
+    AgentEventCallback,
+    AgentRuntimeEvent,
+    redact_event_data,
+    runtime_event_from_mapping,
+)
 
 
 class PersistentWorkerError(RuntimeError):
@@ -53,12 +59,16 @@ class PersistentWorkerClient:
         self.session_id = session_id
         self.event_spool = event_spool
         self.cleanup = cleanup
+        self.stream_id = uuid.uuid4().hex
         self.thread_id: str | None = None
         self._messages: queue.Queue[dict[str, Any] | BaseException | None] = queue.Queue()
         self._stderr: list[str] = []
         self._write_lock = threading.Lock()
         self._turn_lock = threading.Lock()
         self._closed = False
+        self._last_worker_sequence: int | None = None
+        self._delivered_record_keys: set[str] = set()
+        self._emitted_gap_keys: set[str] = set()
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
         self._stderr_reader = threading.Thread(target=self._read_stderr, daemon=True)
         self._prepare_spool()
@@ -115,6 +125,7 @@ class PersistentWorkerClient:
         with self._turn_lock:
             if not self.thread_id:
                 raise PersistentWorkerError("worker session is not open")
+            self._replay_spool_events(event_callback)
             request_id = self._request_id()
             self._send(
                 {
@@ -134,7 +145,13 @@ class PersistentWorkerClient:
                     event_callback=event_callback,
                     cancel_event=cancel_event,
                 )
-            except (PersistentWorkerCancelled, PersistentWorkerTimeout):
+            except (PersistentWorkerCancelled, PersistentWorkerTimeout) as exc:
+                if isinstance(exc, PersistentWorkerTimeout):
+                    self._deliver_gap_event(
+                        event_callback,
+                        reason="turn_timeout",
+                        detail=str(exc),
+                    )
                 self._interrupt(request_id)
                 try:
                     self._wait_terminal(
@@ -252,15 +269,23 @@ class PersistentWorkerClient:
                     continue
                 if item is None:
                     detail = self.stderr_tail or "worker stdout closed without a terminal envelope"
+                    self._deliver_gap_event(
+                        event_callback,
+                        reason="worker_stdout_closed",
+                        detail=detail,
+                    )
                     raise PersistentWorkerError(detail)
                 if isinstance(item, BaseException):
+                    self._deliver_gap_event(
+                        event_callback,
+                        reason="protocol_reader_failed",
+                        detail=str(item),
+                    )
                     raise PersistentWorkerError("worker protocol reader failed") from item
                 activity_deadline = time.monotonic() + max(0, no_event_timeout_seconds)
                 if item.get("type") == "event":
-                    event = runtime_event_from_mapping(item.get("event"))
-                    if event is not None and event_callback is not None:
-                        with suppress(Exception):
-                            event_callback(event)
+                    event = self._runtime_event(item, delivery_source="live")
+                    self._deliver_runtime_event(event_callback, event)
                 if predicate(item):
                     return item
                 if item.get("type") not in {"event", "heartbeat"}:
@@ -288,6 +313,10 @@ class PersistentWorkerClient:
             raise PersistentWorkerError(self.stderr_tail or "worker process is not running")
         line = json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n"
         with self._write_lock:
+            # Persist the redacted dispatch marker before the worker can emit a
+            # response; this keeps turn.start ordered ahead of event/result
+            # records even when the reader thread is scheduled immediately.
+            self._append_spool(value, direction="host")
             self.process.stdin.write(line)
             self.process.stdin.flush()
 
@@ -298,7 +327,10 @@ class PersistentWorkerClient:
                     value = json.loads(line)
                     if not isinstance(value, dict):
                         raise ValueError("NDJSON record must be an object")
-                    self._append_spool(value)
+                    sequence = value.get("sequence")
+                    if isinstance(sequence, int) and sequence > 0:
+                        self._last_worker_sequence = sequence
+                    self._append_spool(value, direction="worker")
                     self._messages.put(value)
                 except BaseException as exc:
                     self._messages.put(exc)
@@ -324,21 +356,234 @@ class PersistentWorkerClient:
             self.event_spool.touch(mode=0o600)
         self.event_spool.chmod(0o600)
 
-    def _append_spool(self, value: dict[str, Any]) -> None:
+    def _append_spool(self, value: dict[str, Any], *, direction: str) -> None:
         safe = {
             key: item
             for key, item in value.items()
-            if key not in {"prompt", "configuration", "gateway_environment", "result"}
+            if key
+            not in {
+                "prompt",
+                "configuration",
+                "gateway_environment",
+                "output_schema",
+                "result",
+            }
         }
         if "event" in safe and isinstance(safe["event"], dict):
             safe["event"] = redact_event_data(safe["event"])
         record = {
             "recorded_at": time.time(),
             "session_id": self.session_id,
+            "stream_id": self.stream_id,
+            "direction": direction,
+            "worker_sequence": (
+                value.get("sequence") if isinstance(value.get("sequence"), int) else None
+            ),
             "envelope": safe,
         }
         with self.event_spool.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    def _runtime_event(
+        self,
+        envelope: dict[str, Any],
+        *,
+        delivery_source: str,
+        stream_id: str | None = None,
+    ) -> AgentRuntimeEvent | None:
+        event = runtime_event_from_mapping(envelope.get("event"))
+        if event is None:
+            return None
+        effective_stream = stream_id or self.stream_id
+        sequence = envelope.get("sequence")
+        worker_sequence = sequence if isinstance(sequence, int) and sequence > 0 else None
+        host_record_key = envelope.get("host_record_key")
+        record_key = (
+            host_record_key
+            if isinstance(host_record_key, str) and host_record_key
+            else f"{self.session_id}:{effective_stream}:event:{worker_sequence}"
+            if worker_sequence is not None
+            else None
+        )
+        return replace(
+            event,
+            session_id=self.session_id,
+            protocol_stream_id=effective_stream,
+            worker_sequence=worker_sequence,
+            delivery_source=delivery_source,
+            protocol_record_key=record_key,
+        )
+
+    def _deliver_runtime_event(
+        self,
+        callback: AgentEventCallback | None,
+        event: AgentRuntimeEvent | None,
+    ) -> None:
+        if callback is None or event is None:
+            return
+        record_key = event.protocol_record_key
+        if record_key and record_key in self._delivered_record_keys:
+            return
+        try:
+            callback(event)
+        except Exception:
+            # The spool remains authoritative and will be retried before the next turn.
+            return
+        if record_key:
+            self._delivered_record_keys.add(record_key)
+
+    def _replay_spool_events(self, callback: AgentEventCallback | None) -> None:
+        if callback is None or not self.event_spool.is_file():
+            return
+        last_sequence: dict[str, int] = {}
+        active_turns: dict[tuple[str, str], int] = {}
+        try:
+            lines = self.event_spool.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            self._deliver_gap_event(
+                callback,
+                reason="spool_read_failed",
+                detail=str(exc),
+            )
+            return
+        for line_number, line in enumerate(lines, start=1):
+            try:
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError("spool record is not an object")
+                envelope = record.get("envelope")
+                if not isinstance(envelope, dict):
+                    raise ValueError("spool record has no envelope")
+            except (json.JSONDecodeError, ValueError) as exc:
+                self._deliver_gap_event(
+                    callback,
+                    reason="spool_record_invalid",
+                    detail=f"line {line_number}: {exc}",
+                    record_key_suffix=f"invalid:{line_number}",
+                )
+                continue
+            stream_id = str(record.get("stream_id") or f"legacy-{self.session_id}")
+            sequence_value = record.get("worker_sequence", envelope.get("sequence"))
+            sequence = (
+                sequence_value
+                if isinstance(sequence_value, int) and sequence_value > 0
+                else None
+            )
+            if sequence is not None:
+                previous = last_sequence.get(stream_id, 0)
+                if sequence > previous + 1:
+                    self._deliver_gap_event(
+                        callback,
+                        reason="worker_sequence_gap",
+                        detail=(
+                            f"worker sequence {previous + 1}..{sequence - 1} "
+                            "is absent from the host spool"
+                        ),
+                        stream_id=stream_id,
+                        missing_from=previous + 1,
+                        missing_to=sequence - 1,
+                        record_key_suffix=f"sequence:{previous + 1}:{sequence - 1}",
+                    )
+                last_sequence[stream_id] = max(previous, sequence)
+            request_id = envelope.get("request_id")
+            envelope_type = envelope.get("type")
+            if isinstance(request_id, str) and request_id:
+                turn_key = (stream_id, request_id)
+                if envelope_type == "turn.start":
+                    active_turns[turn_key] = line_number
+                elif envelope_type in {"turn.result", "turn.error"}:
+                    active_turns.pop(turn_key, None)
+            if envelope.get("type") == "event":
+                event = self._runtime_event(
+                    envelope,
+                    delivery_source="spool_replay",
+                    stream_id=stream_id,
+                )
+                self._deliver_runtime_event(callback, event)
+        for (stream_id, request_id), line_number in active_turns.items():
+            self._deliver_gap_event(
+                callback,
+                reason="incomplete_turn",
+                detail=(
+                    f"turn {request_id} dispatched at spool line {line_number} has no "
+                    "terminal worker envelope"
+                ),
+                stream_id=stream_id,
+                record_key_suffix=f"incomplete-turn:{request_id}",
+            )
+
+    def _deliver_gap_event(
+        self,
+        callback: AgentEventCallback | None,
+        *,
+        reason: str,
+        detail: str,
+        stream_id: str | None = None,
+        missing_from: int | None = None,
+        missing_to: int | None = None,
+        record_key_suffix: str | None = None,
+    ) -> None:
+        if callback is None:
+            return
+        effective_stream = stream_id or self.stream_id
+        suffix = record_key_suffix or f"{reason}:{self._last_worker_sequence or 0}"
+        record_key = f"{self.session_id}:{effective_stream}:gap:{suffix}"
+        if record_key in self._emitted_gap_keys:
+            return
+        event = runtime_event_from_mapping(
+            {
+                "event_type": "event.gap",
+                "message": "Codex 事件流存在无法确认的区间",
+                "data": {
+                    "reason": reason,
+                    "detail": detail[:1000],
+                    "last_worker_sequence": self._last_worker_sequence,
+                    "missing_from": missing_from,
+                    "missing_to": missing_to,
+                },
+            }
+        )
+        if event is None:
+            return
+        event = replace(
+            event,
+            session_id=self.session_id,
+            protocol_stream_id=effective_stream,
+            delivery_source="spool_replay" if stream_id else "live_gap",
+            protocol_record_key=record_key,
+        )
+        if stream_id is None:
+            self._append_host_gap(event, record_key)
+        self._deliver_runtime_event(callback, event)
+        if record_key in self._delivered_record_keys:
+            self._emitted_gap_keys.add(record_key)
+
+    def _append_host_gap(self, event: AgentRuntimeEvent, record_key: str) -> None:
+        envelope = {
+            "schema_version": self.PROTOCOL_VERSION,
+            "type": "event",
+            "host_record_key": record_key,
+            "event": {
+                "event_type": event.event_type,
+                "message": event.message,
+                "data": redact_event_data(event.data),
+            },
+        }
+        record = {
+            "recorded_at": time.time(),
+            "session_id": self.session_id,
+            "stream_id": self.stream_id,
+            "direction": "host",
+            "worker_sequence": None,
+            "envelope": envelope,
+        }
+        try:
+            with self.event_spool.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+                )
+        except OSError:
+            return
 
     @staticmethod
     def _request_id() -> str:

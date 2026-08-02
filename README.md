@@ -101,13 +101,20 @@ export APKSCANNER_ADB_SERIALS=cloud-device-a.example:5555,cloud-device-b.example
 Each investigation keeps one serial for its complete lifecycle. The legacy
 `APKSCANNER_ADB_SERIAL` remains supported as a one-device pool.
 
-For fast generic Activity, Service, Receiver, Provider, and deep-link calls from an ordinary app
-UID, optionally build the deliberately exported helper in [`probe/`](probe/) on an Android SDK 36
-workstation, install it only on a dedicated test device, and configure its path:
+For fast generic Activity, Service, Receiver, Provider, deep-link, and simple Binder calls from an
+ordinary app UID, optionally build the deliberately exported helper in [`probe/`](probe/), install
+it only on a dedicated test device, and configure its path. The reproducible build uses the pinned
+worker image and does not require a host Gradle/Android SDK installation:
 
 ```bash
+./probe/build-probe.sh
 export APKSCANNER_PROBE_APK="$PWD/probe/app/build/outputs/apk/debug/app-debug.apk"
 ```
+
+The Probe receiver requires `android.permission.DUMP`, so only the ADB shell/platform can dispatch
+requests; target calls still originate from the Probe's ordinary application UID. Platform
+`binder_transact` reads a typed reply and evaluates a `binder_reply` Oracle without trusting a
+PoC-authored result log.
 
 Without ADB, scans still complete from static evidence. Without the optional Probe APK, raw ADB
 exploration and Agent-built dedicated PoCs remain available; the platform reports a gap only when

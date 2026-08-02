@@ -313,6 +313,7 @@ class AgentOracleSpec(BaseModel):
         "log_contains",
         "target_uid_log_contains",
         "process_crash",
+        "binder_reply",
     ] = "reachability"
     expected_text: str | None = Field(default=None, min_length=1, max_length=500)
     minimum_rows: int | None = Field(default=None, ge=1, le=1_000_000)
@@ -333,6 +334,7 @@ class AgentOracleSpec(BaseModel):
                 "ui_text",
                 "log_contains",
                 "target_uid_log_contains",
+                "binder_reply",
             }
             and not self.expected_text
         ):
@@ -351,6 +353,7 @@ class AgentOracleSpec(BaseModel):
             },
             "target_uid_log_contains": {"none", "privileged_action"},
             "process_crash": {"none", "denial_of_service"},
+            "binder_reply": {"none", "unauthorized_data_access"},
         }
         if self.impact not in allowed_impacts[self.kind]:
             supported = ", ".join(sorted(allowed_impacts[self.kind]))
@@ -373,9 +376,22 @@ class AgentRequestedTest(BaseModel):
         "insert",
         "update",
         "delete",
+        "binder_transact",
     ] = "auto"
     method: str | None = Field(default=None, min_length=1, max_length=200)
     argument: str | None = Field(default=None, max_length=1000)
+    binder_transaction_code: int | None = Field(
+        default=None,
+        ge=1,
+        le=0x00FFFFFF,
+    )
+    binder_interface_descriptor: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=500,
+    )
+    binder_reply_type: Literal["string", "integer", "long", "boolean"] | None = None
+    binder_read_exception: StrictBool | None = None
     intent_action: str | None = Field(
         default=None,
         pattern=r"^[A-Za-z][A-Za-z0-9_.]{0,254}$",
@@ -392,6 +408,29 @@ class AgentRequestedTest(BaseModel):
             raise ValueError("provider call requires method")
         if self.operation != "call" and (self.method is not None or self.argument is not None):
             raise ValueError("method and argument are only valid for provider call")
+        binder_fields = (
+            self.binder_transaction_code,
+            self.binder_interface_descriptor,
+            self.binder_reply_type,
+            self.binder_read_exception,
+        )
+        if self.operation == "binder_transact":
+            if self.binder_transaction_code is None or self.binder_reply_type is None:
+                raise ValueError(
+                    "binder_transact requires binder_transaction_code and binder_reply_type"
+                )
+            if self.poc is not None:
+                raise ValueError("binder_transact is a platform Probe action and cannot include poc")
+            if self.binder_read_exception is None:
+                self.binder_read_exception = True
+            if self.oracle.kind != "binder_reply":
+                raise ValueError("binder_transact requires a binder_reply Oracle")
+        elif any(value is not None for value in binder_fields):
+            raise ValueError("Binder fields are valid only for binder_transact")
+        if self.binder_interface_descriptor is not None and any(
+            character in self.binder_interface_descriptor for character in "\r\n\x00"
+        ):
+            raise ValueError("binder_interface_descriptor contains a control character")
         if any(
             not 1 <= len(category) <= 255
             or not category[0].isalpha()
@@ -418,10 +457,53 @@ class AgentProofReplay(BaseModel):
         default_factory=dict,
         max_length=16,
     )
+    operation: Literal["auto", "binder_transact"] = "auto"
+    binder_transaction_code: int | None = Field(
+        default=None,
+        ge=1,
+        le=0x00FFFFFF,
+    )
+    binder_interface_descriptor: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=500,
+    )
+    binder_reply_type: Literal["string", "integer", "long", "boolean"] | None = None
+    binder_read_exception: StrictBool | None = None
     reset: Literal["inherit", "clean", "preserve"] = "clean"
     oracle: AgentOracleSpec
     rationale: str = Field(min_length=1, max_length=1000)
-    poc: AgentPocSpec
+    poc: AgentPocSpec | None = None
+
+    @model_validator(mode="after")
+    def validate_replay_action(self) -> Self:
+        binder_fields = (
+            self.binder_transaction_code,
+            self.binder_interface_descriptor,
+            self.binder_reply_type,
+            self.binder_read_exception,
+        )
+        if self.operation == "binder_transact":
+            if self.poc is not None:
+                raise ValueError("binder_transact replay cannot include poc")
+            if self.binder_transaction_code is None or self.binder_reply_type is None:
+                raise ValueError(
+                    "binder_transact requires binder_transaction_code and binder_reply_type"
+                )
+            if self.binder_read_exception is None:
+                self.binder_read_exception = True
+            if self.oracle.kind != "binder_reply":
+                raise ValueError("binder_transact requires a binder_reply Oracle")
+        else:
+            if self.poc is None:
+                raise ValueError("a non-Binder proof replay requires poc")
+            if any(value is not None for value in binder_fields):
+                raise ValueError("Binder fields are valid only for binder_transact")
+        if self.binder_interface_descriptor is not None and any(
+            character in self.binder_interface_descriptor for character in "\r\n\x00"
+        ):
+            raise ValueError("binder_interface_descriptor contains a control character")
+        return self
 
 
 class AgentHypothesisAssessment(BaseModel):

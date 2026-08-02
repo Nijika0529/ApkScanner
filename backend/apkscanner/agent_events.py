@@ -19,6 +19,11 @@ class AgentRuntimeEvent:
     event_type: str
     message: str
     data: dict[str, Any] = field(default_factory=dict)
+    session_id: str | None = None
+    protocol_stream_id: str | None = None
+    worker_sequence: int | None = None
+    delivery_source: str = "live"
+    protocol_record_key: str | None = None
 
     @property
     def dedupe_key(self) -> str:
@@ -134,12 +139,32 @@ def normalize_codex_notification(notification: Any) -> AgentRuntimeEvent | None:
             "Codex 正在制定探索计划" if state == "started" else "Codex 已完成探索计划",
             common,
         )
+    if normalized == "websearch":
+        action = _mapping(item.get("action"))
+        status = str(item.get("status") or "").lower()
+        outcome = "failed" if status in {"failed", "error"} else state
+        return AgentRuntimeEvent(
+            f"web_search.{outcome}",
+            (
+                "Codex Web Search 执行失败"
+                if outcome == "failed"
+                else "Codex 开始执行 Web Search"
+                if outcome == "started"
+                else "Codex 已完成 Web Search"
+            ),
+            _compact(
+                {
+                    **common,
+                    "query": str(item.get("query") or "")[:1000] or None,
+                    "action_type": action.get("type"),
+                }
+            ),
+        )
     if normalized in {
         "commandexecution",
         "filechange",
         "mcptoolcall",
         "dynamictoolcall",
-        "websearch",
         "collabtoolcall",
     }:
         return AgentRuntimeEvent(

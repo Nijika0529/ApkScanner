@@ -105,3 +105,17 @@ def test_vulntest_source_contains_real_attack_paths_and_safe_control() -> None:
     assert "->addJavascriptInterface" in deep_link
     assert '"password"' in provider and '"hunter2"' in provider
     assert "->onTransact" in binder and '"service-secret=hunter2"' in binder
+
+
+def test_platform_probe_supports_shell_gated_binder_transactions() -> None:
+    probe_root = REPOSITORY_ROOT / "probe" / "app" / "src" / "main"
+    manifest = (probe_root / "AndroidManifest.xml").read_text(encoding="utf-8")
+    receiver = (
+        probe_root / "java" / "io" / "apkscanner" / "probe" / "ProbeReceiver.java"
+    ).read_text(encoding="utf-8")
+
+    assert 'android:permission="android.permission.DUMP"' in manifest
+    assert "android.permission.QUERY_ALL_PACKAGES" in manifest
+    assert '"binder_transact"' in receiver
+    assert "service.transact" in receiver
+    assert 'result.put("binderReply"' in receiver

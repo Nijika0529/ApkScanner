@@ -5,9 +5,13 @@ import android.content.ContentValues;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.ServiceConnection;
 import android.database.Cursor;
 import android.net.Uri;
-import android.os.Process;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.os.Parcel;
 import android.os.Bundle;
 import android.util.Base64;
 import android.util.Log;
@@ -17,6 +21,7 @@ import org.json.JSONArray;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Iterator;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Executes one bounded cross-application call from an ordinary application UID. */
 public final class ProbeReceiver extends BroadcastReceiver {
@@ -26,10 +31,6 @@ public final class ProbeReceiver extends BroadcastReceiver {
     public void onReceive(Context context, Intent outerIntent) {
         JSONObject result = new JSONObject();
         try {
-            int senderUid = getSentFromUid();
-            if (senderUid != Process.SHELL_UID && senderUid != Process.ROOT_UID) {
-                throw new SecurityException("only adb shell/root may dispatch probe requests");
-            }
             String encoded = outerIntent.getStringExtra("request_base64");
             if (encoded == null || encoded.length() > 64 * 1024) {
                 throw new IllegalArgumentException("missing or oversized request_base64");
@@ -99,6 +100,11 @@ public final class ProbeReceiver extends BroadcastReceiver {
                     target.setComponent(new ComponentName(packageName, component));
                     applyExtras(target, request.optJSONObject("extras"));
                     applyCategories(target, request.optJSONArray("categories"));
+                    if ("binder_transact".equals(request.optString("operation", "auto"))) {
+                        PendingResult pending = goAsync();
+                        startBinderTransaction(context, target, request, result, pending);
+                        return;
+                    }
                     ComponentName started = context.startService(target);
                     result.put("delivered", started != null);
                     break;
@@ -193,6 +199,172 @@ public final class ProbeReceiver extends BroadcastReceiver {
         String payload = result.toString();
         Log.i(TAG, payload);
         setResultData(payload);
+    }
+
+    private static void startBinderTransaction(
+        Context context,
+        Intent target,
+        JSONObject request,
+        JSONObject result,
+        PendingResult pending
+    ) {
+        // BroadcastReceiver receives a ReceiverRestrictedContext which rejects
+        // bindService even after goAsync(); the process application context is
+        // still the same ordinary app UID and supports the bounded async bind.
+        Context applicationContext = context.getApplicationContext();
+        BinderProbeConnection connection = new BinderProbeConnection(
+            applicationContext,
+            request,
+            result,
+            pending
+        );
+        try {
+            boolean bound = applicationContext.bindService(
+                target,
+                connection,
+                Context.BIND_AUTO_CREATE
+            );
+            result.put("bound", bound);
+            if (!bound) {
+                connection.fail(new SecurityException("bindService returned false"));
+                return;
+            }
+            connection.markBoundAndArmTimeout();
+        } catch (Throwable error) {
+            connection.fail(error);
+        }
+    }
+
+    private static final class BinderProbeConnection implements ServiceConnection {
+        private static final long TIMEOUT_MILLIS = 8_000L;
+
+        private final Context context;
+        private final JSONObject request;
+        private final JSONObject result;
+        private final PendingResult pending;
+        private final Handler handler = new Handler(Looper.getMainLooper());
+        private final AtomicBoolean finished = new AtomicBoolean(false);
+        private final Runnable timeout = new Runnable() {
+            @Override
+            public void run() {
+                fail(new IllegalStateException("Binder probe timed out"));
+            }
+        };
+        private volatile boolean bound;
+
+        BinderProbeConnection(
+            Context context,
+            JSONObject request,
+            JSONObject result,
+            PendingResult pending
+        ) {
+            this.context = context;
+            this.request = request;
+            this.result = result;
+            this.pending = pending;
+        }
+
+        void markBoundAndArmTimeout() {
+            bound = true;
+            handler.postDelayed(timeout, TIMEOUT_MILLIS);
+        }
+
+        @Override
+        public void onServiceConnected(ComponentName name, IBinder service) {
+            Parcel data = Parcel.obtain();
+            Parcel reply = Parcel.obtain();
+            try {
+                result.put("boundComponent", name.flattenToShortString());
+                String descriptor = request.optString("binder_interface_descriptor", "");
+                if (!descriptor.isEmpty()) {
+                    data.writeInterfaceToken(descriptor);
+                    result.put("binderInterfaceDescriptor", descriptor);
+                }
+                int transactionCode = request.getInt("binder_transaction_code");
+                String replyType = request.getString("binder_reply_type");
+                boolean returned = service.transact(transactionCode, data, reply, 0);
+                result.put("binderTransactionCode", transactionCode);
+                result.put("binderTransactReturned", returned);
+                result.put("binderReplyType", replyType);
+                if (!returned) {
+                    throw new IllegalStateException("Binder transact returned false");
+                }
+                reply.setDataPosition(0);
+                if (request.optBoolean("binder_read_exception", true)) {
+                    reply.readException();
+                }
+                switch (replyType) {
+                    case "string":
+                        result.put("binderReply", reply.readString());
+                        break;
+                    case "integer":
+                        result.put("binderReply", reply.readInt());
+                        break;
+                    case "long":
+                        result.put("binderReply", reply.readLong());
+                        break;
+                    case "boolean":
+                        result.put("binderReply", reply.readInt() != 0);
+                        break;
+                    default:
+                        throw new IllegalArgumentException(
+                            "unsupported binder_reply_type: " + replyType
+                        );
+                }
+                result.put("delivered", true);
+                result.put("success", true);
+                finish();
+            } catch (Throwable error) {
+                fail(error);
+            } finally {
+                reply.recycle();
+                data.recycle();
+            }
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+            // A disconnect after a completed transaction is expected and is not a new result.
+        }
+
+        @Override
+        public void onBindingDied(ComponentName name) {
+            fail(new IllegalStateException("Service binding died: " + name));
+        }
+
+        @Override
+        public void onNullBinding(ComponentName name) {
+            fail(new IllegalStateException("Service returned a null binding: " + name));
+        }
+
+        void fail(Throwable error) {
+            try {
+                result.put("success", false);
+                result.put("errorType", error.getClass().getName());
+                result.put("error", String.valueOf(error.getMessage()));
+            } catch (Exception ignored) {
+                // JSONObject writes above use primitive strings only.
+            }
+            finish();
+        }
+
+        private void finish() {
+            if (!finished.compareAndSet(false, true)) {
+                return;
+            }
+            handler.removeCallbacks(timeout);
+            if (bound) {
+                try {
+                    context.unbindService(this);
+                } catch (Throwable ignored) {
+                    // The structured result is more important than an unbind race.
+                }
+            }
+            String payload = result.toString();
+            Log.i(TAG, payload);
+            pending.setResultData(payload);
+            pending.finish();
+        }
     }
 
     private static void applyExtras(Intent intent, JSONObject extras) throws Exception {

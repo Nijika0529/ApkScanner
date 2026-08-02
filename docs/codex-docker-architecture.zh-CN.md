@@ -2,7 +2,7 @@
 
 > 文档状态：目标架构 / 实施基线
 >
-> 基线日期：2026-07-31
+> 基线日期：2026-08-01
 >
 > 适用范围：APK Scanner 的 Agent 调查、PoC 制作、ADB 探索、Proof Replay、结构化裁决和审计链路
 >
@@ -31,8 +31,8 @@
 6. `CURRENT` 完整 JADX、apktool、archive 结果及原始 `target.apk` 通过扫描级只读 bind mount 共享，不复制到各任务工作区；宿主 JADX 缺失或部分失败时，Agent 可用镜像固定的 JADX 输出到自己的可写工作区。
 7. `CURRENT` 同一 primary AgentSession 在自动探索、PoC 修正和最终裁决之间复用同一 Codex Thread；Critic/Rescue 使用新的 UID、工作区和 Thread。
 8. `CURRENT` ADB 设备由 Orchestrator 独占分配。容器进程只能通过任务级 ADB Gateway 使用分配到的 serial。
-9. `TARGET` 原始 ADB、Agent 文本、Agent 自建日志和 Agent 自报“PoC 成功”均不能直接生成 `reproduced_blackbox`；最终证明仍由平台 Proof/Oracle 完成。
-10. `PARTIAL` Agent 运行事件已实时归一化、脱敏并带去重键，Protocol v3 envelope 追加写入 host-only spool 并投影到 ScanEvent；数据库级 spool 重放与显式 `event.gap` 仍待完成。不保存隐藏思维链原文。
+9. `CURRENT` 原始 ADB、Agent 文本、Agent 自建日志和 Agent 自报“PoC 成功”均不能直接生成 `reproduced_blackbox`；最终证明由平台 Proof/Oracle 完成。Provider 行数、目标 UID 日志、目标 UI、崩溃和平台 Probe 的 Binder reply 都有独立判定器。
+10. `CURRENT` Agent 运行事件实时归一化、脱敏并带协议记录键，Protocol v3 envelope 追加写入 host-only spool；数据库唯一记录表幂等投影到 ScanEvent，替换 Worker 会补读 spool，缺序号、损坏记录及无终态 Turn 形成显式 `event.gap`。不保存隐藏思维链原文。
 11. `CURRENT` 所有调查角色只使用 Codex。现在由 DeepSeek V4 Flash 承担 primary、Critic、Rescue 和 finalizer；V4 Pro 原生支持后只替换相应 `ProviderProfile`，不再保留 OpenCode 运行时、Worker、fallback 或 critic 路由。
 12. `CURRENT` 主实现使用 Python `openai-codex` SDK；开发前已更新并审查 `/work/codex`。TypeScript SDK 只保留契约对比 spike，不作为本次迁移目标。
 13. `CURRENT` 本地单用户版本直接连接 DeepSeek，不实现 Provider Gateway。长期 Key 仅注入对应 Codex 进程并从子 shell 过滤，但明确接受 full-access 同 UID 进程可能读取该 Key 的开发风险。
@@ -109,24 +109,28 @@ Docker 容器共享宿主内核，镜像层在并发扫描间复用。`--memory`
 | Provider | 冻结 ProviderProfile、catalog SHA-256 与配置指纹进入审计 | 保持单一可信配置源 | `CURRENT` |
 | DeepSeek | V4 Flash + Responses + `model_provider=deepseek` 已完成真实计费 Turn、工具循环和结构化结果 smoke | 增加固定样本的周期性回归与费用基线 | `CURRENT` |
 | Reasoning effort | profile 支持 `low/high/max`，默认 `high` | 后续按评测调整 phase route | `CURRENT` |
-| Web Search | `web_search=live` 已冻结配置；缺真实 Provider smoke | 验证事件与引用行为 | `PARTIAL` |
+| Web Search | `web_search=live` 已冻结；真实 V4 Flash smoke 产生 `web_search.started/completed` 并返回官方 HTTPS 来源 | 纳入周期性固定回归 | `CURRENT` |
 | Bash 公网 | Docker bridge 公网可用，无宿主端口/设备/socket 挂载 | 企业部署增加受控 egress，阻断元数据/未授权内网 | `PARTIAL` |
 | ADB | 容器 `adb` wrapper 通过任务 token 调用宿主 Gateway；serial 固定、危险命令拒绝、结果写 Evidence | 增加更细的目标/命令 scope 与配额 | `CURRENT` |
 | Proof Replay | primary 在持有 device lease 时获得任务级 Proof Gateway；Critic/Rescue 不下发 token | 保持平台 Oracle 为唯一黑盒证明准入 | `CURRENT` |
-| PoC | Agent 写源码；平台校验结果协议并负责构建、签名、安装、执行、Oracle 和清理 | 增加更多 Oracle 类型与预置 PoC 模板 | `CURRENT` |
-| 事件 | notification 已归一化、脱敏；过滤 token/diff 增量；Worker 序列、heartbeat、host-only spool、无事件 watchdog 已实现 | 增加数据库唯一序列、spool 重放和 crash gap | `PARTIAL` |
+| PoC/Probe | Agent 写复杂协议 PoC；平台负责构建、签名、安装、执行、Oracle 和清理；简单无参数 Binder 事务由 shell-gated Probe 直接执行并读取 typed reply | 增加 Parcel 参数模板与更多 Oracle 类型 | `CURRENT` |
+| 事件 | notification 已归一化、脱敏；Worker 序列、heartbeat、host-only spool、数据库唯一记录、重放、watchdog 和 crash gap 已实现 | 增加跨进程 occurred/received 时间与运维指标 | `CURRENT` |
 | 结构化结果 | 每次 Turn 有闭合 `output_schema`；兼容提取响应末尾唯一 JSON 后仍执行完整 Pydantic/证据校验 | 增加一次同线程 schema 修复 | `PARTIAL` |
 | Agent 路由 | 所有 phase 只走 Codex；无 OpenCode/fallback 可执行路径 | 保持历史报告只读兼容 | `CURRENT` |
 | 能力入口 | Manifest Registry 已支持 built-in、SHA-256 固定 Python script 和显式绑定 MCP Adapter | 增加容器 sidecar、schema engine、Evidence mapper 与能力提案审批 | `PARTIAL` |
 | 平台监督 | REST 提供 snapshot、catalog/invoke、Campaign validate/launch 和已有 SSE 事件线 | 增加 SupervisorSession/RBAC、CampaignRun 持久化、MCP 薄适配和幂等键 | `PARTIAL` |
-| Codex 测试 | SDK/catalog/协议/挂载、真实双 UID、持久 Thread、DeepSeek 计费 Turn、Pixel 4 ADB Gateway、自动 PoC/Proof 与完整 ground-truth benchmark 均通过 | 补 live Web Search 固定回归 | `PARTIAL` |
+| Codex 测试 | SDK/catalog/协议/挂载、真实双 UID、持久 Thread、DeepSeek 计费 Turn、live Web Search、Pixel 4 ADB Gateway、Binder Probe、自动 PoC/Proof 与完整 ground-truth benchmark 均通过 | 纳入周期性费用/耗时基线 | `CURRENT` |
 
-### 3.1 2026-07-31 实施检查点
+### 3.1 2026-08-01 实施检查点
 
 - 工作分支：`feature/codex-docker-migration`；首个迁移提交 `6c3e238` 已推送，后续实现继续在同一分支；
-- `/work/codex` 已在开发收口前再次 `git pull --ff-only` 到 `c42ea41e`；新增内容主要是
-  App Server thread section、MCP elicitation 和外部 Agent 迁移接口，Python SDK 生成协议哈希未变。
-  PyPI 稳定版仍只有 `openai-codex==0.144.4`，因此保持当前 pin，不追随 0.147 alpha；
+- `/work/codex` 已再次 `git pull --ff-only` 到 `6751b54c`；新增内容主要是 realtime 消息确认、
+  remote plugin search、用户输入和 thread history 单写者约束，`sdk/python` 与生成协议哈希未变。
+  PyPI 当前最新版仍只有 `openai-codex==0.144.4`，因此保持 pin；
+- 官方 Codex SDK 文档同时提供 TypeScript 与 beta Python SDK。当前控制面、证据模型和 Worker 都是
+  Python，Python 包又固定携带同版本 CLI，因此主路径不做无收益的语言桥接；仅 Codex Security
+  `@openai/codex-security` 要求 Node.js 22+/Python 3.10+，后续以可选静态扫描 adapter 接入，不充当
+  第二套 Orchestrator 或 debate critic；
 - Phase 0—3 已完成固定工具镜像、扫描级 keeper、只读 scan input、多 UID session、资源参数、
   DeepSeek Responses Provider、官方 model catalog、full-access、effort、Web Search 和 exec-only Key 注入；
 - Phase 4 已切换 Worker Protocol v3：worker/session 长驻、`ephemeral=False`、primary 多 Turn
@@ -150,11 +154,14 @@ Docker 容器共享宿主内核，镜像层在并发扫描间复用。`--memory`
   `reproduced_blackbox` Finding：DeepLink/WebView JS Bridge、`target_activity` 内部组件重定向、
   `inner_intent` 嵌套 Intent 重定向和无权限 Provider 读。ground-truth 结果为 4 TP、0 FP、
   2 FN，precision 1.0、recall 0.666667、F0.5 0.909091（90.91 分）。
-- Service PoC 已由普通 App UID 成功 bind/transact 并取回 `service-secret`，但当前平台没有能独立
-  证明“Binder reply 来自目标而非 PoC 自报”的结果 Oracle，因此 `log_contains/impact=none` 只保留
-  reachability 而未签发 Finding。Proof Gateway 现无条件拒绝 live `impact=none`，避免继续占用设备；
-  同时拒绝 PoC-owned `log_contains` 充当 live harm Oracle。Binder reply Oracle 是明确的后续能力缺口，
-  在实现前 Agent 应通过 ADB 做诊断并如实报告 gap，不能把 PoC 自报升级为危害证据。
+- Probe APK v0.3 已把 minSdk 降到 26，receiver 由 `android.permission.DUMP` 限定为 shell/platform
+  调度，并声明 `QUERY_ALL_PACKAGES` 以解析任意当前扫描目标。对于无参数、primitive reply 的 Service，
+  Agent 提交 `binder_transact` 参数而不提交 PoC；Probe 以普通 App UID 异步 bind、执行 transact、读取
+  `string/integer/long/boolean`，宿主按 request ID 和 expected value 形成 `binder_reply` Oracle。Pixel 4
+  API 33 已真实取回 `service-secret=hunter2`，平台判定 `security_impact_observed=true`；复杂 Parcel 参数、
+  callback 或多事务协议仍使用专用 PoC，PoC-owned `log_contains` 仍不能充当危害 Oracle。
+- DeepSeek V4 Flash 的真实 Docker Web Search smoke 已产生 `web_search.started/completed`，并返回
+  `https://api-docs.deepseek.com/updates/`；事件只保留有界 query/action 元数据，不保存凭据。
 - Receiver PoC 确实将广播送入目标进程，但 Pixel 4 Android 13 的系统日志明确记录
   `allowBackgroundActivityStart: false` / `Abort background activity starts`；平台将
   `background_activity_start_blocked=true` 保存为 `blackbox.poc_system_logcat`，故当前系统配置下
@@ -700,9 +707,10 @@ max_threads = 1
 shell_snapshot = false
 
 [shell_environment_policy]
-inherit = "core"
-include_only = ["^PATH$", "^HOME$", "^TMPDIR$", "^LANG$", "^LC_ALL$", "^TERM$", "^ANDROID_SERIAL$", "^APKSCANNER_ADB_.*$", "^APKSCANNER_PROOF_.*$", "^HTTP_PROXY$", "^HTTPS_PROXY$", "^NO_PROXY$"]
-exclude = ["^DEEPSEEK_API_KEY$", "^OPENAI_API_KEY$", "^CODEX_API_KEY$"]
+inherit = "all"
+ignore_default_excludes = true
+include_only = ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "SHELL", "USER", "LOGNAME", "ANDROID_SERIAL", "APKSCANNER_ADB_*", "APKSCANNER_PROOF_*", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"]
+exclude = ["DEEPSEEK_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY"]
 ```
 
 注意：
@@ -710,7 +718,8 @@ exclude = ["^DEEPSEEK_API_KEY$", "^OPENAI_API_KEY$", "^CODEX_API_KEY$"]
 - DeepSeek 官方示例允许把 bearer token 写入配置文件；本项目不这样做，改用 `env_key` 和进程环境。
 - Executor 只把 `DEEPSEEK_API_KEY` 注入当前 UID 的 Worker/Codex 进程，不注入 Keeper、其他 session 或 Docker 容器全局环境。
 - `shell_snapshot=false` 是凭据安全要求而不是性能选项：当前 Codex 会在 environment policy 过滤前生成登录 shell 快照，启用它会把 Worker 的 Provider Key 写入 `CODEX_HOME/shell_snapshots`。
-- `include_only/exclude` 是正则表达式，因此使用锚定模式。shell environment policy 防止普通子命令直接继承 Key，但 full-access 同 UID 进程仍可能通过 `/proc` 或调试手段读取父进程环境。本地单用户版本明确接受此风险；使用低额度独立 Key、Provider 侧消费上限和定期轮换，不对模型宣称密钥不可见。
+- Codex 按 `inherit → 默认敏感变量过滤 → exclude → set → include_only` 的顺序生成命令环境。这里必须先 `inherit=all`，否则不属于内建 `core` 集合的 ADB/Proof 网关变量会在白名单生效前被删除；`ignore_default_excludes=true` 允许名称含 `TOKEN` 的任务级网关令牌进入后续过滤，最终暴露范围仍由 `include_only` 严格收窄，Provider Key 继续被明确排除。
+- `include_only/exclude` 使用 shell 风格 WildMatch（`*`/`?`），不是正则表达式；精确变量名不得添加 `^`、`$`，前缀匹配写成 `APKSCANNER_ADB_*`。shell environment policy 防止普通子命令直接继承 Provider Key，但 full-access 同 UID 进程仍可能通过 `/proc` 或调试手段读取父进程环境。本地单用户版本明确接受此风险；使用低额度独立 Key、Provider 侧消费上限和定期轮换，不对模型宣称密钥不可见。
 - `history.persistence=save-all` 仅用于 session-private `CODEX_HOME` 的恢复；其内容按敏感审计数据管理，不能进入公共报告。
 - `project_doc_max_bytes=0` 禁止加载任何 workspace 或反编译树中的 `AGENTS.md`；平台可信规则每个 Thread 显式传入 `developer_instructions`。
 - 默认不加载宿主 memories、MCP、plugins、skills 或个人全局说明。

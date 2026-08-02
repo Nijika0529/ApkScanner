@@ -59,6 +59,40 @@ def test_redundant_usage_and_diff_snapshots_are_not_persisted() -> None:
     )
 
 
+def test_web_search_items_have_explicit_audit_event_types() -> None:
+    started = normalize_codex_notification(
+        SimpleNamespace(
+            method="item/started",
+            payload={
+                "item": {
+                    "id": "web-1",
+                    "type": "webSearch",
+                    "query": "Android Binder security",
+                    "action": {"type": "search"},
+                }
+            },
+        )
+    )
+    completed = normalize_codex_notification(
+        SimpleNamespace(
+            method="item/completed",
+            payload={
+                "item": {
+                    "id": "web-1",
+                    "type": "webSearch",
+                    "query": "Android Binder security",
+                    "action": {"type": "search"},
+                }
+            },
+        )
+    )
+
+    assert started is not None and started.event_type == "web_search.started"
+    assert completed is not None and completed.event_type == "web_search.completed"
+    assert completed.data["query"] == "Android Binder security"
+    assert completed.data["action_type"] == "search"
+
+
 def test_worker_events_redact_secret_keys_and_values() -> None:
     event = runtime_event_from_mapping(
         {

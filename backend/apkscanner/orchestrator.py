@@ -44,6 +44,7 @@ from .finding_policy import partition_findings
 from .manifest import parse_manifest
 from .mobsf import MobSFAdapter
 from .models import (
+    AgentRuntimeEventRecord,
     CoverageItem,
     EntryPoint,
     Evidence,
@@ -423,7 +424,11 @@ class ScanOrchestrator:
                 state="guest",
                 uri=None,
                 extras=dict(replay.extras),
-                operation="auto",
+                operation=replay.operation,
+                binder_transaction_code=replay.binder_transaction_code,
+                binder_interface_descriptor=replay.binder_interface_descriptor,
+                binder_reply_type=replay.binder_reply_type,
+                binder_read_exception=replay.binder_read_exception,
                 reset=replay.reset,
                 oracle=replay.oracle,
                 rationale=replay.rationale,
@@ -434,6 +439,11 @@ class ScanOrchestrator:
                     {
                         "entry_point_id": entry_id,
                         "extras": replay.extras,
+                        "operation": replay.operation,
+                        "binder_transaction_code": replay.binder_transaction_code,
+                        "binder_interface_descriptor": replay.binder_interface_descriptor,
+                        "binder_reply_type": replay.binder_reply_type,
+                        "binder_read_exception": replay.binder_read_exception,
                         "oracle": replay.oracle.model_dump(mode="json"),
                         "rationale": " ".join(replay.rationale.lower().split()),
                     },
@@ -534,9 +544,7 @@ class ScanOrchestrator:
                     {
                         "source": "platform",
                         "hypothesis_id": hypothesis_id,
-                        "prior_hypothesis_id": prior_executed_strategy[
-                            "hypothesis_id"
-                        ],
+                        "prior_hypothesis_id": prior_executed_strategy["hypothesis_id"],
                         "entry_point_id": entry_id,
                         "semantic_strategy_signature": semantic_strategy_signature,
                         "prior_result": prior_executed_strategy["result"],
@@ -784,6 +792,71 @@ class ScanOrchestrator:
                 },
             )
             session.commit()
+
+    def _record_agent_runtime_event(
+        self,
+        scan_id: str,
+        task_id: str,
+        event: AgentRuntimeEvent,
+        *,
+        phase: str,
+        round_index: int,
+        agent_backend: str,
+    ) -> bool:
+        """Project one protocol event once, even after spool recovery or reconnect."""
+
+        record_key = event.protocol_record_key
+        stream_id = event.protocol_stream_id
+        session_id = event.session_id
+        normalized_type = (
+            event.event_type
+            if event.event_type.startswith("exploration.")
+            else f"exploration.{event.event_type}"
+        )
+        event_data = {
+            "task_id": task_id,
+            "source": "sdk",
+            "phase": phase,
+            "round_index": round_index,
+            "agent_backend": agent_backend,
+            "session_id": session_id,
+            "protocol_stream_id": stream_id,
+            "worker_sequence": event.worker_sequence,
+            "delivery_source": event.delivery_source,
+            **event.data,
+        }
+        with self.database.session_factory() as session:
+            if record_key and stream_id and session_id:
+                existing = session.scalar(
+                    select(AgentRuntimeEventRecord.id).where(
+                        AgentRuntimeEventRecord.record_key == record_key
+                    )
+                )
+                if existing is not None:
+                    return False
+                session.add(
+                    AgentRuntimeEventRecord(
+                        scan_id=scan_id,
+                        task_id=task_id,
+                        session_id=session_id,
+                        protocol_stream_id=stream_id,
+                        worker_sequence=event.worker_sequence,
+                        record_key=record_key,
+                        event_type=event.event_type,
+                        message=event.message,
+                        data=event.data,
+                        delivery_source=event.delivery_source,
+                    )
+                )
+            add_event(
+                session,
+                scan_id,
+                normalized_type,
+                event.message,
+                event_data,
+            )
+            session.commit()
+        return True
 
     async def submit(self, scan_id: str) -> None:
         if self._shutting_down.is_set():
@@ -2188,6 +2261,7 @@ class ScanOrchestrator:
         rescue_context: dict[str, Any] = {}
         rescue_gate: dict[str, Any] = {}
         phase_counts: dict[str, int] = {}
+        agent_runtime_workspaces: dict[str, Path] = {}
         single_pass_phases = {
             "adversarial_review",
             "rescue_review",
@@ -2372,6 +2446,27 @@ class ScanOrchestrator:
                     dispatch_evidence,
                     platform_context=platform_context,
                 )
+                agent_runtime_workspace = agent_workspace
+                prepare_workspace = getattr(
+                    investigator,
+                    "prepare_session_workspace",
+                    None,
+                )
+                if callable(prepare_workspace):
+                    agent_runtime_workspace = prepare_workspace(
+                        scan=scan,
+                        task=task,
+                        workspace=agent_workspace,
+                        phase=phase,
+                    )
+                runtime_role = (
+                    "critic"
+                    if phase == "adversarial_review"
+                    else "rescue"
+                    if phase in {"rescue_review", "rescue_exploration"}
+                    else "primary"
+                )
+                agent_runtime_workspaces[runtime_role] = agent_runtime_workspace
                 self._record_exploration_event(
                     scan_id,
                     task_id,
@@ -2406,19 +2501,6 @@ class ScanOrchestrator:
                     port = urlsplit(endpoint).port
                     if port is None:
                         raise RuntimeError("internal Agent gateway has no TCP port")
-                    agent_runtime_workspace = agent_workspace
-                    prepare_workspace = getattr(
-                        investigator,
-                        "prepare_session_workspace",
-                        None,
-                    )
-                    if callable(prepare_workspace):
-                        agent_runtime_workspace = prepare_workspace(
-                            scan=scan,
-                            task=task,
-                            workspace=agent_workspace,
-                            phase=phase,
-                        )
                     proof_token = task_gateway_token
                     self._register_live_proof_context(
                         _LiveProofContext(
@@ -2452,6 +2534,15 @@ class ScanOrchestrator:
                     }
 
                 def on_runtime_event(event: AgentRuntimeEvent) -> None:
+                    if not self._record_agent_runtime_event(
+                        scan_id,
+                        task_id,
+                        event,
+                        phase=phase,
+                        round_index=round_index,
+                        agent_backend=agent_backend,
+                    ):
+                        return
                     record = {
                         "schema_version": "1.0",
                         "sequence": len(runtime_events) + 1,
@@ -2459,22 +2550,13 @@ class ScanOrchestrator:
                         "event_type": event.event_type,
                         "message": event.message,
                         "data": event.data,
+                        "session_id": event.session_id,
+                        "protocol_stream_id": event.protocol_stream_id,
+                        "worker_sequence": event.worker_sequence,
+                        "delivery_source": event.delivery_source,
                         "created_at": datetime.now(UTC).isoformat(),
                     }
                     runtime_events.append(record)
-                    self._record_exploration_event(
-                        scan_id,
-                        task_id,
-                        event.event_type,
-                        event.message,
-                        {
-                            "source": "sdk",
-                            "phase": phase,
-                            "round_index": round_index,
-                            "agent_backend": agent_backend,
-                            **event.data,
-                        },
-                    )
 
                 self._record_exploration_event(
                     scan_id,
@@ -3102,13 +3184,16 @@ class ScanOrchestrator:
                         ]
                         poc_artifacts: dict[str, PocBuildResult] = {}
                         if requested:
-                            agent_workspace = (
+                            materialized_workspace = (
                                 self.settings.data_dir
                                 / "workspaces"
                                 / scan_id
                                 / "agent_context"
                                 / task_id
                                 / f"attempt-{task.attempts}"
+                            )
+                            poc_workspace = agent_runtime_workspaces.get(
+                                "primary", materialized_workspace
                             )
                             (
                                 requested,
@@ -3117,7 +3202,7 @@ class ScanOrchestrator:
                             ) = self._build_requested_pocs(
                                 scan_id=scan_id,
                                 task_id=task_id,
-                                workspace=agent_workspace,
+                                workspace=poc_workspace,
                                 requests=requested,
                                 evidence_summaries=evidence_summaries,
                                 cancel_event=cancel_event,
@@ -3570,9 +3655,7 @@ class ScanOrchestrator:
             objection_resolutions=[],
             test_cases=[],
             evidence_ids=evidence_ids,
-            severity_proposal=(
-                self.hypothesis_ledger.task_proven_severity(task_id) or "medium"
-            ),
+            severity_proposal=(self.hypothesis_ledger.task_proven_severity(task_id) or "medium"),
             confidence="high",
             coverage_gaps=(
                 [f"Model finalization failed after platform proof: {agent_error}"]
@@ -3870,6 +3953,7 @@ class ScanOrchestrator:
             if (
                 entry is not None
                 and entry.kind != "provider"
+                and request.operation != "binder_transact"
                 and (
                     request.operation != "auto"
                     or request.method is not None
@@ -3931,6 +4015,8 @@ class ScanOrchestrator:
                 "query",
             }:
                 reason = "provider_rows Oracle requires a provider query operation"
+            elif request.operation == "binder_transact" and entry.kind != "service":
+                reason = "binder_transact is allowed only for Service entries"
             elif (request.intent_action or request.categories) and entry.kind == "provider":
                 reason = "provider requests do not accept Intent routing fields"
             elif (
@@ -4486,6 +4572,10 @@ class ScanOrchestrator:
                             operation=request.operation,
                             method=request.method,
                             argument=request.argument,
+                            binder_transaction_code=request.binder_transaction_code,
+                            binder_interface_descriptor=request.binder_interface_descriptor,
+                            binder_reply_type=request.binder_reply_type,
+                            binder_read_exception=request.binder_read_exception,
                             intent_action=request.intent_action,
                             categories=list(request.categories),
                             oracle=request.oracle,

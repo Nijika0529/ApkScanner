@@ -191,7 +191,8 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     continuation = _phase_prompt("exploration_round")
     assert "A PoC log_contains Oracle records only the PoC's claim" in planning
     assert "live Proof Gateway rejects every impact=none replay" in planning
-    assert "missing Binder/result Oracle" in planning
+    assert "operation=binder_transact" in planning
+    assert "binder_reply may use unauthorized_data_access only" in planning
     assert "target_uid_log_contains may use" in planning
     critic = _phase_prompt("adversarial_review")
     rescue_review = _phase_prompt("rescue_review")

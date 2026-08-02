@@ -30,9 +30,7 @@ AAPT2_RESOURCE_TABLE_COMPATIBILITY_ERRORS = (
 @dataclass(slots=True)
 class PocBuildResult:
     ok: bool
-    commands: list[tuple[str, CommandResult, dict[str, object]]] = field(
-        default_factory=list
-    )
+    commands: list[tuple[str, CommandResult, dict[str, object]]] = field(default_factory=list)
     error: str | None = None
     apk_sha256: str | None = None
     apk_path: Path | None = None
@@ -94,9 +92,7 @@ class PocBuilder:
             name: str(value) if value is not None else None
             for name, value in {
                 "aapt2": self._tool_candidate(name="aapt2"),
-                "d8_or_dx": (
-                    self._dex_tool()[1] if self._dex_tool() is not None else None
-                ),
+                "d8_or_dx": (self._dex_tool()[1] if self._dex_tool() is not None else None),
                 "zipalign": self._tool_candidate(name="zipalign"),
                 "apksigner": self._tool_candidate(name="apksigner"),
             }.items()
@@ -109,9 +105,7 @@ class PocBuilder:
             "target_api": target_api,
             "build_tools_version": self.settings.android_build_tools_version,
             "toolchain": toolchain,
-            "aapt2_fallbacks": [
-                str(item) for item in self._tool_candidates("aapt2")[1:]
-            ],
+            "aapt2_fallbacks": [str(item) for item in self._tool_candidates("aapt2")[1:]],
             "source_contract": "manifest_and_java_or_prebuilt_apk",
             "agent_source_build_contract": {
                 "required_inputs": ["AndroidManifest.xml", "src/**/*.java"],
@@ -191,10 +185,7 @@ class PocBuilder:
                 ok=False,
                 error=(
                     "platform-managed source build is unavailable: "
-                    + ", ".join(
-                        str(item)
-                        for item in capability.get("source_build_missing", [])
-                    )
+                    + ", ".join(str(item) for item in capability.get("source_build_missing", []))
                 ),
             )
         try:
@@ -242,13 +233,9 @@ class PocBuilder:
                 launch_component=effective_spec.launch_component,
                 min_api=min_api,
                 target_api=target_api,
-                visible_packages=(
-                    visible_packages if supports_package_visibility else ()
-                ),
+                visible_packages=(visible_packages if supports_package_visibility else ()),
                 visible_provider_authorities=(
-                    visible_provider_authorities
-                    if supports_package_visibility
-                    else ()
+                    visible_provider_authorities if supports_package_visibility else ()
                 ),
             )
             build_sources = self._build_sources(sources, output)
@@ -430,9 +417,7 @@ class PocBuilder:
                 return PocBuildResult(
                     ok=False,
                     commands=commands,
-                    error=self._command_failure(
-                        f"poc.build.{dex_tool_name}", dex_result
-                    ),
+                    error=self._command_failure(f"poc.build.{dex_tool_name}", dex_result),
                     source_sha256=source_sha256,
                     source_path=source_path,
                 )
@@ -585,15 +570,12 @@ class PocBuilder:
             queries = ElementTree.Element("queries")
             application = root.find("application")
             insert_at = (
-                list(root).index(application)
-                if application is not None
-                else len(list(root))
+                list(root).index(application) if application is not None else len(list(root))
             )
             root.insert(insert_at, queries)
         if queries is not None:
             declared_packages = {
-                node.get(f"{{{ANDROID_NAMESPACE}}}name")
-                for node in queries.findall("package")
+                node.get(f"{{{ANDROID_NAMESPACE}}}name") for node in queries.findall("package")
             }
             for visible_package in visible_packages:
                 if visible_package and visible_package not in declared_packages:
@@ -605,9 +587,7 @@ class PocBuilder:
             declared_authorities = {
                 authority.strip()
                 for node in queries.findall("provider")
-                for authority in (
-                    node.get(f"{{{ANDROID_NAMESPACE}}}authorities") or ""
-                ).split(";")
+                for authority in (node.get(f"{{{ANDROID_NAMESPACE}}}authorities") or "").split(";")
                 if authority.strip()
             }
             for authority in visible_provider_authorities:
@@ -628,11 +608,7 @@ class PocBuilder:
                 matched = False
                 for activity in application.findall("activity"):
                     name = activity.get(f"{{{ANDROID_NAMESPACE}}}name")
-                    normalized = (
-                        f"{package_name}{name}"
-                        if name and name.startswith(".")
-                        else name
-                    )
+                    normalized = f"{package_name}{name}" if name and name.startswith(".") else name
                     if normalized == component:
                         activity.set(
                             f"{{{ANDROID_NAMESPACE}}}exported",
@@ -788,9 +764,7 @@ class PocBuilder:
             return PocBuildResult(
                 ok=False,
                 commands=commands,
-                error=self._command_failure(
-                    "poc.prebuilt.inspect_manifest", commands[-1][1]
-                ),
+                error=self._command_failure("poc.prebuilt.inspect_manifest", commands[-1][1]),
             )
         assert inspection is not None
         package_match = re.search(r"package: name='([^']+)'", inspection.stdout)
@@ -859,11 +833,7 @@ class PocBuilder:
         root = workspace.resolve()
         poc_root = (root / "poc").resolve()
         project = self._resolve_source_project(root, poc_root, spec)
-        if (
-            not project.is_relative_to(poc_root)
-            or not project.is_dir()
-            or project.is_symlink()
-        ):
+        if not project.is_relative_to(poc_root) or not project.is_dir() or project.is_symlink():
             raise ValueError("project_path must resolve to a regular directory under poc/")
         manifest = project / "AndroidManifest.xml"
         sources = sorted((project / "src").rglob("*.java"))
@@ -880,9 +850,7 @@ class PocBuilder:
                 raise ValueError(f"unsupported PoC source file: {item.relative_to(project)}")
             total += item.stat().st_size
         if total > self.settings.poc_max_source_bytes:
-            raise ValueError(
-                f"PoC source exceeds {self.settings.poc_max_source_bytes} bytes"
-            )
+            raise ValueError(f"PoC source exceeds {self.settings.poc_max_source_bytes} bytes")
         tree = ElementTree.parse(manifest)
         root_element = tree.getroot()
         manifest_package = root_element.get("package")
@@ -900,21 +868,14 @@ class PocBuilder:
         if application is None:
             raise ValueError("PoC manifest requires an application")
         activity_elements = application.findall("activity")
-        declared = {
-            item.get(f"{{{ANDROID_NAMESPACE}}}name")
-            for item in activity_elements
-        }
+        declared = {item.get(f"{{{ANDROID_NAMESPACE}}}name") for item in activity_elements}
         component = (
             f"{effective_spec.package_name}{effective_spec.launch_component}"
             if effective_spec.launch_component.startswith(".")
             else effective_spec.launch_component
         )
         normalized_declared = {
-            (
-                f"{effective_spec.package_name}{name}"
-                if name and name.startswith(".")
-                else name
-            )
+            (f"{effective_spec.package_name}{name}" if name and name.startswith(".") else name)
             for name in declared
             if name
         }
@@ -951,9 +912,7 @@ class PocBuilder:
                 if len(normalized_declared) == 1
                 else []
             )
-            if len(candidates) != 1 or not candidates[0].startswith(
-                "io.apkscanner.poc."
-            ):
+            if len(candidates) != 1 or not candidates[0].startswith("io.apkscanner.poc."):
                 raise ValueError("launch_component is not declared as an activity")
             effective_spec = AgentPocSpec.model_validate(
                 {
@@ -1005,15 +964,9 @@ class PocBuilder:
                 )
             )
         if component not in java_activities:
-            candidates = [
-                item
-                for item in java_activities
-                if item.startswith("io.apkscanner.poc.")
-            ]
+            candidates = [item for item in java_activities if item.startswith("io.apkscanner.poc.")]
             if len(candidates) != 1:
-                raise ValueError(
-                    "PoC launcher activity must match exactly one Java Activity class"
-                )
+                raise ValueError("PoC launcher activity must match exactly one Java Activity class")
             effective_spec = AgentPocSpec.model_validate(
                 {
                     **effective_spec.model_dump(mode="python"),
@@ -1021,19 +974,20 @@ class PocBuilder:
                 }
             )
             component = candidates[0]
-        if oracle is not None:
+        # A ui_text Oracle is correlated and decided entirely by the platform's
+        # target-package UI baseline/observation pair.  Its proof does not rely
+        # on model-authored PoC log claims, so a minimal launcher remains valid
+        # even when it omits the optional structured result record.  Oracles
+        # that consume PoC output keep the strict result protocol below.
+        if oracle is not None and oracle.kind != "ui_text":
             launcher_source = java_activity_sources.get(component, "")
             required_markers = {
                 "apkscanner_request_id": "read the injected apkscanner_request_id Intent extra",
                 "success": "log a JSON success boolean",
-                "security_impact_observed": (
-                    "log a JSON security_impact_observed boolean"
-                ),
+                "security_impact_observed": ("log a JSON security_impact_observed boolean"),
             }
             if oracle.kind == "provider_rows":
-                required_markers["row_count"] = (
-                    "log the measured provider row_count integer"
-                )
+                required_markers["row_count"] = "log the measured provider row_count integer"
             missing = [
                 description
                 for marker, description in required_markers.items()
@@ -1041,8 +995,7 @@ class PocBuilder:
             ]
             if missing:
                 raise ValueError(
-                    "PoC launcher must satisfy the platform result protocol: "
-                    + "; ".join(missing)
+                    "PoC launcher must satisfy the platform result protocol: " + "; ".join(missing)
                 )
         if len(log_tags) == 1:
             effective_spec = AgentPocSpec.model_validate(
@@ -1060,11 +1013,7 @@ class PocBuilder:
         spec: AgentPocSpec,
     ) -> Path:
         requested = (root / spec.project_path).resolve()
-        if (
-            requested.is_relative_to(poc_root)
-            and requested.is_dir()
-            and not requested.is_symlink()
-        ):
+        if requested.is_relative_to(poc_root) and requested.is_dir() and not requested.is_symlink():
             return requested
         if not poc_root.is_dir():
             return requested
@@ -1152,20 +1101,14 @@ class PocBuilder:
         if sdk_root is None:
             return None
         candidate = (
-            sdk_root
-            / "platforms"
-            / f"android-{self._requested_compile_api()}"
-            / "android.jar"
+            sdk_root / "platforms" / f"android-{self._requested_compile_api()}" / "android.jar"
         )
         if candidate.is_file():
             return candidate
         installed = [
             (int(match.group(1)), item)
             for item in (sdk_root / "platforms").glob("android-*/android.jar")
-            if item.is_file()
-            and (
-                match := re.fullmatch(r"android-(\d+)", item.parent.name)
-            )
+            if item.is_file() and (match := re.fullmatch(r"android-(\d+)", item.parent.name))
         ]
         installed.sort(key=lambda item: item[0], reverse=True)
         return installed[0][1] if installed else None
@@ -1251,9 +1194,7 @@ class PocBuilder:
             if (java_home / "bin" / "java").is_file():
                 return {
                     "JAVA_HOME": str(java_home),
-                    "PATH": os.pathsep.join(
-                        [str(java_home / "bin"), os.environ.get("PATH", "")]
-                    ),
+                    "PATH": os.pathsep.join([str(java_home / "bin"), os.environ.get("PATH", "")]),
                 }
         return None
 
@@ -1293,10 +1234,7 @@ class PocBuilder:
         result: CommandResult,
     ) -> bool:
         diagnostic = f"{result.stderr}\n{result.stdout}".lower()
-        return any(
-            marker in diagnostic
-            for marker in AAPT2_RESOURCE_TABLE_COMPATIBILITY_ERRORS
-        )
+        return any(marker in diagnostic for marker in AAPT2_RESOURCE_TABLE_COMPATIBILITY_ERRORS)
 
     @staticmethod
     def _command_failure(kind: str, result: CommandResult) -> str:

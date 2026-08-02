@@ -104,11 +104,18 @@ adb connect cloud-device.example:5555
 export APKSCANNER_ADB_SERIAL=cloud-device.example:5555
 ```
 
-如需快速以普通 App UID 调用 Activity、Service、Receiver、Provider 和 Deep Link，可选地在 Android SDK 36 工作站上构建 [`probe/`](probe/) 中的故意导出辅助程序；它只能安装在专用测试设备上：
+如需快速以普通 App UID 调用 Activity、Service、Receiver、Provider、Deep Link 或简单 Binder
+事务，可选地构建 [`probe/`](probe/) 中的故意导出辅助程序；它只能安装在专用测试设备上。
+构建使用固定 Worker 镜像，不要求宿主安装 Gradle/Android SDK：
 
 ```bash
+./probe/build-probe.sh
 export APKSCANNER_PROBE_APK="$PWD/probe/app/build/outputs/apk/debug/app-debug.apk"
 ```
+
+Probe receiver 要求 `android.permission.DUMP`，只有 ADB shell/platform caller 能下发请求；真正的
+入口调用仍由 Probe 自己的普通应用 UID 执行。`binder_transact` 由平台读取 typed reply 并通过
+`binder_reply` Oracle 判定，不信任 Agent PoC 自报的返回值。
 
 没有 ADB 时，扫描仍会依据静态证据完成。没有可选 Probe APK 时，Agent 仍可使用原始
 ADB 探索或构建专用 PoC；仅当某个实际申请的普通 App 测试两种执行路径都不可用时，
@@ -164,9 +171,10 @@ keeper 启动时不获得 Provider Key。仅启动某个 UID worker 的 `docker 
 资源边界，不能作为默认部署方式。除非已验证外部 CLI 与固定 SDK 协议兼容性，否则不要
 覆盖 `APKSCANNER_CODEX_BIN`。
 
-当前已落地的是 Worker Protocol v2 的“一次调用一个临时 Thread”；扫描级容器和同 role
-工作区会复用，但持久 Thread/resume、容器内 ADB Gateway、实时 PoC 回放和 MCP/脚本入口
-仍属于下一阶段。架构、接口和迁移门禁详见
+Worker Protocol v3 已为每个 `task + attempt + role` 保持持久、非 ephemeral Thread；primary
+自动轮次复用同一 Thread，替换 Worker 可通过 `thread_resume` 恢复。任务级 ADB/Proof Gateway、
+实时 PoC/Binder Probe 回放、版本化 Python/MCP Capability 入口和监督 Campaign API 均已落地；
+任意 Capability 自动发现、企业级 RBAC/egress 和完整跨进程 Session/Turn 投影仍是后续能力。详见
 [`docs/codex-docker-architecture.zh-CN.md`](docs/codex-docker-architecture.zh-CN.md)。退役的
 OpenCode 设计仅供历史追溯：
 [`docs/opencode-deepseek.zh-CN.md`](docs/opencode-deepseek.zh-CN.md)。

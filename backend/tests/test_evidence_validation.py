@@ -550,6 +550,79 @@ def test_non_provider_request_ignores_provider_only_fields() -> None:
     assert accepted[0].oracle.impact == "none"
 
 
+def test_service_request_preserves_platform_binder_transaction() -> None:
+    entry = EntryPoint(
+        id="11111111-1111-1111-1111-111111111111",
+        scan_id="scan",
+        kind="service",
+        name="io.apkscanner.vulntest.CommandService",
+        owner_component="io.apkscanner.vulntest.CommandService",
+        exported=True,
+    )
+    request = AgentRequestedTest(
+        hypothesis_id="22222222-2222-2222-2222-222222222222",
+        entry_point_id=entry.id,
+        state="guest",
+        uri=None,
+        extras={},
+        operation="binder_transact",
+        binder_transaction_code=1,
+        binder_reply_type="string",
+        oracle={
+            "kind": "binder_reply",
+            "expected_text": "service-secret=hunter2",
+            "impact": "unauthorized_data_access",
+        },
+        rationale="Read a sensitive Binder reply as an ordinary application UID.",
+    )
+
+    accepted, gaps = ScanOrchestrator._validate_requested_tests(
+        [request],
+        [entry],
+        hypothesis_ids={request.hypothesis_id},
+    )
+
+    assert gaps == []
+    assert accepted == [request]
+    assert accepted[0].operation == "binder_transact"
+
+
+def test_platform_binder_transaction_is_rejected_for_non_service_entry() -> None:
+    request = AgentRequestedTest(
+        hypothesis_id="22222222-2222-2222-2222-222222222222",
+        entry_point_id="11111111-1111-1111-1111-111111111111",
+        state="guest",
+        uri=None,
+        extras={},
+        operation="binder_transact",
+        binder_transaction_code=1,
+        binder_reply_type="string",
+        oracle={
+            "kind": "binder_reply",
+            "expected_text": "secret",
+            "impact": "unauthorized_data_access",
+        },
+        rationale="This action belongs only to a Service.",
+    )
+    entry = EntryPoint(
+        id=request.entry_point_id,
+        scan_id="scan",
+        kind="activity",
+        name="com.example.MainActivity",
+        owner_component="com.example.MainActivity",
+        exported=True,
+    )
+
+    accepted, gaps = ScanOrchestrator._validate_requested_tests(
+        [request],
+        [entry],
+        hypothesis_ids={request.hypothesis_id},
+    )
+
+    assert accepted == []
+    assert any("allowed only for Service" in gap for gap in gaps)
+
+
 def test_provider_rows_oracle_rejects_a_non_query_operation() -> None:
     entry = EntryPoint(
         id="11111111-1111-1111-1111-111111111111",

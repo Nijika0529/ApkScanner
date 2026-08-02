@@ -5,8 +5,8 @@
   "sdk_version": "0.144.4",
   "runtime_distribution": "openai-codex-cli-bin",
   "runtime_version": "0.144.4",
-  "source_commit": "c42ea41ee0b836539a2a5d24f3faff96cc48db40",
-  "source_commit_time": "2026-07-31T19:08:45+00:00",
+  "source_commit": "6751b54cae32b23786001e2414d749a9916201e1",
+  "source_commit_time": "2026-08-01T01:17:26+00:00",
   "generated_protocol_sha256": "85e21305e212d00a33e1092f134b71135944cde4dfc711922636b74558b7eab1",
-  "verified_at": "2026-07-31T19:23:56.420992+00:00"
+  "verified_at": "2026-08-01T03:46:25+00:00"
 }
