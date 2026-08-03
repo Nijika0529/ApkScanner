@@ -61,6 +61,10 @@ JADX 的非零退出码不直接等同于反编译不可用。平台把结果归
 绑定同一个 serial。同一台设备上不会穿插其他 APK 的状态和日志，两台设备则可各运行一个
 完整任务。
 
+宿主控制面通过 `APKSCANNER_HOST_ADB` 固定真实 platform-tools 的绝对路径；容器中的 `adb` 则是
+任务级 Gateway wrapper。项目安装不再注册名为 `adb` 的宿主 console script，避免 pyenv/venv PATH
+优先级让 Gateway 意外覆盖操作者和设备探测所需的真实客户端。
+
 设备池容量在任务运行期间动态读取，运行中接入设备会自动增加可提交 worker，排空设备会停止新的
 lease。默认只有 API 36+ 设备具备裁决资格；显式 legacy smoke 设备只验证工具链，平台在 Proof 层
 强制把其结果保持为 inconclusive。

@@ -140,7 +140,7 @@ Docker 容器共享宿主内核，镜像层在并发扫描间复用。`--memory`
 - Capability Registry 已实现 built-in、hash-pinned Python script 和显式 MCP binding；监督 REST 已提供
   snapshot、catalog/invoke、Campaign validate/launch，作为未来独立监督 Agent 的窄控制面；
 - Worker 镜像 `apk-scanner-codex-worker:0.2.0` 标记 SDK `0.144.4` / Protocol `3` / Worker
-  revision `20260802.1`，真实 Docker
+  revision `20260803.1`，真实 Docker
   UID/Thread 和 Pixel 4 ADB Gateway 集成测试通过；
 - `vulntest.apk` 曾在 Pixel 4 Android 13/API 33 完成真实 DeepSeek/Codex 自动 PoC smoke：Codex 在独立
   UID 工作区读取宿主机反编译结果、生成源码 PoC，经平台构建/签名/安装后，以普通 App UID 触发
@@ -1012,6 +1012,10 @@ Agent: adb shell am start ...
   -> 返回原 exit code/stdout/stderr
 ```
 
+包装器在 Python 分发中命名为 `apkscanner-adb-gateway`，只在 Worker 镜像内部链接为
+`/usr/local/bin/adb`。宿主控制面通过 `APKSCANNER_HOST_ADB` 使用真实 platform-tools 的绝对路径，
+两者不再争用 PATH 中的同名 console script。
+
 容器中不得安装可绕过 wrapper 的第二份真实 adb，且网络策略不得允许直连宿主 ADB server。若未来需要完整 adb smart-socket 兼容，应实现带相同策略的协议代理，不能直接暴露 5037。
 
 ### 13.3 Token 与策略
@@ -1356,7 +1360,7 @@ started_at, completed_at
 
 | 文件/新模块 | 具体改动 |
 | --- | --- |
-| `backend/apkscanner/config.py` | 增加 direct DeepSeek Provider、扫描容器、UID 池、资源、网络、turn/watchdog 和 host 禁用配置；集中校验 |
+| `backend/apkscanner/config.py` | 增加 direct DeepSeek Provider、扫描容器、UID 池、资源、网络、turn/watchdog、host 禁用和宿主真实 ADB 路径配置；集中校验 |
 | `backend/apkscanner/agent_execution.py`（新） | 定义 ExecutionProfile、ProviderProfile、PhaseRoute、WorkspaceManifest |
 | `backend/apkscanner/agent_backend.py`（新） | 定义 `open_attempt/run_turn/interrupt/close/capability` 后端协议 |
 | `backend/apkscanner/agent_workspace.py`（新） | 创建 scan/session 目录、分配 UID、0700/chown、物化上下文、mount manifest、artifact ingestion |

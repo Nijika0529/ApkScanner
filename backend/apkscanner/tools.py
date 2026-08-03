@@ -6,6 +6,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,13 +56,23 @@ class TimeBudget:
 
 
 class ToolRunner:
-    def __init__(self, timeout_seconds: int = 600, max_output_chars: int = 2_000_000):
+    def __init__(
+        self,
+        timeout_seconds: int = 600,
+        max_output_chars: int = 2_000_000,
+        *,
+        executable_overrides: Mapping[str, str] | None = None,
+    ):
         self.timeout_seconds = timeout_seconds
         self.max_output_chars = max_output_chars
+        self.executable_overrides = dict(executable_overrides or {})
         self._shutdown = threading.Event()
 
     def available(self, tool: str) -> bool:
-        return shutil.which(tool) is not None
+        return self._resolve_executable(tool) is not None
+
+    def _resolve_executable(self, tool: str) -> str | None:
+        return shutil.which(self.executable_overrides.get(tool, tool))
 
     def run(
         self,
@@ -72,7 +83,9 @@ class ToolRunner:
         env: dict[str, str] | None = None,
         cancel_event: threading.Event | None = None,
     ) -> CommandResult:
-        if not argv or not shutil.which(argv[0]):
+        original_argv = list(argv)
+        executable = self._resolve_executable(argv[0]) if argv else None
+        if not argv or executable is None:
             return CommandResult(argv=argv, exit_code=127, stdout="", stderr="tool not found")
         if self._shutdown.is_set() or (
             cancel_event is not None and cancel_event.is_set()
@@ -88,8 +101,10 @@ class ToolRunner:
         if env:
             command_env.update(env)
         effective_timeout = self.timeout_seconds if timeout is None else timeout
+        dispatch_argv = [executable, *argv[1:]]
         return self._run_cancelable(
-            argv,
+            dispatch_argv,
+            reported_argv=original_argv,
             cwd=cwd,
             env=command_env,
             timeout=effective_timeout,
@@ -100,6 +115,7 @@ class ToolRunner:
         self,
         argv: list[str],
         *,
+        reported_argv: list[str],
         cwd: Path | None,
         env: dict[str, str],
         timeout: int,
@@ -130,7 +146,7 @@ class ToolRunner:
             if self._shutdown.is_set() or cancel_event.is_set():
                 stdout, stderr = self._terminate(process)
                 return CommandResult(
-                    argv=argv,
+                    argv=reported_argv,
                     exit_code=130,
                     stdout=stdout[-self.max_output_chars :],
                     stderr=(stderr or "command cancelled")[-self.max_output_chars :],
@@ -140,7 +156,7 @@ class ToolRunner:
             if remaining <= 0:
                 stdout, stderr = self._terminate(process)
                 return CommandResult(
-                    argv=argv,
+                    argv=reported_argv,
                     exit_code=124,
                     stdout=stdout[-self.max_output_chars :],
                     stderr=(stderr or "command timed out")[-self.max_output_chars :],
@@ -149,7 +165,7 @@ class ToolRunner:
             try:
                 stdout, stderr = process.communicate(timeout=min(0.1, remaining))
                 return CommandResult(
-                    argv=argv,
+                    argv=reported_argv,
                     exit_code=process.returncode,
                     stdout=stdout[-self.max_output_chars :],
                     stderr=stderr[-self.max_output_chars :],

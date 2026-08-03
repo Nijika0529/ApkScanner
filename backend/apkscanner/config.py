@@ -55,6 +55,7 @@ class Settings:
     codex_turn_timeout_seconds: int = 3_600
     codex_no_event_timeout_seconds: int = 900
     deepseek_base_url: str = "https://api.deepseek.com/"
+    host_adb_executable: str = "adb"
     adb_serial: str | None = None
     adb_serials: tuple[str, ...] = ()
     probe_apk_path: Path | None = None
@@ -94,6 +95,14 @@ class Settings:
         legacy_serial = (os.getenv("APKSCANNER_ADB_SERIAL") or "").strip() or None
         if not configured_serials and legacy_serial:
             configured_serials = (legacy_serial,)
+        configured_host_adb = os.getenv("APKSCANNER_HOST_ADB")
+        if configured_host_adb is None:
+            host_adb_executable = "adb"
+        else:
+            host_adb_path = Path(configured_host_adb.strip()).expanduser()
+            if not configured_host_adb.strip() or not host_adb_path.is_absolute():
+                raise ValueError("APKSCANNER_HOST_ADB must be an absolute executable path")
+            host_adb_executable = str(host_adb_path)
         settings = cls(
             data_dir=data_dir,
             database_url=database_url,
@@ -163,6 +172,7 @@ class Settings:
             deepseek_base_url=os.getenv(
                 "APKSCANNER_DEEPSEEK_BASE_URL", "https://api.deepseek.com/"
             ),
+            host_adb_executable=host_adb_executable,
             adb_serial=configured_serials[0] if configured_serials else legacy_serial,
             adb_serials=configured_serials,
             probe_apk_path=(

@@ -31,7 +31,7 @@ dev = [
 apk-scanner = "apkscanner.cli:main"
 scanctl = "apkscanner.cli:main"
 apkscanner-proof = "apkscanner.proof_client:main"
-adb = "apkscanner.adb_gateway:main"
+apkscanner-adb-gateway = "apkscanner.adb_gateway:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["backend/apkscanner"]

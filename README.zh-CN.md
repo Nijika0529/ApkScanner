@@ -48,6 +48,10 @@ scanctl serve
 
 打开 `http://127.0.0.1:8000`。如需独立前端开发，在 `frontend/` 中运行 `npm run dev`，Vite 会将 `/api` 代理到 8000 端口。
 
+旧分支曾把任务级 Gateway 注册成宿主全局 `adb`。升级已有 editable install 后执行一次
+`python -m pip install --force-reinstall --no-deps -e .` 和 `hash -r`；新版只注册
+`apkscanner-adb-gateway`，不会覆盖 platform-tools 的 `adb`。
+
 无需 Web UI 执行前台扫描：
 
 ```bash
@@ -99,7 +103,8 @@ Web 上传对话框和 CLI 均可将每次扫描锁定为 `codex` 或 `none`；`
 配置已在本地 ADB 服务器中记录的远程 Android 16 ADB 序列号或端点：
 
 ```bash
-adb connect cloud-device.example:5555
+export APKSCANNER_HOST_ADB=/真实的/platform-tools/adb
+"$APKSCANNER_HOST_ADB" connect cloud-device.example:5555
 export APKSCANNER_ADB_SERIAL=cloud-device.example:5555
 ```
 
@@ -252,6 +257,7 @@ source/control/sink/reachable path/boundary/counterevidence/proof gaps 证据元
 | `APKSCANNER_DATA_DIR` | `.data` | SQLite、工作区、APK、证据、报告存储目录 |
 | `APKSCANNER_DATABASE_URL` | Data 目录中的 SQLite | SQLAlchemy 数据库 URL |
 | `APKSCANNER_FRONTEND_DIST` | 未设置 | FastAPI 提供的前端构建产物目录 |
+| `APKSCANNER_HOST_ADB` | 从 PATH 探测 | 宿主真实 platform-tools `adb` 的绝对路径；`start.sh` 会解析并固定 |
 | `APKSCANNER_ADB_SERIAL` | 未设置 | 远程云真机 ADB 序列号 |
 | `APKSCANNER_PROBE_APK` | 未设置 | 已构建的 Probe APK 路径 |
 | `APKSCANNER_ANDROID_SDK_ROOT` | Android SDK 环境变量/未设置 | 平台托管 Agent PoC 构建所用 SDK |

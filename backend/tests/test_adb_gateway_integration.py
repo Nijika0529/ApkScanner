@@ -18,13 +18,18 @@ from sqlalchemy import select
 @pytest.mark.skipif(
     os.getenv("APKSCANNER_RUN_ADB_TESTS") != "1"
     or not os.getenv("APKSCANNER_TEST_ADB_SERIAL")
-    or shutil.which("docker") is None
-    or shutil.which("adb") is None,
-    reason="requires explicit ADB integration opt-in, a serial, Docker and adb",
+    or not os.getenv("APKSCANNER_HOST_ADB")
+    or shutil.which("docker") is None,
+    reason="requires explicit ADB integration opt-in, a serial, Docker and host adb path",
 )
 def test_container_adb_wrapper_reaches_fixed_serial_gateway(settings, monkeypatch) -> None:  # noqa: ANN001
     serial = os.environ["APKSCANNER_TEST_ADB_SERIAL"]
-    configured = replace(settings, adb_serial=serial, adb_serials=(serial,))
+    configured = replace(
+        settings,
+        host_adb_executable=os.environ["APKSCANNER_HOST_ADB"],
+        adb_serial=serial,
+        adb_serials=(serial,),
+    )
     configured.ensure_directories()
     database = Database(configured)
     database.create_all()

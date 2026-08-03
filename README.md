@@ -87,7 +87,8 @@ resolves the service default when the scan is created and is persisted with that
 Configure a remote Android 16 ADB serial or endpoint already known to the local ADB server:
 
 ```bash
-adb connect cloud-device.example:5555
+export APKSCANNER_HOST_ADB=/absolute/path/to/platform-tools/adb
+"$APKSCANNER_HOST_ADB" connect cloud-device.example:5555
 export APKSCANNER_ADB_SERIAL=cloud-device.example:5555
 ```
 
@@ -99,6 +100,12 @@ export APKSCANNER_ADB_SERIALS=cloud-device-a.example:5555,cloud-device-b.example
 
 Each investigation keeps one serial for its complete lifecycle. The legacy
 `APKSCANNER_ADB_SERIAL` remains supported as a one-device pool.
+`APKSCANNER_HOST_ADB`, when set, must be an absolute path. The host service uses this real
+platform-tools binary while the worker image exposes a separate task-scoped Gateway as `adb`.
+Installing APKScanner therefore does not replace the operator's host `adb` command. After upgrading
+an older editable install, run `python -m pip install --force-reinstall --no-deps -e .` and `hash -r`
+once to remove the retired host-side `adb` console entry point from the active Python environment
+and shell command cache.
 
 For fast generic Activity, Service, Receiver, Provider, deep-link, and simple Binder calls from an
 ordinary app UID, optionally build the deliberately exported helper in [`probe/`](probe/), install
@@ -244,6 +251,7 @@ OpenCode design remains only for historical reference in
 | `APKSCANNER_DATA_DIR` | `.data` | SQLite, workspaces, APKs, evidence, reports |
 | `APKSCANNER_DATABASE_URL` | SQLite in data dir | SQLAlchemy database URL |
 | `APKSCANNER_FRONTEND_DIST` | unset | Built frontend directory served by FastAPI |
+| `APKSCANNER_HOST_ADB` | PATH lookup | Absolute path to the real host platform-tools `adb`; `start.sh` resolves and pins it |
 | `APKSCANNER_ADB_SERIAL` | unset | Remote cloud-device ADB serial |
 | `APKSCANNER_ADB_SERIALS` | unset | Comma-separated ADB device pool; investigation concurrency follows the pool size |
 | `APKSCANNER_PROBE_APK` | unset | Built Probe APK path |

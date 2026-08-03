@@ -59,12 +59,42 @@ stop_existing() {
   rm -f "$PID_FILE"
 }
 
+resolve_host_adb() {
+  local explicit="${APKSCANNER_HOST_ADB:-}"
+  local candidate resolved version_output
+  local -a candidates=()
+
+  if [ -n "$explicit" ]; then
+    if [[ "$explicit" != /* ]]; then
+      echo "APKSCANNER_HOST_ADB must be an absolute executable path" >&2
+      return 1
+    fi
+    candidates+=("$explicit")
+  else
+    [ -n "${ANDROID_SDK_ROOT:-}" ] && candidates+=("$ANDROID_SDK_ROOT/platform-tools/adb")
+    [ -n "${ANDROID_HOME:-}" ] && candidates+=("$ANDROID_HOME/platform-tools/adb")
+    candidates+=("/usr/local/bin/adb" "/usr/bin/adb")
+    candidate="$(command -v adb 2>/dev/null || true)"
+    [ -n "$candidate" ] && candidates+=("$candidate")
+  fi
+
+  for candidate in "${candidates[@]}"; do
+    [ -x "$candidate" ] || continue
+    version_output="$("$candidate" version 2>&1 || true)"
+    [[ "$version_output" == *"Android Debug Bridge version"* ]] || continue
+    resolved="$(readlink -f "$candidate" 2>/dev/null || true)"
+    printf '%s\n' "${resolved:-$candidate}"
+    return 0
+  done
+  return 1
+}
+
 detect_adb_serials() {
   local -a devices=()
   local attempt
   for attempt in $(seq 1 5); do
     mapfile -t devices < <(
-      adb devices 2>/dev/null |
+      "$APKSCANNER_HOST_ADB" devices 2>/dev/null |
         awk 'NR > 1 && $2 == "device" { print $1 }'
     )
     if [ "${#devices[@]}" -gt 0 ]; then
@@ -80,6 +110,16 @@ detect_adb_serials() {
 
 # Build before stopping the running service. A failed frontend build therefore
 # cannot replace a working process or silently leave FastAPI serving an old bundle.
+if resolved_host_adb="$(resolve_host_adb)"; then
+  export APKSCANNER_HOST_ADB="$resolved_host_adb"
+  echo "host adb: $APKSCANNER_HOST_ADB"
+elif [ -n "${APKSCANNER_HOST_ADB:-}" ]; then
+  echo "configured APKSCANNER_HOST_ADB is not a real Android platform-tools adb" >&2
+  exit 1
+else
+  export APKSCANNER_HOST_ADB="/nonexistent/apkscanner-host-adb"
+  echo "real host adb was not found; device tasks will use static-only mode" >&2
+fi
 build_frontend
 stop_existing
 
@@ -105,6 +145,7 @@ nohup setsid env \
   APKSCANNER_CODEX_PROVIDER="$APKSCANNER_CODEX_PROVIDER" \
   APKSCANNER_CODEX_MODEL="$APKSCANNER_CODEX_MODEL" \
   APKSCANNER_AGENT_PERMISSION_PROFILE="$APKSCANNER_AGENT_PERMISSION_PROFILE" \
+  APKSCANNER_HOST_ADB="$APKSCANNER_HOST_ADB" \
   APKSCANNER_ADB_SERIAL="$APKSCANNER_ADB_SERIAL" \
   APKSCANNER_ADB_SERIALS="$APKSCANNER_ADB_SERIALS" \
   APKSCANNER_DEVICE_INSTALL_POLICY="$APKSCANNER_DEVICE_INSTALL_POLICY" \

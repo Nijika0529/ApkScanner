@@ -93,8 +93,10 @@ COPY backend ./backend
 COPY config/deepseek-models.json ./config/deepseek-models.json
 RUN python -m pip install --no-cache-dir --no-deps --no-build-isolation .
 RUN ln -s /usr/local/lib/python3.13/site-packages/codex_cli_bin/bin/codex \
-        /usr/local/bin/codex
+        /usr/local/bin/codex \
+    && test -x /usr/local/bin/apkscanner-adb-gateway \
+    && ln -s /usr/local/bin/apkscanner-adb-gateway /usr/local/bin/adb
 
-LABEL io.apkscanner.worker-revision="20260802.1"
+LABEL io.apkscanner.worker-revision="20260803.1"
 
 ENTRYPOINT ["python", "-m", "apkscanner.codex_worker"]

@@ -52,6 +52,12 @@ Evidence、模型结论、Thread/Turn、版本 PoC 回放和历史 Finding。该
 直接领取第二个任务。每个任务从 prepare、Probe、Agent 多轮、PoC、Oracle 到 cleanup 全程独占同一
 serial；跨扫描的最终 ADB 并发仍由全局 device lease 队列约束。
 
+宿主和容器的 ADB 命令空间必须分离：宿主通过 `APKSCANNER_HOST_ADB` 固定真实
+platform-tools 绝对路径，`ToolRunner` 在执行时解析该覆盖值但 Evidence 仍记录规范化的 `adb`
+argv；Python 包只安装 `apkscanner-adb-gateway`，仅 Worker 镜像把它链接成 `/usr/local/bin/adb`。
+因此安装或启动平台不会覆盖操作者终端里的真实 `adb`。`start.sh` 会用 `adb version` 拒绝误指向
+任务 Gateway 的候选；未找到真实客户端时进入 static-only，而不是依赖 PATH 顺序碰运气。
+
 设备成员持久化在 `adb_devices` 表，环境变量中的 serial 只作为首次启动 seed。运行时接口为：
 
 | 操作 | API | 语义 |

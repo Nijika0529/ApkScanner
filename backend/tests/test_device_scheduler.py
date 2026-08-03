@@ -35,6 +35,29 @@ def test_settings_parse_a_comma_separated_device_pool(
     assert settings.configured_adb_serials == ("device-a", "device-b")
 
 
+def test_settings_accept_an_absolute_host_adb_executable(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # noqa: ANN001
+    monkeypatch.setenv("APKSCANNER_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("APKSCANNER_HOST_ADB", "/opt/android/platform-tools/adb")
+
+    settings = Settings.from_env()
+
+    assert settings.host_adb_executable == "/opt/android/platform-tools/adb"
+
+
+def test_settings_reject_a_relative_host_adb_executable(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # noqa: ANN001
+    monkeypatch.setenv("APKSCANNER_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("APKSCANNER_HOST_ADB", "adb")
+
+    with pytest.raises(ValueError, match="absolute executable path"):
+        Settings.from_env()
+
+
 def test_fully_leased_device_pool_is_busy_but_still_available() -> None:
     class AvailableRunner:
         @staticmethod

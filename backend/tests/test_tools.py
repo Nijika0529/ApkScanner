@@ -26,6 +26,25 @@ def test_explicit_zero_timeout_does_not_fall_back_to_default(monkeypatch) -> Non
     assert observed["timeout"] == 0
 
 
+def test_tool_runner_uses_an_explicit_executable_without_changing_audit_argv(
+    tmp_path: Path,
+) -> None:
+    real_adb = tmp_path / "platform-tools-adb"
+    real_adb.write_text(
+        "#!/bin/sh\nprintf 'real adb: %s\\n' \"$*\"\n",
+        encoding="utf-8",
+    )
+    real_adb.chmod(0o755)
+    runner = ToolRunner(executable_overrides={"adb": str(real_adb)})
+
+    assert runner.available("adb") is True
+    result = runner.run(["adb", "version"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "real adb: version"
+    assert result.argv == ["adb", "version"]
+
+
 def test_time_budget_can_exclude_shared_resource_queue_wait() -> None:
     budget = TimeBudget(deadline=100.0)
     assert budget.extend(12.5).deadline == 112.5

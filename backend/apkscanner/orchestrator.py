@@ -122,7 +122,10 @@ class ScanOrchestrator:
         self.settings = settings
         self.database = database
         self.store = store
-        self.runner = ToolRunner(settings.tool_timeout_seconds)
+        self.runner = ToolRunner(
+            settings.tool_timeout_seconds,
+            executable_overrides={"adb": settings.host_adb_executable},
+        )
         self.inspector = ApkInspector(settings, self.runner)
         self.rules = BuiltinRuleEngine()
         self.evidence = EvidenceRecorder(store)
