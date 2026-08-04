@@ -19,6 +19,7 @@ from apkscanner.models import EntryPoint, InvestigationTask, ProofAttempt, Scan
 from apkscanner.orchestrator import ScanOrchestrator, _LiveProofContext
 from apkscanner.poc import PocBuilder, PocBuildResult
 from apkscanner.schemas import (
+    AgentBinderScriptStep,
     AgentOracleSpec,
     AgentPocSpec,
     AgentProofReplay,
@@ -114,6 +115,89 @@ def test_embedded_live_proof_endpoint_rejects_an_unregistered_task(settings) -> 
         assert "not active" in error.value.read().decode()
     finally:
         orchestrator.shutdown()
+
+
+def test_live_proof_replay_accepts_bounded_platform_binder_script() -> None:
+    replay = AgentProofReplay.model_validate(
+        {
+            "hypothesis_id": "11111111-2222-4333-8444-555555555555",
+            "entry_point_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "operation": "binder_script",
+            "binder_transaction_code": 7,
+            "binder_interface_descriptor": "com.example.ISecret",
+            "binder_script": [
+                {
+                    "operation": "write_string",
+                    "string_value": "account",
+                    "integer_value": None,
+                    "boolean_value": None,
+                },
+                {
+                    "operation": "read_string",
+                    "string_value": None,
+                    "integer_value": None,
+                    "boolean_value": None,
+                },
+            ],
+            "oracle": {
+                "kind": "binder_reply",
+                "expected_text": "secret=",
+                "match_mode": "contains",
+                "reply_index": 0,
+                "impact": "unauthorized_data_access",
+            },
+            "rationale": "Platform Probe writes the primitive argument and reads the reply.",
+        }
+    )
+
+    assert replay.poc is None
+    assert replay.binder_read_exception is True
+    assert replay.binder_script is not None
+    assert replay.binder_script[0].operation == "write_string"
+
+
+def test_impactful_binder_non_empty_match_is_rejected() -> None:
+    with pytest.raises(ValueError, match="non-empty Binder reply"):
+        AgentOracleSpec(
+            kind="binder_reply",
+            match_mode="non_empty",
+            impact="unauthorized_data_access",
+        )
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (
+            {"operation": "write_integer", "integer_value": 2**31},
+            "signed 32-bit",
+        ),
+        (
+            {"operation": "write_long", "integer_value": 2**63},
+            "signed 64-bit",
+        ),
+        (
+            {"operation": "write_bytes_base64", "string_value": "Zh=="},
+            "canonical base64",
+        ),
+    ],
+)
+def test_binder_script_rejects_values_that_android_parcel_cannot_encode(
+    payload: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        AgentBinderScriptStep.model_validate(payload)
+
+
+def test_binder_reply_rejects_an_invalid_regex() -> None:
+    with pytest.raises(ValueError, match="regex expected_text is invalid"):
+        AgentOracleSpec(
+            kind="binder_reply",
+            expected_text="(",
+            match_mode="regex",
+            impact="none",
+        )
 
 
 def write_poc_project(workspace: Path) -> Path:
@@ -1146,12 +1230,12 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
             }
         ),
     )
-    context.round_index = settings.agent_max_rounds
-    limited = orchestrator.execute_live_proof_replay(
+    context.round_index = 10_000
+    after_many_rounds = orchestrator.execute_live_proof_replay(
         task_id,
         "secret-token",
         working_replay.model_copy(
-            update={"rationale": "Try one more materially different replay after the budget."}
+            update={"rationale": "Try another materially different replay after many rounds."}
         ),
     )
 
@@ -1187,11 +1271,12 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
     assert unrelated["executed"] is False
     assert unrelated["deduplicated_strategy"] is True
     assert unrelated["prior_hypothesis_id"] == hypothesis.id
-    assert limited["accepted"] is False
-    assert limited["executed"] is False
-    assert limited["limit_reached"] is True
-    assert limited["maximum_replays"] == settings.agent_max_rounds
-    assert len(captured) == 3
+    assert after_many_rounds["accepted"] is True
+    assert after_many_rounds["executed"] is False
+    assert after_many_rounds["deduplicated_strategy"] is True
+    assert "limit_reached" not in after_many_rounds
+    assert "maximum_replays" not in after_many_rounds
+    assert len(captured) == 4
 
     fallback = orchestrator._platform_proof_fallback_result(
         task_id,

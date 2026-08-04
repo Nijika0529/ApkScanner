@@ -151,6 +151,7 @@ def test_private_benchmark_rewards_proven_harm_and_penalizes_confirmed_noise(
     assert metrics["recall"] == 0.5
     assert metrics["score_100"] == 83.33
     assert metrics["unproven_ai_noise"] == 3
+    assert evaluation.result["quality_gate"]["passed"] is False
     assert evaluation.result["matches"][0]["ground_truth_id"] == "GT-1"
     assert evaluation.result["missed"][0]["ground_truth_id"] == "GT-2"
     assert evaluation.investigator_backend == "opencode"
@@ -241,6 +242,7 @@ def test_benchmark_uses_maximum_matching_instead_of_truth_file_order(settings) -
     evaluation = BenchmarkEvaluator(settings, database).evaluate(scan_id, spec)
     assert evaluation.result["metrics"]["true_positives"] == 2
     assert evaluation.result["metrics"]["false_negatives"] == 0
+    assert evaluation.result["quality_gate"]["passed"] is True
     assert {
         item["ground_truth_id"]: item["finding_id"]
         for item in evaluation.result["matches"]

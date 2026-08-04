@@ -26,7 +26,7 @@ export function Button({ className, variant, size, ...props }: ButtonHTMLAttribu
 }
 
 export function Card({ className, ...props }: HTMLAttributes<HTMLDivElement>) {
-  return <div className={cn("rounded-2xl border border-slate-200 bg-white/95 shadow-[0_16px_45px_rgba(15,23,42,.07)] backdrop-blur", className)} {...props} />
+  return <div className={cn("rounded-2xl border border-slate-200 bg-white shadow-[0_16px_45px_rgba(15,23,42,.07)]", className)} {...props} />
 }
 
 const badgeVariants = cva("inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-semibold tracking-wide", {

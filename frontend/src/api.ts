@@ -154,10 +154,15 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(spec),
     }),
-  agentAudits: (id: string, signal?: AbortSignal, includeArtifacts = false) =>
-    request<AgentAudit[]>(`/api/v1/scans/${id}/agent-audits?include_artifacts=${includeArtifacts ? "true" : "false"}`, { signal }),
-  events: (id: string, signal?: AbortSignal, after = 0, limit = 300) =>
-    request<ScanEvent[]>(`/api/v1/scans/${id}/events?after=${after}&limit=${limit}`, { signal }),
+  agentAudits: (id: string, signal?: AbortSignal, includeArtifacts = false, auditId?: string) => {
+    const query = new URLSearchParams({
+      include_artifacts: includeArtifacts ? "true" : "false",
+    })
+    if (auditId) query.set("audit_id", auditId)
+    return request<AgentAudit[]>(`/api/v1/scans/${id}/agent-audits?${query}`, { signal })
+  },
+  events: (id: string, signal?: AbortSignal, after = 0, limit = 300, detail: "summary" | "full" = "full") =>
+    request<ScanEvent[]>(`/api/v1/scans/${id}/events?detail=${detail}&after=${after}&limit=${limit}`, { signal }),
   invalidateScanCache,
   upload: async (file: File, investigator: InvestigatorChoice = "configured", baselineScanId?: string) => {
     const form = new FormData()

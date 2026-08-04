@@ -43,6 +43,7 @@ class TaskType(StrEnum):
     COMPONENT = "component"
     DEEP_LINK = "deep_link"
     STATIC_REVIEW = "static_review"
+    ADAPTIVE_VERIFICATION = "adaptive_verification"
 
 
 class FindingStatus(StrEnum):

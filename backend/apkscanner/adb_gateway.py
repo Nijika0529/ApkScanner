@@ -6,9 +6,9 @@ import re
 import sys
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .tools import CommandResult
 
@@ -55,12 +55,15 @@ class AdbGatewayRequest(BaseModel):
 
     args: list[str] = Field(min_length=1, max_length=64)
     timeout_seconds: int = Field(default=30, ge=1, le=120)
+    policy: Literal["scoped", "adaptive"] = "scoped"
 
-    @field_validator("args")
-    @classmethod
-    def validate_args(cls, values: list[str]) -> list[str]:
-        validate_adb_args(values)
-        return values
+    @model_validator(mode="after")
+    def validate_policy(self) -> AdbGatewayRequest:
+        if self.policy == "adaptive":
+            validate_adaptive_adb_args(self.args)
+        else:
+            validate_adb_args(self.args)
+        return self
 
 
 class AdbGatewayResponse(BaseModel):
@@ -145,6 +148,27 @@ def validate_adb_args(args: list[str]) -> None:
     raise ValueError("ADB shell command is outside the task-scoped exploration policy")
 
 
+def validate_adaptive_adb_args(args: list[str]) -> None:
+    """Allow arbitrary device-side experiments without surrendering transport ownership."""
+
+    if not args:
+        raise ValueError("ADB command cannot be empty")
+    for value in args:
+        if not isinstance(value, str) or not value or len(value) > 4096 or "\x00" in value:
+            raise ValueError("ADB argument is invalid")
+    if args[0].startswith("-"):
+        raise ValueError("ADB transport selectors are controlled by the platform")
+    if args[0] in {
+        "connect",
+        "disconnect",
+        "kill-server",
+        "start-server",
+        "tcpip",
+        "usb",
+    }:
+        raise ValueError("ADB server and transport commands remain platform-owned")
+
+
 def main() -> None:
     task_id = os.getenv("APKSCANNER_ADB_TASK_ID", "")
     endpoint = os.getenv("APKSCANNER_ADB_GATEWAY_URL", "")
@@ -154,7 +178,12 @@ def main() -> None:
         raise SystemExit(126)
     raw_args = sys.argv[1:]
     try:
-        payload = AdbGatewayRequest(args=raw_args).model_dump_json().encode()
+        policy = (
+            "adaptive"
+            if os.getenv("APKSCANNER_ADB_POLICY", "scoped").lower() == "adaptive"
+            else "scoped"
+        )
+        payload = AdbGatewayRequest(args=raw_args, policy=policy).model_dump_json().encode()
     except ValueError as exc:
         print(f"adb: {exc}", file=sys.stderr)
         raise SystemExit(126) from exc

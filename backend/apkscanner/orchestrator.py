@@ -25,7 +25,12 @@ from sqlalchemy import select, update
 
 from .adb_gateway import AdbGatewayRequest, AdbGatewayResponse
 from .agent_events import AgentCancelledError, AgentRuntimeEvent
-from .agent_prompt import developer_instructions, investigation_prompt
+from .agent_prompt import (
+    adaptive_verification_prompt,
+    adaptive_verifier_developer_instructions,
+    developer_instructions,
+    investigation_prompt,
+)
 from .artifacts import ArtifactStore
 from .codex_runner import CodexInvestigator, CodexRunResult
 from .config import Settings
@@ -59,7 +64,9 @@ from .poc import PocBuilder, PocBuildResult
 from .repository import add_event, now
 from .rules import BuiltinRuleEngine
 from .schemas import (
+    ADAPTIVE_VERIFIER_RESULT_JSON_SCHEMA,
     AGENT_RESULT_JSON_SCHEMA,
+    AdaptiveVerificationResult,
     AgentInvestigationResult,
     AgentOracleSpec,
     AgentProofReplay,
@@ -110,6 +117,8 @@ class _LiveProofContext:
     cancel_event: threading.Event
     round_index: int
     device: AdbDeviceAdapter | None = None
+    adb_policy: str = "scoped"
+    container_workspace: str | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
     responses: dict[str, dict[str, Any]] = field(default_factory=dict)
     proof_strategies: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -519,12 +528,25 @@ class ScanOrchestrator:
             raise PermissionError("ADB gateway is not active for this task")
         if context.device is None:
             raise ValueError("this task does not own an ADB device")
+        if request.policy != context.adb_policy:
+            raise PermissionError("ADB gateway policy does not match this task")
         with context.lock:
             self._raise_if_cancelled(context.cancel_event)
             if context.budget.expired:
                 raise TimeoutError("task time budget is exhausted")
             timeout = min(request.timeout_seconds, max(1, context.budget.remaining(120)))
-            result = context.device.execute_gateway(request.args, timeout=timeout)
+            forwarded_args = list(request.args)
+            if context.adb_policy == "adaptive" and context.container_workspace:
+                forwarded_args = self._translate_adaptive_adb_paths(
+                    forwarded_args,
+                    container_workspace=context.container_workspace,
+                    host_workspace=context.workspace,
+                )
+            result = context.device.execute_gateway(
+                forwarded_args,
+                timeout=timeout,
+                policy=context.adb_policy,
+            )
             self._record_commands(
                 context.scan_id,
                 context.task_id,
@@ -535,7 +557,11 @@ class ScanOrchestrator:
                         {
                             "source": "codex_gateway",
                             "round_index": context.round_index,
-                            "gateway_policy": "task_scoped_v1",
+                            "gateway_policy": (
+                                "adaptive_task_scoped_v1"
+                                if context.adb_policy == "adaptive"
+                                else "task_scoped_v1"
+                            ),
                         },
                     )
                 ],
@@ -556,6 +582,29 @@ class ScanOrchestrator:
                 },
             )
             return AdbGatewayResponse.from_command(result).model_dump(mode="json")
+
+    @staticmethod
+    def _translate_adaptive_adb_paths(
+        args: list[str],
+        *,
+        container_workspace: str,
+        host_workspace: Path,
+    ) -> list[str]:
+        """Translate verifier-local APK/file paths for the host-owned ADB process."""
+
+        prefix = container_workspace.rstrip("/")
+        host_root = host_workspace.resolve()
+        translated: list[str] = []
+        for value in args:
+            if value == prefix or value.startswith(prefix + "/"):
+                relative = value[len(prefix) :].lstrip("/")
+                target = (host_root / relative).resolve()
+                if not target.is_relative_to(host_root):
+                    raise ValueError("ADB local path escapes the verifier workspace")
+                translated.append(str(target))
+            else:
+                translated.append(value)
+        return translated
 
     def execute_live_proof_replay(
         self,
@@ -624,48 +673,6 @@ class ScanOrchestrator:
                 entry_id = context.default_entry_id
             if entry_id not in {entry.id for entry in context.entries}:
                 raise ValueError("proof replay entry point is outside this task")
-            if context.round_index >= self.settings.agent_max_rounds:
-                response = {
-                    "schema_version": "1.0",
-                    "accepted": False,
-                    "executed": False,
-                    "hypothesis_id": hypothesis_id,
-                    "entry_point_id": entry_id,
-                    "result": "inconclusive",
-                    "evidence_ids": [],
-                    "evidence": [],
-                    "gaps": [
-                        "The task live-proof replay budget is exhausted. Stop changing the PoC "
-                        "and return a conclusion from the existing platform evidence."
-                    ],
-                    "deduplicated": False,
-                    "limit_reached": True,
-                    "maximum_replays": self.settings.agent_max_rounds,
-                }
-                receipt_payload = json.dumps(
-                    response,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode()
-                response["receipt_signature"] = hmac.new(
-                    token.encode(),
-                    receipt_payload,
-                    hashlib.sha256,
-                ).hexdigest()
-                context.responses[signature] = response
-                self._record_exploration_event(
-                    context.scan_id,
-                    context.task_id,
-                    "proof_replay.limit_reached",
-                    "任务级 PoC 实时重放次数已达到上限",
-                    {
-                        "source": "platform",
-                        "hypothesis_id": hypothesis_id,
-                        "entry_point_id": entry_id,
-                        "maximum_replays": self.settings.agent_max_rounds,
-                    },
-                )
-                return response
             request = AgentRequestedTest(
                 hypothesis_id=hypothesis_id,
                 entry_point_id=entry_id,
@@ -677,6 +684,11 @@ class ScanOrchestrator:
                 binder_interface_descriptor=replay.binder_interface_descriptor,
                 binder_reply_type=replay.binder_reply_type,
                 binder_read_exception=replay.binder_read_exception,
+                binder_script=(
+                    [item.model_dump(mode="json") for item in replay.binder_script]
+                    if replay.binder_script is not None
+                    else None
+                ),
                 reset=replay.reset,
                 oracle=replay.oracle,
                 rationale=replay.rationale,
@@ -692,6 +704,11 @@ class ScanOrchestrator:
                         "binder_interface_descriptor": replay.binder_interface_descriptor,
                         "binder_reply_type": replay.binder_reply_type,
                         "binder_read_exception": replay.binder_read_exception,
+                        "binder_script": (
+                            [item.model_dump(mode="json") for item in replay.binder_script]
+                            if replay.binder_script is not None
+                            else None
+                        ),
                         "oracle": replay.oracle.model_dump(mode="json"),
                         "rationale": " ".join(replay.rationale.lower().split()),
                     },
@@ -802,7 +819,6 @@ class ScanOrchestrator:
             accepted, validation_gaps = self._validate_requested_tests(
                 [request],
                 context.entries,
-                limit=1,
                 hypothesis_ids=set(hypothesis_ids),
                 permission_profile=self.settings.agent_permission_profile,
             )
@@ -1284,6 +1300,7 @@ class ScanOrchestrator:
         try:
             self._run_static(scan_id)
             self._run_tasks(scan_id)
+            self._run_adaptive_verifier(scan_id)
             self._finish(scan_id)
         except Exception as exc:
             with self.database.session_factory() as session:
@@ -1806,6 +1823,8 @@ class ScanOrchestrator:
                         select(InvestigationTask.id).where(
                             InvestigationTask.scan_id == scan_id,
                             InvestigationTask.status == TaskStatus.QUEUED.value,
+                            InvestigationTask.task_type
+                            != TaskType.ADAPTIVE_VERIFICATION.value,
                         )
                     )
                 )
@@ -1845,6 +1864,817 @@ class ScanOrchestrator:
                 for future in completed:
                     future.result()
 
+    def _run_adaptive_verifier(self, scan_id: str) -> None:
+        """Batch the strongest unresolved findings into one terminal Codex thread."""
+
+        if (
+            not self.settings.adaptive_verifier_enabled
+            or not self.settings.codex_enabled
+            or self.settings.codex_isolation != "docker"
+        ):
+            return
+        severity_rank = {
+            "info": 0,
+            "low": 1,
+            "medium": 2,
+            "high": 3,
+            "critical": 4,
+        }
+        minimum_rank = severity_rank[self.settings.adaptive_verifier_min_severity]
+        with self.database.session_factory() as session:
+            scan = session.get(Scan, scan_id)
+            if scan is None:
+                return
+            candidates = [
+                finding
+                for finding in session.scalars(
+                    select(Finding).where(
+                        Finding.scan_id == scan_id,
+                        Finding.status == FindingStatus.SUPPORTED_STATIC.value,
+                    )
+                )
+                if severity_rank.get(finding.severity, 0) >= minimum_rank
+            ]
+            candidates.sort(
+                key=lambda item: (
+                    -severity_rank.get(item.severity, 0),
+                    item.created_at,
+                    item.id,
+                )
+            )
+            if not candidates:
+                scan.stats = {
+                    **dict(scan.stats or {}),
+                    "adaptive_verification": {
+                        "enabled": True,
+                        "candidate_count": 0,
+                        "status": "not_needed",
+                    },
+                }
+                session.commit()
+                return
+            fingerprint_payload = [
+                {
+                    "id": item.id,
+                    "status": item.status,
+                    "severity": item.severity,
+                    "confidence": item.confidence,
+                    "evidence_ids": sorted(
+                        evidence_id
+                        for evidence_id in item.evidence_ids
+                        if evidence_id
+                        not in {
+                            str(history_item.get("response_evidence_id"))
+                            for history_item in (
+                                (item.metadata_json or {}).get(
+                                    "adaptive_verification_history"
+                                )
+                                or []
+                            )
+                            if isinstance(history_item, dict)
+                            and history_item.get("response_evidence_id")
+                        }
+                    ),
+                }
+                for item in candidates
+            ]
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    fingerprint_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            previous = session.scalar(
+                select(InvestigationTask)
+                .where(
+                    InvestigationTask.scan_id == scan_id,
+                    InvestigationTask.task_type
+                    == TaskType.ADAPTIVE_VERIFICATION.value,
+                )
+                .order_by(InvestigationTask.created_at.desc())
+                .limit(1)
+            )
+            if (
+                previous is not None
+                and (previous.preconditions or {}).get("candidate_fingerprint") == fingerprint
+                and previous.status
+                in {
+                    TaskStatus.COMPLETED.value,
+                    TaskStatus.NOT_REPRODUCED.value,
+                    TaskStatus.INCONCLUSIVE.value,
+                }
+            ):
+                return
+            candidate_ids = [item.id for item in candidates]
+            entry_ids = list(
+                dict.fromkeys(
+                    entry_id for item in candidates for entry_id in item.entry_point_ids
+                )
+            )
+            if (
+                previous is not None
+                and (previous.preconditions or {}).get("candidate_fingerprint") == fingerprint
+                and previous.status != TaskStatus.DELETED.value
+            ):
+                task = previous
+                task.status = TaskStatus.RUNNING.value
+                task.target_entry_ids = entry_ids
+                task.hypotheses = [item.title for item in candidates]
+                task.attempts += 1
+                task.started_at = now()
+                task.completed_at = None
+                task.error = None
+            else:
+                task = InvestigationTask(
+                    scan_id=scan_id,
+                    task_type=TaskType.ADAPTIVE_VERIFICATION.value,
+                    status=TaskStatus.RUNNING.value,
+                    priority=100,
+                    target_entry_ids=entry_ids,
+                    hypotheses=[item.title for item in candidates],
+                    preconditions={
+                        "candidate_finding_ids": candidate_ids,
+                        "candidate_fingerprint": fingerprint,
+                        "batch_policy": "one_thread_per_scan",
+                    },
+                    allowed_side_effects=[
+                        "build_and_install_poc",
+                        "adb_on_leased_device",
+                        "public_network",
+                        "ssh_authorized_hosts",
+                        "deploy_remote_test_fixture",
+                    ],
+                    device_profile={
+                        "adaptive_verifier": True,
+                        "android_api_minimum": self.settings.device_min_api,
+                    },
+                    attempts=1,
+                    started_at=now(),
+                )
+                session.add(task)
+            scan.status = ScanStatus.INVESTIGATING.value
+            scan.stats = {
+                **dict(scan.stats or {}),
+                "adaptive_verification": {
+                    "enabled": True,
+                    "candidate_count": len(candidate_ids),
+                    "candidate_finding_ids": candidate_ids,
+                    "status": "running",
+                },
+            }
+            session.flush()
+            task_id = task.id
+            add_event(
+                session,
+                scan_id,
+                "adaptive_verification.started",
+                f"高权限验证 Agent 开始批量检查 {len(candidate_ids)} 个待验证风险",
+                {
+                    "task_id": task_id,
+                    "candidate_count": len(candidate_ids),
+                    "candidate_finding_ids": candidate_ids,
+                    "thread_policy": "one_thread_per_scan",
+                },
+            )
+            session.commit()
+
+        cancel_event = threading.Event()
+        with self._task_cancellations_lock:
+            self._task_cancellations[task_id] = cancel_event
+        try:
+            self._run_adaptive_verifier_impl(scan_id, task_id, cancel_event)
+        except AgentCancelledError:
+            self._mark_task_canceled(scan_id, task_id)
+        except Exception as exc:
+            with self.database.session_factory() as session:
+                task = session.get(InvestigationTask, task_id)
+                scan = session.get(Scan, scan_id)
+                if task is not None:
+                    task.status = TaskStatus.FAILED.value
+                    task.error = str(exc)
+                    task.completed_at = now()
+                if scan is not None:
+                    scan.stats = {
+                        **dict(scan.stats or {}),
+                        "adaptive_verification": {
+                            **dict((scan.stats or {}).get("adaptive_verification") or {}),
+                            "status": "failed",
+                            "error": str(exc)[:2000],
+                        },
+                    }
+                add_event(
+                    session,
+                    scan_id,
+                    "adaptive_verification.failed",
+                    "高权限验证 Agent 未完成；保留原有静态风险结论",
+                    {"task_id": task_id, "error": str(exc)[:2000]},
+                )
+                session.commit()
+        finally:
+            self.codex.close_task(scan_id, task_id)
+            with self._task_cancellations_lock:
+                if self._task_cancellations.get(task_id) is cancel_event:
+                    self._task_cancellations.pop(task_id, None)
+
+    def _run_adaptive_verifier_impl(
+        self,
+        scan_id: str,
+        task_id: str,
+        cancel_event: threading.Event,
+    ) -> None:
+        with self.database.session_factory() as session:
+            scan = session.get(Scan, scan_id)
+            task = session.get(InvestigationTask, task_id)
+            if scan is None or task is None:
+                raise LookupError("Adaptive Verifier scan task disappeared")
+            candidate_ids = list(
+                (task.preconditions or {}).get("candidate_finding_ids") or []
+            )
+            findings = list(
+                session.scalars(
+                    select(Finding).where(
+                        Finding.scan_id == scan_id,
+                        Finding.id.in_(candidate_ids),
+                    )
+                )
+            )
+            findings_by_id = {item.id: item for item in findings}
+            findings = [findings_by_id[value] for value in candidate_ids if value in findings_by_id]
+            if not findings:
+                raise ValueError("Adaptive Verifier has no persisted candidate findings")
+            entry_ids = list(
+                dict.fromkeys(
+                    entry_id for finding in findings for entry_id in finding.entry_point_ids
+                )
+            )
+            entries_by_id = {
+                item.id: item
+                for item in session.scalars(
+                    select(EntryPoint).where(EntryPoint.scan_id == scan_id)
+                )
+            }
+            entries = [entries_by_id[value] for value in entry_ids if value in entries_by_id]
+            source_task_ids = {
+                str(task_id_value)
+                for finding in findings
+                if isinstance((task_id_value := (finding.metadata_json or {}).get("task_id")), str)
+            }
+            hypotheses_by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            if source_task_ids:
+                for hypothesis in session.scalars(
+                    select(SecurityHypothesis).where(
+                        SecurityHypothesis.task_id.in_(source_task_ids)
+                    )
+                ):
+                    hypotheses_by_task[hypothesis.task_id].append(
+                        {
+                            "id": hypothesis.id,
+                            "category": hypothesis.category,
+                            "claim": hypothesis.claim,
+                            "impact": hypothesis.impact,
+                            "status": hypothesis.status,
+                            "proof_obligations": hypothesis.proof_obligations,
+                            "support_evidence_ids": hypothesis.support_evidence_ids,
+                            "refute_evidence_ids": hypothesis.refute_evidence_ids,
+                        }
+                    )
+            all_evidence = list(
+                session.scalars(select(Evidence).where(Evidence.scan_id == scan_id))
+            )
+            prior_adaptive_evidence = [
+                item for item in all_evidence if item.task_id == task_id
+            ]
+            explicit_evidence_ids = {
+                evidence_id for finding in findings for evidence_id in finding.evidence_ids
+            }
+            selected_evidence = [
+                item
+                for item in all_evidence
+                if item.task_id is None
+                or item.task_id in source_task_ids
+                or item.task_id == task_id
+                or item.id in explicit_evidence_ids
+            ]
+            evidence_summaries = [self._evidence_summary(item) for item in selected_evidence]
+            candidate_payload = [
+                {
+                    "finding_id": finding.id,
+                    "title": finding.title,
+                    "description": finding.description,
+                    "severity": finding.severity,
+                    "confidence": finding.confidence,
+                    "status": finding.status,
+                    "entry_point_ids": finding.entry_point_ids,
+                    "locations": finding.locations,
+                    "evidence_ids": finding.evidence_ids,
+                    "source_task_id": (finding.metadata_json or {}).get("task_id"),
+                    "proof_backlog": (finding.metadata_json or {}).get("proof_backlog"),
+                    "coverage_gaps": (finding.metadata_json or {}).get("coverage_gaps", []),
+                    "security_hypotheses": hypotheses_by_task.get(
+                        str((finding.metadata_json or {}).get("task_id")), []
+                    ),
+                    "entry_points": [
+                        {
+                            "id": entry_id,
+                            "kind": entries_by_id[entry_id].kind,
+                            "name": entries_by_id[entry_id].name,
+                            "owner_component": entries_by_id[entry_id].owner_component,
+                            "exported": entries_by_id[entry_id].exported,
+                            "permission": entries_by_id[entry_id].permission,
+                            "deep_links": entries_by_id[entry_id].deep_links,
+                            "code_anchors": entries_by_id[entry_id].code_anchors,
+                            "metadata": entries_by_id[entry_id].metadata_json,
+                        }
+                        for entry_id in finding.entry_point_ids
+                        if entry_id in entries_by_id
+                    ],
+                }
+                for finding in findings
+            ]
+
+        capability = self.codex.capability(deep=True)
+        if not capability.get("available"):
+            raise RuntimeError(str(capability.get("detail") or "Codex is unavailable"))
+        budget = TimeBudget.from_seconds(self.settings.adaptive_verifier_timeout_seconds)
+        device_session = None
+        task_device: AdbDeviceAdapter | None = None
+        if self.device_pool.capacity > 0:
+            device_session = self._task_device_session(
+                scan_id,
+                task_id,
+                priority=100,
+                cancel_event=cancel_event,
+            )
+            lease_metadata = device_session.__enter__()
+            task_device = lease_metadata["device"]
+            budget = budget.extend(lease_metadata["wait_seconds"])
+        try:
+            device_context = (
+                task_device.capability(non_blocking=False)
+                if task_device is not None
+                else self.device_pool.capability(non_blocking=True)
+            )
+            if task_device is not None:
+                health_commands = []
+                for kind, args in (
+                    ("adaptive.device.health", ["get-state"]),
+                    (
+                        "adaptive.device.package_status",
+                        ["shell", "pm", "path", scan.package_name or ""],
+                    ),
+                ):
+                    result = task_device.execute_gateway(
+                        args,
+                        timeout=min(45, max(1, budget.remaining(45))),
+                    )
+                    health_commands.append((kind, result, {"adaptive_verifier": True}))
+                self._record_commands(
+                    scan_id,
+                    task_id,
+                    health_commands,
+                    evidence_summaries,
+                )
+            platform_context = {
+                "phase": "adaptive_verification",
+                "output_language": "zh-CN",
+                "candidate_count": len(candidate_payload),
+                "candidate_finding_ids": candidate_ids,
+                "device": device_context,
+                "adb_gateway": {
+                    "available": task_device is not None,
+                    "mode": "adaptive_task_scoped_fixed_serial",
+                    "command": "adb <arguments>",
+                    "policy": "adaptive",
+                },
+                "ssh": {
+                    "available": bool(
+                        self.settings.adaptive_verifier_copy_host_ssh
+                        and self.settings.adaptive_verifier_ssh_source is not None
+                        and self.settings.adaptive_verifier_ssh_source.is_dir()
+                    ),
+                    "path": "~/.ssh",
+                    "mode": "host_copy_in_private_verifier_home",
+                    "client": "OpenSSH direct ssh/scp",
+                },
+                "workspace": {
+                    "writable_root": ".",
+                    "output_root": "output",
+                    "poc_root": "poc",
+                    "complete_decompiler_roots": [
+                        "/scan-input/jadx",
+                        "/scan-input/apktool",
+                        "/scan-input/archive",
+                    ],
+                    "target_apk": "/scan-input/target.apk",
+                },
+                "target_code_context": self._target_code_context(scan_id, entries),
+                "proof_policy": {
+                    "mode": "model_semantic_judgment",
+                    "fixed_oracle_required": False,
+                    "runtime_evidence_required_for_reproduced_blackbox": True,
+                },
+                "recovery": {
+                    "is_retry": task.attempts > 1 and bool(prior_adaptive_evidence),
+                    "attempt": task.attempts,
+                    "previous_attempt_evidence_count": len(prior_adaptive_evidence),
+                    "instruction": (
+                        "Reuse prior Adaptive Verifier evidence and finalize all candidates; "
+                        "do not repeat successful experiments."
+                        if task.attempts > 1 and prior_adaptive_evidence
+                        else "No previous Adaptive Verifier evidence is available."
+                    ),
+                },
+            }
+            source_workspace = self._materialize_agent_evidence(
+                scan_id,
+                task_id,
+                task.attempts,
+                evidence_summaries,
+                platform_context=platform_context,
+            )
+            runtime_workspace = self.codex.prepare_session_workspace(
+                scan=scan,
+                task=task,
+                workspace=source_workspace,
+                phase="adaptive_verification",
+            )
+            prompt = adaptive_verification_prompt(
+                scan,
+                candidate_payload,
+                evidence_summaries,
+                platform_context,
+            )
+            audit_id = str(uuid.uuid4())
+            with self.database.session_factory() as session:
+                self.evidence.json(
+                    session,
+                    scan_id=scan_id,
+                    task_id=task_id,
+                    kind="agent.request",
+                    value={
+                        "schema_version": "1.0",
+                        "audit_id": audit_id,
+                        "phase": "adaptive_verification",
+                        "developer_instructions": adaptive_verifier_developer_instructions(
+                            ssh_available=platform_context["ssh"]["available"]
+                        ),
+                        "prompt": prompt,
+                        "output_schema": ADAPTIVE_VERIFIER_RESULT_JSON_SCHEMA,
+                        "candidate_finding_ids": candidate_ids,
+                    },
+                    summary="Codex scan-level Adaptive Verifier request",
+                    metadata={
+                        "audit_id": audit_id,
+                        "phase": "adaptive_verification",
+                        "attempt": task.attempts,
+                        "backend": "codex",
+                        "provider": self.settings.codex_provider,
+                        "model": self.settings.codex_model,
+                        "isolation": self.settings.codex_isolation,
+                    },
+                )
+                session.commit()
+            gateway_token: str | None = None
+            gateway_environment: dict[str, str] | None = None
+            if task_device is not None:
+                endpoint = self._ensure_live_proof_endpoint()
+                port = urlsplit(endpoint).port
+                if port is None:
+                    raise RuntimeError("internal Adaptive Verifier gateway has no TCP port")
+                gateway_token = secrets.token_urlsafe(48)
+                source_hypotheses = [
+                    hypothesis
+                    for values in hypotheses_by_task.values()
+                    for hypothesis in values
+                ]
+                self._register_live_proof_context(
+                    _LiveProofContext(
+                        token=gateway_token,
+                        scan_id=scan_id,
+                        task_id=task_id,
+                        package_name=scan.package_name or "",
+                        workspace=runtime_workspace,
+                        entries=entries,
+                        default_entry_id=entries[0].id if entries else "",
+                        hypotheses=source_hypotheses,
+                        budget=budget,
+                        evidence_summaries=evidence_summaries,
+                        cancel_event=cancel_event,
+                        round_index=0,
+                        device=task_device,
+                        adb_policy="adaptive",
+                        container_workspace=self.codex.workspaces.prepare_session(
+                            scan_id=scan.id,
+                            task_id=task.id,
+                            attempt=task.attempts,
+                            role="verifier",
+                            source_workspace=source_workspace,
+                            context={"phase": "adaptive_verification"},
+                        ).container_workspace,
+                    )
+                )
+                docker_base = f"http://apkscanner-host:{port}"
+                gateway_environment = {
+                    "APKSCANNER_ADB_TASK_ID": task_id,
+                    "APKSCANNER_ADB_GATEWAY_URL": (
+                        f"{docker_base}/api/v1/internal/tasks/{task_id}/adb"
+                    ),
+                    "APKSCANNER_ADB_TOKEN": gateway_token,
+                    "APKSCANNER_ADB_POLICY": "adaptive",
+                }
+            runtime_events: list[dict[str, Any]] = []
+
+            def on_runtime_event(event: AgentRuntimeEvent) -> None:
+                if not self._record_agent_runtime_event(
+                    scan_id,
+                    task_id,
+                    event,
+                    phase="adaptive_verification",
+                    round_index=0,
+                    agent_backend="codex",
+                ):
+                    return
+                runtime_events.append(
+                    {
+                        "schema_version": "1.0",
+                        "sequence": len(runtime_events) + 1,
+                        "dedupe_key": event.dedupe_key,
+                        "event_type": event.event_type,
+                        "message": event.message,
+                        "data": event.data,
+                        "created_at": datetime.now(UTC).isoformat(),
+                    }
+                )
+
+            try:
+                try:
+                    result = self.codex.verify_batch(
+                        scan=scan,
+                        task=task,
+                        workspace=source_workspace,
+                        prompt=prompt,
+                        timeout_seconds=max(1, budget.remaining()),
+                        event_callback=on_runtime_event,
+                        cancel_event=cancel_event,
+                        gateway_environment=gateway_environment,
+                    )
+                except AgentCancelledError as exc:
+                    self._record_agent_cancellation(
+                        scan_id=scan_id,
+                        task_id=task_id,
+                        audit_id=audit_id,
+                        backend="codex",
+                        phase="adaptive_verification",
+                        attempt=task.attempts,
+                        error=exc,
+                    )
+                    raise
+                except Exception as exc:
+                    self._record_agent_error(
+                        scan_id=scan_id,
+                        task_id=task_id,
+                        audit_id=audit_id,
+                        backend="codex",
+                        phase="adaptive_verification",
+                        attempt=task.attempts,
+                        error=exc,
+                    )
+                    raise
+            finally:
+                if gateway_token is not None:
+                    self._unregister_live_proof_context(task_id, gateway_token)
+            with self.database.session_factory() as session:
+                response_evidence = self.evidence.json(
+                    session,
+                    scan_id=scan_id,
+                    task_id=task_id,
+                    kind="agent.response",
+                    value={
+                        "schema_version": "1.0",
+                        "audit_id": audit_id,
+                        "thread_id": result.thread_id,
+                        "turn_id": result.turn_id,
+                        "structured_output": result.result.model_dump(mode="json"),
+                        "usage": result.usage,
+                    },
+                    summary="Codex scan-level Adaptive Verifier semantic result",
+                    metadata={
+                        "audit_id": audit_id,
+                        "phase": "adaptive_verification",
+                        "attempt": task.attempts,
+                        "backend": "codex",
+                        "provider": self.settings.codex_provider,
+                        "model": self.settings.codex_model,
+                        "isolation": self.settings.codex_isolation,
+                        "thread_id": result.thread_id,
+                        "turn_id": result.turn_id,
+                        "verification_mode": "adaptive_agent",
+                    },
+                )
+                session.commit()
+                response_evidence_id = response_evidence.id
+            self._record_agent_runtime_events(
+                scan_id=scan_id,
+                task_id=task_id,
+                audit_id=audit_id,
+                backend="codex",
+                phase="adaptive_verification",
+                attempt=task.attempts,
+                events=runtime_events,
+            )
+            self._apply_adaptive_verifier_result(
+                scan_id=scan_id,
+                task_id=task_id,
+                candidate_ids=candidate_ids,
+                result=result.result,
+                thread_id=result.thread_id,
+                turn_id=result.turn_id,
+                response_evidence_id=response_evidence_id,
+                android16_verdict_eligible=bool(
+                    device_context.get("android16_verdict_eligible")
+                ),
+            )
+        finally:
+            if device_session is not None:
+                device_session.__exit__(None, None, None)
+
+    def _apply_adaptive_verifier_result(
+        self,
+        *,
+        scan_id: str,
+        task_id: str,
+        candidate_ids: list[str],
+        result: AdaptiveVerificationResult,
+        thread_id: str,
+        turn_id: str,
+        response_evidence_id: str,
+        android16_verdict_eligible: bool,
+    ) -> None:
+        candidate_set = set(candidate_ids)
+        assessments: dict[str, Any] = {}
+        ignored: list[str] = []
+        for assessment in result.assessments:
+            if assessment.finding_id not in candidate_set or assessment.finding_id in assessments:
+                ignored.append(assessment.finding_id)
+                continue
+            assessments[assessment.finding_id] = assessment
+        with self.database.session_factory() as session:
+            scan = session.get(Scan, scan_id)
+            task = session.get(InvestigationTask, task_id)
+            if scan is None or task is None:
+                raise LookupError("Adaptive Verifier result target disappeared")
+            known_evidence_ids = set(
+                session.scalars(select(Evidence.id).where(Evidence.scan_id == scan_id))
+            )
+            verdict_counts: Counter[str] = Counter()
+            model_verdict_counts: Counter[str] = Counter()
+            verdict_overrides: list[dict[str, str]] = []
+            for finding_id in candidate_ids:
+                finding = session.get(Finding, finding_id)
+                assessment = assessments.get(finding_id)
+                if finding is None or assessment is None:
+                    continue
+                model_verdict = assessment.verdict
+                model_verdict_counts[model_verdict] += 1
+                verdict = model_verdict
+                verdict_override_reason: str | None = None
+                if (
+                    model_verdict == FindingStatus.REPRODUCED_BLACKBOX.value
+                    and not android16_verdict_eligible
+                ):
+                    verdict = FindingStatus.SUPPORTED_STATIC.value
+                    verdict_override_reason = (
+                        "Adaptive runtime evidence came from a compatibility-smoke device below "
+                        "Android 16 / API 36 and cannot issue a reproduced verdict."
+                    )
+                    verdict_overrides.append(
+                        {
+                            "finding_id": finding_id,
+                            "model_verdict": model_verdict,
+                            "applied_verdict": verdict,
+                            "reason": verdict_override_reason,
+                        }
+                    )
+                verdict_counts[verdict] += 1
+                accepted_evidence_ids = [
+                    evidence_id
+                    for evidence_id in assessment.evidence_ids
+                    if evidence_id in known_evidence_ids
+                ]
+                accepted_evidence_ids.append(response_evidence_id)
+                history = list(
+                    (finding.metadata_json or {}).get("adaptive_verification_history") or []
+                )
+                history.append(
+                    {
+                        "schema_version": "1.0",
+                        "task_id": task_id,
+                        "thread_id": thread_id,
+                        "turn_id": turn_id,
+                        "verification_mode": "adaptive_agent",
+                        "model_verdict": model_verdict,
+                        "verdict": verdict,
+                        "verdict_override_reason": verdict_override_reason,
+                        "android16_verdict_eligible": android16_verdict_eligible,
+                        "compatibility_smoke_only": not android16_verdict_eligible,
+                        "confidence": assessment.confidence,
+                        "runtime_observed": assessment.runtime_observed,
+                        "summary": assessment.summary,
+                        "attack_chain": assessment.attack_chain,
+                        "security_impact": assessment.security_impact,
+                        "counterevidence": assessment.counterevidence,
+                        "remaining_gaps": assessment.remaining_gaps,
+                        "experiments": [
+                            experiment.model_dump(mode="json")
+                            for experiment in assessment.experiments
+                        ],
+                        "response_evidence_id": response_evidence_id,
+                    }
+                )
+                finding.status = verdict
+                finding.confidence = assessment.confidence
+                finding.review_note = (
+                    f"{assessment.summary}\n兼容性烟测限制：{verdict_override_reason}"
+                    if verdict_override_reason
+                    else assessment.summary
+                )
+                finding.evidence_ids = list(
+                    dict.fromkeys([*finding.evidence_ids, *accepted_evidence_ids])
+                )
+                finding.metadata_json = {
+                    **dict(finding.metadata_json or {}),
+                    "harm_demonstrated": verdict
+                    == FindingStatus.REPRODUCED_BLACKBOX.value,
+                    "verification_mode": "adaptive_agent",
+                    "adaptive_verification": history[-1],
+                    "adaptive_verification_history": history[-10:],
+                    "proof_backlog": {
+                        **dict((finding.metadata_json or {}).get("proof_backlog") or {}),
+                        "status": (
+                            "verified"
+                            if verdict == FindingStatus.REPRODUCED_BLACKBOX.value
+                            else "closed"
+                            if verdict
+                            in {
+                                FindingStatus.REFUTED_STATIC.value,
+                                FindingStatus.NOT_REPRODUCED.value,
+                            }
+                            else "proof_required"
+                        ),
+                        "verification_mode": "adaptive_agent",
+                        "verifier_task_id": task_id,
+                    },
+                }
+            missing = [value for value in candidate_ids if value not in assessments]
+            output = result.model_dump(mode="json")
+            output["verification_mode"] = "adaptive_agent"
+            output["response_evidence_id"] = response_evidence_id
+            output["missing_candidate_assessments"] = missing
+            output["ignored_assessment_finding_ids"] = ignored
+            output["android16_verdict_eligible"] = android16_verdict_eligible
+            output["verdict_overrides"] = verdict_overrides
+            task.thread_id = thread_id
+            task.turn_id = turn_id
+            task.result = output
+            task.status = TaskStatus.COMPLETED.value
+            task.completed_at = now()
+            scan.stats = {
+                **dict(scan.stats or {}),
+                "adaptive_verification": {
+                    **dict((scan.stats or {}).get("adaptive_verification") or {}),
+                    "status": "completed",
+                    "task_id": task_id,
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "response_evidence_id": response_evidence_id,
+                    "assessment_count": len(assessments),
+                    "missing_assessment_count": len(missing),
+                    "verdict_counts": dict(verdict_counts),
+                    "model_verdict_counts": dict(model_verdict_counts),
+                    "compatibility_override_count": len(verdict_overrides),
+                },
+            }
+            add_event(
+                session,
+                scan_id,
+                "adaptive_verification.completed",
+                f"高权限验证 Agent 已完成 {len(assessments)} 个候选的语义判断",
+                {
+                    "task_id": task_id,
+                    "candidate_count": len(candidate_ids),
+                    "assessment_count": len(assessments),
+                    "missing_assessment_count": len(missing),
+                    "verdict_counts": dict(verdict_counts),
+                    "model_verdict_counts": dict(model_verdict_counts),
+                    "compatibility_override_count": len(verdict_overrides),
+                    "android16_verdict_eligible": android16_verdict_eligible,
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                },
+            )
+            session.commit()
+
     def _current_investigation_concurrency(self) -> int:
         """Follow live assignable ADB capacity, retaining one static-only lane."""
         return max(1, self.device_pool.capacity)
@@ -1857,6 +2687,8 @@ class ScanOrchestrator:
                     .where(
                         InvestigationTask.scan_id == scan_id,
                         InvestigationTask.status == TaskStatus.QUEUED.value,
+                        InvestigationTask.task_type
+                        != TaskType.ADAPTIVE_VERIFICATION.value,
                     )
                     .limit(1)
                 )
@@ -1883,6 +2715,8 @@ class ScanOrchestrator:
                 .where(
                     InvestigationTask.scan_id == scan_id,
                     InvestigationTask.status == TaskStatus.QUEUED.value,
+                    InvestigationTask.task_type
+                    != TaskType.ADAPTIVE_VERIFICATION.value,
                 )
                 .order_by(
                     InvestigationTask.priority.desc(),
@@ -1911,6 +2745,8 @@ class ScanOrchestrator:
                         select(InvestigationTask).where(
                             InvestigationTask.scan_id == scan_id,
                             InvestigationTask.status == TaskStatus.QUEUED.value,
+                            InvestigationTask.task_type
+                            != TaskType.ADAPTIVE_VERIFICATION.value,
                         )
                     )
                 )
@@ -2496,8 +3332,7 @@ class ScanOrchestrator:
             "max_rescue_reviews": 1,
             "max_rescue_explorations": 1,
             "max_final_evaluations": 1,
-            "critic_max_objections": 2,
-            "critic_and_rescue_are_mutually_exclusive": True,
+            "critic_and_rescue_are_mutually_exclusive": False,
         }
         package_name = scan.package_name
         investigator = self.investigators.get(agent_backend)
@@ -2579,17 +3414,10 @@ class ScanOrchestrator:
                     if critic_turn
                     else evidence_summaries
                 )
-                dispatch_code_context = (
-                    {
-                        "status": "candidate_evidence_only",
-                        "components": [],
-                    }
-                    if critic_turn
-                    else target_code_context
-                )
+                dispatch_code_context = target_code_context
                 gateway_available = bool(
                     not critic_turn
-                    and phase not in {"rescue_review", "rescue_exploration"}
+                    and phase not in {"rescue_review", "final_evaluation"}
                     and self.settings.codex_isolation == "docker"
                     and device_lease_owned
                     and task_device is not None
@@ -2608,9 +3436,49 @@ class ScanOrchestrator:
                         [] if blind_rescue or critic_turn else deepcopy(agent_round_history)
                     ),
                     "further_test_rounds_available": (phase != "final_evaluation"),
-                    "exploration_limits": {
-                        "max_rounds": self.settings.agent_max_rounds,
-                        "tests_per_round": self.settings.agent_tests_per_round,
+                    "exploration_policy": {
+                        "mode": "agent_directed",
+                        "count_limits": False,
+                        "termination": [
+                            "agent_reports_no_material_followup",
+                            "all_hypotheses_proven",
+                            "task_cancelled",
+                            "task_lifecycle_deadline",
+                        ],
+                    },
+                    "proof_capabilities": {
+                        "schema_version": "1.0",
+                        "ordinary_app_uid_probe": True,
+                        "operations": ["binder_transact", "binder_script"],
+                        "binder_primitive_writes": [
+                            "string",
+                            "integer",
+                            "long",
+                            "boolean",
+                            "bytes_base64",
+                        ],
+                        "binder_primitive_reads": [
+                            "string",
+                            "integer",
+                            "long",
+                            "boolean",
+                            "bytes_base64",
+                        ],
+                        "binder_reply_match_modes": [
+                            "exact",
+                            "contains",
+                            "regex",
+                            "sha256",
+                            "non_empty_diagnostic_only",
+                        ],
+                        "impact_oracles": [
+                            "provider_rows",
+                            "binder_reply",
+                            "target_uid_log_contains",
+                            "ui_text",
+                            "process_crash",
+                        ],
+                        "poc_log_is_auxiliary_only": True,
                     },
                     "continuation": continuation_context or None,
                     "context_policy": (
@@ -2641,7 +3509,7 @@ class ScanOrchestrator:
                         {
                             "mode": "candidate_and_cited_evidence_only",
                             "evidence_ids": sorted(critic_evidence_ids),
-                            "maximum_objections": 2,
+                            "bounded_source_recheck_allowed": True,
                         }
                         if critic_turn
                         else None
@@ -2703,7 +3571,9 @@ class ScanOrchestrator:
                     "critic"
                     if phase == "adversarial_review"
                     else "rescue"
-                    if phase in {"rescue_review", "rescue_exploration"}
+                    if phase == "rescue_review"
+                    else "rescue_explorer"
+                    if phase == "rescue_exploration"
                     else "primary"
                 )
                 agent_runtime_workspaces[runtime_role] = agent_runtime_workspace
@@ -2904,7 +3774,7 @@ class ScanOrchestrator:
                             "hypothesis": hypothesis,
                         },
                     )
-                for request in result.result.requested_tests[: self.settings.agent_tests_per_round]:
+                for request in result.result.requested_tests:
                     self._record_exploration_event(
                         scan_id,
                         task_id,
@@ -3014,7 +3884,6 @@ class ScanOrchestrator:
                 current_result is None
                 or not self._needs_rescue_review(current_result.result)
                 or self.hypothesis_ledger.task_all_hypotheses_proven(task_id)
-                or phase_counts.get("adversarial_review", 0) > 0
             ):
                 return current_result
 
@@ -3400,7 +4269,6 @@ class ScanOrchestrator:
                         and not self.hypothesis_ledger.task_all_hypotheses_proven(task_id)
                         and prepared
                         and not budget.expired
-                        and completed_rounds < self.settings.agent_max_rounds
                     ):
                         planning_result = agent_result
                         planning_turn_id = planning_result.turn_id
@@ -3417,7 +4285,6 @@ class ScanOrchestrator:
                         requested, platform_request_gaps = self._validate_requested_tests(
                             planning_result.result.requested_tests,
                             testable_entries,
-                            limit=self.settings.agent_tests_per_round,
                             hypothesis_ids=hypothesis_ids,
                             permission_profile=self.settings.agent_permission_profile,
                         )
@@ -3474,7 +4341,7 @@ class ScanOrchestrator:
                                 scan_id,
                                 task_id,
                                 "action.rejected",
-                                "部分 AI 测试申请被平台边界策略拒绝或截断",
+                                "部分 AI 测试申请被平台边界策略拒绝",
                                 {
                                     "source": "platform",
                                     "round_index": completed_rounds,
@@ -3719,6 +4586,11 @@ class ScanOrchestrator:
                                 "device": current_device_capability(),
                                 "executed_agent_tests": executed_agent_tests,
                                 "agent_round_history": agent_round_history,
+                                "hypothesis_progress": (
+                                    self.hypothesis_ledger.task_hypothesis_progress(
+                                        task_id
+                                    )
+                                ),
                             },
                         },
                         "status": (
@@ -3740,6 +4612,9 @@ class ScanOrchestrator:
                             "agent_backend": agent_backend,
                             "negative_closure_rescue": deepcopy(rescue_gate),
                             "debate_policy": deepcopy(debate_policy),
+                            "hypothesis_progress": (
+                                self.hypothesis_ledger.task_hypothesis_progress(task_id)
+                            ),
                         },
                     },
                 )
@@ -3761,6 +4636,9 @@ class ScanOrchestrator:
                             "agent_backend": agent_backend,
                             "negative_closure_rescue": deepcopy(rescue_gate),
                             "debate_policy": deepcopy(debate_policy),
+                            "hypothesis_progress": (
+                                self.hypothesis_ledger.task_hypothesis_progress(task_id)
+                            ),
                         },
                     },
                 )
@@ -3776,6 +4654,9 @@ class ScanOrchestrator:
                             "agent_backend": agent_backend,
                             "negative_closure_rescue": deepcopy(rescue_gate),
                             "debate_policy": deepcopy(debate_policy),
+                            "hypothesis_progress": (
+                                self.hypothesis_ledger.task_hypothesis_progress(task_id)
+                            ),
                         },
                     },
                 )
@@ -4188,7 +5069,6 @@ class ScanOrchestrator:
         requests: list[AgentRequestedTest],
         entries: list[EntryPoint],
         *,
-        limit: int = 8,
         hypothesis_ids: set[str] | None = None,
         permission_profile: str = "personal_lab",
     ) -> tuple[list[AgentRequestedTest], list[str]]:
@@ -4196,7 +5076,7 @@ class ScanOrchestrator:
         accepted: list[AgentRequestedTest] = []
         gaps: list[str] = []
         seen: set[str] = set()
-        for request in requests[:limit]:
+        for request in requests:
             entry = entries_by_id.get(request.entry_point_id)
             if (
                 entry is not None
@@ -4263,8 +5143,8 @@ class ScanOrchestrator:
                 "query",
             }:
                 reason = "provider_rows Oracle requires a provider query operation"
-            elif request.operation == "binder_transact" and entry.kind != "service":
-                reason = "binder_transact is allowed only for Service entries"
+            elif request.operation in {"binder_transact", "binder_script"} and entry.kind != "service":
+                reason = f"{request.operation} is allowed only for Service entries"
             elif (request.intent_action or request.categories) and entry.kind == "provider":
                 reason = "provider requests do not accept Intent routing fields"
             elif (
@@ -4287,11 +5167,6 @@ class ScanOrchestrator:
                 continue
             seen.add(signature)
             accepted.append(request)
-        if len(requests) > limit:
-            gaps.append(
-                f"Rejected {len(requests) - limit} agent-requested test(s) above the "
-                f"per-round limit of {limit}."
-            )
         return accepted, gaps
 
     @staticmethod
@@ -4442,7 +5317,6 @@ class ScanOrchestrator:
         accepted, validation_gaps = self._validate_requested_tests(
             requests,
             entries,
-            limit=max(len(requests), 1),
             hypothesis_ids=hypothesis_ids,
             permission_profile=self.settings.agent_permission_profile,
         )
@@ -4849,6 +5723,11 @@ class ScanOrchestrator:
                             binder_interface_descriptor=request.binder_interface_descriptor,
                             binder_reply_type=request.binder_reply_type,
                             binder_read_exception=request.binder_read_exception,
+                            binder_script=(
+                                [item.model_dump(mode="json") for item in request.binder_script]
+                                if request.binder_script is not None
+                                else None
+                            ),
                             intent_action=request.intent_action,
                             categories=list(request.categories),
                             oracle=request.oracle,
@@ -4936,7 +5815,15 @@ class ScanOrchestrator:
         assigned_device_serial = (
             assigned_device.get("serial") if isinstance(assigned_device, dict) else None
         )
-        adb_access = execution.adb == "task_gateway" and bool(assigned_device_serial)
+        proof_replay = platform_context.get("proof_replay")
+        gateway_available = bool(
+            isinstance(proof_replay, dict) and proof_replay.get("available") is True
+        )
+        adb_access = (
+            execution.adb == "task_gateway"
+            and bool(assigned_device_serial)
+            and gateway_available
+        )
         network_access = execution.shell_network == "public_egress"
         audit_id = str(uuid.uuid4())
         metadata = {

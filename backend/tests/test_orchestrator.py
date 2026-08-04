@@ -31,9 +31,226 @@ from apkscanner.models import (
 from apkscanner.orchestrator import ScanOrchestrator
 from apkscanner.planner import StaticEntryClosure
 from apkscanner.reports import ReportBuilder
-from apkscanner.schemas import AgentInvestigationResult
+from apkscanner.schemas import AdaptiveVerificationResult, AgentInvestigationResult
 from apkscanner.tools import CommandResult, ToolRunner
 from sqlalchemy import select
+
+
+def test_adaptive_verifier_batches_high_value_static_findings_once(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    configured = replace(
+        settings,
+        codex_enabled=True,
+        adaptive_verifier_enabled=True,
+        adaptive_verifier_min_severity="high",
+    )
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="adaptive.apk",
+            package_name="com.example.adaptive",
+            artifact_sha256="a" * 64,
+            artifact_path=str(configured.data_dir / "adaptive.apk"),
+        )
+        entry = EntryPoint(
+            scan=scan,
+            kind="deep_link",
+            name="adaptive://open/",
+            owner_component="com.example.adaptive.WebActivity",
+            exported=True,
+        )
+        session.add_all([scan, entry])
+        session.flush()
+        session.add_all(
+            [
+                Finding(
+                    scan_id=scan.id,
+                    dedupe_key="adaptive-high",
+                    rule_id="AGENT-ENTRY-INVESTIGATION",
+                    title="JSB token leak",
+                    description="Attacker HTML reaches a JavaScript bridge token source.",
+                    masvs="MASVS-PLATFORM",
+                    severity="high",
+                    confidence="high",
+                    status="supported_static",
+                    entry_point_ids=[entry.id],
+                ),
+                Finding(
+                    scan_id=scan.id,
+                    dedupe_key="adaptive-medium",
+                    rule_id="AGENT-ENTRY-INVESTIGATION",
+                    title="Lower priority signal",
+                    description="Not selected by the configured severity gate.",
+                    masvs="MASVS-PLATFORM",
+                    severity="medium",
+                    confidence="medium",
+                    status="supported_static",
+                    entry_point_ids=[entry.id],
+                ),
+            ]
+        )
+        session.commit()
+        scan_id = scan.id
+
+    orchestrator = ScanOrchestrator(configured, database, ArtifactStore(configured))
+    dispatched: list[list[str]] = []
+
+    def complete_batch(actual_scan_id: str, task_id: str, _cancel_event) -> None:  # noqa: ANN001
+        with database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            assert task is not None
+            dispatched.append(list(task.preconditions["candidate_finding_ids"]))
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            session.commit()
+
+    monkeypatch.setattr(orchestrator, "_run_adaptive_verifier_impl", complete_batch)
+    orchestrator._run_adaptive_verifier(scan_id)
+
+    with database.session_factory() as session:
+        tasks = list(
+            session.scalars(
+                select(InvestigationTask).where(
+                    InvestigationTask.scan_id == scan_id,
+                    InvestigationTask.task_type == "adaptive_verification",
+                )
+            )
+        )
+        high = session.scalar(select(Finding).where(Finding.dedupe_key == "adaptive-high"))
+        assert high is not None
+        assert dispatched == [[high.id]]
+        assert len(tasks) == 1
+        assert tasks[0].target_entry_ids
+
+
+@pytest.mark.parametrize(
+    ("android16_eligible", "expected_status", "expected_backlog"),
+    [
+        (True, "reproduced_blackbox", "verified"),
+        (False, "supported_static", "proof_required"),
+    ],
+)
+def test_adaptive_verifier_semantic_result_updates_original_finding(
+    settings,  # noqa: ANN001
+    android16_eligible: bool,
+    expected_status: str,
+    expected_backlog: str,
+) -> None:
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    store = ArtifactStore(settings)
+    orchestrator = ScanOrchestrator(settings, database, store)
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="semantic.apk",
+            package_name="com.example.semantic",
+            artifact_sha256="b" * 64,
+            artifact_path=str(settings.data_dir / "semantic.apk"),
+        )
+        finding = Finding(
+            scan=scan,
+            dedupe_key="semantic-jsb",
+            rule_id="AGENT-ENTRY-INVESTIGATION",
+            title="JSB credential exposure",
+            description="Static bridge chain",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            confidence="medium",
+            status="supported_static",
+            metadata_json={"proof_backlog": {"status": "proof_required"}},
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="adaptive_verification",
+            status="running",
+        )
+        session.add_all([scan, finding, task])
+        session.flush()
+        response = orchestrator.evidence.json(
+            session,
+            scan_id=scan.id,
+            task_id=task.id,
+            kind="agent.adaptive_response",
+            value={"observed": "token from target bridge"},
+            summary="Adaptive response",
+        )
+        session.commit()
+        scan_id = scan.id
+        task_id = task.id
+        finding_id = finding.id
+        response_id = response.id
+
+    result = AdaptiveVerificationResult.model_validate(
+        {
+            "summary": "高权限 Agent 在真实 WebView 中取得目标 Bridge 返回的账号令牌。",
+            "assessments": [
+                {
+                    "finding_id": finding_id,
+                    "verdict": "reproduced_blackbox",
+                    "confidence": "high",
+                    "runtime_observed": True,
+                    "summary": "恶意页面调用 Bridge 后把目标进程返回值发送到测试服务器。",
+                    "attack_chain": "Deep Link -> WebView -> JSB -> token -> remote callback",
+                    "security_impact": "普通第三方应用可诱导泄露当前账号凭据。",
+                    "counterevidence": [],
+                    "remaining_gaps": [],
+                    "evidence_ids": [],
+                    "experiments": [
+                        {
+                            "objective": "验证攻击者页面能否取得 Bridge token",
+                            "actions": ["部署 HTML", "触发 Deep Link", "读取回调日志"],
+                            "observations": ["回调日志收到目标进程产生的 token"],
+                            "artifact_paths": ["output/jsb-callback.log"],
+                            "conclusion": "运行结果支持凭据泄露。",
+                        }
+                    ],
+                }
+            ],
+            "shared_observations": [],
+            "cleanup_actions": [],
+            "coverage_gaps": [],
+        }
+    )
+    orchestrator._apply_adaptive_verifier_result(
+        scan_id=scan_id,
+        task_id=task_id,
+        candidate_ids=[finding_id],
+        result=result,
+        thread_id="thread-adaptive",
+        turn_id="turn-adaptive",
+        response_evidence_id=response_id,
+        android16_verdict_eligible=android16_eligible,
+    )
+
+    with database.session_factory() as session:
+        finding = session.get(Finding, finding_id)
+        task = session.get(InvestigationTask, task_id)
+        scan = session.get(Scan, scan_id)
+        assert finding is not None and task is not None and scan is not None
+        assert finding.status == expected_status
+        assert finding.confidence == "high"
+        assert response_id in finding.evidence_ids
+        assert finding.metadata_json["verification_mode"] == "adaptive_agent"
+        assert finding.metadata_json["proof_backlog"]["status"] == expected_backlog
+        assert finding.metadata_json["harm_demonstrated"] is android16_eligible
+        verification = finding.metadata_json["adaptive_verification"]
+        assert verification["model_verdict"] == "reproduced_blackbox"
+        assert verification["android16_verdict_eligible"] is android16_eligible
+        assert task.status == "completed"
+        assert task.thread_id == "thread-adaptive"
+        assert scan.stats["adaptive_verification"]["verdict_counts"] == {
+            expected_status: 1
+        }
+        assert scan.stats["adaptive_verification"][
+            "compatibility_override_count"
+        ] == (0 if android16_eligible else 1)
 
 
 def test_runtime_event_projection_is_idempotent_across_spool_replay(settings) -> None:  # noqa: ANN001
@@ -739,7 +956,6 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
         settings,
         adb_serial="iterative-device:5555",
         codex_enabled=True,
-        agent_max_rounds=3,
     )
     configured.ensure_directories()
     database = Database(configured)
@@ -823,7 +1039,16 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
             context = kwargs["platform_context"]
             phase = context["phase"]
             phases.append(phase)
-            assert context["exploration_limits"]["max_rounds"] == 3
+            assert context["exploration_policy"] == {
+                "mode": "agent_directed",
+                "count_limits": False,
+                "termination": [
+                    "agent_reports_no_material_followup",
+                    "all_hypotheses_proven",
+                    "task_cancelled",
+                    "task_lifecycle_deadline",
+                ],
+            }
             hypothesis_id = context["security_hypotheses"][0]["id"]
             requested_tests = []
             if phase == "test_planning":
@@ -920,7 +1145,6 @@ def test_agent_generated_poc_is_built_from_the_docker_session_workspace(
         settings,
         adb_serial="runtime-workspace-device:5555",
         codex_enabled=True,
-        agent_max_rounds=1,
     )
     configured.ensure_directories()
     database = Database(configured)
@@ -1331,13 +1555,14 @@ def test_positive_debate_is_single_pass_and_arbitrates_only_real_objections(
                 assert context["agent_round_history"] == []
                 assert context["executed_agent_tests"] == []
                 assert context["target_code_context"] == {
-                    "status": "candidate_evidence_only",
+                    "schema_version": "1.0",
+                    "global_decompilation": {"status": "index_unavailable"},
                     "components": [],
                 }
                 assert context["critic_scope"] == {
                     "mode": "candidate_and_cited_evidence_only",
                     "evidence_ids": [cited_id],
-                    "maximum_objections": 2,
+                    "bounded_source_recheck_allowed": True,
                 }
                 objections = (
                     [
@@ -1375,7 +1600,8 @@ def test_positive_debate_is_single_pass_and_arbitrates_only_real_objections(
             if phase == "final_evaluation":
                 assert critic_objects
                 assert (
-                    context["debate"]["critic"]["review_objections"][0]["objection_id"] == "OBJ-1"
+                    context["debate"]["critic"]["review_objections"][0]["objection_id"]
+                    == "OBJ-1"
                 )
                 return SimpleNamespace(
                     thread_id="thread-final",
@@ -1411,6 +1637,49 @@ def test_positive_debate_is_single_pass_and_arbitrates_only_real_objections(
                                 "evidence_ids": [cited_id],
                             }
                         ],
+                        test_cases=[],
+                        evidence_ids=[cited_id],
+                        severity_proposal="info",
+                        confidence="high",
+                        coverage_gaps=[],
+                        followups=[],
+                        requested_tests=[],
+                    ),
+                )
+            if phase == "rescue_review":
+                assert critic_objects
+                assert context["blind_rescue"] == {
+                    "mode": "independent_negative_closure_review",
+                    "prior_model_conclusion_withheld": True,
+                }
+                assert context["candidate_under_review"] is None
+                return SimpleNamespace(
+                    thread_id="thread-rescue",
+                    turn_id="turn-rescue",
+                    usage={"input_tokens": 1, "output_tokens": 1},
+                    result=AgentInvestigationResult(
+                        summary="盲审独立确认当前证据没有敏感操作链。",
+                        result="refuted_static",
+                        hypotheses_tested=[hypothesis_id],
+                        hypothesis_assessments=[
+                            {
+                                "hypothesis_id": hypothesis_id,
+                                "verdict": "refuted_static",
+                                "source": "Exported manifest entry",
+                                "control": "Explicit Intent",
+                                "sink": "",
+                                "reachable_path": "Caller -> EntryActivity",
+                                "boundary": "android_component_export_boundary",
+                                "counterevidence": [
+                                    "Independent review found no sensitive sink"
+                                ],
+                                "proof_gaps": [],
+                                "evidence_ids": [cited_id],
+                                "confidence": "high",
+                            }
+                        ],
+                        review_objections=[],
+                        objection_resolutions=[],
                         test_cases=[],
                         evidence_ids=[cited_id],
                         severity_proposal="info",
@@ -1459,7 +1728,12 @@ def test_positive_debate_is_single_pass_and_arbitrates_only_real_objections(
     orchestrator._run_task(scan_id, task_id, 120)
 
     assert phases == (
-        ["test_planning", "adversarial_review", "final_evaluation"]
+        [
+            "test_planning",
+            "adversarial_review",
+            "final_evaluation",
+            "rescue_review",
+        ]
         if critic_objects
         else ["test_planning", "adversarial_review"]
     )
@@ -1472,10 +1746,12 @@ def test_positive_debate_is_single_pass_and_arbitrates_only_real_objections(
         )
         policy = completed.result["debate_policy"]
         assert policy["phase_counts"]["adversarial_review"] == 1
-        assert policy["phase_counts"].get("rescue_review", 0) == 0
+        assert policy["phase_counts"].get("rescue_review", 0) == int(critic_objects)
         assert policy["phase_counts"].get("final_evaluation", 0) == int(critic_objects)
         assert policy["outcome"] == (
-            "arbiter_completed" if critic_objects else "candidate_kept_without_arbiter"
+            "independent_closure_confirmed"
+            if critic_objects
+            else "candidate_kept_without_arbiter"
         )
 
 
@@ -1863,7 +2139,11 @@ def test_manual_continuation_gets_a_fresh_budget_after_scan_deadline(
 
 
 def test_orchestrator_persists_audit_evidence_for_every_ai_call(settings, fixture_apk) -> None:  # noqa: ANN001
-    configured = replace(settings, codex_enabled=True)
+    configured = replace(
+        settings,
+        codex_enabled=True,
+        adaptive_verifier_enabled=False,
+    )
     configured.ensure_directories()
     database = Database(configured)
     database.create_all()

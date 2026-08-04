@@ -100,7 +100,11 @@ public final class ProbeReceiver extends BroadcastReceiver {
                     target.setComponent(new ComponentName(packageName, component));
                     applyExtras(target, request.optJSONObject("extras"));
                     applyCategories(target, request.optJSONArray("categories"));
-                    if ("binder_transact".equals(request.optString("operation", "auto"))) {
+                    String operation = request.optString("operation", "auto");
+                    if (
+                        "binder_transact".equals(operation)
+                            || "binder_script".equals(operation)
+                    ) {
                         PendingResult pending = goAsync();
                         startBinderTransaction(context, target, request, result, pending);
                         return;
@@ -280,12 +284,19 @@ public final class ProbeReceiver extends BroadcastReceiver {
                     data.writeInterfaceToken(descriptor);
                     result.put("binderInterfaceDescriptor", descriptor);
                 }
+                JSONArray script = request.optJSONArray("binder_script");
+                if (script != null) {
+                    applyBinderWrites(data, script);
+                    result.put("binderScriptStepCount", script.length());
+                }
                 int transactionCode = request.getInt("binder_transaction_code");
-                String replyType = request.getString("binder_reply_type");
+                String replyType = request.optString("binder_reply_type", "");
                 boolean returned = service.transact(transactionCode, data, reply, 0);
                 result.put("binderTransactionCode", transactionCode);
                 result.put("binderTransactReturned", returned);
-                result.put("binderReplyType", replyType);
+                if (!replyType.isEmpty()) {
+                    result.put("binderReplyType", replyType);
+                }
                 if (!returned) {
                     throw new IllegalStateException("Binder transact returned false");
                 }
@@ -293,23 +304,14 @@ public final class ProbeReceiver extends BroadcastReceiver {
                 if (request.optBoolean("binder_read_exception", true)) {
                     reply.readException();
                 }
-                switch (replyType) {
-                    case "string":
-                        result.put("binderReply", reply.readString());
-                        break;
-                    case "integer":
-                        result.put("binderReply", reply.readInt());
-                        break;
-                    case "long":
-                        result.put("binderReply", reply.readLong());
-                        break;
-                    case "boolean":
-                        result.put("binderReply", reply.readInt() != 0);
-                        break;
-                    default:
-                        throw new IllegalArgumentException(
-                            "unsupported binder_reply_type: " + replyType
-                        );
+                if (script != null) {
+                    JSONArray replies = readBinderReplies(reply, script);
+                    result.put("binderReplies", replies);
+                    if (replies.length() == 1) {
+                        result.put("binderReply", replies.get(0));
+                    }
+                } else {
+                    result.put("binderReply", readBinderValue(reply, replyType));
                 }
                 result.put("delivered", true);
                 result.put("success", true);
@@ -364,6 +366,76 @@ public final class ProbeReceiver extends BroadcastReceiver {
             Log.i(TAG, payload);
             pending.setResultData(payload);
             pending.finish();
+        }
+    }
+
+    private static void applyBinderWrites(Parcel data, JSONArray script) throws Exception {
+        for (int index = 0; index < script.length(); index++) {
+            JSONObject step = script.getJSONObject(index);
+            String operation = step.getString("operation");
+            switch (operation) {
+                case "write_string":
+                    data.writeString(step.getString("string_value"));
+                    break;
+                case "write_integer":
+                    data.writeInt(step.getInt("integer_value"));
+                    break;
+                case "write_long":
+                    data.writeLong(step.getLong("integer_value"));
+                    break;
+                case "write_boolean":
+                    data.writeInt(step.getBoolean("boolean_value") ? 1 : 0);
+                    break;
+                case "write_bytes_base64":
+                    data.writeByteArray(
+                        Base64.decode(step.getString("string_value"), Base64.DEFAULT)
+                    );
+                    break;
+                default:
+                    if (!operation.startsWith("read_")) {
+                        throw new IllegalArgumentException(
+                            "unsupported Binder script operation: " + operation
+                        );
+                    }
+            }
+        }
+    }
+
+    private static JSONArray readBinderReplies(Parcel reply, JSONArray script) throws Exception {
+        JSONArray replies = new JSONArray();
+        for (int index = 0; index < script.length(); index++) {
+            String operation = script.getJSONObject(index).getString("operation");
+            if (!operation.startsWith("read_")) {
+                continue;
+            }
+            replies.put(readBinderValue(reply, operation.substring("read_".length())));
+        }
+        if (replies.length() == 0) {
+            throw new IllegalArgumentException("binder_script requires at least one read step");
+        }
+        return replies;
+    }
+
+    private static Object readBinderValue(Parcel reply, String type) {
+        switch (type) {
+            case "string": {
+                String value = reply.readString();
+                return value == null ? JSONObject.NULL : value;
+            }
+            case "integer":
+                return reply.readInt();
+            case "long":
+                return reply.readLong();
+            case "boolean":
+                return reply.readInt() != 0;
+            case "bytes_base64": {
+                byte[] value = reply.createByteArray();
+                return value == null
+                    ? JSONObject.NULL
+                    : Base64.encodeToString(value, Base64.NO_WRAP);
+            }
+            default:
+                throw new IllegalArgumentException("unsupported Binder reply type: " + type);
         }
     }
 

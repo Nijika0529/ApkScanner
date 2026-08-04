@@ -105,6 +105,7 @@ PHASE_NAMES = frozenset(
         "adversarial_review",
         "rescue_review",
         "rescue_exploration",
+        "adaptive_verification",
         "final_evaluation",
         "recovery_evaluation",
     }

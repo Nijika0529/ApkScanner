@@ -107,12 +107,12 @@ class AgentWorkspaceManager:
                 self._copy_bounded_workspace(source_workspace, existing.workspace)
                 if context is not None:
                     self._write_context(existing, context)
+                if role == "verifier" and not (existing.home / ".ssh").is_dir():
+                    self._copy_verifier_ssh(existing)
                 return existing
-            if len(self._leases) >= self.settings.codex_max_sessions:
-                raise RuntimeError("global Codex Agent-session limit is exhausted")
-            scan_session_count = sum(1 for lease_key in self._leases if lease_key[0] == scan_id)
-            if scan_session_count >= self.settings.codex_max_sessions_per_scan:
-                raise RuntimeError("per-scan Codex Agent-session limit is exhausted")
+            # Retained role workspaces are audit state, not active Codex workers. Do not make a
+            # fourth task fail merely because earlier primary/critic directories still exist.
+            # Runtime worker capacity is queued by CodexInvestigator and these UIDs remain unique.
             uid = self._allocate_uid(scan_id)
             workspace_key = self._workspace_key(task_id, attempt, role)
             scan_root = self.prepare_scan(scan_id)
@@ -170,6 +170,8 @@ class AgentWorkspaceManager:
             )
             self._copy_bounded_workspace(source_workspace, session.workspace)
             self._write_context(session, context or {})
+            if role == "verifier":
+                self._copy_verifier_ssh(session)
             self._leases[key] = session
             return session
 
@@ -180,7 +182,7 @@ class AgentWorkspaceManager:
             self._leases = {key: value for key, value in self._leases.items() if key[0] != scan_id}
             self._used_uids.pop(scan_id, None)
             for session in terminal:
-                self._purge_shell_snapshots(session)
+                self._purge_runtime_credentials(session)
 
     def forget_task(self, scan_id: str, task_id: str) -> None:
         """Release a terminal task's active-session slots while retaining its audit files.
@@ -201,17 +203,54 @@ class AgentWorkspaceManager:
                 if not (key[0] == scan_id and key[1] == task_id)
             }
             for session in terminal:
-                self._purge_shell_snapshots(session)
+                self._purge_runtime_credentials(session)
 
     @staticmethod
-    def _purge_shell_snapshots(session: SessionWorkspace) -> None:
-        """Never retain SDK login-shell environment captures in an audit workspace."""
+    def _purge_runtime_credentials(session: SessionWorkspace) -> None:
+        """Remove transient provider snapshots and copied verifier SSH material."""
 
         snapshots = session.codex_home / "shell_snapshots"
         if snapshots.is_symlink() or snapshots.is_file():
             snapshots.unlink(missing_ok=True)
         elif snapshots.is_dir():
             shutil.rmtree(snapshots)
+        ssh_copy = session.home / ".ssh"
+        if ssh_copy.is_symlink() or ssh_copy.is_file():
+            ssh_copy.unlink(missing_ok=True)
+        elif ssh_copy.is_dir():
+            shutil.rmtree(ssh_copy)
+
+    def _copy_verifier_ssh(self, session: SessionWorkspace) -> None:
+        """Copy the host's OpenSSH material into only the verifier's private HOME."""
+
+        source = self.settings.adaptive_verifier_ssh_source
+        if (
+            not self.settings.adaptive_verifier_copy_host_ssh
+            or source is None
+            or not source.is_dir()
+        ):
+            return
+        source = source.resolve()
+        destination = session.home / ".ssh"
+        if destination.exists():
+            shutil.rmtree(destination)
+        destination.mkdir(mode=0o700)
+        os.chown(destination, session.uid, session.gid, follow_symlinks=False)
+        destination.chmod(0o700)
+        for item in source.rglob("*"):
+            relative = item.relative_to(source)
+            target = destination / relative
+            if item.is_dir() and not item.is_symlink():
+                target.mkdir(mode=0o700, parents=True, exist_ok=True)
+                os.chown(target, session.uid, session.gid, follow_symlinks=False)
+                target.chmod(0o700)
+                continue
+            if not item.is_file():
+                continue
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            shutil.copyfile(item, target, follow_symlinks=True)
+            os.chown(target, session.uid, session.gid, follow_symlinks=False)
+            target.chmod(0o600)
 
     def _allocate_uid(self, scan_id: str) -> int:
         used = self._used_uids.setdefault(scan_id, set())

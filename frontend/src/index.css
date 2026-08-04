@@ -18,6 +18,10 @@ button:disabled { cursor: default; }
 ::selection { background: rgba(8, 145, 178, .2); color: #083344; }
 
 .font-display { font-family: "Space Grotesk", Inter, ui-sans-serif, system-ui, sans-serif; }
+.content-auto {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 240px;
+}
 .app-grid {
   position: fixed;
   inset: 0;

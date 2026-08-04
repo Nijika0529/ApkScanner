@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.apkscanner.adaptivecases"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="36" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <permission
+        android:name="io.apkscanner.adaptivecases.SIGNATURE_ONLY"
+        android:protectionLevel="signature" />
+
+    <application
+        android:allowBackup="false"
+        android:debuggable="false"
+        android:label="APKScanner Adaptive Cases"
+        android:theme="@android:style/Theme.Material.Light"
+        android:usesCleartextTraffic="true">
+
+        <activity
+            android:name=".LauncherActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".BridgeActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="adaptivecases" android:host="web" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".ImportActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/zip" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="io.apkscanner.adaptivecases.IMPORT_ARCHIVE" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".PendingIntentBrokerActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.apkscanner.adaptivecases.GET_CAPABILITY" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".SafeCapabilityActivity"
+            android:exported="true"
+            android:permission="io.apkscanner.adaptivecases.SIGNATURE_ONLY" />
+
+        <service
+            android:name=".SecretBinderService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.apkscanner.adaptivecases.BIND_ACCOUNT" />
+            </intent-filter>
+        </service>
+
+        <service
+            android:name=".LocalTokenService"
+            android:exported="false" />
+
+        <provider
+            android:name=".VaultProvider"
+            android:authorities="io.apkscanner.adaptivecases.vault"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <grant-uri-permission android:pathPrefix="/" />
+        </provider>
+    </application>
+</manifest>

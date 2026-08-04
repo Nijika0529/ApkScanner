@@ -83,12 +83,18 @@ export APKSCANNER_ALLOW_LEGACY_DEVICE_SMOKE=true
 
 ## 3.1 控制台事件性能契约
 
-- 历史事件默认只返回最近 300 条，`after + limit` 用于增量分页；SSE 从客户端当前 cursor 开始，
-  单批最多读取 200 条，不再从 0 重放整条时间线。
-- 浏览器直接把 SSE 事件合并到最多 500 条的本地窗口；数据刷新以 650ms debounce 合并，单条
-  `exploration.*` 不再触发 13 个详情接口。
+- 历史事件默认只返回最近 300 条，`after + limit` 用于增量分页；交互控制台使用
+  `detail=summary`，过滤 tool/step/session/evidence 等高频运行遥测，完整事件仍保留在数据库和审计
+  Evidence 中。SSE 从客户端当前 cursor 开始，不再从 0 重放整条时间线。
+- 总览不再挂载扫描活动时间线；顶层 SSE 只分发轻量事件且不把每条事件写回详情 state。探索任务页
+  打开时才读取 300 条关键事件窗口，750ms 批量合并；单个折叠时间线展开后最多生成最近 100 条 DOM。
+- 只有会改变任务、Finding、Hypothesis 或扫描状态的摘要事件触发 650ms debounce 数据刷新；相同的
+  health、device、scan 和 mutable detail 响应保留原 React 引用，不产生空重渲染。
 - Entry、快照、版本 Diff 和模式匹配使用有界 GET 缓存；`static.completed/scan.final` 会主动失效。
-- AI 审计列表默认只返回 Evidence 元数据；用户进入“AI 审计”页时才读取正文并做 SHA-256 校验。
+- 版本快照、Diff 和模式匹配只在进入“版本演进”时加载。AI 审计列表只返回 Evidence 元数据，正文按
+  单条 `audit_id` 加载并校验 SHA-256；JSON/Markdown 仅在具体 artifact 展开后格式化。
+- 常驻扫描侧栏最多首屏 100 项；攻击面、覆盖、任务、验证链和审计均分批挂载，并对离屏卡片使用
+  `content-visibility`。固定侧栏、顶栏和普通 Card 不使用大面积 backdrop blur，减少选择文本和滚动时重绘。
 
 ## 4. 静态资产和版本演进
 

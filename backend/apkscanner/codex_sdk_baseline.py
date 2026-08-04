@@ -18,7 +18,7 @@ VERIFIED_SOURCE_COMMIT = "6751b54cae32b23786001e2414d749a9916201e1"
 # Bump whenever the host/worker protocol implementation changes without a
 # third-party SDK version change. The image capability gate prevents a stale
 # locally cached worker from silently speaking an older command schema.
-WORKER_REVISION = "20260803.1"
+WORKER_REVISION = "20260804.1"
 
 
 class SdkBaseline(BaseModel):

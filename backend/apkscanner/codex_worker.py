@@ -413,6 +413,7 @@ class PersistentCodexWorker:
             "APKSCANNER_ADB_TASK_ID",
             "APKSCANNER_ADB_GATEWAY_URL",
             "APKSCANNER_ADB_TOKEN",
+            "APKSCANNER_ADB_POLICY",
             "APKSCANNER_PROOF_TASK_ID",
             "APKSCANNER_PROOF_REPLAY_URL",
             "APKSCANNER_PROOF_TOKEN",
@@ -424,7 +425,10 @@ class PersistentCodexWorker:
         for name, value in values.items():
             if not isinstance(value, str) or len(value) > 4096:
                 raise ValueError("gateway environment value is invalid")
-            if name.endswith("_URL"):
+            if name == "APKSCANNER_ADB_POLICY":
+                if value not in {"scoped", "adaptive"}:
+                    raise ValueError("gateway ADB policy is invalid")
+            elif name.endswith("_URL"):
                 parsed = url_adapter.validate_python(value)
                 if parsed.scheme != "http" or parsed.host not in {"apkscanner-host", "127.0.0.1"}:
                     raise ValueError("gateway URL must target the platform bridge")

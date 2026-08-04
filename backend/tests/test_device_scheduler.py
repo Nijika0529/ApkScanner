@@ -58,6 +58,15 @@ def test_settings_reject_a_relative_host_adb_executable(
         Settings.from_env()
 
 
+def test_ui_observation_window_adapts_to_recent_adb_latency(settings) -> None:  # noqa: ANN001
+    adapter = AdbDeviceAdapter(settings, object())  # type: ignore[arg-type]
+
+    assert adapter._adaptive_ui_observation_window(5) == 15.0
+    adapter._ui_dump_latencies.extend([3.0, 4.0, 5.0])
+    assert adapter._adaptive_ui_observation_window(5) == 21.0
+    assert adapter._adaptive_ui_observation_window(90) == 90.0
+
+
 def test_fully_leased_device_pool_is_busy_but_still_available() -> None:
     class AvailableRunner:
         @staticmethod
@@ -600,6 +609,30 @@ def test_binder_reply_claim_requires_successful_platform_transaction() -> None:
 
     assert metadata["security_impact_observed"] is False
     assert metadata["oracle"]["matched"] is False
+
+
+def test_binder_script_oracle_matches_selected_reply_with_contains() -> None:
+    oracle = AgentOracleSpec(
+        kind="binder_reply",
+        expected_text="hunter2",
+        match_mode="contains",
+        reply_index=1,
+        impact="unauthorized_data_access",
+    )
+
+    metadata = AdbDeviceAdapter._evaluate_probe_oracle(
+        oracle,
+        probe_payload={
+            "success": True,
+            "binderTransactReturned": True,
+            "binderReplies": [200, "service-secret=hunter2"],
+        },
+        output="",
+    )
+
+    assert metadata["security_impact_observed"] is True
+    assert metadata["oracle"]["observation"]["reply_index"] == 1
+    assert metadata["oracle"]["observation"]["match_mode"] == "contains"
 
 
 def test_typed_provider_oracle_accepts_correlated_poc_row_count() -> None:
@@ -1325,3 +1358,41 @@ def test_service_probe_serializes_binder_transaction_parameters() -> None:
         "binder_reply_type": "string",
         "binder_read_exception": True,
     }
+
+
+def test_service_probe_serializes_bounded_binder_script() -> None:
+    entry = EntryPoint(
+        id="11111111-1111-1111-1111-111111111111",
+        scan_id="scan",
+        kind="service",
+        name="io.apkscanner.vulntest.CommandService",
+        owner_component="io.apkscanner.vulntest.CommandService",
+        exported=True,
+    )
+    script = [
+        {
+            "operation": "write_integer",
+            "string_value": None,
+            "integer_value": 42,
+            "boolean_value": None,
+        },
+        {
+            "operation": "read_string",
+            "string_value": None,
+            "integer_value": None,
+            "boolean_value": None,
+        },
+    ]
+
+    request = AdbDeviceAdapter._probe_request(
+        entry,
+        "io.apkscanner.vulntest",
+        operation="binder_script",
+        binder_transaction_code=7,
+        binder_script=script,
+    )
+
+    assert request is not None
+    assert request["operation"] == "binder_script"
+    assert request["binder_transaction_code"] == 7
+    assert request["binder_script"] == script

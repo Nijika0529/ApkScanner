@@ -483,6 +483,62 @@ def test_event_history_is_bounded_and_supports_incremental_cursors(settings) -> 
         assert [item["data"]["index"] for item in incremental.json()] == [9, 10, 11]
 
 
+def test_event_history_summary_excludes_high_rate_runtime_telemetry(settings) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    with app.state.database.session_factory() as session:
+        scan = Scan(
+            status="final",
+            filename="event-summary.apk",
+            artifact_sha256="f" * 64,
+            artifact_path=str(settings.data_dir / "event-summary.apk"),
+        )
+        session.add(scan)
+        session.flush()
+        session.add_all(
+            [
+                api_module.ScanEvent(
+                    scan_id=scan.id,
+                    event_type="exploration.model.tool.started",
+                    message="verbose tool event",
+                ),
+                api_module.ScanEvent(
+                    scan_id=scan.id,
+                    event_type="exploration.evidence.created",
+                    message="verbose evidence event",
+                ),
+                api_module.ScanEvent(
+                    scan_id=scan.id,
+                    event_type="exploration.action.completed",
+                    message="action completed",
+                ),
+                api_module.ScanEvent(
+                    scan_id=scan.id,
+                    event_type="exploration.model.completed",
+                    message="model completed",
+                ),
+                api_module.ScanEvent(
+                    scan_id=scan.id,
+                    event_type="task.completed",
+                    message="task completed",
+                ),
+            ]
+        )
+        session.commit()
+        scan_id = scan.id
+
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/v1/scans/{scan_id}/events?detail=summary&limit=20"
+        )
+
+    assert response.status_code == 200
+    assert [item["event_type"] for item in response.json()] == [
+        "exploration.action.completed",
+        "exploration.model.completed",
+        "task.completed",
+    ]
+
+
 def test_completed_scan_can_be_deleted_with_its_unshared_files(settings) -> None:  # noqa: ANN001
     app = create_app(settings)
     store = app.state.store
@@ -1279,6 +1335,18 @@ def test_codex_audit_records_frozen_execution_and_provider_profiles(settings) ->
         assert summary["integrity"] == "not_checked"
         assert summary["artifacts"]["request"]["content"] is None
         assert summary["artifacts"]["response"]["content"] is None
+        selected = client.get(
+            f"/api/v1/scans/{scan.id}/agent-audits",
+            params={"include_artifacts": "true", "audit_id": audit_id},
+        ).json()
+        assert [item["id"] for item in selected] == [audit_id]
+        assert selected[0]["integrity"] == "verified"
+        assert selected[0]["artifacts"]["response"]["content"] is not None
+        missing = client.get(
+            f"/api/v1/scans/{scan.id}/agent-audits",
+            params={"include_artifacts": "true", "audit_id": "missing-audit"},
+        ).json()
+        assert missing == []
 
 
 def test_scan_and_task_agent_controls_are_persisted(settings) -> None:  # noqa: ANN001

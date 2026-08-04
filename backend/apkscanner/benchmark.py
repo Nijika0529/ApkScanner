@@ -390,6 +390,19 @@ class BenchmarkEvaluator:
             if precision == 0.0 or recall == 0.0
             else (1.25 * precision * recall) / ((0.25 * precision) + recall)
         )
+        quality_gate = {
+            "passed": bool(
+                precision >= spec.quality_gate.minimum_precision
+                and recall >= spec.quality_gate.minimum_recall
+                and false_positive_count <= spec.quality_gate.maximum_false_positives
+            ),
+            "minimum_precision": spec.quality_gate.minimum_precision,
+            "minimum_recall": spec.quality_gate.minimum_recall,
+            "maximum_false_positives": spec.quality_gate.maximum_false_positives,
+            "observed_precision": round(precision, 6),
+            "observed_recall": round(recall, 6),
+            "observed_false_positives": false_positive_count,
+        }
         return {
             "schema_version": "1.0",
             "score_policy": {
@@ -414,6 +427,7 @@ class BenchmarkEvaluator:
                 "score_100": round(f_half * 100, 2),
                 "unproven_ai_noise": len(ai_noise),
             },
+            "quality_gate": quality_gate,
             "matches": matches,
             "missed": missed,
             "false_positives": false_positives,

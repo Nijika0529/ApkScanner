@@ -88,12 +88,14 @@ def developer_instructions(
         "establishes component reachability, do not retry equivalent URI, extra, quoting, force-stop, "
         "or logcat variants unless the prior output identifies a specific changed input that can "
         "resolve a different hypothesis. Shell-UID reachability cannot prove ordinary-app impact; "
-        "when impact requires an app UID, returned Provider data, or WebView result capture, move "
-        "directly to one dedicated PoC instead of searching logcat for an observation the target "
+        "when impact requires an app UID, returned Provider data, or WebView result capture, prefer "
+        "a dedicated PoC or platform Probe instead of searching logcat for an observation the target "
         "does not emit. For a no-argument Service Binder transaction with a primitive reply, use "
         "the platform binder_transact replay instead of authoring a Binder PoC. After preparing "
-        "the smallest supported replay, submit exactly one live "
-        "proof replay rather than continuing raw ADB exploration. "
+        "the smallest supported replay, submit a live proof replay rather than continuing equivalent "
+        "raw ADB exploration. Keep a primary strategy, materially distinct fallback strategies, "
+        "and a disconfirming test; "
+        "an inconclusive receipt may justify another materially changed strategy. "
         "After one ordinary-app replay answers a hypothesis, do not fall back to repeated "
         "adb-shell broadcasts, starts, force-stops, dumpsys filters, or logcat variants: shell "
         "identity cannot upgrade that proof. A reproduced_blackbox receipt ends that hypothesis. "
@@ -104,7 +106,7 @@ def developer_instructions(
         "the manifest and Java sources, then invoke apkscanner-proof without discovering or "
         "invoking an Android SDK toolchain. Do not add package-visibility workarounds merely "
         "for the platform build: it normalizes the target SDK and target package/provider "
-        "visibility. One existence/path check for each PoC source is sufficient; do not "
+        "visibility. Avoid redundant existence/path checks for unchanged PoC sources; do not "
         "re-read or re-verify an unchanged file with repeated cat, grep, stat, checksum, xxd, or "
         "directory-listing commands. "
         if direct_tool_access
@@ -136,6 +138,117 @@ All human-readable conclusions must use Simplified Chinese. Keep schema enum val
 Evidence IDs, package/class names, code symbols, paths, commands, and URIs verbatim.
 {response_instruction}
 """.strip()
+
+
+def adaptive_verifier_developer_instructions(*, ssh_available: bool) -> str:
+    """Developer policy for the single scan-level, tool-enabled verifier."""
+
+    ssh_instruction = (
+        "A private copy of the host SSH configuration and keys is available at ~/.ssh. "
+        "Use OpenSSH directly (ssh/scp); no platform SSH wrapper exists. You may inspect the "
+        "configured host aliases, connect to the authorized Aliyun test host, deploy HTML or "
+        "small callback services, and inspect their logs for this APK verification. "
+        if ssh_available
+        else "No host SSH material was available; do not report that as proof against a candidate. "
+    )
+    return f"""
+You are the terminal Adaptive Verifier for an authorized Android application security scan.
+Your job is to establish or falsify the real security impact of the supplied candidate
+findings. This is not a Critic pass and not a bounded platform-Oracle exercise.
+
+Codex sandboxing is disabled inside the scan container. You have a writable private workspace,
+the complete read-only JADX/apktool/archive views under /scan-input, Bash, Python, Android build
+tools, live web search, public network access, and task-scoped ADB while the device lease is held.
+You may build complete Android PoCs, helper programs, HTML/JavaScript pages, and local or remote
+test services. You may use several materially different approaches and adapt after failures.
+Do not stop merely because apkscanner-proof has no matching Oracle or because a fixed Probe
+cannot express the observation. {ssh_instruction}
+
+There is no platform-imposed count limit on shell, ADB, web-search, PoC rebuild, fallback-strategy,
+or evidence-gathering actions in this verification turn. Continue with as many materially useful
+actions as the evidence requires. Preserve an assessment for every candidate before the task
+lifecycle ends; an unresolved edge must become supported_static or not_reproduced with an explicit
+gap, never a fabricated conclusion.
+
+Every Android PoC must compile against and declare targetSdk API 36 or newer, even when the
+leased phone is an older compatibility-smoke device. A lower minSdk is allowed so the same PoC
+can run locally, and a legacy dx-based fallback is allowed when it still produces an APK whose
+declared targetSdk satisfies that API-36 contract. Do not lower targetSdk to match the phone.
+
+For WebView/JavaScript-bridge candidates, trace the whole chain: attacker-controlled URL or
+navigation, redirects and final-origin checks, JavaScript enablement, bridge lifetime and exposed
+methods, sensitive native source or privileged operation, and the data/action observable by the
+attacker. When useful, deploy an attacker page to the authorized Aliyun host, load it through the
+real application, invoke the bridge, and inspect page callbacks or server logs. Decide token or
+credential authenticity semantically from runtime provenance, code usage, session/account
+behavior, and authorized backend responses; do not rely on a hard-coded token regex.
+
+For every candidate, record concrete actions and observations. A semantic verdict may rely on
+ADB output, application behavior, an ordinary-app PoC, a remote callback, SSH-visible server logs,
+or a combination. The platform will preserve your structured response and tool timeline; it will
+not reinterpret returned values with a fixed Oracle. Use reproduced_blackbox only after an actual
+runtime observation establishes the claimed impact. Use not_reproduced only when a relevant
+runtime attempt produced meaningful counterevidence. Keep supported_static when the static chain
+remains credible but execution is blocked or inconclusive.
+
+Work only on the supplied APK, assigned Android device, and SSH hosts already authorized by the
+host configuration. Do not spawn subagents or modify APKScanner itself. Keep generated files in
+the current workspace or /tmp. Clean up temporary remote pages/services and PoC APKs when doing so
+would not destroy the only useful evidence. Return only the requested JSON schema, with all
+human-readable conclusions in Simplified Chinese.
+""".strip()
+
+
+def adaptive_verification_prompt(
+    scan: Scan,
+    candidates: list[dict[str, Any]],
+    evidence: list[dict[str, Any]],
+    platform_context: dict[str, Any],
+) -> str:
+    """Build one scan-level batch prompt without inheriting conservative task rules."""
+
+    compact_evidence = [
+        {
+            key: item.get(key)
+            for key in ("id", "kind", "task_id", "exit_code", "summary", "artifact")
+            if item.get(key) is not None
+        }
+        for item in evidence
+    ]
+    payload = {
+        "schema_version": "1.0",
+        "scan": {
+            "id": scan.id,
+            "package_name": scan.package_name,
+            "artifact_sha256": scan.artifact_sha256,
+            "artifact_path": "/scan-input/target.apk",
+        },
+        "candidates": candidates,
+        "evidence": compact_evidence,
+        "platform_context": platform_context,
+    }
+    recovery = platform_context.get("recovery")
+    recovery_instruction = ""
+    if isinstance(recovery, dict) and recovery.get("is_retry"):
+        recovery_instruction = (
+            "这是 Adaptive Verifier 的恢复轮次。上一次实验已经由平台保存为当前 task_id 的"
+            " Evidence，并已物化到工作区；先按 Evidence ID 读取这些 JSON，尤其是普通应用 PoC"
+            " 的 results.txt 输出。不要重复已经成功的 Receiver、localhost、Binder、WebView、"
+            "文件导入或 PendingIntent 实验。仅允许针对仍缺结论的候选做少量补充检查，然后立即"
+            "返回全部 assessment；即使某项仍有缺口，也必须用 supported_static 或"
+            " not_reproduced 明确收尾。\n"
+        )
+    return (
+        recovery_instruction
+        + "批量验证下面所有候选风险。先读取当前工作区的 context.json，再按风险和共享攻击链"
+        "制定验证顺序；可以把同一 WebView、组件或登录态相关候选合并到一次实验中。不要重复"
+        "普通调查 Agent 已完成的静态摘要，而要补齐外部攻击者到真实影响的链路。固定 Probe、"
+        "apkscanner-proof、原始 ADB、完整 PoC、远端 HTML/回调和 SSH 日志都只是可选证据来源。"
+        "若第一次方案失败，依据具体错误改变实现、输入、时序或观测位置。每个 finding_id 必须"
+        "且只能返回一条 assessment；不要创造新的 finding_id。最终由你对返回值、token、账号"
+        "能力或其他语义影响作综合判断。\n\nADAPTIVE_VERIFICATION_CONTEXT_JSON:\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2)
+    )
 
 
 def investigation_prompt(
@@ -202,8 +315,16 @@ def investigation_prompt(
     }
     if phase in {"adversarial_review", "rescue_review"}:
         access_instruction = (
-            "This independent review has no workspace, shell, device, or network tools. Use only "
-            "the supplied platform dossier and return requested_tests=[]."
+            "This independent review has no device or network tools and must return "
+            "requested_tests=[]. The Critic may use read-only shell/search operations to re-open "
+            "the exact bounded source anchors cited by the candidate; do not modify the workspace "
+            "or expand into an unrelated APK inventory."
+            if phase == "adversarial_review"
+            else (
+                "This blind review has no device or network tools. Use the supplied dossier and "
+                "bounded source context, return requested_tests=[], and leave execution to the "
+                "tool-enabled rescue phase."
+            )
         )
     elif direct_tool_access and shell_access and workspace_write:
         access_instruction = (
@@ -225,7 +346,7 @@ def investigation_prompt(
             "working input; the platform immediately builds/replays, records, and cleans it. The "
             "proof JSON hypothesis_id is mandatory: use the exact hypothesis whose concrete impact "
             "the Oracle tests, never omit it or attach a distinct exploit chain to a generic "
-            "reachability hypothesis. One successful harm replay is enough for the exploit chain: "
+            "reachability hypothesis. A successful harm replay is sufficient for the exploit chain: "
             "do not replay the same PoC for reachability, input-validation, or other supporting "
             "hypotheses. Assess those from the shared evidence. A materially different attacker "
             "primitive and sink is not a supporting hypothesis: for example target_activity "
@@ -251,7 +372,7 @@ def investigation_prompt(
             "The PoC package must start with "
             "io.apkscanner.poc.; its manifest package, Activity class name, Java package "
             "declaration, and src/ directory must describe the same fully qualified class. Verify "
-            "the manifest and Java source once with test -f before invoking proof. Its "
+            "the manifest and Java source with test -f before invoking proof. Its "
             "declared launch Activity must read the apkscanner_request_id Intent extra and log a "
             "single JSON result using the requested log_tag. Include that request ID plus "
             "success and security_impact_observed booleans. When the requested oracle kind is "
@@ -268,7 +389,7 @@ def investigation_prompt(
             "device satisfies minSdk and the APK installs and launches, do not blame an "
             "inconclusive Oracle on those version numbers. After a proof receipt reports "
             "reproduced_blackbox, stop testing that hypothesis. If it reports deduplicated=true, "
-            "do not submit it again. If it is inconclusive, inspect the receipt once and retry only "
+            "do not submit it again. If it is inconclusive, inspect the receipt and retry "
             "with a concrete change to the PoC input, implementation, or Oracle; never resubmit an "
             "unchanged project merely to obtain a different answer."
         )
@@ -286,17 +407,19 @@ def investigation_prompt(
     else:
         access_instruction = (
             "You cannot inspect files or execute commands directly. Treat TASK_CONTEXT_JSON as "
-            "the complete input for this turn and use requested_tests for bounded platform actions."
+            "the complete input for this turn and use requested_tests for policy-controlled "
+            "platform actions."
         )
     if phase == "adversarial_review":
         role_instruction = (
             "Act as the independent Critic. Examine platform_context.candidate_under_review and try "
             "to falsify it. Identify permission checks, caller validation, unreachable paths, "
             "required authentication or configuration, harmless behavior, and missing impact. Use "
-            "only supplied evidence, return requested_tests=[], and do not reopen workspace or "
-            "device exploration. Do not restate the candidate as fact. Give each material objection "
-            "a stable ID OBJ-1 or OBJ-2 and return it in review_objections with its exact evidence "
-            "basis. Return at most two objections, only for defects that could change the verdict; "
+            "the supplied evidence and, when needed, re-open only its exact cited source anchors; "
+            "return requested_tests=[] and do not use the device. Do not restate the candidate as "
+            "fact. Give each material objection a stable unique ID beginning with OBJ-1 and return "
+            "it in review_objections with its exact evidence basis. Include every distinct objection "
+            "that could change the verdict; "
             "do not add stylistic, speculative, or duplicate objections. If no material objection "
             "survives the supplied evidence, return "
             "review_objections=[]. platform_context.platform_proven_hypotheses contains immutable "
@@ -339,29 +462,37 @@ def investigation_prompt(
             "interesting issue; follow them only when the seed implementation contains a concrete "
             "edge to them. "
             "When platform_context.device says this task owns an available device, use the exact "
-            "serial to run adb -s <serial> get-state and adb -s <serial> shell id within the first "
-            "ten tool actions; report the exact failure if either command fails instead of silently "
+            "serial to run adb -s <serial> get-state and adb -s <serial> shell id early in the "
+            "investigation; report the exact failure if either command fails instead of silently "
             "avoiding ADB. "
             "Before naming a method, API call, Intent extra, URI, or sink, open the actual target "
             "source or Smali and verify that exact symbol or literal exists; never complete a likely "
             "Android pattern from memory. Close every static hypothesis you can. Request only the "
-            "smallest phone test or complete PoC APK needed for a remaining proof gap."
+            "smallest phone test or complete PoC APK needed for a remaining proof gap. For every "
+            "material hypothesis, identify a primary proof strategy, materially distinct fallback "
+            "strategies, and a disconfirming predicate. Do not stop solely because the first "
+            "Oracle type is unavailable; record oracle_gap and select another advertised strategy."
         ),
         "exploration_round": (
             "This is a dynamic-verification continuation, not a fresh audit. Do not rescan the APK, "
             "repeat the first-round static analysis, or revisit entries without new evidence. Read "
             "agent_round_history and executed_agent_tests first. Work only on a concrete rejected or "
-            "failed request, PoC build/runtime defect, Oracle miss, or unresolved dynamic path. A new "
+            "failed request, PoC build/runtime defect, Oracle miss, runtime contradiction, newly "
+            "resolved exact code edge, or unresolved dynamic path. A new "
             "requested_test must contain a changed PoC, input, or Oracle that directly addresses that "
-            "recorded gap. If the prior test is terminal or no meaningful change remains, return no "
-            "requested tests and stop."
+            "recorded gap. The platform imposes no exploration-round or no-progress-round count "
+            "ceiling. Continue while another investigation turn can materially test, repair, "
+            "falsify, or refine a security hypothesis, and decide from the evidence when no further "
+            "useful action remains."
         ),
         "adversarial_review": (
-            "This is one evidence-only review, not a new APK audit. Read only the supplied candidate "
-            "and the platform Evidence IDs it cited. Do not use tools, ADB, reconstruct unrelated "
+            "This is one adversarial review, not a new APK audit. Read the supplied candidate, "
+            "the platform Evidence IDs it cited, and only exact source anchors needed to verify "
+            "them. Do not use ADB or reconstruct unrelated "
             "entry points, or request new tests. Check only whether the claimed path is real, a "
-            "permission or caller guard blocks it, or the claimed harm is unsupported. Return at "
-            "most OBJ-1 and OBJ-2. The text analysis pass is a short argument memo, not the "
+            "permission or caller guard blocks it, or the claimed harm is unsupported. Return each "
+            "distinct material objection with a unique OBJ-prefixed ID. The text analysis pass is "
+            "a short argument memo, not the "
             "structured verdict; stop immediately once those decisive checks are resolved."
         ),
         "rescue_review": (
@@ -534,9 +665,9 @@ def investigation_prompt(
         "execution pair: either Probe request plus Probe log, or dedicated PoC launch plus PoC log. "
         "The same request ID and test-case ID must appear in both records, and a platform Oracle "
         "must independently observe concrete security impact. During test_planning and "
-        "exploration_round phases, use the limits in "
-        "platform_context.exploration_limits and request only the next smallest set of bounded "
-        "follow-up tests against supplied entry-point IDs. Link each requested test to one of "
+        "exploration_round phases, choose every materially useful follow-up test against supplied "
+        "entry-point IDs; the platform does not impose an exploration-round or per-round test "
+        "count. Link each requested test to one of "
         "platform_context.security_hypotheses by setting hypothesis_id; never invent a hypothesis "
         "ID. In the final structured result, hypotheses_tested must contain exact hypothesis IDs, "
         "not claim text. Emit one hypothesis_assessments item for every tested hypothesis. Each "
@@ -559,7 +690,8 @@ def investigation_prompt(
         "When platform_context.proof_replay.available=true, requested_tests is a deprecated "
         "compatibility field: always return requested_tests=[] and use the live command instead. "
         "The proof JSON contains mandatory hypothesis_id and entry_point_id plus oracle and "
-        "rationale. It contains either poc for a custom app or operation=binder_transact with "
+        "rationale. It contains either poc for a custom app, operation=binder_transact, or "
+        "operation=binder_script with "
         "Binder fields for the platform Probe; extras/reset are optional. Copy both IDs exactly from the supplied task "
         'context. Use this shape: {"hypothesis_id":"<exact-id>","entry_point_id":'
         '"<exact-seed-id>","poc":{"project_path":"poc/name","package_name":'
@@ -583,8 +715,15 @@ def investigation_prompt(
         '"binder_interface_descriptor":null,"binder_reply_type":"string",'
         '"binder_read_exception":true,"oracle":{"kind":"binder_reply",'
         '"expected_text":"service-secret=hunter2","impact":"unauthorized_data_access"}}. '
-        "Use a dedicated ordinary-app PoC only when request Parcel arguments, callbacks, multiple "
-        "transactions, or another unsupported Binder protocol are required. Android "
+        "When primitive arguments, byte arrays, or multiple primitive reply values are needed, use "
+        "operation=binder_script. Keep binder_transaction_code and optional descriptor/readException, "
+        "then provide binder_script steps: write_string/write_integer/write_long/write_boolean/"
+        "write_bytes_base64 followed by read_string/read_integer/read_long/read_boolean/"
+        "read_bytes_base64. The platform Probe performs every step from its ordinary app UID. "
+        "binder_reply supports exact, contains, regex, and sha256 match_mode plus reply_index; "
+        "non_empty is diagnostic reachability only and cannot prove harm. Use a dedicated ordinary-"
+        "app PoC only when callbacks, multiple transactions, Parcelable objects, or another "
+        "unsupported Binder protocol are required. Android "
         "Activity lifecycle callbacks run on the main thread: never use Thread.sleep, await, or "
         "other blocking work in onCreate/onStart/onResume to keep a PoC visible. Set the view and "
         "return; use Handler.postDelayed only when a later action is truly required, because "
@@ -603,7 +742,7 @@ def investigation_prompt(
         "reachability supports impact=none only; provider_rows may use "
         "unauthorized_data_access. A PoC log_contains Oracle records only the PoC's claim and never "
         "becomes platform harm evidence. The live Proof Gateway rejects every impact=none replay, "
-        "so do not submit a log_contains reachability PoC there; use the bounded ADB gateway for "
+        "so do not submit a log_contains reachability PoC there; use the task-scoped ADB gateway for "
         "diagnostics. binder_reply may use unauthorized_data_access only; it becomes platform harm "
         "evidence only when the Probe successfully binds, transact returns true, and the typed reply "
         "exactly matches expected_text. "

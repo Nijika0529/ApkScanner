@@ -717,23 +717,61 @@ class HypothesisLedger:
         """
 
         with self.database.session_factory() as session:
-            hypothesis_ids = list(
+            hypotheses = list(
                 session.scalars(
-                    select(SecurityHypothesis.id)
+                    select(SecurityHypothesis)
                     .where(SecurityHypothesis.task_id == task_id)
                     .order_by(SecurityHypothesis.created_at)
                 )
             )
-            proven_ids = set(
+            attempts = list(
                 session.scalars(
-                    select(ProofAttempt.hypothesis_id).where(
-                        ProofAttempt.task_id == task_id,
-                        ProofAttempt.harm_demonstrated.is_(True),
-                    )
+                    select(ProofAttempt)
+                    .where(ProofAttempt.task_id == task_id)
+                    .order_by(ProofAttempt.created_at)
                 )
             )
+        hypothesis_ids = [item.id for item in hypotheses]
+        proven_ids = {item.hypothesis_id for item in attempts if item.harm_demonstrated}
+        attempts_by_hypothesis: dict[str, list[ProofAttempt]] = {}
+        for attempt in attempts:
+            attempts_by_hypothesis.setdefault(attempt.hypothesis_id, []).append(attempt)
         proven = [item for item in hypothesis_ids if item in proven_ids]
         unresolved = [item for item in hypothesis_ids if item not in proven_ids]
+        stages: dict[str, dict[str, Any]] = {}
+        for hypothesis in hypotheses:
+            owned_attempts = attempts_by_hypothesis.get(hypothesis.id, [])
+            if hypothesis.id in proven_ids:
+                stage = "impact_reproduced"
+            elif any(item.status == ProofAttemptStatus.REFUTED.value for item in owned_attempts):
+                stage = "case_refuted"
+            elif any(
+                bool((item.oracle or {}).get("execution_demonstrated"))
+                for item in owned_attempts
+            ):
+                stage = "ordinary_uid_reachable"
+            elif owned_attempts:
+                stage = "oracle_gap"
+            elif hypothesis.status in {
+                HypothesisStatus.ACCEPTED_FOR_PROOF.value,
+                HypothesisStatus.PROOF_PLANNED.value,
+                HypothesisStatus.EXECUTING.value,
+                HypothesisStatus.INCONCLUSIVE.value,
+            }:
+                stage = "static_path_supported"
+            elif hypothesis.status == HypothesisStatus.REFUTED.value:
+                stage = "refuted_static"
+            else:
+                stage = "untriaged"
+            stages[hypothesis.id] = {
+                "stage": stage,
+                "hypothesis_status": hypothesis.status,
+                "proof_attempt_count": len(owned_attempts),
+                "latest_attempt_status": (
+                    owned_attempts[-1].status if owned_attempts else None
+                ),
+                "latest_error": owned_attempts[-1].error if owned_attempts else None,
+            }
         return {
             "schema_version": "1.0",
             "total": len(hypothesis_ids),
@@ -741,6 +779,7 @@ class HypothesisLedger:
             "unresolved_count": len(unresolved),
             "proven_hypothesis_ids": proven,
             "unresolved_hypothesis_ids": unresolved,
+            "proof_stage_by_hypothesis": stages,
             "all_platform_proven": bool(hypothesis_ids) and not unresolved,
         }
 

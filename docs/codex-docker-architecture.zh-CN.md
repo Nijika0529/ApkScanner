@@ -31,7 +31,7 @@
 6. `CURRENT` 完整 JADX、apktool、archive 结果及原始 `target.apk` 通过扫描级只读 bind mount 共享，不复制到各任务工作区；宿主 JADX 缺失或部分失败时，Agent 可用镜像固定的 JADX 输出到自己的可写工作区。
 7. `CURRENT` 同一 primary AgentSession 在自动探索、PoC 修正和最终裁决之间复用同一 Codex Thread；Critic/Rescue 使用新的 UID、工作区和 Thread。
 8. `CURRENT` ADB 设备由 Orchestrator 独占分配。容器进程只能通过任务级 ADB Gateway 使用分配到的 serial。
-9. `CURRENT` 原始 ADB、Agent 文本、Agent 自建日志和 Agent 自报“PoC 成功”均不能直接生成 `reproduced_blackbox`；最终证明由平台 Proof/Oracle 完成。Provider 行数、目标 UID 日志、目标 UI、崩溃和平台 Probe 的 Binder reply 都有独立判定器。
+9. `CURRENT` 固定 Proof/Oracle 是普通探索的快速、可重复验证通道；扫描末尾另有一个全新的 scan-level Adaptive Verifier Thread，批量处理静态证据较强但仍待验证的风险。它可综合真实 ADB、普通应用 PoC、远端回调和 SSH 可见日志作语义判断，不要求预先存在某一种固定 Oracle；`reproduced_blackbox` 仍要求真实运行观测，不能只靠静态推断或自报成功。
 10. `CURRENT` Agent 运行事件实时归一化、脱敏并带协议记录键，Protocol v3 envelope 追加写入 host-only spool；数据库唯一记录表幂等投影到 ScanEvent，替换 Worker 会补读 spool，缺序号、损坏记录及无终态 Turn 形成显式 `event.gap`。不保存隐藏思维链原文。
 11. `CURRENT` 所有调查角色只使用 Codex。现在由 DeepSeek V4 Flash 承担 primary、Critic、Rescue 和 finalizer；V4 Pro 原生支持后只替换相应 `ProviderProfile`，不再保留 OpenCode 运行时、Worker、fallback 或 critic 路由。
 12. `CURRENT` 主实现使用 Python `openai-codex` SDK；开发前已更新并审查 `/work/codex`。TypeScript SDK 只保留契约对比 spike，不作为本次迁移目标。
@@ -44,7 +44,7 @@
 Docker 不只解决 ADB 排队，也负责：
 
 - 把 `Sandbox.full_access` 的影响限制在当前扫描容器；
-- 防止 Agent 读取 SQLite、其他 APK、其他任务、宿主凭据和 Docker 控制接口；
+- 防止普通 Agent 读取 SQLite、其他 APK、其他任务、宿主凭据和 Docker 控制接口；Adaptive Verifier 只获得宿主 SSH 配置的私有运行时副本；
 - 固定 Codex、Bash、编译辅助工具和证书版本；
 - 对 CPU、内存、PID、临时磁盘、网络和生命周期设置硬边界；
 - 在取消、超时或崩溃后回收整个进程树；
@@ -82,7 +82,7 @@ Docker 容器共享宿主内核，镜像层在并发扫描间复用。`--memory`
 
 - APK Intake、Manifest 语义、静态规则和 Security IR 的既有定义；
 - `ordinary_app_uid` 默认威胁模型；
-- Finding 必须通过平台 Evidence 和危害 Oracle 的原则；
+- Finding 必须保留可审计 Evidence；普通阶段优先使用固定 Oracle，终局 Adaptive Verifier 可基于真实实验作语义危害判断；
 - 当前仅针对已授权 APK、专用测试设备和测试后端的业务边界；
 - Web/JSON/HTML/SARIF 的总体产品出口。
 
@@ -112,10 +112,11 @@ Docker 容器共享宿主内核，镜像层在并发扫描间复用。`--memory`
 | Web Search | `web_search=live` 已冻结；真实 V4 Flash smoke 产生 `web_search.started/completed` 并返回官方 HTTPS 来源 | 纳入周期性固定回归 | `CURRENT` |
 | Bash 公网 | Docker bridge 公网可用，无宿主端口/设备/socket 挂载 | 企业部署增加受控 egress，阻断元数据/未授权内网 | `PARTIAL` |
 | ADB | 容器 `adb` wrapper 通过任务 token 调用宿主 Gateway；serial 固定、危险命令拒绝、结果写 Evidence | 增加更细的目标/命令 scope 与配额 | `CURRENT` |
-| Proof Replay | primary 在持有 device lease 时获得任务级 Proof Gateway；Critic/Rescue 不下发 token | 保持平台 Oracle 为唯一黑盒证明准入 | `CURRENT` |
-| PoC/Probe | Agent 写复杂协议 PoC；平台负责构建、签名、安装、执行、Oracle 和清理；简单无参数 Binder 事务由 shell-gated Probe 直接执行并读取 typed reply | 增加 Parcel 参数模板与更多 Oracle 类型 | `CURRENT` |
+| Proof Replay | primary 与 tool-enabled rescue_exploration 在持有 device lease 时获得任务级 Proof Gateway；Critic/rescue_review 不下发 token | 固定 Oracle 保持为快速路径；不能表达的验证交由终局 Adaptive Verifier | `CURRENT` |
+| Adaptive Verifier | 每次扫描一个新 verifier UID/工作区/Thread，批量接收全部符合严重度条件的 `supported_static` Finding；拥有写入、网络、固定 serial 的扩展 ADB 策略和可选 SSH 副本 | 补足 JSB、Binder、远端回调等难以规则化的语义验证；不按 Finding 创建 Agent | `CURRENT` |
+| PoC/Probe | Agent 写复杂协议 PoC；平台负责构建、签名、安装、执行、Oracle 和清理；简单 Binder 事务及有界 primitive Parcel 脚本由 shell-gated Probe 执行并读取 typed reply | 继续增加 Parcelable、callback、多事务协议和更多 Oracle 类型 | `CURRENT` |
 | 事件 | notification 已归一化、脱敏；Worker 序列、heartbeat、host-only spool、数据库唯一记录、重放、watchdog 和 crash gap 已实现 | 增加跨进程 occurred/received 时间与运维指标 | `CURRENT` |
-| 结构化结果 | Worker 使用显式 `result_contract`；调查契约由平台固定 Schema，并在响应末尾 JSON 兼容提取后执行完整 Pydantic/证据校验 | 增加一次同线程 schema 修复 | `CURRENT` |
+| 结构化结果 | Worker 使用显式 `result_contract`；调查契约由平台固定 Schema，并在响应末尾 JSON 兼容提取后执行完整 Pydantic/证据校验 | 增加无固定次数的同线程 schema 修复，以任务生命周期为终止边界 | `CURRENT` |
 | Agent 路由 | 所有 phase 只走 Codex；无 OpenCode/fallback 可执行路径 | 保持历史报告只读兼容 | `CURRENT` |
 | 能力入口 | Manifest Registry 已支持 built-in、SHA-256 固定 Python script 和显式绑定 MCP Adapter | 增加容器 sidecar、schema engine、Evidence mapper 与能力提案审批 | `PARTIAL` |
 | 平台监督 | REST 提供 snapshot、catalog/invoke、Campaign validate/launch 和已有 SSE 事件线 | 增加 SupervisorSession/RBAC、CampaignRun 持久化、MCP 薄适配和幂等键 | `PARTIAL` |
@@ -140,7 +141,7 @@ Docker 容器共享宿主内核，镜像层在并发扫描间复用。`--memory`
 - Capability Registry 已实现 built-in、hash-pinned Python script 和显式 MCP binding；监督 REST 已提供
   snapshot、catalog/invoke、Campaign validate/launch，作为未来独立监督 Agent 的窄控制面；
 - Worker 镜像 `apk-scanner-codex-worker:0.2.0` 标记 SDK `0.144.4` / Protocol `3` / Worker
-  revision `20260803.1`，真实 Docker
+  revision `20260804.1`，真实 Docker
   UID/Thread 和 Pixel 4 ADB Gateway 集成测试通过；
 - `vulntest.apk` 曾在 Pixel 4 Android 13/API 33 完成真实 DeepSeek/Codex 自动 PoC smoke：Codex 在独立
   UID 工作区读取宿主机反编译结果、生成源码 PoC，经平台构建/签名/安装后，以普通 App UID 触发
@@ -150,16 +151,24 @@ Docker 容器共享宿主内核，镜像层在并发扫描间复用。`--memory`
 - 真机 smoke 同时修复了三项边界缺陷：Proof 客户端重复拼接完整 URL、Windows ADB 桥接下
   `uiautomator dump /dev/tty` 无法返回 XML、以及模型最终 JSON 前带说明文字时的严格尾部对象提取；
 - 平台现强制源码 PoC 读取 `apkscanner_request_id` 并输出 `success`、
-  `security_impact_observed`（Provider 另含 `row_count`）字段；每任务实时重放受
-  `agent_max_rounds` 约束，模型最终化失败也不能覆盖已经形成的不可变平台 Proof。
+  `security_impact_observed`（Provider 另含 `row_count`）字段；每任务实时重放没有次数
+  上限，重复或同语义策略仍会幂等去重，模型最终化失败也不能覆盖已经形成的不可变平台 Proof。
 - 完整扫描 `49b6d20c-af28-4b4e-a83c-51f4a2c4b868` 的 6 个任务全部完成并封印，形成 4 个
   `reproduced_blackbox` Finding：DeepLink/WebView JS Bridge、`target_activity` 内部组件重定向、
   `inner_intent` 嵌套 Intent 重定向和无权限 Provider 读。ground-truth 结果为 4 TP、0 FP、
   2 FN，precision 1.0、recall 0.666667、F0.5 0.909091（90.91 分）。
-- Probe APK v0.3 已把 minSdk 降到 26，receiver 由 `android.permission.DUMP` 限定为 shell/platform
+- 当前工作区数据库中的三次可复核 benchmark 分别为 `2/6`、`2/6`、`3/6` TP，均为 0 FP；
+  最新一次 precision 1.0、recall 0.5、F0.5 0.8333。它说明当前精度较高但召回率仍不够高，
+  不能把历史本地测试表述为“接近 100%”。ground-truth 默认质量门禁固定为 precision 1.0、
+  recall 1.0、0 FP；100% 只表示固定 APK、ground-truth、设备策略和扫描器版本的回归门禁，
+  不承诺对任意 APK 和未知漏洞达到数学意义上的全发现。该最新扫描的 6 个探索任务本身均已
+  完成，因此“调度完成率 100%”和“漏洞召回率 50%”必须作为两项不同指标展示。
+- Probe APK v0.4 保持 minSdk 26，receiver 由 `android.permission.DUMP` 限定为 shell/platform
   调度，并声明 `QUERY_ALL_PACKAGES` 以解析任意当前扫描目标。对于无参数、primitive reply 的 Service，
   Agent 提交 `binder_transact` 参数而不提交 PoC；Probe 以普通 App UID 异步 bind、执行 transact、读取
-  `string/integer/long/boolean`，宿主按 request ID 和 expected value 形成 `binder_reply` Oracle。Pixel 4
+  `string/integer/long/boolean`，宿主按 request ID 和 expected value 形成 `binder_reply` Oracle。复杂但仍由
+  primitive 构成的 Parcel 可改用 `binder_script`，由同一个平台 Probe 执行有界 primitive/bytes 写入、
+  多值读取及 exact/contains/regex/SHA-256 匹配；Agent 自写代码不能伪造 Probe 返回值。Pixel 4
   API 33 已真实取回 `service-secret=hunter2`，平台判定 `security_impact_observed=true`；复杂 Parcel 参数、
   callback 或多事务协议仍使用专用 PoC，PoC-owned `log_contains` 仍不能充当危害 Oracle。
 - DeepSeek V4 Flash 的真实 Docker Web Search smoke 已产生 `web_search.started/completed`，并返回
@@ -225,6 +234,7 @@ flowchart TB
         KEEP[Trusted container keeper]
         S1[UID 21001<br/>primary Worker + Python SDK + Thread]
         S2[UID 21002<br/>critic/rescue Worker + Python SDK + Thread]
+        SV[UID 21003<br/>scan-level Adaptive Verifier + fresh Thread]
         SHELL[Bash / Patch / Web Search]
         TASKWS[/agent-workspaces/&lt;session&gt; RW 0700]
         SCANWS[/scan-input RO]
@@ -249,10 +259,13 @@ flowchart TB
     ORCH -->|scan lifecycle| KEEP
     ORCH <-->|session exec stream| S1
     ORCH <-->|session exec stream| S2
+    ORCH <-->|terminal batch verification| SV
     S1 --> SHELL
     S2 --> SHELL
+    SV --> SHELL
     S1 --> DS
     S2 --> DS
+    SV --> DS
     SHELL --> ADB
     ADB --> SCHED
     SHELL --> PROOF
@@ -269,7 +282,7 @@ flowchart TB
 | Docker Executor | 每扫描容器、session exec、UID 进程组、资源限制、网络、健康检查、停止和回收 |
 | Container Keeper | 仅维持容器和执行可信 session-control；不运行模型、不持有 Provider Key、不拥有业务决策 |
 | Codex Worker | SDK 客户端、Thread/Turn、流式事件、结构化结果、interrupt |
-| Codex Agent | 阅读、搜索、编写脚本和 PoC、提出测试、解释证据、输出结构化判断 |
+| Codex Agent | 阅读、搜索、编写脚本和 PoC、提出测试、解释证据、输出结构化判断；终局 verifier 批量完成语义验证 |
 | Device Scheduler | serial 独占、优先级、健康状态、设备清理 |
 | ADB Gateway | serial 强绑定、命令串行、策略拒绝、事件和输出摘要 |
 | Proof/Oracle | PoC 重放、普通 App UID、客观危害观察、Evidence 和签名回执 |
@@ -358,7 +371,8 @@ Agent 不拥有设备租约、Provider 选择、Finding 准入、Evidence 真伪
   "rescue_review": "codex:deepseek-v4-flash",
   "rescue_exploration": "codex:deepseek-v4-flash",
   "final_evaluation": "codex:deepseek-v4-flash",
-  "recovery_evaluation": "codex:deepseek-v4-flash"
+  "recovery_evaluation": "codex:deepseek-v4-flash",
+  "adaptive_verification": "codex:deepseek-v4-flash"
 }
 ```
 
@@ -368,6 +382,7 @@ Agent 不拥有设备租约、Provider 选择、Finding 准入、Evidence 真伪
 - 所有合法 route 的 backend 必须为 `codex`；配置解析器应直接拒绝 OpenCode backend。
 - Provider、模型或 SDK 失败必须形成显式失败/coverage gap，禁止静默 fallback。
 - Critic/Rescue 的 memo 必须作为带哈希的输入制品传给最终裁决，不能依赖隐藏状态；使用同一模型时也必须使用独立 UID、工作区和新 Thread。
+- Adaptive Verifier 在普通任务全部收口后创建；每次 scan/batch 只有一个新 UID、工作区和 Thread，所有候选一次输入、一次结构化批量输出，不为每个 Finding 创建 Agent。
 - V4 Pro 原生支持 Codex 后，只替换对应 phase route 和 ProviderProfile，不改变 Worker、Evidence、事件或输出契约。
 
 ## 6. 工作区与挂载规范
@@ -444,7 +459,7 @@ Agent 不拥有设备租约、Provider 选择、Finding 准入、Evidence 真伪
 - 整个 `<data_dir>`；
 - SQLite/PostgreSQL 凭据；
 - 其他 scan；同一扫描其他 session 目录虽在同一父挂载下，但必须被 Unix 权限拒绝；
-- 宿主 `/home`、`/root`、SSH/Git 凭据；
+- 宿主 `/home`、`/root` 和 Git 凭据；唯一例外是 Adaptive Verifier 可把配置的宿主 SSH 目录复制到其私有 `HOME/.ssh`，禁止 bind mount；
 - `/var/run/docker.sock` 或任何容器管理 socket；
 - 未经 ADB Gateway 的 host ADB socket；
 - 宿主真实 `CODEX_HOME`；
@@ -459,6 +474,8 @@ CODEX_HOME=/agent-workspaces/<key>/codex-home
 TMPDIR=/agent-workspaces/<key>/tmp
 APKSCANNER_SCAN_ROOT=/scan-input
 ```
+
+Verifier 的 SSH 是运行时文件副本，不是平台 wrapper：默认来源为启动用户的 `~/.ssh`，容器内直接使用 `ssh`/`scp`。副本只存在于 verifier 的 `0700` HOME，文件统一收紧为 `0600`，不进入 Prompt、事件或 Git；task/scan 关闭时由 Workspace Manager 定向删除。普通 primary、Critic 和 Rescue session 不获得该副本。
 
 反编译 APK 中可能包含 `AGENTS.md`、提示词或工具配置，它们一律是待分析数据。目标配置设置 `project_doc_max_bytes = 0` 禁止自动发现项目说明，可信指令只通过 Python SDK 的 `developer_instructions` 注入。
 
@@ -753,6 +770,7 @@ exclude = ["DEEPSEEK_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY"]
 | 主探索 | Codex | `deepseek-v4-flash` | Responses、Bash、文件、Web Search、多轮 Thread |
 | 结构化裁决 | Codex | `deepseek-v4-flash` | 原生 `output_schema` |
 | Critic/Rescue Review | Codex | `deepseek-v4-flash` | 新 UID/工作区/Thread，只产出证据 memo |
+| Adaptive Verifier | Codex | `deepseek-v4-flash` | 每扫描一个全新 Thread，批量验证剩余高价值风险并作语义判断 |
 | Pro 原生迁移 | Codex（未来） | `deepseek-v4-pro` | 官方支持并通过本项目 smoke/eval 后替换 review profile |
 
 DeepSeek Codex 接入文档要求使用 Responses Provider；截至本文基线，官方明确只有 V4 Flash 支持 Codex，V4 Pro 预计 2026 年 8 月初支持。项目 `openai-codex==0.144.4` 高于官方最低 `0.144.0`，但仍需通过项目自己的协议测试，不能仅凭版本号切换。Pro 上线前不再绕行其他 Agent SDK；上线后也只是新增 Codex ProviderProfile。
@@ -848,9 +866,11 @@ stateDiagram-v2
 
 - 初始探索、平台执行测试后的反馈、PoC 修正和最终裁决优先复用 primary Thread。
 - 每次 Turn 后立即持久化 thread/turn 标识、配置指纹、usage、terminal status 和事件 offset。
-- schema/语义错误允许在同一 Thread 发起一次明确的 repair Turn；仍失败则本阶段失败。
+- schema/语义错误在同一 Thread 发起明确的 repair Turn 并传入精确错误，不设置固定 repair 次数；
+  成功、取消或任务生命周期到期时结束。
 - Critic 使用新 Thread，不继承 primary 的说服性结论。
 - Blind Rescue 使用新 Thread，并使用独立 role 工作区；只接收平台允许的种子和证据。
+- Adaptive Verifier 不复用 primary/Critic/Rescue Thread；普通任务结束后，将筛选出的 `supported_static` Findings、已有 Evidence 和精确源码锚点一次性装入一个新 Thread。它在该批次中保持连续上下文，返回每个原 Finding ID 的 assessment。
 - 自动重试优先 resume 原 Thread；仅在本地状态损坏、SDK 不支持恢复或配置指纹变化时创建新 Thread。
 - 创建替代 Thread 时记录 `parent_session_id`、`recovery_reason` 和完整上下文重放哈希。
 - 人工“继续深度探索”创建新 attempt、新 UID/session 和新 Thread，并加载旧 Evidence；scan 仍活动时可继续使用原扫描容器，但不复活已释放设备租约。
@@ -860,6 +880,7 @@ stateDiagram-v2
 - 扫描容器在第一个 AgentSession 前创建，在 scan terminal、取消或恢复失败后关闭；不得跨 `scan_id` 复用。
 - primary Worker 进程从首次 Turn 到该 attempt 自动多轮结束持续存在；不得跨 task/attempt/role 复用。
 - Critic/Rescue 触发时在同一扫描容器启动新的 UID/Worker/Thread；结束即回收该 UID 的进程，目录按保留策略归档。
+- Adaptive Verifier 复用同一扫描容器，但使用独立 verifier UID/Worker/Thread；它可见自身私有 SSH 副本，其他 session 不可见。结束后立即清理 Worker、Gateway token 和 SSH 副本。
 - 不同 role 可共享镜像和 `/scan-input`，但不共享可写 workspace、HOME、CODEX_HOME、TMPDIR、Key 环境、Thread 或 ADB/Proof token。
 - Worker crash 后在同一容器、同一 UID workspace 启动 replacement generation，并尝试 `thread_resume`；旧 UID 进程必须先确认全部死亡。
 - 扫描容器 crash/OOM 后，Executor 可用相同 scan mounts 创建替代容器；从宿主挂载的 session state 恢复，并记录 `container_generation`。
@@ -1054,6 +1075,7 @@ Gateway token 绑定：
 | --- | --- | --- |
 | Agent 自由探索 | 写脚本、写 PoC、试运行、查看失败 | 调查线索，不直接证明 |
 | 平台 Proof Replay | 校验、构建/接收、签名、安装、执行、Oracle | 可生成动态 Evidence |
+| Adaptive Verifier | 扫描末尾用完整工具、扩展 ADB、远端页面/回调和直接 SSH 批量验证剩余风险 | 真实运行观测 + 模型语义判断，可更新原 Finding |
 
 ### 14.2 Docker 内调用
 
@@ -1077,9 +1099,20 @@ Gateway token 绑定：
 
 - `execution_demonstrated` 与 `harm_demonstrated` 分开。
 - 普通 App UID 能启动组件不等于危害成立。
-- 只有领域 Oracle 观察到未授权数据返回、状态变化、权限边界绕过或其他具体影响，才能设置 `harm_demonstrated=true`。
-- `reproduced_blackbox` 必须引用同一 Proof Attempt 的调用、身份、输出、Oracle 和制品 Evidence。
+- 普通探索阶段只有领域 Oracle 观察到未授权数据返回、状态变化、权限边界绕过或其他具体影响，才能设置 `harm_demonstrated=true`；这是快速路径，不是全部漏洞类型的封闭枚举。
+- 普通探索产生的 `reproduced_blackbox` 必须引用同一 Proof Attempt 的调用、身份、输出、Oracle 和制品 Evidence。
 - Critic 或模型文字不得推翻已经由平台签名的 Proof。
+
+### 14.5 Adaptive Verifier 终局语义验证
+
+- 触发时机：所有普通探索任务结束、扫描封印之前；选取全部严重度达到配置阈值且状态仍为 `supported_static` 的 Finding，不按候选数量截断。
+- 批处理：一个扫描创建一个特殊 `adaptive_verification` task、一个 verifier UID 和一个全新 Codex Thread；约 4—5 个候选应一次输入，禁止每个风险各建 Agent。
+- 权限：verifier 具有私有可写工作区、完整只读反编译根、Bash/Python/Android 构建工具、Web Search、公网、分配设备上的扩展 ADB 策略，以及可选的宿主 SSH 运行时副本。ADB serial、租约和 server 所有权仍归平台。
+- 策略：固定 Proof、Probe 和 Oracle 仍可使用，但不是前置条件。Agent 可自行构建普通 App PoC、部署授权的 Aliyun HTML/回调、经真实 App 触发 JSB，并结合页面回调、应用行为、ADB 输出或 SSH 可见服务日志判断影响。
+- 语义：token/credential 是否真实不写死为正则；由 Agent 结合返回值来源、目标代码用法、账号/会话行为和授权后端响应综合判断。
+- 准入：`reproduced_blackbox` 必须声明 `runtime_observed=true` 并描述具体实验与观测；纯静态推断只能保持 `supported_static`。平台校验候选 Finding ID 和引用 Evidence ID 的归属，但不再用固定 Oracle 重解释业务语义。
+- 失败：没有设备、SSH 不可用、Provider/Schema 失败或实验不充分时保留原 Finding，并显式记录 gap；不得因为 verifier 失败把可信静态风险删除。
+- 审计：请求、结构化 response、Thread/Turn、usage 和全量工具事件沿用 Protocol v3 事件线；隐藏思维链仍不保存。
 
 ## 15. 结构化输出与最终判定
 
@@ -1099,7 +1132,7 @@ Gateway token 绑定：
 ### 15.2 失败策略
 
 - incomplete、failed、cancelled 或没有 terminal result：本 Turn 失败，不能解析部分文本。
-- Schema 或可修复语义错误：在同一 Thread 发起最多一次 repair Turn，传入精确错误。
+- Schema 或可修复语义错误：在同一 Thread 传入精确错误并继续 repair，不设置固定次数；任务取消或生命周期到期时才停止。
 - ID 越权、伪造 Evidence、冲突 Proof 或不允许的副作用：平台直接拒绝相关字段，并记录安全事件；不要求模型“说服平台”。
 - 最终仍无有效结果：任务进入 `inconclusive`/failed 对应状态并保留 coverage gap，不制造 Finding。
 - 不允许因结构化失败静默换模型、换 Provider 或换后端。
@@ -1117,8 +1150,8 @@ Agent 可以决定：
 
 - 测试是否允许执行；
 - Evidence 是否真实有效；
-- Proof 是否满足攻击者身份和危害；
-- Finding 是否准入；
+- 普通 Proof 是否满足攻击者身份和固定 Oracle；
+- Finding 是否满足结构、ID 和 Evidence 归属准入；Adaptive Verifier 对难以规则化的运行结果负责语义判断；
 - 最终状态、严重性约束和报告展示层级。
 
 ## 16. 凭据与网络安全
@@ -1131,6 +1164,7 @@ Agent 可以决定：
 | ADB Gateway token | 可见但只绑定单 serial | task session token |
 | Proof token | 可见但只绑定单 task/attempt | task session token |
 | Capability token/凭据 | 默认不可见；按 adapter 声明 | 平台侧调用优先；必须 scope 到 session/capability |
+| 宿主 SSH 配置/私钥 | 仅 Adaptive Verifier 可见 | 将配置目录复制进 verifier 私有 `HOME/.ssh`；不用 wrapper，不挂载宿主目录；task/scan 结束删除副本 |
 | 数据库凭据 | 禁止 | 不挂载、不进环境 |
 | 用户 Codex auth/config | 禁止 | 不挂载宿主 `CODEX_HOME` |
 
@@ -1189,9 +1223,9 @@ Resource Scheduler 同时限制活跃扫描容器数和全局 AgentSession 数�
 | 单 Turn | 60 分钟 | 可按 phase 覆盖 |
 | 单 task attempt | 4 小时 | 包含自动多轮和 Proof |
 | 单 scan | 24 小时 | 保持总体 SLA 边界 |
-| 自动探索轮次 | 最多 5 | 防止无新证据循环 |
-
-预算是平台资源治理，不是模型 tool-step 上限。只要持续产生新 Evidence、仍在预算内且未达到收敛条件，Agent 可以继续使用工具。
+探索轮次、单轮测试、工具调用、PoC 重建和 Proof Replay 均无次数上限。预算是平台资源治理，
+不是模型 tool-step 上限；只要 Agent 仍有实质验证动作、任务生命周期有效且未达到证据终态，
+就可以继续探索。
 
 ### 17.3 降低资源成本
 
@@ -1224,7 +1258,7 @@ Resource Scheduler 同时限制活跃扫描容器数和全局 AgentSession 数�
 | --- | --- | --- |
 | SDK 内部可恢复 SSE 中断 | SDK 有界重连 | 同一 Thread/Turn |
 | 429/5xx 且 provider 标记可重试 | 有界退避一次平台重试 | 优先同一 Thread |
-| Schema/可修复语义错误 | 一次 repair Turn | 同一 Thread |
+| Schema/可修复语义错误 | 持续 repair 至成功、取消或生命周期到期 | 同一 Thread |
 | Worker crash，state 完整 | 同一扫描容器启动 replacement Worker，`thread_resume` | 同一 Thread |
 | Worker crash，state 损坏 | 新 Thread + 完整上下文重放 | 记录 lineage |
 | 扫描容器 crash/OOM | 重建该 scan 容器；逐 session 恢复 | 完整 state 才 resume |
@@ -1332,8 +1366,8 @@ started_at, completed_at
 | `APKSCANNER_CODEX_WEB_SEARCH` | `live` | `disabled/cached/live`，按实际 SDK 枚举校验 |
 | `APKSCANNER_CODEX_SHELL_NETWORK` | `public_egress` | Bash 网络 profile |
 | `APKSCANNER_CODEX_MAX_CONTAINERS` | 自动 | 活跃扫描容器上限 |
-| `APKSCANNER_CODEX_MAX_SESSIONS` | 自动 | 全局 AgentSession 并发上限 |
-| `APKSCANNER_CODEX_MAX_SESSIONS_PER_SCAN` | `3` | 单扫描并发 UID Worker 上限 |
+| `APKSCANNER_CODEX_MAX_SESSIONS` | `8` | 全局活动 Worker 上限；空闲线程可恢复驱逐，忙时排队而非失败 |
+| `APKSCANNER_CODEX_MAX_SESSIONS_PER_SCAN` | `6` | 单扫描活动 Worker 上限；审计工作区不占该配额 |
 | `APKSCANNER_CODEX_UID_MIN/MAX` | 预留区间 | 每扫描 session 数字 UID 池 |
 | `APKSCANNER_CODEX_CPU_LIMIT` | `6` | `scan_standard` 容器硬上限 |
 | `APKSCANNER_CODEX_MEMORY_LIMIT` | `12g` | `scan_standard` 容器硬上限 |
@@ -1341,6 +1375,11 @@ started_at, completed_at
 | `APKSCANNER_CODEX_TMPFS_SIZE` | `1g` | 扫描容器共享 `/tmp` 上限；session 使用私有 TMPDIR |
 | `APKSCANNER_CODEX_TURN_TIMEOUT` | `3600` | 单 Turn 上限 |
 | `APKSCANNER_CODEX_NO_EVENT_TIMEOUT` | `900` | 包括 heartbeat |
+| `APKSCANNER_ADAPTIVE_VERIFIER_ENABLED` | `true` | 扫描末尾是否启动一个批量语义验证 Thread |
+| `APKSCANNER_ADAPTIVE_VERIFIER_MIN_SEVERITY` | `info` | 默认纳入全部 `supported_static` Finding；需要收窄时再提高阈值 |
+| `APKSCANNER_ADAPTIVE_VERIFIER_TIMEOUT` | `3600` | 批量 verifier Turn 总超时 |
+| `APKSCANNER_ADAPTIVE_VERIFIER_COPY_HOST_SSH` | `true` | 是否把宿主 SSH 目录复制给 verifier |
+| `APKSCANNER_ADAPTIVE_VERIFIER_SSH_SOURCE` | 启动用户 `~/.ssh` | SSH 复制来源；空值禁用 |
 | `APKSCANNER_TASK_TIMEOUT` | `14400` | task attempt 总预算建议值 |
 | `DEEPSEEK_API_KEY` | 必填 | 仅由宿主注入目标 session exec，不写入配置/事件 |
 | `APKSCANNER_ADB_GATEWAY_URL` | 内部生成 | task ADB RPC |
@@ -1518,7 +1557,7 @@ V4 Pro 原生 Codex 支持是独立 ProviderProfile 变更：官方宣布支持�
 - Agent 能读取完整 JADX/apktool/archive；
 - Agent 修改只读根失败；
 - symlink、`..`、非法 mount target 和 sibling task 访问失败；
-- Agent 不能读取数据库、宿主 home、其他 scan 和 Docker socket；
+- 普通 Agent 不能读取数据库、宿主 home、其他 scan 和 Docker socket；Adaptive Verifier 只能读取复制到其私有 HOME 的配置 SSH 子集；
 - 同一扫描容器多个 UID 读取同一反编译树不产生完整副本；
 - sibling UID 不能读取 workspace、HOME、CODEX_HOME、TMPDIR 或 `/proc/<pid>/environ`；取消一个 UID 后同扫描其他 session 继续运行。
 
@@ -1529,7 +1568,7 @@ V4 Pro 原生 Codex 支持是独立 ProviderProfile 变更：官方宣布支持�
 - `Sandbox.full_access`、`ApprovalMode.deny_all`、provider、model、effort 均能从审计确认；
 - V4 Flash Responses 工具循环、Web Search 和 `output_schema` 成功；
 - incomplete/stream failure 不产生成功结果；
-- schema repair 最多一次且复用 Thread；
+- schema repair 复用同一 Thread 且没有固定次数上限，直到成功、取消或生命周期到期；
 - DeepSeek Key 不出现在 workspace、event、stderr、container-global env、Docker inspect 或 Codex 子 shell 环境；
 - `CODEX_HOME/shell_snapshots` 不存在，且 session 结束后扫描目录的 key-pattern 扫描为零命中；
 - 安全测试明确记录：同 UID full-access 进程可能观察 Worker Key，这是接受的本地风险；不同 UID 读取失败。
@@ -1549,11 +1588,11 @@ V4 Pro 原生 Codex 支持是独立 ProviderProfile 变更：官方宣布支持�
 - assigned serial 自动注入；
 - 显式其他 serial、host adb、设备管理命令被拒绝；
 - 两个并发 task 不能交叉设备；
-- raw ADB 成功不会升级 Finding；
+- 普通阶段 raw ADB 成功不会升级 Finding；Adaptive Verifier 必须结合真实运行观测作完整语义判断；
 - Proof token 不能跨 task/attempt 使用；
 - Proof 重复请求幂等；
 - 用户取消后 Agent 请求被拒绝，但 cleanup 仍执行；
-- 只有平台 Oracle 能设置 `harm_demonstrated=true`。
+- 普通阶段由平台 Oracle 设置 `harm_demonstrated=true`；终局 verifier 可在 `runtime_observed=true` 时基于批量实验结果设置。
 
 ### 23.5 网络与安全
 
@@ -1881,7 +1920,7 @@ flowchart LR
 - 用同一 Unix 用户运行多个 task/role，或让 Container Keeper 持有 Provider/ADB/Proof 凭据。
 - 仅靠 `ANDROID_SERIAL` 环境变量宣称设备隔离。
 - 每轮重新创建 Worker 和 Thread，却在 UI 中伪装成真正连续会话。
-- 把 Agent 自己生成的 stdout、截图或 PoC 日志自动当作客观危害证明。
+- 把 Agent 自己生成的 stdout、截图或 PoC 日志在未结合真实目标运行语义时自动当作危害证明。
 - 在 provider、schema 或工具失败时静默切换模型/后端。
 - 保留 OpenCode critic/rescue/fallback 以“临时兼容”为名继续增加双栈复杂度。
 - 自动注册或执行 Agent/监督 Agent 新写的 Python 脚本、任意 MCP server/tool 或任意 URL。
@@ -1901,7 +1940,7 @@ Codex 主路径只有同时满足以下条件才算完成：
 5. DeepSeek Key 只注入目标 session exec，不进入配置、容器全局环境、其他 UID、子 shell 或日志；同 UID 可见风险被明确接受和展示；
 6. ADB serial 由 Gateway 强绑定，跨设备和 host adb 访问被测试拒绝；
 7. Codex Docker 能在当前 Turn 调用 Proof Replay 并接收平台签名回执；
-8. 只有平台 Proof/Oracle 能生成 `reproduced_blackbox`；
+8. 普通任务仅由平台 Proof/Oracle 生成 `reproduced_blackbox`；扫描级 Adaptive Verifier 可基于真实运行实验和结构化语义评估更新原 Finding，纯静态文字不得升级；
 9. AgentEvent v1 增量持久化；已确认事件可恢复，无法确认的 crash 窗口产生显式 gap 且不重复；
 10. 取消、超时、OOM、provider 中断、schema 错误和恢复均有明确事件和状态；
 11. session 终态后对应 UID 无残留进程；scan 终态后容器、网络、token 和设备租约全部清理；
@@ -1909,7 +1948,8 @@ Codex 主路径只有同时满足以下条件才算完成：
 13. 运行、critic、rescue、测试、部署和 fallback 中均不存在 OpenCode 可执行路径；历史报告仍可读取；
 14. `SdkBaseline` 记录 `/work/codex` commit 和 Python runtime 契约；SDK 更新必须经过 Source Gate；
 15. Python/MCP 测试入口只能通过 Capability Registry，能够生成、校验、去重和审计 `TestEntrySeed`；
-16. README、总体架构、配置表、部署和回滚说明与实现一致。
+16. README、总体架构、配置表、部署和回滚说明与实现一致；
+17. 每次扫描至多一个 Adaptive Verifier Thread 批量处理候选；其 ADB 固定 serial，宿主 SSH 仅复制到 verifier 私有 HOME 且结束后清理，所有工具事件进入既有事件线。
 17. 动态验证设备默认拒绝 API 35 及以下；漏洞、平台缓解和修复结论均记录 Android 16/API 36+ 环境。
 18. 相同 APK 与同一分析工具链复用内容寻址静态缓存；新版本通过安全语义 Diff、历史 PoC 重放和独立当前版本 Proof 判断持续、修复、回归或新增，详见 [版本安全演进规范](version-security-evolution.md)。
 

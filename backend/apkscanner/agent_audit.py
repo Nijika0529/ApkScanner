@@ -26,6 +26,7 @@ def build_agent_audits(
     scan_id: str,
     *,
     include_artifacts: bool = True,
+    audit_id: str | None = None,
 ) -> list[dict[str, Any]]:
     evidence = list(
         session.scalars(
@@ -39,9 +40,11 @@ def build_agent_audits(
     )
     grouped: dict[str, list[Evidence]] = defaultdict(list)
     for item in evidence:
-        audit_id = item.metadata_json.get("audit_id")
-        if isinstance(audit_id, str):
-            grouped[audit_id].append(item)
+        item_audit_id = item.metadata_json.get("audit_id")
+        if isinstance(item_audit_id, str) and (
+            audit_id is None or item_audit_id == audit_id
+        ):
+            grouped[item_audit_id].append(item)
 
     audits = [
         _build_audit(

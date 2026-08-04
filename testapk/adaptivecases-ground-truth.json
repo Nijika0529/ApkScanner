@@ -1,0 +1,66 @@
+{
+  "schema_version": "1.0",
+  "name": "APKScanner adaptive Android attack-chain fixture",
+  "apk_sha256": "64538a7792ff3d0b28ac00c779bcf8b566e16d3cc7627933b9df730a94acd755",
+  "quality_gate": {
+    "minimum_precision": 1.0,
+    "minimum_recall": 1.0,
+    "maximum_false_positives": 0
+  },
+  "vulnerabilities": [
+    {
+      "id": "AC-002",
+      "title": "ACTION_SEND Zip Slip overwrites files outside the import directory",
+      "harm": "A provider-controlled ZIP entry containing ../ is joined directly to filesDir and can overwrite another private application path without canonical containment.",
+      "severity": "high",
+      "minimum_proof": "dynamic",
+      "match": {
+        "entry_names": ["io.apkscanner.adaptivecases.ImportActivity", "static://external_file_ingress_boundary"],
+        "title_contains": ["ZIP"]
+      }
+    },
+    {
+      "id": "AC-003",
+      "title": "Exported dynamic receiver returns the session token to an attacker callback",
+      "harm": "After the launcher registers a RECEIVER_EXPORTED callback without permission, an ordinary app sends the public action and receives account credentials through its PendingIntent.",
+      "severity": "high",
+      "minimum_proof": "dynamic",
+      "match": {
+        "entry_names": ["static://runtime_ipc_boundary", "io.apkscanner.adaptivecases.LauncherActivity"],
+        "title_contains": ["Receiver"]
+      }
+    },
+    {
+      "id": "AC-004",
+      "title": "Unauthenticated localhost TCP service discloses account credentials",
+      "harm": "Any ordinary app with INTERNET permission connects to 127.0.0.1:48765 and obtains the target account and session token using GET_SESSION.",
+      "severity": "high",
+      "minimum_proof": "dynamic",
+      "match": {
+        "entry_names": ["static://runtime_ipc_boundary"],
+        "title_contains": ["127.0.0.1"]
+      }
+    },
+    {
+      "id": "AC-005",
+      "title": "Attacker-controlled WebView content invokes an account JavaScript bridge",
+      "harm": "An external deep-link URL is loaded with JavaScript and universal file access enabled, and the page can read the current account token through AccountBridge.getSessionToken.",
+      "severity": "critical",
+      "minimum_proof": "dynamic",
+      "match": {
+        "entry_names": ["io.apkscanner.adaptivecases.BridgeActivity", "static://web_content_boundary"],
+        "title_contains": ["AccountBridge"]
+      }
+    },
+    {
+      "id": "AC-006",
+      "title": "Exported Binder service returns an account session bundle without caller validation",
+      "harm": "An ordinary app binds to the exported service, sends transaction 7 with get_session_bundle, and receives status, account, token, and expiry fields.",
+      "severity": "high",
+      "minimum_proof": "dynamic",
+      "match": {
+        "entry_names": ["io.apkscanner.adaptivecases.SecretBinderService"]
+      }
+    }
+  ]
+}

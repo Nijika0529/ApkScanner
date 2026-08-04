@@ -30,7 +30,7 @@ import {
   UploadCloud,
   X,
 } from "lucide-react"
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type FormEvent } from "react"
 import { api } from "./api"
 import { MarkdownContent } from "./components/MarkdownContent"
 import { Badge, Button, Card, Dialog, DialogContent, DialogDescription, DialogTitle, Progress, Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui"
@@ -74,6 +74,25 @@ const DETAIL_REFRESH_EVENTS = [
   "device.pool.removed",
 ] as const
 
+const MUTABLE_EXPLORATION_EVENTS = new Set([
+  "exploration.action.completed",
+  "exploration.cancelled",
+  "exploration.completed",
+  "exploration.conclusion.recorded",
+  "exploration.control.updated",
+  "exploration.debate.completed",
+  "exploration.failed",
+  "exploration.hypothesis.recorded",
+  "exploration.model.cancelled",
+  "exploration.model.completed",
+  "exploration.model.failed",
+  "exploration.poc.build.completed",
+  "exploration.poc.build.failed",
+  "exploration.proof_replay.completed",
+  "exploration.proof_terminal",
+  "exploration.started",
+])
+
 function statusTone(status: string): "neutral" | "good" | "warning" | "danger" | "info" {
   if (["final", "completed", "covered", "accepted", "reproduced_blackbox", "proven"].includes(status)) return "good"
   if (["failed", "critical", "high", "tool_failed"].includes(status)) return "danger"
@@ -90,6 +109,16 @@ function isAbortError(reason: unknown) {
   return reason instanceof DOMException && reason.name === "AbortError"
 }
 
+function sameJsonValue(left: unknown, right: unknown) {
+  return left === right || JSON.stringify(left) === JSON.stringify(right)
+}
+
+function replaceScanIfChanged(items: Scan[], scan: Scan) {
+  const current = items.find((item) => item.id === scan.id)
+  if (current && sameJsonValue(current, scan)) return items
+  return items.map((item) => item.id === scan.id ? scan : item)
+}
+
 interface DetailData {
   scan: Scan
   entries: EntryPoint[]
@@ -100,11 +129,9 @@ interface DetailData {
   audits: AgentAudit[]
   hypotheses: SecurityHypothesis[]
   evaluations: BenchmarkEvaluation[]
-  events: ScanEvent[]
-  securitySnapshot: SecuritySnapshot | null
-  versionDiff: VersionDiff | null
-  patternMatches: PatternMatch[]
 }
+
+type ScanEventSubscriber = (event: ScanEvent) => void
 
 function App() {
   const [scans, setScans] = useState<Scan[]>([])
@@ -120,7 +147,17 @@ function App() {
   const detailRequestRef = useRef(0)
   const liveRequestRef = useRef(0)
   const latestEventIdRef = useRef(0)
+  const eventSubscribersRef = useRef(new Set<ScanEventSubscriber>())
   const selectedIdRef = useRef<string | null>(selectedId)
+
+  const subscribeEvents = useCallback((subscriber: ScanEventSubscriber) => {
+    eventSubscribersRef.current.add(subscriber)
+    return () => eventSubscribersRef.current.delete(subscriber)
+  }, [])
+
+  const updateHealth = useCallback((next: Health) => {
+    setHealth((current) => current && sameJsonValue(current, next) ? current : next)
+  }, [])
 
   const loadScans = useCallback(async () => {
     const data = await api.scans()
@@ -138,7 +175,7 @@ function App() {
   const loadDetail = useCallback(async (id: string, signal?: AbortSignal) => {
     const requestId = ++detailRequestRef.current
     try {
-      const [scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events, securitySnapshot, versionDiff, patternMatches] = await Promise.all([
+      const [scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, eventCursor] = await Promise.all([
         api.scan(id, signal),
         api.entries(id, signal),
         api.findings(id, signal),
@@ -148,16 +185,13 @@ function App() {
         api.agentAudits(id, signal),
         api.hypotheses(id, signal),
         api.evaluations(id, signal),
-        api.events(id, signal),
-        api.securitySnapshot(id, signal),
-        api.versionDiff(id, signal),
-        api.patternMatches(id, signal),
+        api.events(id, signal, 0, 1),
       ])
       if (signal?.aborted || requestId !== detailRequestRef.current) return false
-      const data = { scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events, securitySnapshot, versionDiff, patternMatches }
-      latestEventIdRef.current = events.at(-1)?.id ?? 0
+      const data = { scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations }
+      latestEventIdRef.current = eventCursor.at(-1)?.id ?? 0
       setDetail(data)
-      setScans((items) => items.map((item) => item.id === scan.id ? scan : item))
+      setScans((items) => replaceScanIfChanged(items, scan))
       return true
     } catch (reason) {
       if (signal?.aborted || requestId !== detailRequestRef.current || isAbortError(reason)) {
@@ -182,17 +216,29 @@ function App() {
         api.hypotheses(id, signal),
       ])
       if (signal?.aborted || requestId !== liveRequestRef.current) return
-      setDetail((current) => current?.scan.id === id ? {
-        ...current,
-        scan,
-        findings,
-        signals,
-        coverage,
-        tasks,
-        audits,
-        hypotheses,
-      } : current)
-      setScans((items) => items.map((item) => item.id === scan.id ? scan : item))
+      setDetail((current) => {
+        if (current?.scan.id !== id) return current
+        if (
+          sameJsonValue(current.scan, scan)
+          && sameJsonValue(current.findings, findings)
+          && sameJsonValue(current.signals, signals)
+          && sameJsonValue(current.coverage, coverage)
+          && sameJsonValue(current.tasks, tasks)
+          && sameJsonValue(current.audits, audits)
+          && sameJsonValue(current.hypotheses, hypotheses)
+        ) return current
+        return {
+          ...current,
+          scan,
+          findings,
+          signals,
+          coverage,
+          tasks,
+          audits,
+          hypotheses,
+        }
+      })
+      setScans((items) => replaceScanIfChanged(items, scan))
     } catch (reason) {
       if (!signal?.aborted && requestId === liveRequestRef.current && !isAbortError(reason)) {
         throw reason
@@ -224,14 +270,14 @@ function App() {
         setLoading(false)
       })
     void api.health()
-      .then(setHealth)
+      .then(updateHealth)
       .catch((reason: Error) => setError(reason.message))
     const healthTimer = window.setInterval(
-      () => void api.health().then(setHealth).catch(() => undefined),
+      () => void api.health().then(updateHealth).catch(() => undefined),
       15_000,
     )
     return () => window.clearInterval(healthTimer)
-  }, [loadScans])
+  }, [loadScans, updateHealth])
 
   useEffect(() => {
     if (!selectedId) {
@@ -270,20 +316,16 @@ function App() {
         return
       }
       latestEventIdRef.current = Math.max(latestEventIdRef.current, event.id)
-      setDetail((current) => {
-        if (current?.scan.id !== selectedId) return current
-        const merged = current.events.some((item) => item.id === event.id)
-          ? current.events
-          : [...current.events, event].slice(-500)
-        return { ...current, events: merged }
-      })
+      eventSubscribersRef.current.forEach((subscriber) => subscriber(event))
       const full = ["static.completed", "scan.final", "scan.failed"].includes(event.event_type)
-      refresh(full)
+      const mutable = !event.event_type.startsWith("exploration.")
+        || MUTABLE_EXPLORATION_EVENTS.has(event.event_type)
+      if (full || mutable) refresh(full)
     }
     void refreshDetail(selectedId, { signal: controller.signal }).finally(() => {
       if (controller.signal.aborted) return
       source = new EventSource(
-        `/api/v1/scans/${selectedId}/events/stream?after=${latestEventIdRef.current}`,
+        `/api/v1/scans/${selectedId}/events/stream?detail=summary&after=${latestEventIdRef.current}`,
       )
       DETAIL_REFRESH_EVENTS.forEach((eventType) => source?.addEventListener(eventType, receive))
       source.addEventListener("end", () => source?.close())
@@ -340,7 +382,7 @@ function App() {
     <div className="min-h-screen bg-slate-50 text-slate-900">
       <a href="#main-content" className="sr-only fixed left-4 top-4 z-[100] rounded-lg bg-cyan-700 px-4 py-2 font-semibold text-white focus:not-sr-only">跳到主要内容</a>
       <div className="app-grid" aria-hidden="true" />
-      <aside className="fixed inset-y-0 left-0 z-30 hidden w-80 border-r border-slate-200/80 bg-white/95 backdrop-blur-xl lg:block">{sidebar}</aside>
+      <aside className="fixed inset-y-0 left-0 z-30 hidden w-80 border-r border-slate-200 bg-white lg:block">{sidebar}</aside>
       {mobileNavOpen && (
         <div className="fixed inset-0 z-50 lg:hidden">
           <button className="absolute inset-0 bg-slate-900/35" aria-label="关闭导航" onClick={() => setMobileNavOpen(false)} />
@@ -348,7 +390,7 @@ function App() {
         </div>
       )}
       <main id="main-content" className="relative min-h-screen lg:pl-80">
-        <header className="sticky top-0 z-20 flex h-16 items-center justify-between border-b border-slate-200/80 bg-white/85 px-4 backdrop-blur-xl sm:px-6 lg:px-8">
+        <header className="sticky top-0 z-20 flex h-16 items-center justify-between border-b border-slate-200 bg-white px-4 sm:px-6 lg:px-8">
           <div className="flex items-center gap-3">
             <Button variant="ghost" size="icon" className="lg:hidden" onClick={() => setMobileNavOpen(true)} aria-label="打开扫描列表"><Menu className="h-5 w-5" /></Button>
             <div>
@@ -363,7 +405,7 @@ function App() {
         </header>
         <div className="mx-auto max-w-[1500px] p-4 sm:p-6 lg:p-8">
           {error && <div role="alert" className="mb-6 flex items-start gap-3 rounded-xl border border-rose-500/35 bg-rose-500/10 p-4 text-sm text-rose-800"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /><span>{error}</span><button className="ml-auto" onClick={() => setError(null)} aria-label="关闭错误"><X className="h-4 w-4" /></button></div>}
-          {loading && !detail ? <LoadingState /> : detail ? <ScanDetailView data={detail} health={health} onRefresh={() => refreshDetail(detail.scan.id)} onDelete={() => setDeleteTarget(detail.scan)} onFreshRun={() => setFreshRunTarget(detail.scan)} onVersionCreated={onUploaded} /> : <EmptyState onUpload={() => setUploadOpen(true)} />}
+          {loading && !detail ? <LoadingState /> : detail ? <ScanDetailView data={detail} health={health} subscribeEvents={subscribeEvents} onRefresh={() => refreshDetail(detail.scan.id)} onDelete={() => setDeleteTarget(detail.scan)} onFreshRun={() => setFreshRunTarget(detail.scan)} onVersionCreated={onUploaded} /> : <EmptyState onUpload={() => setUploadOpen(true)} />}
         </div>
       </main>
       <UploadDialog open={uploadOpen} onOpenChange={setUploadOpen} onUploaded={onUploaded} health={health} />
@@ -374,6 +416,7 @@ function App() {
 }
 
 function Sidebar({ scans, selectedId, health, onSelect, onUpload }: { scans: Scan[]; selectedId: string | null; health: Health | null; onSelect: (id: string) => void; onUpload: () => void }) {
+  const [visibleCount, setVisibleCount] = useState(100)
   const ready = health?.capabilities.filter((item) => item.available || item.busy).length ?? 0
   const total = health?.capabilities.length ?? 0
   return (
@@ -388,12 +431,13 @@ function Sidebar({ scans, selectedId, health, onSelect, onUpload }: { scans: Sca
       <nav className="min-h-0 flex-1 overflow-y-auto p-3" aria-label="扫描任务">
         <p className="px-3 pb-2 pt-2 text-[11px] font-bold uppercase tracking-[.16em] text-slate-600">最近扫描</p>
         <div className="space-y-1">
-          {scans.map((scan) => (
+          {scans.slice(0, visibleCount).map((scan) => (
             <button key={scan.id} onClick={() => onSelect(scan.id)} className={cn("group w-full rounded-xl border px-3 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-700", selectedId === scan.id ? "border-cyan-500/30 bg-cyan-500/10" : "border-transparent hover:border-slate-200 hover:bg-slate-100")}>
               <div className="mb-1.5 flex items-center justify-between gap-2"><span className="truncate text-sm font-medium text-slate-800">{scan.package_name ?? scan.filename}</span><ChevronRight className={cn("h-4 w-4 shrink-0 text-slate-700", selectedId === scan.id && "text-cyan-600")} /></div>
               <div className="flex items-center justify-between gap-2 text-[11px] text-slate-500"><span>{formatDate(scan.created_at)}</span><span>{statusLabel(scan.status)}</span></div>
             </button>
           ))}
+          {visibleCount < scans.length && <Button className="mt-2 w-full" variant="ghost" size="sm" onClick={() => setVisibleCount((count) => count + 100)}>加载更多扫描 · {scans.length - visibleCount}</Button>}
           {!scans.length && <p className="px-3 py-8 text-center text-sm text-slate-600">还没有扫描记录</p>}
         </div>
       </nav>
@@ -407,28 +451,28 @@ function Sidebar({ scans, selectedId, health, onSelect, onUpload }: { scans: Sca
   )
 }
 
-function ScanDetailView({ data, health, onRefresh, onDelete, onFreshRun, onVersionCreated }: { data: DetailData; health: Health | null; onRefresh: () => Promise<void>; onDelete: () => void; onFreshRun: () => void; onVersionCreated: (scan: Scan) => Promise<void> }) {
-  const { scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, events, securitySnapshot, versionDiff, patternMatches } = data
-  const [fullAudits, setFullAudits] = useState<AgentAudit[] | null>(null)
-  const [auditLoading, setAuditLoading] = useState(false)
-  const [auditLoadError, setAuditLoadError] = useState<string | null>(null)
-  useEffect(() => {
-    setFullAudits(null)
-    setAuditLoading(false)
-    setAuditLoadError(null)
-  }, [scan.id])
-  const loadFullAudits = useCallback(async () => {
-    if (auditLoading) return
-    setAuditLoading(true)
-    setAuditLoadError(null)
+function ScanDetailView({ data, health, subscribeEvents, onRefresh, onDelete, onFreshRun, onVersionCreated }: { data: DetailData; health: Health | null; subscribeEvents: (subscriber: ScanEventSubscriber) => () => void; onRefresh: () => Promise<void>; onDelete: () => void; onFreshRun: () => void; onVersionCreated: (scan: Scan) => Promise<void> }) {
+  const { scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations } = data
+  const [versionData, setVersionData] = useState<{ snapshot: SecuritySnapshot | null; diff: VersionDiff | null; matches: PatternMatch[] } | null>(null)
+  const [versionLoading, setVersionLoading] = useState(false)
+  const [versionLoadError, setVersionLoadError] = useState<string | null>(null)
+  const loadVersionData = useCallback(async () => {
+    if (versionData || versionLoading) return
+    setVersionLoading(true)
+    setVersionLoadError(null)
     try {
-      setFullAudits(await api.agentAudits(scan.id, undefined, true))
+      const [snapshot, diff, matches] = await Promise.all([
+        api.securitySnapshot(scan.id),
+        api.versionDiff(scan.id),
+        api.patternMatches(scan.id),
+      ])
+      setVersionData({ snapshot, diff, matches })
     } catch (reason) {
-      setAuditLoadError(reason instanceof Error ? reason.message : "完整审计加载失败")
+      setVersionLoadError(reason instanceof Error ? reason.message : "版本演进数据加载失败")
     } finally {
-      setAuditLoading(false)
+      setVersionLoading(false)
     }
-  }, [auditLoading, scan.id])
+  }, [scan.id, versionData, versionLoading])
   const verificationCandidates = signals.filter(isVerificationCandidate)
   const staticSignals = signals.filter((signal) => !isVerificationCandidate(signal))
   const high = findings.filter((item) => ["critical", "high"].includes(item.severity)).length
@@ -460,32 +504,32 @@ function ScanDetailView({ data, health, onRefresh, onDelete, onFreshRun, onVersi
       </div>
       <Card className="p-4 sm:p-6">
         <Tabs defaultValue="overview" onValueChange={(value) => {
-          if (value === "audits" && fullAudits === null) void loadFullAudits()
+          if (value === "versions") void loadVersionData()
         }}>
           <TabsList aria-label="扫描详情">
-            <TabsTrigger value="overview">总览</TabsTrigger><TabsTrigger value="entries">攻击面 <span className="ml-1 text-xs text-slate-500">{entries.length}</span></TabsTrigger><TabsTrigger value="findings">已证实 Finding <span className="ml-1 text-xs text-slate-500">{findings.length}</span></TabsTrigger><TabsTrigger value="proof-backlog">待验证风险 <span className="ml-1 text-xs text-slate-500">{verificationCandidates.length}</span></TabsTrigger><TabsTrigger value="signals">静态线索 <span className="ml-1 text-xs text-slate-500">{staticSignals.length}</span></TabsTrigger><TabsTrigger value="versions">版本演进 <span className="ml-1 text-xs text-slate-500">{patternMatches.length}</span></TabsTrigger><TabsTrigger value="coverage">覆盖矩阵</TabsTrigger><TabsTrigger value="tasks">探索任务</TabsTrigger><TabsTrigger value="proofs">验证链 <span className="ml-1 text-xs text-slate-500">{hypotheses.length}</span></TabsTrigger><TabsTrigger value="audits">AI 审计 <span className="ml-1 text-xs text-slate-500">{audits.length}</span></TabsTrigger>
+            <TabsTrigger value="overview">总览</TabsTrigger><TabsTrigger value="entries">攻击面 <span className="ml-1 text-xs text-slate-500">{entries.length}</span></TabsTrigger><TabsTrigger value="findings">已证实 Finding <span className="ml-1 text-xs text-slate-500">{findings.length}</span></TabsTrigger><TabsTrigger value="proof-backlog">待验证风险 <span className="ml-1 text-xs text-slate-500">{verificationCandidates.length}</span></TabsTrigger><TabsTrigger value="signals">静态线索 <span className="ml-1 text-xs text-slate-500">{staticSignals.length}</span></TabsTrigger><TabsTrigger value="versions">版本演进{versionData && <span className="ml-1 text-xs text-slate-500">{versionData.matches.length}</span>}</TabsTrigger><TabsTrigger value="coverage">覆盖矩阵</TabsTrigger><TabsTrigger value="tasks">探索任务</TabsTrigger><TabsTrigger value="proofs">验证链 <span className="ml-1 text-xs text-slate-500">{hypotheses.length}</span></TabsTrigger><TabsTrigger value="audits">AI 审计 <span className="ml-1 text-xs text-slate-500">{audits.length}</span></TabsTrigger>
           </TabsList>
-          <TabsContent value="overview"><Overview scan={scan} events={events} health={health} coverage={coverage} /></TabsContent>
+          <TabsContent value="overview"><Overview scan={scan} health={health} coverage={coverage} /></TabsContent>
           <TabsContent value="entries"><EntryPoints entries={entries} /></TabsContent>
           <TabsContent value="findings"><Findings findings={findings} verificationCandidates={verificationCandidates} scanStatus={scan.status} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="proof-backlog"><ProofBacklog signals={verificationCandidates} tasks={tasks} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="signals"><Signals signals={staticSignals} onRefresh={onRefresh} /></TabsContent>
-          <TabsContent value="versions"><VersionEvolution scan={scan} snapshot={securitySnapshot} diff={versionDiff} matches={patternMatches} entries={entries} onCreated={onVersionCreated} /></TabsContent>
+          <TabsContent value="versions">{versionLoading ? <LoadingState /> : versionLoadError ? <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">{versionLoadError}<Button className="ml-3" variant="secondary" size="sm" onClick={() => void loadVersionData()}>重试</Button></div> : versionData ? <VersionEvolution scan={scan} snapshot={versionData.snapshot} diff={versionData.diff} matches={versionData.matches} entries={entries} onCreated={onVersionCreated} /> : <EmptyRow text="正在准备版本演进数据" />}</TabsContent>
           <TabsContent value="coverage"><CoverageMatrix coverage={coverage} /></TabsContent>
-          <TabsContent value="tasks"><Tasks scan={scan} tasks={tasks} entries={entries} audits={audits} events={events} health={health} onRefresh={onRefresh} /></TabsContent>
+          <TabsContent value="tasks"><Tasks scan={scan} tasks={tasks} entries={entries} audits={audits} subscribeEvents={subscribeEvents} health={health} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="proofs"><HypothesisPipeline scanId={scan.id} scanStatus={scan.status} hypotheses={hypotheses} evaluations={evaluations} entries={entries} onRefresh={onRefresh} /></TabsContent>
-          <TabsContent value="audits"><AgentAudits audits={fullAudits ?? audits} tasks={tasks} entries={entries} loading={auditLoading} loadError={auditLoadError} onReload={loadFullAudits} /></TabsContent>
+          <TabsContent value="audits"><AgentAudits audits={audits} tasks={tasks} entries={entries} /></TabsContent>
         </Tabs>
       </Card>
     </div>
   )
 }
 
-function Overview({ scan, events, health, coverage }: { scan: Scan; events: ScanEvent[]; health: Health | null; coverage: CoverageItem[] }) {
+function Overview({ scan, health, coverage }: { scan: Scan; health: Health | null; coverage: CoverageItem[] }) {
   const baselines = coverage.filter((item) => item.control_id.endsWith("-BASELINE"))
-  return <div className="grid gap-6 xl:grid-cols-[1.35fr_.65fr]">
-    <div><SectionTitle icon={Activity} title="扫描活动" description="平台事件与证据生成轨迹" /><ol className="mt-4 space-y-1">{events.slice().reverse().map((event, index) => <li key={event.id} className="relative flex gap-4 py-3"><div className="relative flex w-5 justify-center"><span className={cn("mt-1.5 h-2.5 w-2.5 rounded-full border-2", index === 0 ? "border-cyan-300 bg-cyan-600" : "border-slate-300 bg-slate-100")} />{index < events.length - 1 && <span className="absolute left-1/2 top-6 h-[calc(100%-10px)] w-px -translate-x-1/2 bg-slate-100" />}</div><div className="min-w-0"><p className="text-sm text-slate-800">{event.message}</p><p className="mt-1 text-xs text-slate-600">{formatDate(event.created_at)} · {event.event_type}</p></div></li>)}{!events.length && <EmptyRow text="扫描事件尚未生成" />}</ol></div>
-    <div className="space-y-6"><DevicePoolPanel /><div><SectionTitle icon={ListChecks} title="MASVS 基线" description="APK-only 初始覆盖" /><div className="mt-4 space-y-3">{baselines.map((item) => <div key={item.id} className="rounded-xl border border-slate-200 bg-slate-50 p-3"><div className="mb-2 flex items-center justify-between gap-3"><span className="text-xs font-semibold text-slate-700">{item.domain.replace("MASVS-", "")}</span><Badge tone={statusTone(item.status)}>{statusLabel(item.status)}</Badge></div><p className="text-xs leading-relaxed text-slate-500">{item.gap_reason ?? item.title}</p></div>)}</div></div><div><SectionTitle icon={ServerCog} title="运行能力" description="缺失能力会形成覆盖缺口" /><div className="mt-4 grid grid-cols-2 gap-2">{health?.capabilities.map((item) => <div key={item.name} title={item.detail ?? undefined} className="flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-xs"><span className={cn("h-2 w-2 rounded-full", item.busy ? "bg-amber-400" : item.available ? "bg-emerald-400" : "bg-slate-300")} /><span className="truncate text-slate-600">{item.name}{item.busy ? " · 忙碌" : ""}</span></div>)}</div></div></div>
+  return <div className="grid gap-6 xl:grid-cols-2">
+    <DevicePoolPanel />
+    <div className="space-y-6"><div><SectionTitle icon={ListChecks} title="MASVS 基线" description="APK-only 初始覆盖" /><div className="mt-4 space-y-3">{baselines.map((item) => <div key={item.id} className="rounded-xl border border-slate-200 bg-slate-50 p-3"><div className="mb-2 flex items-center justify-between gap-3"><span className="text-xs font-semibold text-slate-700">{item.domain.replace("MASVS-", "")}</span><Badge tone={statusTone(item.status)}>{statusLabel(item.status)}</Badge></div><p className="text-xs leading-relaxed text-slate-500">{item.gap_reason ?? item.title}</p></div>)}</div></div><div><SectionTitle icon={ServerCog} title="运行能力" description="缺失能力会形成覆盖缺口" /><div className="mt-4 grid grid-cols-2 gap-2">{health?.capabilities.map((item) => <div key={item.name} title={item.detail ?? undefined} className="flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-xs"><span className={cn("h-2 w-2 rounded-full", item.busy ? "bg-amber-400" : item.available ? "bg-emerald-400" : "bg-slate-300")} /><span className="truncate text-slate-600">{item.name}{item.busy ? " · 忙碌" : ""}</span></div>)}</div></div></div>
     {scan.error && <p className="text-rose-700">{scan.error}</p>}
   </div>
 }
@@ -498,7 +542,8 @@ function DevicePoolPanel() {
   const [error, setError] = useState<string | null>(null)
   const refresh = useCallback(async (probe = false) => {
     try {
-      setDevices(await api.devices(probe))
+      const next = await api.devices(probe)
+      setDevices((current) => sameJsonValue(current, next) ? current : next)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "读取设备池失败")
     }
@@ -547,8 +592,15 @@ function DevicePoolPanel() {
 function EntryPoints({ entries }: { entries: EntryPoint[] }) {
   const [query, setQuery] = useState("")
   const [kind, setKind] = useState("all")
-  const filtered = entries.filter((entry) => (kind === "all" || entry.kind === kind) && `${entry.name} ${entry.owner_component}`.toLowerCase().includes(query.toLowerCase()))
-  return <div><div className="mb-5 flex flex-col gap-3 sm:flex-row"><label className="flex-1"><span className="sr-only">搜索入口</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索组件、URI 或 authority" className="field" /></label><label><span className="sr-only">入口类型</span><select value={kind} onChange={(event) => setKind(event.target.value)} className="field sm:w-48"><option value="all">全部入口</option><option value="activity">Activity</option><option value="service">Service</option><option value="receiver">Receiver</option><option value="provider">Provider</option><option value="deep_link">Deep Link</option></select></label></div><div className="overflow-x-auto rounded-xl border border-slate-200"><table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-slate-50 text-xs text-slate-500"><tr><th className="px-4 py-3 font-medium">类型</th><th className="px-4 py-3 font-medium">入口</th><th className="px-4 py-3 font-medium">可达性</th><th className="px-4 py-3 font-medium">权限</th><th className="px-4 py-3 font-medium">判定依据</th></tr></thead><tbody className="divide-y divide-slate-200">{filtered.map((entry) => <tr key={entry.id} className="hover:bg-slate-100"><td className="px-4 py-3"><EntryIcon kind={entry.kind} /></td><td className="max-w-md px-4 py-3"><p className="truncate font-mono text-xs text-slate-800" title={entry.name}>{entry.name}</p>{entry.owner_component && entry.owner_component !== entry.name && <p className="mt-1 truncate text-xs text-slate-600">handler · {entry.owner_component}</p>}</td><td className="px-4 py-3"><Badge tone={entry.exported ? "warning" : "good"}>{entry.exported ? "外部可达" : "私有"}</Badge></td><td className="px-4 py-3 text-xs text-slate-600">{entry.permission ?? "无"}{entry.permission_protection && <span className="block text-slate-600">{entry.permission_protection}</span>}</td><td className="px-4 py-3 text-xs text-slate-500">{entry.exported_reason}</td></tr>)}</tbody></table>{!filtered.length && <EmptyRow text="没有匹配的入口" />}</div></div>
+  const deferredQuery = useDeferredValue(query.trim().toLowerCase())
+  const [visibleCount, setVisibleCount] = useState(200)
+  useEffect(() => setVisibleCount(200), [deferredQuery, kind, entries])
+  const filtered = useMemo(
+    () => entries.filter((entry) => (kind === "all" || entry.kind === kind) && `${entry.name} ${entry.owner_component}`.toLowerCase().includes(deferredQuery)),
+    [deferredQuery, entries, kind],
+  )
+  const visible = filtered.slice(0, visibleCount)
+  return <div><div className="mb-5 flex flex-col gap-3 sm:flex-row"><label className="flex-1"><span className="sr-only">搜索入口</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索组件、URI 或 authority" className="field" /></label><label><span className="sr-only">入口类型</span><select value={kind} onChange={(event) => setKind(event.target.value)} className="field sm:w-48"><option value="all">全部入口</option><option value="activity">Activity</option><option value="service">Service</option><option value="receiver">Receiver</option><option value="provider">Provider</option><option value="deep_link">Deep Link</option></select></label></div><div className="overflow-x-auto rounded-xl border border-slate-200"><table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-slate-50 text-xs text-slate-500"><tr><th className="px-4 py-3 font-medium">类型</th><th className="px-4 py-3 font-medium">入口</th><th className="px-4 py-3 font-medium">可达性</th><th className="px-4 py-3 font-medium">权限</th><th className="px-4 py-3 font-medium">判定依据</th></tr></thead><tbody className="divide-y divide-slate-200">{visible.map((entry) => <tr key={entry.id} className="hover:bg-slate-100"><td className="px-4 py-3"><EntryIcon kind={entry.kind} /></td><td className="max-w-md px-4 py-3"><p className="truncate font-mono text-xs text-slate-800" title={entry.name}>{entry.name}</p>{entry.owner_component && entry.owner_component !== entry.name && <p className="mt-1 truncate text-xs text-slate-600">handler · {entry.owner_component}</p>}</td><td className="px-4 py-3"><Badge tone={entry.exported ? "warning" : "good"}>{entry.exported ? "外部可达" : "私有"}</Badge></td><td className="px-4 py-3 text-xs text-slate-600">{entry.permission ?? "无"}{entry.permission_protection && <span className="block text-slate-600">{entry.permission_protection}</span>}</td><td className="px-4 py-3 text-xs text-slate-500">{entry.exported_reason}</td></tr>)}</tbody></table>{!filtered.length && <EmptyRow text="没有匹配的入口" />}</div>{visibleCount < filtered.length && <div className="mt-3 flex justify-center"><Button variant="secondary" size="sm" onClick={() => setVisibleCount((count) => count + 200)}>加载更多入口 · {filtered.length - visibleCount}</Button></div>}</div>
   }
 
 function VersionEvolution({ scan, snapshot, diff, matches, entries, onCreated }: { scan: Scan; snapshot: SecuritySnapshot | null; diff: VersionDiff | null; matches: PatternMatch[]; entries: EntryPoint[]; onCreated: (scan: Scan) => Promise<void> }) {
@@ -670,7 +722,7 @@ function FindingCard({ finding, onRefresh }: { finding: Finding; onRefresh: () =
   const [open, setOpen] = useState(false)
   const [reviewOpen, setReviewOpen] = useState(false)
   return (
-    <article className="rounded-xl border border-slate-200 bg-slate-50/70">
+    <article className="content-auto rounded-xl border border-slate-200 bg-slate-50/70">
       <button
         onClick={() => setOpen(!open)}
         className="flex w-full items-start gap-4 p-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-700 sm:p-5"
@@ -758,13 +810,15 @@ function ReviewDialog({ finding, open, onOpenChange, onReviewed }: { finding: Fi
 function CoverageMatrix({ coverage }: { coverage: CoverageItem[] }) {
   const baseline = coverage.filter((item) => item.control_id.endsWith("-BASELINE"))
   const entryCoverage = coverage.filter((item) => item.entry_point_id)
+  const [visibleCount, setVisibleCount] = useState(200)
   const stages = ["static", "deterministic_dynamic", "agent", "blackbox"]
-  return <div className="space-y-8"><div><SectionTitle icon={ShieldCheck} title="MASVS 域覆盖" description="覆盖不代表无漏洞；缺口必须进入报告" /><div className="mt-4 overflow-x-auto rounded-xl border border-slate-200"><table className="w-full min-w-[850px] text-sm"><thead className="bg-slate-50 text-xs text-slate-500"><tr><th className="px-4 py-3 text-left font-medium">Domain</th>{stages.map((stage) => <th key={stage} className="px-3 py-3 text-center font-medium">{stage.replace("deterministic_dynamic", "确定性动态")}</th>)}<th className="px-4 py-3 text-left font-medium">缺口</th></tr></thead><tbody className="divide-y divide-slate-200">{baseline.map((item) => <tr key={item.id}><td className="px-4 py-3 font-semibold text-slate-700">{item.domain}</td>{stages.map((stage) => <td key={stage} className="px-3 py-3 text-center"><StageState value={String(item.stages[stage] ?? "pending")} /></td>)}<td className="max-w-xs px-4 py-3 text-xs leading-relaxed text-slate-500">{item.gap_reason ?? "—"}</td></tr>)}</tbody></table></div></div><div><SectionTitle icon={CircleDot} title="入口覆盖" description={`${entryCoverage.length} 个入口的逐项状态`} /><div className="mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-3">{entryCoverage.map((item) => <div key={item.id} className="rounded-xl border border-slate-200 p-3"><div className="mb-2 flex items-center justify-between gap-3"><p className="truncate font-mono text-xs text-slate-700" title={item.title}>{item.title.replace("Entry point: ", "")}</p><Badge tone={statusTone(item.status)}>{statusLabel(item.status)}</Badge></div><p className="line-clamp-2 text-xs text-slate-600">{item.gap_reason ?? "全部计划阶段已记录"}</p></div>)}</div></div></div>
+  return <div className="space-y-8"><div><SectionTitle icon={ShieldCheck} title="MASVS 域覆盖" description="覆盖不代表无漏洞；缺口必须进入报告" /><div className="mt-4 overflow-x-auto rounded-xl border border-slate-200"><table className="w-full min-w-[850px] text-sm"><thead className="bg-slate-50 text-xs text-slate-500"><tr><th className="px-4 py-3 text-left font-medium">Domain</th>{stages.map((stage) => <th key={stage} className="px-3 py-3 text-center font-medium">{stage.replace("deterministic_dynamic", "确定性动态")}</th>)}<th className="px-4 py-3 text-left font-medium">缺口</th></tr></thead><tbody className="divide-y divide-slate-200">{baseline.map((item) => <tr key={item.id}><td className="px-4 py-3 font-semibold text-slate-700">{item.domain}</td>{stages.map((stage) => <td key={stage} className="px-3 py-3 text-center"><StageState value={String(item.stages[stage] ?? "pending")} /></td>)}<td className="max-w-xs px-4 py-3 text-xs leading-relaxed text-slate-500">{item.gap_reason ?? "—"}</td></tr>)}</tbody></table></div></div><div><SectionTitle icon={CircleDot} title="入口覆盖" description={`${entryCoverage.length} 个入口的逐项状态`} /><div className="mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-3">{entryCoverage.slice(0, visibleCount).map((item) => <div key={item.id} className="rounded-xl border border-slate-200 p-3"><div className="mb-2 flex items-center justify-between gap-3"><p className="truncate font-mono text-xs text-slate-700" title={item.title}>{item.title.replace("Entry point: ", "")}</p><Badge tone={statusTone(item.status)}>{statusLabel(item.status)}</Badge></div><p className="line-clamp-2 text-xs text-slate-600">{item.gap_reason ?? "全部计划阶段已记录"}</p></div>)}</div>{visibleCount < entryCoverage.length && <div className="mt-3 flex justify-center"><Button variant="secondary" size="sm" onClick={() => setVisibleCount((count) => count + 200)}>加载更多覆盖项 · {entryCoverage.length - visibleCount}</Button></div>}</div></div>
 }
 
 function HypothesisPipeline({ scanId, scanStatus, hypotheses, evaluations, entries, onRefresh }: { scanId: string; scanStatus: string; hypotheses: SecurityHypothesis[]; evaluations: BenchmarkEvaluation[]; entries: EntryPoint[]; onRefresh: () => Promise<void> }) {
   const [evaluating, setEvaluating] = useState(false)
   const [evaluationError, setEvaluationError] = useState<string | null>(null)
+  const [visibleCount, setVisibleCount] = useState(100)
   const names = new Map(entries.map((entry) => [entry.id, entry.name]))
   const proven = hypotheses.filter((item) => item.status === "proven").length
   const challenged = hypotheses.filter((item) => ["challenged", "refuted"].includes(item.status)).length
@@ -791,39 +845,109 @@ function HypothesisPipeline({ scanId, scanStatus, hypotheses, evaluations, entri
       <SectionTitle icon={Gauge} title="私有真值评测" description="只计算平台确认并达到 ground truth 最低证明等级的 Finding" />
       <div className="mt-4 grid gap-3 md:grid-cols-2">{evaluations.map((evaluation) => {
         const metrics = recordValue(evaluation.result.metrics)
+        const qualityGate = recordValue(evaluation.result.quality_gate)
+        const qualityGatePassed = typeof qualityGate?.passed === "boolean" ? qualityGate.passed : null
         const provenance = recordValue(evaluation.result.data_provenance)
         const simulation = recordValue(evaluation.result.simulation)
         const synthetic = textValue(provenance?.kind) === "synthetic_demo"
         const omittedIds = Array.isArray(simulation?.omitted_ground_truth_ids) ? simulation.omitted_ground_truth_ids.filter((item): item is string => typeof item === "string") : []
         return <div key={evaluation.id} className={cn("rounded-xl border p-4", synthetic ? "border-amber-300 bg-amber-50/70" : "border-cyan-200 bg-cyan-50/60")}>
-          <div className="flex items-center justify-between gap-3"><div><div className="flex flex-wrap items-center gap-2"><p className="font-semibold text-slate-900">{evaluation.name}</p>{synthetic && <Badge tone="warning">仿真数据</Badge>}</div><p className="mt-1 text-xs text-slate-600">{evaluation.investigator_backend}{evaluation.model ? ` · ${evaluation.model}` : ""}</p></div><Badge tone={synthetic ? "warning" : "info"}>{synthetic ? `召回 ${((numberValue(metrics?.recall) ?? 0) * 100).toFixed(2)}%` : `${numberValue(metrics?.score_100)?.toFixed(2) ?? "0.00"} 分`}</Badge></div>
+          <div className="flex items-center justify-between gap-3"><div><div className="flex flex-wrap items-center gap-2"><p className="font-semibold text-slate-900">{evaluation.name}</p>{synthetic && <Badge tone="warning">仿真数据</Badge>}{qualityGatePassed !== null && <Badge tone={qualityGatePassed ? "good" : "danger"}>{qualityGatePassed ? "100% 回归门禁通过" : "100% 回归门禁未通过"}</Badge>}</div><p className="mt-1 text-xs text-slate-600">{evaluation.investigator_backend}{evaluation.model ? ` · ${evaluation.model}` : ""}</p></div><Badge tone={synthetic ? "warning" : "info"}>{synthetic ? `召回 ${((numberValue(metrics?.recall) ?? 0) * 100).toFixed(2)}%` : `${numberValue(metrics?.score_100)?.toFixed(2) ?? "0.00"} 分`}</Badge></div>
           {synthetic && <div className="mt-3 rounded-lg border border-amber-300 bg-white/70 px-3 py-2 text-xs leading-5 text-amber-950">此卡仅用于汇报演练：未执行目标 APK、未连接真机，也没有生成 Finding 或 Evidence。仿真召回率为 {((numberValue(metrics?.recall) ?? 0) * 100).toFixed(2)}%；选择性漏报 {omittedIds.length} 项。</div>}
           <div className="mt-4 grid grid-cols-3 gap-2 text-center text-xs"><div className="rounded-lg bg-white p-2"><strong className="block text-base text-emerald-700">{numberValue(metrics?.true_positives) ?? 0}</strong>命中</div><div className="rounded-lg bg-white p-2"><strong className="block text-base text-rose-700">{numberValue(metrics?.false_positives) ?? 0}</strong>有害误报</div><div className="rounded-lg bg-white p-2"><strong className="block text-base text-amber-700">{numberValue(metrics?.false_negatives) ?? 0}</strong>漏报</div></div>
           {synthetic && omittedIds.length > 0 && <p className="mt-3 break-words text-xs leading-5 text-slate-600">仿真漏报：{omittedIds.join("、")}</p>}
         </div>
       })}</div>
     </div>}
-    <div className="space-y-3">{hypotheses.map((hypothesis) => {
+    <div className="space-y-3">{hypotheses.slice(0, visibleCount).map((hypothesis) => {
       const latestArgument = hypothesis.arguments.at(-1)
       const latestSummary = markdownToPlainText(textValue(latestArgument?.payload.summary) ?? "") || undefined
-      return <article key={hypothesis.id} className={cn("rounded-xl border bg-white p-4", hypothesis.status === "proven" ? "border-emerald-200" : "border-slate-200")}>
+      return <article key={hypothesis.id} className={cn("content-auto rounded-xl border bg-white p-4", hypothesis.status === "proven" ? "border-emerald-200" : "border-slate-200")}>
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between"><div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><Badge tone={statusTone(hypothesis.status)}>{statusLabel(hypothesis.status)}</Badge><Badge>{hypothesis.category}</Badge><span className="font-mono text-[11px] text-slate-400">{hypothesis.id}</span></div><h3 className="mt-3 font-semibold text-slate-950">{hypothesis.claim}</h3><p className="mt-2 break-all font-mono text-xs text-slate-500">{hypothesis.entry_point_ids.map((id) => names.get(id) ?? id).join(" · ")}</p></div><div className="text-right"><p className="text-2xl font-black text-slate-800">{hypothesis.confidence_score}</p><p className="text-[11px] text-slate-500">平台置信分</p></div></div>
         <div className="mt-4 grid gap-3 lg:grid-cols-2"><div className="rounded-lg border border-slate-200 bg-slate-50 p-3"><p className="text-xs font-bold text-slate-700">辩论记录 · {hypothesis.arguments.length}</p><p className="mt-2 text-xs leading-5 text-slate-600">{latestArgument ? `${latestArgument.role} / ${latestArgument.phase}${latestSummary ? `：${latestSummary}` : ""}` : "等待 Hunter 产生第一项结构化论证"}</p></div><div className="rounded-lg border border-slate-200 bg-slate-50 p-3"><p className="text-xs font-bold text-slate-700">Proof Attempt · {hypothesis.proof_attempts.length}</p><div className="mt-2 flex flex-wrap gap-2">{hypothesis.proof_attempts.length ? hypothesis.proof_attempts.map((proof) => <Badge key={proof.id} tone={proof.harm_demonstrated ? "good" : statusTone(proof.status)}>{proof.test_case_id} · {proof.harm_demonstrated ? "危害已证明" : statusLabel(proof.status)}</Badge>) : <span className="text-xs text-slate-600">尚未进入设备证明队列</span>}</div></div></div>
         <p className="mt-3 text-xs leading-5 text-slate-600">{hypothesis.impact || "等待平台确认实际安全影响。"}</p>
       </article>
-    })}{!hypotheses.length && <EmptyRow text="扫描任务启动后将生成结构化漏洞假设" />}</div>
+    })}{!hypotheses.length && <EmptyRow text="扫描任务启动后将生成结构化漏洞假设" />}{visibleCount < hypotheses.length && <div className="flex justify-center py-3"><Button variant="secondary" size="sm" onClick={() => setVisibleCount((count) => count + 100)}>加载更多验证链 · {hypotheses.length - visibleCount}</Button></div>}</div>
   </div>
 }
 
-function Tasks({ scan, tasks, entries, audits, events, health, onRefresh }: { scan: Scan; tasks: InvestigationTask[]; entries: EntryPoint[]; audits: AgentAudit[]; events: ScanEvent[]; health: Health | null; onRefresh: () => Promise<void> }) {
-  const names = new Map(entries.map((item) => [item.id, item.name]))
-  const auditCounts = audits.reduce((counts, audit) => counts.set(audit.task_id, (counts.get(audit.task_id) ?? 0) + 1), new Map<string | null, number>())
+function mergeEventWindow(current: ScanEvent[], incoming: ScanEvent[], limit = 300) {
+  const merged = new Map(current.map((event) => [event.id, event]))
+  incoming.forEach((event) => merged.set(event.id, event))
+  return [...merged.values()].sort((left, right) => left.id - right.id).slice(-limit)
+}
+
+function useTaskEventWindow(scanId: string, subscribeEvents: (subscriber: ScanEventSubscriber) => () => void) {
+  const [events, setEvents] = useState<ScanEvent[]>([])
+  useEffect(() => {
+    const controller = new AbortController()
+    let pending: ScanEvent[] = []
+    let flushTimer: ReturnType<typeof setTimeout> | undefined
+    const flush = () => {
+      flushTimer = undefined
+      if (!pending.length) return
+      const batch = pending
+      pending = []
+      setEvents((current) => mergeEventWindow(current, batch))
+    }
+    const unsubscribe = subscribeEvents((event) => {
+      if (!event.event_type.startsWith("exploration.")) return
+      pending.push(event)
+      if (!flushTimer) flushTimer = setTimeout(flush, 750)
+    })
+    void api.events(scanId, controller.signal, 0, 300, "summary")
+      .then((history) => setEvents((current) => mergeEventWindow(history, current)))
+      .catch((reason) => {
+        if (!isAbortError(reason)) console.warn("failed to load task event window", reason)
+      })
+    return () => {
+      controller.abort()
+      unsubscribe()
+      if (flushTimer) clearTimeout(flushTimer)
+    }
+  }, [scanId, subscribeEvents])
+  return events
+}
+
+function TaskEventDetails({ events }: { events: ScanEvent[] }) {
+  const [open, setOpen] = useState(false)
+  const visibleEvents = events.slice(-100).reverse()
+  return (
+    <details className="group border-t border-slate-200 bg-white" onToggle={(event) => setOpen(event.currentTarget.open)}>
+      <summary className="flex min-h-11 cursor-pointer list-none items-center justify-between gap-3 px-4 py-2 text-xs font-semibold text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-700 sm:px-5">
+        <span>关键事件时间线 · {events.length}{events.length > 100 ? "（展开显示最近 100 条）" : ""}</span>
+        <ChevronRight className="h-4 w-4 text-slate-400 transition-transform group-open:rotate-90" />
+      </summary>
+      {open && <ol className="max-h-[34rem] space-y-0 overflow-y-auto border-t border-slate-100 px-4 py-3 sm:px-5">
+        {visibleEvents.map((event, index) => <ExplorationEventRow key={event.id} event={event} latest={index === 0} />)}
+      </ol>}
+    </details>
+  )
+}
+
+function Tasks({ scan, tasks, entries, audits, subscribeEvents, health, onRefresh }: { scan: Scan; tasks: InvestigationTask[]; entries: EntryPoint[]; audits: AgentAudit[]; subscribeEvents: (subscriber: ScanEventSubscriber) => () => void; health: Health | null; onRefresh: () => Promise<void> }) {
+  const events = useTaskEventWindow(scan.id, subscribeEvents)
+  const names = useMemo(() => new Map(entries.map((item) => [item.id, item.name])), [entries])
+  const auditCounts = useMemo(() => audits.reduce((counts, audit) => counts.set(audit.task_id, (counts.get(audit.task_id) ?? 0) + 1), new Map<string | null, number>()), [audits])
+  const eventsByTask = useMemo(() => {
+    const grouped = new Map<string, ScanEvent[]>()
+    events.forEach((event) => {
+      const taskId = textValue(event.data.task_id)
+      if (!taskId) return
+      const taskEvents = grouped.get(taskId) ?? []
+      taskEvents.push(event)
+      grouped.set(taskId, taskEvents)
+    })
+    return grouped
+  }, [events])
   const [retrying, setRetrying] = useState<string | null>(null)
   const [controlSaving, setControlSaving] = useState<string | null>(null)
   const [rerunOpen, setRerunOpen] = useState(false)
   const [controlError, setControlError] = useState<string | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<InvestigationTask | null>(null)
   const [cancelTarget, setCancelTarget] = useState<InvestigationTask | null>(null)
+  const [visibleTaskCount, setVisibleTaskCount] = useState(40)
+  useEffect(() => setVisibleTaskCount(40), [scan.id])
   async function retry(task: InvestigationTask, contextMode: "continue" | "independent") {
     setRetrying(`${task.id}:${contextMode}`)
     setControlError(null)
@@ -900,9 +1024,9 @@ function Tasks({ scan, tasks, entries, audits, events, health, onRefresh }: { sc
         <TaskStateMetric label="未形成判断" value={stateCounts.unresolved ?? 0} tone="border-amber-200 bg-amber-50 text-amber-950" />
         <TaskStateMetric label="已停止" value={stateCounts.stopped ?? 0} tone="border-slate-200 bg-slate-100 text-slate-800" />
       </div>
-      {tasks.map((task) => {
+      {tasks.slice(0, visibleTaskCount).map((task) => {
         const visualState = taskVisualState(task)
-        const taskEvents = events.filter((event) => event.event_type.startsWith("exploration.") && event.data.task_id === task.id)
+        const taskEvents = eventsByTask.get(task.id) ?? []
         const latest = taskEvents.at(-1)
         const started = taskEvents.find((event) => event.event_type === "exploration.started")
         const lastPhased = taskEvents.slice().reverse().find((event) => textValue(event.data.phase))
@@ -915,7 +1039,7 @@ function Tasks({ scan, tasks, entries, audits, events, health, onRefresh }: { sc
         const continuationNumber = numberValue(continuation?.continuation_number)
         const independent = recordValue(task.result.independent_reanalysis)
         return (
-          <article key={task.id} className={cn("overflow-hidden rounded-xl border bg-white shadow-sm", visualState.card)}>
+          <article key={task.id} className={cn("content-auto overflow-hidden rounded-xl border bg-white shadow-sm", visualState.card)}>
             <div className={cn("flex flex-col gap-2 border-b px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-5", visualState.banner)}>
               <div className="flex items-center gap-2">
                 {visualState.group === "active" ? <Activity className="h-4 w-4 animate-pulse motion-reduce:animate-none" /> : visualState.group === "judged" ? <Check className="h-4 w-4" /> : visualState.group === "unresolved" ? <AlertTriangle className="h-4 w-4" /> : visualState.group === "stopped" ? <X className="h-4 w-4" /> : <Clock3 className="h-4 w-4" />}
@@ -928,7 +1052,7 @@ function Tasks({ scan, tasks, entries, audits, events, health, onRefresh }: { sc
                 <div className={cn("grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-violet-500/10 text-violet-700", task.status === "running" && "animate-pulse motion-reduce:animate-none")}><Bot className="h-5 w-5" /></div>
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
-                    <h3 className="font-semibold text-slate-900">{task.task_type === "deep_link" ? "Deep Link handler 探索" : "导出组件探索"}</h3>
+                    <h3 className="font-semibold text-slate-900">{taskTypeLabel(task.task_type)}</h3>
                     <Badge tone={statusTone(task.status)}>{statusLabel(task.status)}</Badge>
                     <Badge>priority {task.priority}</Badge>
                     {backend && <Badge tone="info">{backend}{model ? ` · ${model}` : ""}</Badge>}
@@ -964,20 +1088,11 @@ function Tasks({ scan, tasks, entries, audits, events, health, onRefresh }: { sc
                 </div>
               </div>
             </div>
-            {taskEvents.length > 0 && (
-              <details className="group border-t border-slate-200 bg-white">
-                <summary className="flex min-h-11 cursor-pointer list-none items-center justify-between gap-3 px-4 py-2 text-xs font-semibold text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-700 sm:px-5">
-                  <span>关键事件时间线 · {taskEvents.length}</span>
-                  <ChevronRight className="h-4 w-4 text-slate-400 transition-transform group-open:rotate-90" />
-                </summary>
-                <ol className="max-h-[34rem] space-y-0 overflow-y-auto border-t border-slate-100 px-4 py-3 sm:px-5">
-                  {taskEvents.slice().reverse().map((event, index) => <ExplorationEventRow key={event.id} event={event} latest={index === 0} />)}
-                </ol>
-              </details>
-            )}
+            {taskEvents.length > 0 && <TaskEventDetails events={taskEvents} />}
           </article>
         )
       })}
+      {visibleTaskCount < tasks.length && <div className="flex justify-center py-3"><Button variant="secondary" size="sm" onClick={() => setVisibleTaskCount((count) => count + 40)}>加载更多任务 · {tasks.length - visibleTaskCount}</Button></div>}
       {!tasks.length && <EmptyRow text="静态规划完成后将生成入口探索任务" />}
       <DeleteTaskDialog
         task={deleteTarget}
@@ -998,6 +1113,14 @@ function Tasks({ scan, tasks, entries, audits, events, health, onRefresh }: { sc
 
 function TaskStateMetric({ label, value, tone }: { label: string; value: number; tone: string }) {
   return <div className={cn("flex items-center justify-between rounded-xl border px-3 py-2.5", tone)}><span className="text-xs font-semibold">{label}</span><span className="text-lg font-black tabular-nums">{value}</span></div>
+}
+
+function taskTypeLabel(taskType: string) {
+  return {
+    deep_link: "Deep Link handler 探索",
+    static_review: "静态语义审计",
+    adaptive_verification: "高权限批量验证",
+  }[taskType] ?? "导出组件探索"
 }
 
 function taskVisualState(task: InvestigationTask) {
@@ -1083,7 +1206,7 @@ function CancelTaskDialog({ task, target, onOpenChange, onCancelled }: { task: I
       <DialogContent>
         <DialogTitle className="text-xl font-bold text-slate-950">{waiting ? "取消等待任务？" : "停止当前 AI 分析？"}</DialogTitle>
         <DialogDescription className="mt-2 text-sm leading-6 text-slate-600">{waiting ? "任务会从等待队列中取消，不会占用云真机或调用模型。" : "平台会中止当前 Codex turn，保留已经产生的 Evidence 和审计事件，但本次任务不会生成新的最终判断。"}</DialogDescription>
-        {task && <div className="mt-5 rounded-xl border border-amber-200 bg-amber-50 p-4"><p className="font-semibold text-amber-950">{task.task_type === "deep_link" ? "Deep Link handler 探索" : "导出组件探索"}</p><p className="mt-1 break-all font-mono text-xs text-amber-800">{target || task.id}</p></div>}
+        {task && <div className="mt-5 rounded-xl border border-amber-200 bg-amber-50 p-4"><p className="font-semibold text-amber-950">{taskTypeLabel(task.task_type)}</p><p className="mt-1 break-all font-mono text-xs text-amber-800">{target || task.id}</p></div>}
         {error && <p role="alert" className="mt-4 text-sm text-rose-700">{error}</p>}
         <div className="mt-6 flex justify-end gap-2"><Button variant="ghost" onClick={() => onOpenChange(false)} disabled={cancelling}>继续分析</Button><Button variant="danger" onClick={cancel} disabled={cancelling}>{cancelling ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <X className="h-4 w-4" />}{cancelling ? "正在处理" : waiting ? "确认取消等待" : "确认停止分析"}</Button></div>
       </DialogContent>
@@ -1113,7 +1236,7 @@ function DeleteTaskDialog({ task, target, onOpenChange, onDeleted }: { task: Inv
       <DialogContent>
         <DialogTitle className="text-xl font-bold text-slate-950">删除已执行任务？</DialogTitle>
         <DialogDescription className="mt-2 text-sm leading-6 text-slate-600">任务将从探索任务列表移除。已经形成的 Hypothesis、辩论记录、Proof Attempt、Finding、Evidence 和 AI 审计均会保留，仍可在报告、验证链与“AI 审计”页中追溯。正在停止的任务会继续完成后台中止和设备清理，但不会重新出现在列表中。</DialogDescription>
-        {task && <div className="mt-5 rounded-xl border border-rose-200 bg-rose-50 p-4"><p className="font-semibold text-rose-900">{task.task_type === "deep_link" ? "Deep Link handler 探索" : "导出组件探索"}</p><p className="mt-1 break-all font-mono text-xs text-rose-700">{target || task.id}</p></div>}
+        {task && <div className="mt-5 rounded-xl border border-rose-200 bg-rose-50 p-4"><p className="font-semibold text-rose-900">{taskTypeLabel(task.task_type)}</p><p className="mt-1 break-all font-mono text-xs text-rose-700">{target || task.id}</p></div>}
         {error && <p role="alert" className="mt-4 text-sm text-rose-700">{error}</p>}
         <div className="mt-6 flex justify-end gap-2"><Button variant="ghost" onClick={() => onOpenChange(false)} disabled={deleting}>取消</Button><Button variant="danger" onClick={remove} disabled={deleting}>{deleting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}{deleting ? "正在删除" : "确认删除任务"}</Button></div>
       </DialogContent>
@@ -1140,25 +1263,42 @@ function ExplorationEventRow({ event, latest }: { event: ScanEvent; latest: bool
   )
 }
 
-function AgentAudits({ audits, tasks, entries, loading, loadError, onReload }: { audits: AgentAudit[]; tasks: InvestigationTask[]; entries: EntryPoint[]; loading: boolean; loadError: string | null; onReload: () => Promise<void> }) {
-  const tasksById = new Map(tasks.map((task) => [task.id, task]))
-  const names = new Map(entries.map((entry) => [entry.id, entry.name]))
+function AgentAudits({ audits, tasks, entries }: { audits: AgentAudit[]; tasks: InvestigationTask[]; entries: EntryPoint[] }) {
+  const [visibleCount, setVisibleCount] = useState(30)
+  const [loadedAudits, setLoadedAudits] = useState<Record<string, AgentAudit>>({})
+  const [loadingAuditId, setLoadingAuditId] = useState<string | null>(null)
+  const [loadErrors, setLoadErrors] = useState<Record<string, string>>({})
+  const tasksById = useMemo(() => new Map(tasks.map((task) => [task.id, task])), [tasks])
+  const names = useMemo(() => new Map(entries.map((entry) => [entry.id, entry.name])), [entries])
+  async function loadAudit(audit: AgentAudit) {
+    setLoadingAuditId(audit.id)
+    setLoadErrors((current) => ({ ...current, [audit.id]: "" }))
+    try {
+      const loaded = (await api.agentAudits(audit.scan_id, undefined, true, audit.id))[0]
+      if (!loaded) throw new Error("审计记录不存在")
+      setLoadedAudits((current) => ({ ...current, [audit.id]: loaded }))
+    } catch (reason) {
+      setLoadErrors((current) => ({
+        ...current,
+        [audit.id]: reason instanceof Error ? reason.message : "审计正文加载失败",
+      }))
+    } finally {
+      setLoadingAuditId(null)
+    }
+  }
   if (!audits.length) return <EmptyRow text="本次扫描没有调用 AI，因此没有 AI 审计记录" />
   return (
     <div className="space-y-4">
       <div className="rounded-xl border border-cyan-200 bg-cyan-50 p-4 text-sm leading-6 text-cyan-950">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <span>每次模型调用的精确输入、SDK 关键事件、结构化原始输出、测试裁决和证据校验均保存为不可变 Evidence。审计正文按需加载，避免拖慢扫描主页面。</span>
-          <Button variant="secondary" size="sm" onClick={() => void onReload()} disabled={loading}>{loading ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}{loading ? "正在校验" : "刷新完整审计"}</Button>
-        </div>
+        每次模型调用的精确输入、SDK 关键事件、结构化原始输出、测试裁决和证据校验均保存为不可变 Evidence。列表只加载元数据；点击单条记录后才读取并校验该次调用的正文。
       </div>
-      {loadError && <p role="alert" className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">{loadError}</p>}
-      {audits.map((audit) => {
+      {audits.slice(0, visibleCount).map((summaryAudit) => {
+        const audit = loadedAudits[summaryAudit.id] ?? summaryAudit
         const task = audit.task_id ? tasksById.get(audit.task_id) : undefined
         const target = task?.target_entry_ids.map((id) => names.get(id) ?? id).join(" · ")
         const current = Boolean(task?.turn_id && audit.turn_id === task.turn_id)
         return (
-          <article key={audit.id} className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+          <article key={audit.id} className="content-auto overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
             <div className="flex flex-col gap-4 border-b border-slate-200 p-4 sm:flex-row sm:items-start sm:justify-between">
               <div className="flex min-w-0 gap-3">
                 <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-violet-50 text-violet-700"><ScrollText className="h-5 w-5" /></div>
@@ -1176,26 +1316,31 @@ function AgentAudits({ audits, tasks, entries, loading, loadError, onReload }: {
               <div className="shrink-0 text-right text-xs text-slate-500">
                 <p>{formatDate(audit.started_at)}</p>
                 <p className="mt-1 font-mono">audit {shortHash(audit.id)}</p>
+                <Button className="mt-2" variant="secondary" size="sm" onClick={() => void loadAudit(audit)} disabled={loadingAuditId !== null}>{loadingAuditId === audit.id ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <ScrollText className="h-3.5 w-3.5" />}{audit.integrity === "not_checked" ? "加载并校验正文" : "重新校验"}</Button>
               </div>
             </div>
-            <AuditConclusion audit={audit} current={current} taskResult={textValue(task?.result.result)} />
-            <div className="grid gap-3 p-4 md:grid-cols-2">
-              <AuditValue label="Thread ID" value={audit.thread_id ?? "—"} />
-              <AuditValue label="Turn ID" value={audit.turn_id ?? "—"} />
-            </div>
-            {audit.integrity_errors.length > 0 && <div role="alert" className="mx-4 mb-4 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">{audit.integrity_errors.join("；")}</div>}
-            <div className="space-y-3 px-4 pb-4">
-              <AuditArtifact title="模型精确输入" artifact={audit.artifacts.request} />
-              <AuditArtifact title="SDK 关键事件" artifact={audit.artifacts.events} />
-              <AuditArtifact title="模型结构化原始输出" artifact={audit.artifacts.response} />
-              <AuditArtifact title="AI 申请测试的白名单裁决" artifact={audit.artifacts.test_validation} />
-              <AuditArtifact title="平台证据校验与最终结论" artifact={audit.artifacts.validation} />
-              <AuditArtifact title="用户中止记录" artifact={audit.artifacts.cancellation} />
-              <AuditArtifact title="调用错误" artifact={audit.artifacts.error} />
-            </div>
+            {loadErrors[audit.id] && <div role="alert" className="m-4 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">{loadErrors[audit.id]}</div>}
+            {audit.integrity !== "not_checked" && <>
+              <AuditConclusion audit={audit} current={current} taskResult={textValue(task?.result.result)} />
+              <div className="grid gap-3 p-4 md:grid-cols-2">
+                <AuditValue label="Thread ID" value={audit.thread_id ?? "—"} />
+                <AuditValue label="Turn ID" value={audit.turn_id ?? "—"} />
+              </div>
+              {audit.integrity_errors.length > 0 && <div role="alert" className="mx-4 mb-4 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">{audit.integrity_errors.join("；")}</div>}
+              <div className="space-y-3 px-4 pb-4">
+                <AuditArtifact title="模型精确输入" artifact={audit.artifacts.request} />
+                <AuditArtifact title="SDK 关键事件" artifact={audit.artifacts.events} />
+                <AuditArtifact title="模型结构化原始输出" artifact={audit.artifacts.response} />
+                <AuditArtifact title="AI 申请测试的白名单裁决" artifact={audit.artifacts.test_validation} />
+                <AuditArtifact title="平台证据校验与最终结论" artifact={audit.artifacts.validation} />
+                <AuditArtifact title="用户中止记录" artifact={audit.artifacts.cancellation} />
+                <AuditArtifact title="调用错误" artifact={audit.artifacts.error} />
+              </div>
+            </>}
           </article>
         )
       })}
+      {visibleCount < audits.length && <div className="flex justify-center py-3"><Button variant="secondary" size="sm" onClick={() => setVisibleCount((count) => count + 30)}>加载更多审计 · {audits.length - visibleCount}</Button></div>}
     </div>
   )
 }
@@ -1302,17 +1447,18 @@ function stringValues(value: unknown): string[] {
 }
 
 function AuditArtifact({ title, artifact }: { title: string; artifact?: AgentAudit["artifacts"][string] }) {
+  const [open, setOpen] = useState(false)
   if (!artifact) return null
   return (
-    <details className="group rounded-lg border border-slate-200 bg-slate-50">
+    <details className="group rounded-lg border border-slate-200 bg-slate-50" onToggle={(event) => setOpen(event.currentTarget.open)}>
       <summary className="flex min-h-11 cursor-pointer list-none items-center justify-between gap-3 px-3 py-2 text-sm font-semibold text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-700">
         <span>{title}</span>
         <span className="font-mono text-[11px] font-normal text-slate-500">SHA256 {shortHash(artifact.sha256)}</span>
       </summary>
-      <div className="border-t border-slate-200 p-3">
+      {open && <div className="border-t border-slate-200 p-3">
         <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-white p-4 font-mono text-xs leading-6 text-slate-800 ring-1 ring-inset ring-slate-200">{formatAuditContent(artifact.content)}</pre>
         <a className="mt-3 inline-flex text-xs font-semibold text-cyan-800 underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-700" href={`/api/v1/evidence/${artifact.evidence_id}/download`}>下载不可变 Evidence</a>
-      </div>
+      </div>}
     </details>
   )
 }
@@ -1326,6 +1472,7 @@ function auditPhaseLabel(phase: string) {
     static_only: "静态证据判断",
     test_planning: "补充测试规划",
     exploration_round: "自适应深度探索",
+    adaptive_verification: "高权限批量验证",
     final_evaluation: "最终证据判断",
     recovery_evaluation: "异常恢复判断",
   }[phase] ?? phase
@@ -1336,6 +1483,7 @@ function explorationPhaseLabel(phase: string) {
     static_only: "静态证据判断",
     test_planning: "首轮测试规划",
     exploration_round: "自适应探索",
+    adaptive_verification: "高权限批量验证",
     final_evaluation: "最终证据判断",
     recovery_evaluation: "异常恢复判断",
   }[phase] ?? phase

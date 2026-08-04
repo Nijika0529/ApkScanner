@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import re
 from datetime import datetime
 from typing import Any, Literal, Self
 
@@ -381,6 +383,72 @@ class AgentPocSpec(BaseModel):
     )
 
 
+class AgentBinderScriptStep(BaseModel):
+    """One bounded primitive Parcel write/read performed by the platform Probe."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: Literal[
+        "write_string",
+        "write_integer",
+        "write_long",
+        "write_boolean",
+        "write_bytes_base64",
+        "read_string",
+        "read_integer",
+        "read_long",
+        "read_boolean",
+        "read_bytes_base64",
+    ]
+    string_value: str | None = Field(default=None, max_length=16_384)
+    integer_value: StrictInt | None = None
+    boolean_value: StrictBool | None = None
+
+    @model_validator(mode="after")
+    def validate_value(self) -> Self:
+        write_field = {
+            "write_string": "string_value",
+            "write_bytes_base64": "string_value",
+            "write_integer": "integer_value",
+            "write_long": "integer_value",
+            "write_boolean": "boolean_value",
+        }.get(self.operation)
+        populated = {
+            "string_value": self.string_value is not None,
+            "integer_value": self.integer_value is not None,
+            "boolean_value": self.boolean_value is not None,
+        }
+        if write_field is None:
+            if any(populated.values()):
+                raise ValueError("Binder read steps cannot include a value")
+            return self
+        if not populated[write_field] or sum(populated.values()) != 1:
+            raise ValueError(f"{self.operation} requires only {write_field}")
+        if self.operation == "write_integer" and not -(2**31) <= self.integer_value < 2**31:
+            raise ValueError("write_integer requires a signed 32-bit value")
+        if self.operation == "write_long" and not -(2**63) <= self.integer_value < 2**63:
+            raise ValueError("write_long requires a signed 64-bit value")
+        if self.operation == "write_bytes_base64":
+            try:
+                decoded = base64.b64decode(self.string_value or "", validate=True)
+            except ValueError as exc:
+                raise ValueError("write_bytes_base64 requires canonical base64") from exc
+            if base64.b64encode(decoded).decode("ascii") != self.string_value:
+                raise ValueError("write_bytes_base64 requires canonical base64")
+        return self
+
+
+def _validate_binder_script(steps: list[AgentBinderScriptStep]) -> None:
+    seen_read = False
+    for step in steps:
+        is_read = step.operation.startswith("read_")
+        if seen_read and not is_read:
+            raise ValueError("Binder write steps must precede all read steps")
+        seen_read = seen_read or is_read
+    if not seen_read:
+        raise ValueError("binder_script requires at least one read step")
+
+
 class AgentOracleSpec(BaseModel):
     """An objective observation the platform can evaluate after a requested test."""
 
@@ -396,6 +464,8 @@ class AgentOracleSpec(BaseModel):
         "binder_reply",
     ] = "reachability"
     expected_text: str | None = Field(default=None, min_length=1, max_length=500)
+    match_mode: Literal["exact", "contains", "regex", "sha256", "non_empty"] = "exact"
+    reply_index: int = Field(default=0, ge=0, le=31)
     minimum_rows: int | None = Field(default=None, ge=1, le=1_000_000)
     impact: Literal[
         "none",
@@ -416,9 +486,27 @@ class AgentOracleSpec(BaseModel):
                 "target_uid_log_contains",
                 "binder_reply",
             }
+            and self.match_mode != "non_empty"
             and not self.expected_text
         ):
             raise ValueError(f"{self.kind} requires expected_text")
+        if self.kind != "binder_reply" and (
+            self.match_mode != "exact" or self.reply_index != 0
+        ):
+            raise ValueError("match_mode and reply_index are supported only by binder_reply")
+        if self.kind == "binder_reply" and self.match_mode == "non_empty" and self.impact != "none":
+            raise ValueError("a non-empty Binder reply alone cannot prove security impact")
+        if self.kind == "binder_reply" and self.match_mode == "regex" and self.expected_text:
+            try:
+                re.compile(self.expected_text)
+            except re.error as exc:
+                raise ValueError("binder_reply regex expected_text is invalid") from exc
+        if (
+            self.kind == "binder_reply"
+            and self.match_mode == "sha256"
+            and (not self.expected_text or not re.fullmatch(r"[a-f0-9]{64}", self.expected_text))
+        ):
+            raise ValueError("binder_reply sha256 requires a lowercase SHA-256 expected_text")
         if self.kind == "provider_rows" and self.minimum_rows is None:
             self.minimum_rows = 1
         allowed_impacts = {
@@ -457,6 +545,7 @@ class AgentRequestedTest(BaseModel):
         "update",
         "delete",
         "binder_transact",
+        "binder_script",
     ] = "auto"
     method: str | None = Field(default=None, min_length=1, max_length=200)
     argument: str | None = Field(default=None, max_length=1000)
@@ -472,6 +561,11 @@ class AgentRequestedTest(BaseModel):
     )
     binder_reply_type: Literal["string", "integer", "long", "boolean"] | None = None
     binder_read_exception: StrictBool | None = None
+    binder_script: list[AgentBinderScriptStep] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=32,
+    )
     intent_action: str | None = Field(
         default=None,
         pattern=r"^[A-Za-z][A-Za-z0-9_.]{0,254}$",
@@ -493,20 +587,29 @@ class AgentRequestedTest(BaseModel):
             self.binder_interface_descriptor,
             self.binder_reply_type,
             self.binder_read_exception,
+            self.binder_script,
         )
-        if self.operation == "binder_transact":
-            if self.binder_transaction_code is None or self.binder_reply_type is None:
+        if self.operation in {"binder_transact", "binder_script"}:
+            if self.binder_transaction_code is None:
                 raise ValueError(
-                    "binder_transact requires binder_transaction_code and binder_reply_type"
+                    f"{self.operation} requires binder_transaction_code"
                 )
+            if self.operation == "binder_transact" and self.binder_reply_type is None:
+                raise ValueError("binder_transact requires binder_reply_type")
+            if self.operation == "binder_script" and not self.binder_script:
+                raise ValueError("binder_script requires at least one script step")
+            if self.operation == "binder_script" and self.binder_script:
+                _validate_binder_script(self.binder_script)
+            if self.operation == "binder_transact" and self.binder_script is not None:
+                raise ValueError("binder_script steps require operation=binder_script")
             if self.poc is not None:
-                raise ValueError("binder_transact is a platform Probe action and cannot include poc")
+                raise ValueError(f"{self.operation} is a platform Probe action and cannot include poc")
             if self.binder_read_exception is None:
                 self.binder_read_exception = True
             if self.oracle.kind != "binder_reply":
-                raise ValueError("binder_transact requires a binder_reply Oracle")
+                raise ValueError(f"{self.operation} requires a binder_reply Oracle")
         elif any(value is not None for value in binder_fields):
-            raise ValueError("Binder fields are valid only for binder_transact")
+            raise ValueError("Binder fields are valid only for Binder operations")
         if self.binder_interface_descriptor is not None and any(
             character in self.binder_interface_descriptor for character in "\r\n\x00"
         ):
@@ -537,7 +640,7 @@ class AgentProofReplay(BaseModel):
         default_factory=dict,
         max_length=16,
     )
-    operation: Literal["auto", "binder_transact"] = "auto"
+    operation: Literal["auto", "binder_transact", "binder_script"] = "auto"
     binder_transaction_code: int | None = Field(
         default=None,
         ge=1,
@@ -550,6 +653,11 @@ class AgentProofReplay(BaseModel):
     )
     binder_reply_type: Literal["string", "integer", "long", "boolean"] | None = None
     binder_read_exception: StrictBool | None = None
+    binder_script: list[AgentBinderScriptStep] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=32,
+    )
     reset: Literal["inherit", "clean", "preserve"] = "clean"
     oracle: AgentOracleSpec
     rationale: str = Field(min_length=1, max_length=1000)
@@ -562,23 +670,30 @@ class AgentProofReplay(BaseModel):
             self.binder_interface_descriptor,
             self.binder_reply_type,
             self.binder_read_exception,
+            self.binder_script,
         )
-        if self.operation == "binder_transact":
+        if self.operation in {"binder_transact", "binder_script"}:
             if self.poc is not None:
-                raise ValueError("binder_transact replay cannot include poc")
-            if self.binder_transaction_code is None or self.binder_reply_type is None:
-                raise ValueError(
-                    "binder_transact requires binder_transaction_code and binder_reply_type"
-                )
+                raise ValueError(f"{self.operation} replay cannot include poc")
+            if self.binder_transaction_code is None:
+                raise ValueError(f"{self.operation} requires binder_transaction_code")
+            if self.operation == "binder_transact" and self.binder_reply_type is None:
+                raise ValueError("binder_transact requires binder_reply_type")
+            if self.operation == "binder_script" and not self.binder_script:
+                raise ValueError("binder_script requires at least one script step")
+            if self.operation == "binder_script" and self.binder_script:
+                _validate_binder_script(self.binder_script)
+            if self.operation == "binder_transact" and self.binder_script is not None:
+                raise ValueError("binder_script steps require operation=binder_script")
             if self.binder_read_exception is None:
                 self.binder_read_exception = True
             if self.oracle.kind != "binder_reply":
-                raise ValueError("binder_transact requires a binder_reply Oracle")
+                raise ValueError(f"{self.operation} requires a binder_reply Oracle")
         else:
             if self.poc is None:
                 raise ValueError("a non-Binder proof replay requires poc")
             if any(value is not None for value in binder_fields):
-                raise ValueError("Binder fields are valid only for binder_transact")
+                raise ValueError("Binder fields are valid only for Binder operations")
         if self.binder_interface_descriptor is not None and any(
             character in self.binder_interface_descriptor for character in "\r\n\x00"
         ):
@@ -604,9 +719,9 @@ class AgentHypothesisAssessment(BaseModel):
     sink: str = Field(default="", max_length=2000)
     reachable_path: str = Field(default="", max_length=4000)
     boundary: str = Field(default="", max_length=2000)
-    counterevidence: list[str] = Field(default_factory=list, max_length=50)
-    proof_gaps: list[str] = Field(default_factory=list, max_length=50)
-    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
+    counterevidence: list[str] = Field(default_factory=list)
+    proof_gaps: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
     confidence: Literal["high", "medium", "low"] = "medium"
 
 
@@ -622,7 +737,7 @@ class AgentReviewObjection(BaseModel):
     )
     claim: str = Field(min_length=1, max_length=2000)
     basis: str = Field(min_length=1, max_length=4000)
-    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
+    evidence_ids: list[str] = Field(default_factory=list)
 
 
 class AgentObjectionResolution(BaseModel):
@@ -633,11 +748,11 @@ class AgentObjectionResolution(BaseModel):
     objection_id: str = Field(pattern=r"^OBJ-[A-Za-z0-9_-]{1,32}$")
     disposition: Literal["sustained", "overruled", "partially_sustained"]
     rationale: str = Field(min_length=1, max_length=4000)
-    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
+    evidence_ids: list[str] = Field(default_factory=list)
 
 
 class AgentTestCaseSummary(BaseModel):
-    """A bounded model-authored summary; platform ProofAttempt rows remain authoritative."""
+    """A model-authored summary; platform ProofAttempt rows remain authoritative."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -648,7 +763,7 @@ class AgentTestCaseSummary(BaseModel):
     )
     description: str = Field(min_length=1, max_length=2000)
     status: Literal["planned", "executed", "passed", "failed", "inconclusive"]
-    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
+    evidence_ids: list[str] = Field(default_factory=list)
 
 
 def _normalize_wire_extras(request: dict[str, Any]) -> dict[str, Any]:
@@ -707,29 +822,17 @@ class AgentInvestigationResult(BaseModel):
         "reproduced_blackbox",
         "not_reproduced",
     ]
-    hypotheses_tested: list[str] = Field(max_length=100)
-    hypothesis_assessments: list[AgentHypothesisAssessment] = Field(
-        default_factory=list,
-        max_length=100,
-    )
-    review_objections: list[AgentReviewObjection] = Field(
-        default_factory=list,
-        max_length=2,
-    )
-    objection_resolutions: list[AgentObjectionResolution] = Field(
-        default_factory=list,
-        max_length=100,
-    )
-    test_cases: list[AgentTestCaseSummary] = Field(max_length=200)
-    evidence_ids: list[str] = Field(max_length=500)
+    hypotheses_tested: list[str]
+    hypothesis_assessments: list[AgentHypothesisAssessment] = Field(default_factory=list)
+    review_objections: list[AgentReviewObjection] = Field(default_factory=list)
+    objection_resolutions: list[AgentObjectionResolution] = Field(default_factory=list)
+    test_cases: list[AgentTestCaseSummary]
+    evidence_ids: list[str]
     severity_proposal: Literal["critical", "high", "medium", "low", "info"]
     confidence: Literal["high", "medium", "low"]
-    coverage_gaps: list[str] = Field(max_length=100)
-    followups: list[str] = Field(max_length=100)
-    requested_tests: list[AgentRequestedTest] = Field(
-        default_factory=list,
-        max_length=1000,
-    )
+    coverage_gaps: list[str]
+    followups: list[str]
+    requested_tests: list[AgentRequestedTest] = Field(default_factory=list)
 
     @model_validator(mode="wrap")
     @classmethod
@@ -813,7 +916,7 @@ class AgentInvestigationResult(BaseModel):
             return handler(normalized)
         gaps = normalized.get("coverage_gaps")
         normalized["coverage_gaps"] = [
-            *((gaps if isinstance(gaps, list) else [])[:99]),
+            *(gaps if isinstance(gaps, list) else []),
             (
                 f"平台拒绝了 {len(rejected)} 个格式或能力不受支持的补充测试请求；"
                 "具体校验错误已保留，下一轮必须修正或改用其他验证策略。"
@@ -840,6 +943,67 @@ class AgentInvestigationResult(BaseModel):
         if len(resolution_ids) != len(set(resolution_ids)):
             raise ValueError("objection_resolutions must use unique objection_id values")
         return self
+
+
+class AdaptiveVerifierExperiment(BaseModel):
+    """One free-form, model-operated verification experiment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    objective: str = Field(min_length=1, max_length=4000)
+    actions: list[str] = Field(default_factory=list)
+    observations: list[str] = Field(default_factory=list)
+    artifact_paths: list[str] = Field(default_factory=list)
+    conclusion: str = Field(min_length=1, max_length=8000)
+
+
+class AdaptiveVerifierAssessment(BaseModel):
+    """A semantic verdict for one previously persisted candidate finding."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    finding_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
+    verdict: Literal[
+        "reproduced_blackbox",
+        "supported_static",
+        "refuted_static",
+        "not_reproduced",
+        "inconclusive",
+    ]
+    confidence: Literal["high", "medium", "low"]
+    runtime_observed: bool
+    summary: str = Field(min_length=1, max_length=8000)
+    attack_chain: str = Field(default="", max_length=12_000)
+    security_impact: str = Field(default="", max_length=8000)
+    counterevidence: list[str] = Field(default_factory=list)
+    remaining_gaps: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    experiments: list[AdaptiveVerifierExperiment] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_runtime_verdict(self) -> Self:
+        if self.verdict == "reproduced_blackbox" and not self.runtime_observed:
+            raise ValueError("reproduced_blackbox requires an actual runtime observation")
+        if self.verdict == "not_reproduced" and not self.runtime_observed:
+            raise ValueError("not_reproduced requires a relevant runtime attempt")
+        return self
+
+
+class AdaptiveVerificationResult(BaseModel):
+    """Scan-level terminal output from the privileged adaptive verifier."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"] = "1.0"
+    summary: str = Field(
+        min_length=1,
+        max_length=12_000,
+        pattern=r"[\u3400-\u9fff]",
+    )
+    assessments: list[AdaptiveVerifierAssessment]
+    shared_observations: list[str] = Field(default_factory=list)
+    cleanup_actions: list[str] = Field(default_factory=list)
+    coverage_gaps: list[str] = Field(default_factory=list)
 
 
 class HypothesisArgumentOut(ApiModel):
@@ -919,6 +1083,14 @@ class GroundTruthVulnerability(BaseModel):
     match: GroundTruthMatch
 
 
+class BenchmarkQualityGate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    minimum_precision: float = Field(default=1.0, ge=0.0, le=1.0)
+    minimum_recall: float = Field(default=1.0, ge=0.0, le=1.0)
+    maximum_false_positives: int = Field(default=0, ge=0, le=10_000)
+
+
 class BenchmarkSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -926,6 +1098,7 @@ class BenchmarkSpec(BaseModel):
     name: str = Field(min_length=1, max_length=256)
     apk_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     vulnerabilities: list[GroundTruthVulnerability] = Field(min_length=1, max_length=500)
+    quality_gate: BenchmarkQualityGate = Field(default_factory=BenchmarkQualityGate)
 
     @model_validator(mode="after")
     def require_unique_vulnerability_ids(self) -> Self:
@@ -1090,3 +1263,6 @@ def _agent_result_wire_schema() -> dict[str, Any]:
 
 
 AGENT_RESULT_JSON_SCHEMA = _agent_result_wire_schema()
+ADAPTIVE_VERIFIER_RESULT_JSON_SCHEMA = _inline_local_json_schema_refs(
+    AdaptiveVerificationResult.model_json_schema()
+)

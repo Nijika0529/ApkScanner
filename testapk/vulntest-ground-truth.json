@@ -1,6 +1,11 @@
 {
   "schema_version": "1.0",
   "name": "APKScanner minimal vulnerable Android fixture",
+  "quality_gate": {
+    "minimum_precision": 1.0,
+    "minimum_recall": 1.0,
+    "maximum_false_positives": 0
+  },
   "vulnerabilities": [
     {
       "id": "VT-001",

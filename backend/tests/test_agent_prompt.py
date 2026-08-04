@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import pytest
-from apkscanner.agent_prompt import developer_instructions, investigation_prompt
+from apkscanner.agent_prompt import (
+    adaptive_verification_prompt,
+    adaptive_verifier_developer_instructions,
+    developer_instructions,
+    investigation_prompt,
+)
 from apkscanner.models import EntryPoint, InvestigationTask, Scan
 from apkscanner.schemas import (
+    ADAPTIVE_VERIFIER_RESULT_JSON_SCHEMA,
     AGENT_RESULT_JSON_SCHEMA,
     AgentInvestigationResult,
     AgentPocSpec,
@@ -34,7 +40,10 @@ def test_final_agent_summary_requires_chinese_text() -> None:
 
 
 def test_agent_output_schema_uses_provider_compatible_additional_properties() -> None:
-    pending: list[object] = [AGENT_RESULT_JSON_SCHEMA]
+    pending: list[object] = [
+        AGENT_RESULT_JSON_SCHEMA,
+        ADAPTIVE_VERIFIER_RESULT_JSON_SCHEMA,
+    ]
     while pending:
         value = pending.pop()
         if isinstance(value, list):
@@ -50,6 +59,22 @@ def test_agent_output_schema_uses_provider_compatible_additional_properties() ->
         if isinstance(properties, dict):
             assert value.get("required") == list(properties)
         pending.extend(value.values())
+
+
+def test_agent_output_schemas_do_not_cap_exploration_collections() -> None:
+    for name in (
+        "hypotheses_tested",
+        "hypothesis_assessments",
+        "review_objections",
+        "test_cases",
+        "evidence_ids",
+        "coverage_gaps",
+        "followups",
+        "requested_tests",
+    ):
+        assert "maxItems" not in AGENT_RESULT_JSON_SCHEMA["properties"][name]
+    for name in ("assessments", "shared_observations", "cleanup_actions", "coverage_gaps"):
+        assert "maxItems" not in ADAPTIVE_VERIFIER_RESULT_JSON_SCHEMA["properties"][name]
 
 
 def test_agent_result_converts_closed_wire_extras_to_android_mapping() -> None:
@@ -131,11 +156,70 @@ def test_agent_adb_policy_keeps_full_access_with_hard_safety_boundary() -> None:
     assert "After one ordinary-app replay answers a hypothesis" in instructions
     assert "A reproduced_blackbox receipt ends that hypothesis" in instructions
     assert "never reconstruct a task UUID" in instructions
-    assert "One existence/path check for each PoC source is sufficient" in instructions
-    assert "move directly to one dedicated PoC" in instructions
-    assert "submit exactly one live proof replay" in instructions
+    assert "Avoid redundant existence/path checks for unchanged PoC sources" in instructions
+    assert "prefer a dedicated PoC or platform Probe" in instructions
+    assert "materially distinct fallback strategies" in instructions
+    assert "submit a live proof replay" in instructions
     assert "without discovering or invoking an Android SDK toolchain" in instructions
     assert "poc_builder.source_build_available=true" in instructions
+
+
+def test_adaptive_verifier_prompt_uses_semantic_oracles_and_direct_host_ssh() -> None:
+    scan = Scan(
+        id="00000000-0000-0000-0000-000000000001",
+        filename="sample.apk",
+        package_name="com.example.sample",
+        artifact_sha256="a" * 64,
+        artifact_path="/tmp/sample.apk",
+    )
+    candidate_id = "00000000-0000-0000-0000-000000000004"
+    instructions = adaptive_verifier_developer_instructions(ssh_available=True)
+    prompt = adaptive_verification_prompt(
+        scan,
+        [{"finding_id": candidate_id, "title": "JSB token leak"}],
+        [],
+        {"ssh": {"available": True}},
+    )
+
+    assert "ssh/scp" in instructions
+    assert "~/.ssh" in instructions
+    assert "Aliyun" in instructions
+    assert "hard-coded token regex" in instructions
+    assert "not a bounded platform-Oracle exercise" in instructions
+    assert "no platform-imposed count limit" in instructions
+    assert "at most 80" not in instructions
+    assert "two PoC rebuild" not in instructions
+    assert "targetSdk API 36 or newer" in instructions
+    assert "legacy dx-based fallback" in instructions
+    assert "Do not lower targetSdk to match the phone" in instructions
+    assert "每个 finding_id 必须且只能返回一条 assessment" in prompt
+    assert candidate_id in prompt
+    assert "最终由你对返回值、token、账号能力" in prompt
+
+
+def test_adaptive_verifier_retry_reuses_prior_runtime_evidence() -> None:
+    scan = Scan(
+        id="00000000-0000-0000-0000-000000000001",
+        filename="sample.apk",
+        package_name="com.example.sample",
+        artifact_sha256="a" * 64,
+        artifact_path="/tmp/sample.apk",
+    )
+    prompt = adaptive_verification_prompt(
+        scan,
+        [{"finding_id": "00000000-0000-0000-0000-000000000004"}],
+        [{"id": "evidence-1", "kind": "agent.adb.gateway"}],
+        {
+            "recovery": {
+                "is_retry": True,
+                "previous_attempt_evidence_count": 1,
+            }
+        },
+    )
+
+    assert "恢复轮次" in prompt
+    assert "不要重复已经成功的 Receiver、localhost、Binder、WebView" in prompt
+    assert "previous_attempt_evidence_count" in prompt
 
 
 def _phase_prompt(
@@ -214,10 +298,11 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     assert "Do not read sibling application components" in planning
     assert "not a fresh audit" in continuation
     assert "changed PoC, input, or Oracle" in continuation
-    assert "return requested_tests=[], and do not reopen" in critic
+    assert "re-open only its exact cited source anchors" in critic
+    assert "unique OBJ-prefixed ID" in critic
     assert "does not need to regenerate hypothesis assessment receipts" in critic
     assert "OBJ-1" in critic
-    assert "at most two objections" in critic
+    assert "Include every distinct objection" in critic
     assert "not a new APK audit" in critic
     assert "review_objections" in critic
     assert "platform_proven_hypotheses" in critic
@@ -273,7 +358,7 @@ def test_requested_tests_can_be_omitted_when_no_platform_replay_is_needed() -> N
     assert result.requested_tests == []
 
 
-def test_critic_cannot_expand_beyond_two_objections() -> None:
+def test_single_critic_turn_can_report_every_material_objection() -> None:
     payload = _result("Critic 只应保留可能改变最终结论的实质异议。").model_dump(mode="json")
     payload["review_objections"] = [
         {
@@ -282,11 +367,12 @@ def test_critic_cannot_expand_beyond_two_objections() -> None:
             "basis": "候选证据不足。",
             "evidence_ids": [],
         }
-        for index in range(1, 4)
+        for index in range(1, 6)
     ]
 
-    with pytest.raises(ValidationError, match="too_long"):
-        AgentInvestigationResult.model_validate(payload)
+    result = AgentInvestigationResult.model_validate(payload)
+
+    assert len(result.review_objections) == 5
 
 
 def test_poc_base_package_remains_inside_the_controlled_namespace() -> None:

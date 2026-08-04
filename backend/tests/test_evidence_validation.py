@@ -437,6 +437,42 @@ def test_activity_request_accepts_its_declared_deep_link_and_android_extra_key()
     assert any("preserve" in gap for gap in gaps)
 
 
+def test_agent_requested_tests_are_not_truncated_by_a_per_round_count() -> None:
+    entry = EntryPoint(
+        id="11111111-1111-1111-1111-111111111111",
+        scan_id="scan",
+        kind="activity",
+        name="com.example.ManyTestsActivity",
+        owner_component="com.example.ManyTestsActivity",
+        exported=True,
+        exported_reason="explicit_true",
+        intent_filters=[],
+        deep_links=[],
+        metadata_json={},
+    )
+    hypothesis_id = "22222222-2222-2222-2222-222222222222"
+    requests = [
+        AgentRequestedTest(
+            hypothesis_id=hypothesis_id,
+            entry_point_id=entry.id,
+            state="guest",
+            uri=None,
+            extras={"variant": str(index)},
+            rationale=f"Exercise materially distinct input {index}.",
+        )
+        for index in range(12)
+    ]
+
+    accepted, gaps = ScanOrchestrator._validate_requested_tests(
+        requests,
+        [entry],
+        hypothesis_ids={hypothesis_id},
+    )
+
+    assert accepted == requests
+    assert gaps == []
+
+
 def test_requested_test_deduplication_ignores_rationale_only_changes() -> None:
     entry = EntryPoint(
         id="11111111-1111-1111-1111-111111111111",

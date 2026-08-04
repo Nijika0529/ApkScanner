@@ -16,6 +16,19 @@ internal WebView with a sensitive JavaScript bridge, a pre-production endpoint,
 an embedded service secret, a persistent unauthenticated policy update,
 an unbound authorization callback, and external session switching.
 
+`adaptivecases.apk` is the Android attack-chain and terminal Adaptive Verifier
+fixture. It targets API 36 while retaining minSdk 26. Its five positive cases
+cover ACTION_SEND Zip Slip import, an exported dynamic receiver, an
+unauthenticated localhost server, a WebView JS bridge credential leak, and a
+multi-value Binder credential reply. It also contains two adversarial controls:
+a mutable implicit PendingIntent whose redirected receiver sees the URI but does
+not receive permission to open the private provider, and a signature-protected
+immutable PendingIntent activity. The first control is intentionally close to a
+real capability-delegation bug so the scanner must not equate redirection with a
+demonstrated URI disclosure.
+The adaptive fixture build normalizes ZIP timestamps and disables v1 signing so
+repeated builds from unchanged sources produce the same APK SHA-256.
+
 Covered paths:
 
 - exported `MainActivity` with `target_activity` → `Class.forName` →
@@ -34,6 +47,7 @@ Build from the repository root:
 testapk/build-vulntest.sh
 testapk/build-rescuetest.sh
 testapk/build-specialcases.sh
+testapk/build-adaptivecases.sh
 ```
 
 The checked-in keystore is a public, test-only key used solely to make fixture

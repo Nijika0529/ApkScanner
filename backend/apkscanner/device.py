@@ -299,6 +299,7 @@ class AdbDeviceAdapter:
         self._active_cancel_event: threading.Event | None = None
         self._probe_apk_sha256: str | None = None
         self._probe_ready = False
+        self._ui_dump_latencies: list[float] = []
 
     @property
     def configured(self) -> bool:
@@ -702,6 +703,7 @@ class AdbDeviceAdapter:
         binder_interface_descriptor: str | None = None,
         binder_reply_type: str | None = None,
         binder_read_exception: bool | None = None,
+        binder_script: list[dict[str, Any]] | None = None,
         intent_action: str | None = None,
         categories: list[str] | None = None,
         oracle: AgentOracleSpec | None = None,
@@ -736,6 +738,7 @@ class AdbDeviceAdapter:
                     binder_interface_descriptor=binder_interface_descriptor,
                     binder_reply_type=binder_reply_type,
                     binder_read_exception=binder_read_exception,
+                    binder_script=binder_script,
                     intent_action=intent_action,
                     categories=categories,
                 )
@@ -1420,7 +1423,8 @@ class AdbDeviceAdapter:
         """Wait for an asynchronous target-owned UI transition within the PoC window."""
 
         started = time.monotonic()
-        deadline = started + max(timeout_seconds, 1)
+        adaptive_window = self._adaptive_ui_observation_window(timeout_seconds)
+        deadline = started + adaptive_window
         attempts = 0
         last = self._budget_exhausted(
             ["adb", "-s", self.serial or "", "shell", "uiautomator", "dump"]
@@ -1441,6 +1445,11 @@ class AdbDeviceAdapter:
                 baseline_valid=baseline_valid,
                 observation_valid=last.exit_code == 0,
             )
+            metadata["observation_policy"] = {
+                "mode": "adaptive_adb_latency",
+                "window_seconds": adaptive_window,
+                "recent_ui_dump_p50_seconds": self._recent_ui_dump_p50(),
+            }
             if (
                 bool((metadata.get("oracle") or {}).get("matched"))
                 or time.monotonic() >= deadline
@@ -1481,6 +1490,7 @@ class AdbDeviceAdapter:
     ) -> CommandResult:
         """Dump UI XML through a device file so bridged ADB never depends on `/dev/tty`."""
 
+        started = time.monotonic()
         remote_path = f"/data/local/tmp/apkscanner-ui-{secrets.token_hex(8)}.xml"
         dump = self._adb_budget(
             ["shell", "uiautomator", "dump", remote_path],
@@ -1510,6 +1520,19 @@ class AdbDeviceAdapter:
                 timeout=15,
                 respect_cancellation=False,
             )
+            self._ui_dump_latencies.append(max(0.0, time.monotonic() - started))
+            del self._ui_dump_latencies[:-12]
+
+    def _recent_ui_dump_p50(self) -> float | None:
+        if not self._ui_dump_latencies:
+            return None
+        ordered = sorted(self._ui_dump_latencies)
+        return round(ordered[len(ordered) // 2], 3)
+
+    def _adaptive_ui_observation_window(self, requested_seconds: int) -> float:
+        latency = self._recent_ui_dump_p50() or 2.5
+        adaptive = min(60, max(15, latency * 4 + 5))
+        return float(max(requested_seconds, adaptive))
 
     @staticmethod
     def _logcat_process_id(line: str) -> str | None:
@@ -1576,6 +1599,7 @@ class AdbDeviceAdapter:
         binder_interface_descriptor: str | None = None,
         binder_reply_type: str | None = None,
         binder_read_exception: bool | None = None,
+        binder_script: list[dict[str, Any]] | None = None,
         intent_action: str | None = None,
         categories: list[str] | None = None,
     ) -> dict[str, Any] | None:
@@ -1608,12 +1632,15 @@ class AdbDeviceAdapter:
             request["method"] = method
         if argument is not None:
             request["argument"] = argument
-        if operation == "binder_transact":
+        if operation in {"binder_transact", "binder_script"}:
             request["binder_transaction_code"] = binder_transaction_code
-            request["binder_reply_type"] = binder_reply_type
             request["binder_read_exception"] = (
                 True if binder_read_exception is None else binder_read_exception
             )
+            if binder_reply_type is not None:
+                request["binder_reply_type"] = binder_reply_type
+            if binder_script is not None:
+                request["binder_script"] = binder_script
             if binder_interface_descriptor is not None:
                 request["binder_interface_descriptor"] = binder_interface_descriptor
         if intent_action is not None:
@@ -1694,14 +1721,35 @@ class AdbDeviceAdapter:
                 impact_observed=(matched and oracle.impact == "unauthorized_data_access"),
                 refutation_observed=success,
             )
-        if oracle.kind == "binder_reply" and oracle.expected_text:
-            reply = probe_payload.get("binderReply") if isinstance(probe_payload, dict) else None
+        if (
+            oracle.kind == "binder_reply"
+            and oracle.match_mode != "non_empty"
+            and oracle.expected_text
+        ):
+            replies = probe_payload.get("binderReplies") if isinstance(probe_payload, dict) else None
+            reply = (
+                replies[oracle.reply_index]
+                if isinstance(replies, list) and oracle.reply_index < len(replies)
+                else probe_payload.get("binderReply")
+                if isinstance(probe_payload, dict) and oracle.reply_index == 0
+                else None
+            )
             transact_returned = bool(
                 isinstance(probe_payload, dict)
                 and probe_payload.get("binderTransactReturned") is True
             )
             actual_text = str(reply).lower() if isinstance(reply, bool) else str(reply)
-            matched = success and transact_returned and actual_text == oracle.expected_text
+            if oracle.match_mode == "contains":
+                predicate_matched = oracle.expected_text in actual_text
+            elif oracle.match_mode == "regex":
+                predicate_matched = re.search(oracle.expected_text, actual_text) is not None
+            elif oracle.match_mode == "sha256":
+                predicate_matched = hashlib.sha256(actual_text.encode()).hexdigest() == (
+                    oracle.expected_text
+                )
+            else:
+                predicate_matched = actual_text == oracle.expected_text
+            matched = success and transact_returned and reply is not None and predicate_matched
             return cls._oracle_metadata(
                 oracle,
                 matched=matched,
@@ -1713,9 +1761,43 @@ class AdbDeviceAdapter:
                         if isinstance(probe_payload, dict)
                         else None
                     ),
+                    "reply_index": oracle.reply_index,
+                    "match_mode": oracle.match_mode,
                     "transact_returned": transact_returned,
                 },
                 impact_observed=(matched and oracle.impact == "unauthorized_data_access"),
+                refutation_observed=success and transact_returned,
+            )
+        if oracle.kind == "binder_reply" and oracle.match_mode == "non_empty":
+            replies = probe_payload.get("binderReplies") if isinstance(probe_payload, dict) else None
+            reply = (
+                replies[oracle.reply_index]
+                if isinstance(replies, list) and oracle.reply_index < len(replies)
+                else probe_payload.get("binderReply")
+                if isinstance(probe_payload, dict) and oracle.reply_index == 0
+                else None
+            )
+            transact_returned = bool(
+                isinstance(probe_payload, dict)
+                and probe_payload.get("binderTransactReturned") is True
+            )
+            matched = bool(
+                success
+                and transact_returned
+                and reply is not None
+                and reply != ""
+                and reply != b""
+            )
+            return cls._oracle_metadata(
+                oracle,
+                matched=matched,
+                observation={
+                    "reply_index": oracle.reply_index,
+                    "match_mode": oracle.match_mode,
+                    "actual_text": str(reply) if reply is not None else None,
+                    "transact_returned": transact_returned,
+                },
+                impact_observed=False,
                 refutation_observed=success and transact_returned,
             )
         if oracle.kind == "log_contains" and oracle.expected_text:
@@ -1942,12 +2024,21 @@ class AdbDeviceAdapter:
             cancel_event=self._active_cancel_event if respect_cancellation else None,
         )
 
-    def execute_gateway(self, args: list[str], timeout: int = 30) -> CommandResult:
+    def execute_gateway(
+        self,
+        args: list[str],
+        timeout: int = 30,
+        *,
+        policy: str = "scoped",
+    ) -> CommandResult:
         """Execute a policy-validated command on this adapter's fixed serial."""
 
-        from .adb_gateway import validate_adb_args
+        from .adb_gateway import validate_adaptive_adb_args, validate_adb_args
 
-        validate_adb_args(args)
+        if policy == "adaptive":
+            validate_adaptive_adb_args(args)
+        else:
+            validate_adb_args(args)
         with self._lease:
             return self._adb(args, timeout=max(1, min(120, timeout)))
 

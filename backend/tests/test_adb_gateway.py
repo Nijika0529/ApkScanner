@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import pytest
-from apkscanner.adb_gateway import AdbGatewayRequest, AdbGatewayResponse, validate_adb_args
+from apkscanner.adb_gateway import (
+    AdbGatewayRequest,
+    AdbGatewayResponse,
+    validate_adaptive_adb_args,
+    validate_adb_args,
+)
 from apkscanner.tools import CommandResult
 from pydantic import ValidationError
 
@@ -43,3 +48,34 @@ def test_gateway_response_bounds_command_output() -> None:
     response = AdbGatewayResponse.from_command(result, max_bytes=16)
     assert response.truncated is True
     assert len(response.stdout) < 100
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["install", "/agent-workspaces/verifier/workspace/poc.apk"],
+        ["uninstall", "io.apkscanner.poc.verify"],
+        ["push", "/agent-workspaces/verifier/workspace/page.html", "/data/local/tmp/page.html"],
+        ["shell", "sh", "-c", "am start -a android.intent.action.VIEW"],
+        ["forward", "tcp:8080", "tcp:8080"],
+    ],
+)
+def test_adaptive_gateway_allows_verifier_device_experiments(args: list[str]) -> None:
+    validate_adaptive_adb_args(args)
+    request = AdbGatewayRequest(args=args, policy="adaptive")
+    assert request.policy == "adaptive"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["-s", "other", "shell", "id"],
+        ["connect", "other:5555"],
+        ["disconnect"],
+        ["kill-server"],
+        ["tcpip", "5555"],
+    ],
+)
+def test_adaptive_gateway_keeps_serial_and_server_ownership(args: list[str]) -> None:
+    with pytest.raises((ValueError, ValidationError)):
+        AdbGatewayRequest(args=args, policy="adaptive")

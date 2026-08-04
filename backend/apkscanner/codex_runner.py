@@ -21,7 +21,11 @@ from .agent_events import (
     emit_agent_event,
     normalize_codex_notification,
 )
-from .agent_prompt import developer_instructions, investigation_prompt
+from .agent_prompt import (
+    adaptive_verifier_developer_instructions,
+    developer_instructions,
+    investigation_prompt,
+)
 from .agent_workspace import AgentWorkspaceManager
 from .codex_executor import CodexDockerExecutor
 from .codex_protocol import (
@@ -33,7 +37,12 @@ from .codex_protocol import (
 from .codex_sdk_baseline import PINNED_SDK_VERSION, WORKER_REVISION, runtime_capability
 from .config import Settings
 from .models import EntryPoint, InvestigationTask, Scan
-from .schemas import AGENT_RESULT_JSON_SCHEMA, AgentInvestigationResult
+from .schemas import (
+    ADAPTIVE_VERIFIER_RESULT_JSON_SCHEMA,
+    AGENT_RESULT_JSON_SCHEMA,
+    AdaptiveVerificationResult,
+    AgentInvestigationResult,
+)
 
 
 @dataclass(slots=True)
@@ -45,11 +54,20 @@ class CodexRunResult:
 
 
 @dataclass(slots=True)
+class CodexAdaptiveRunResult:
+    thread_id: str
+    turn_id: str
+    result: AdaptiveVerificationResult
+    usage: dict[str, Any]
+
+
+@dataclass(slots=True)
 class _ActiveDockerSession:
     workspace: Any
     container: Any
     client: PersistentWorkerClient
     role: str
+    last_used: float
 
 
 class CodexInvestigator:
@@ -60,7 +78,9 @@ class CodexInvestigator:
         self._deep_capability: dict[str, Any] | None = None
         self._capability_lock = threading.Lock()
         self._session_lock = threading.RLock()
+        self._session_condition = threading.Condition(self._session_lock)
         self._sessions: dict[tuple[str, str, int, str], _ActiveDockerSession] = {}
+        self._busy_sessions: set[tuple[str, str, int, str]] = set()
 
     def capability(self, *, deep: bool = False) -> dict[str, Any]:
         capability = runtime_capability()
@@ -332,8 +352,35 @@ class CodexInvestigator:
             "critic"
             if phase == "adversarial_review"
             else "rescue"
-            if phase in {"rescue_review", "rescue_exploration"}
+            if phase == "rescue_review"
+            else "rescue_explorer"
+            if phase == "rescue_exploration"
             else "primary"
+        )
+        restricted_review = phase in {
+            "adversarial_review",
+            "rescue_review",
+            "final_evaluation",
+            "recovery_evaluation",
+        }
+        device = platform_context.get("device")
+        proof_replay = platform_context.get("proof_replay")
+        adb_access = bool(
+            not restricted_review
+            and isinstance(device, dict)
+            and device.get("serial")
+            and isinstance(proof_replay, dict)
+            and proof_replay.get("available") is True
+        )
+        actual_developer_instructions = developer_instructions(
+            direct_tool_access=True,
+            shell_access=True,
+            workspace_write=not restricted_review,
+            adb_access=adb_access,
+            network_access=(
+                not restricted_review
+                and self.settings.codex_shell_network == "public_egress"
+            ),
         )
         active = self._prepare_active_session(
             scan=scan,
@@ -342,8 +389,13 @@ class CodexInvestigator:
             phase=phase,
             role=role,
             scan_workspace=scan_workspace,
-            gateway_environment=gateway_environment if role == "primary" else None,
+            gateway_environment=(
+                gateway_environment if role in {"primary", "rescue_explorer"} else None
+            ),
+            cancel_event=cancel_event,
+            developer_instructions_text=actual_developer_instructions,
         )
+        session_key = (scan.id, task.id, task.attempts, role)
         effective_worker_timeout = min(
             (self.settings.task_timeout_seconds if timeout_seconds is None else timeout_seconds),
             self.settings.codex_turn_timeout_seconds,
@@ -368,10 +420,93 @@ class CodexInvestigator:
         except PersistentWorkerError as exc:
             self._discard_session(scan.id, task.id, task.attempts, role)
             raise RuntimeError(f"containerized Codex worker failed: {exc}") from exc
+        finally:
+            self._release_active_session(session_key)
         return CodexRunResult(
             thread_id=str(result["thread_id"]),
             turn_id=str(result["turn_id"]),
             result=AgentInvestigationResult.model_validate(result["result"]),
+            usage=result.get("usage") or {},
+        )
+
+    def verify_batch(
+        self,
+        *,
+        scan: Scan,
+        task: InvestigationTask,
+        workspace: Path,
+        prompt: str,
+        timeout_seconds: int,
+        event_callback: AgentEventCallback | None = None,
+        cancel_event: threading.Event | None = None,
+        gateway_environment: dict[str, str] | None = None,
+    ) -> CodexAdaptiveRunResult:
+        """Run the one scan-level adaptive verifier in its own persistent thread."""
+
+        if self.settings.codex_isolation != "docker":
+            raise RuntimeError("the Adaptive Verifier requires Docker isolation")
+        capability = self._docker_capability(
+            {
+                "available": True,
+                "version": importlib.metadata.version("openai-codex"),
+                "isolation": "docker",
+            }
+        )
+        if not capability.get("available"):
+            raise RuntimeError(str(capability.get("detail")))
+        scan_workspace = (self.settings.data_dir / "workspaces" / scan.id).resolve()
+        if not scan_workspace.is_dir() or "," in str(scan_workspace):
+            raise ValueError("scan decompiler workspace is unavailable or unsafe")
+        ssh_source = self.settings.adaptive_verifier_ssh_source
+        ssh_available = bool(
+            self.settings.adaptive_verifier_copy_host_ssh
+            and ssh_source is not None
+            and ssh_source.is_dir()
+        )
+        role = "verifier"
+        phase = "adaptive_verification"
+        active = self._prepare_active_session(
+            scan=scan,
+            task=task,
+            source_workspace=workspace,
+            phase=phase,
+            role=role,
+            scan_workspace=scan_workspace,
+            gateway_environment=gateway_environment,
+            cancel_event=cancel_event,
+            developer_instructions_text=adaptive_verifier_developer_instructions(
+                ssh_available=ssh_available
+            ),
+        )
+        session_key = (scan.id, task.id, task.attempts, role)
+        effective_timeout = min(
+            timeout_seconds,
+            self.settings.adaptive_verifier_timeout_seconds,
+            self.settings.codex_turn_timeout_seconds,
+        )
+        try:
+            result = active.client.turn(
+                prompt=prompt,
+                output_schema=ADAPTIVE_VERIFIER_RESULT_JSON_SCHEMA,
+                result_contract="json_object.v1",
+                timeout_seconds=effective_timeout,
+                no_event_timeout_seconds=self.settings.codex_no_event_timeout_seconds,
+                event_callback=event_callback,
+                cancel_event=cancel_event,
+            )
+        except PersistentWorkerCancelled as exc:
+            raise AgentCancelledError("Adaptive Verifier was cancelled by the user") from exc
+        except PersistentWorkerTimeout as exc:
+            raise TimeoutError(f"Adaptive Verifier exceeded its timeout: {exc}") from exc
+        except PersistentWorkerError as exc:
+            self._discard_session(scan.id, task.id, task.attempts, role)
+            raise RuntimeError(f"Adaptive Verifier worker failed: {exc}") from exc
+        finally:
+            self._release_active_session(session_key)
+        return CodexAdaptiveRunResult(
+            thread_id=str(result["thread_id"]),
+            turn_id=str(result["turn_id"]),
+            result=AdaptiveVerificationResult.model_validate(result["result"]),
             usage=result.get("usage") or {},
         )
 
@@ -408,10 +543,17 @@ class CodexInvestigator:
         role: str,
         scan_workspace: Path,
         gateway_environment: dict[str, str] | None,
+        cancel_event: threading.Event | None,
+        developer_instructions_text: str,
     ) -> _ActiveDockerSession:
         key = (scan.id, task.id, task.attempts, role)
-        with self._session_lock:
+        with self._session_condition:
             existing = self._sessions.get(key)
+            while existing is not None and key in self._busy_sessions:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise AgentCancelledError("Codex session wait was cancelled")
+                self._session_condition.wait(timeout=0.5)
+                existing = self._sessions.get(key)
             if existing is not None and existing.client.process.poll() is None:
                 self.workspaces.prepare_session(
                     scan_id=scan.id,
@@ -421,10 +563,13 @@ class CodexInvestigator:
                     source_workspace=source_workspace,
                     context={"phase": phase},
                 )
+                existing.last_used = time.monotonic()
+                self._busy_sessions.add(key)
                 return existing
             if existing is not None:
                 self._sessions.pop(key, None)
                 existing.client.kill()
+            self._wait_for_worker_capacity(scan.id, cancel_event=cancel_event)
             sessions_root = self.workspaces.prepare_scan(scan.id)
             agent_session = self.workspaces.prepare_session(
                 scan_id=scan.id,
@@ -460,7 +605,7 @@ class CodexInvestigator:
                 cleanup=stop_session,
             )
             configuration = {
-                "developer_instructions": developer_instructions(direct_tool_access=True),
+                "developer_instructions": developer_instructions_text,
                 "model": self.settings.codex_model,
                 "model_provider": self.settings.codex_provider,
                 "reasoning_effort": self.settings.codex_reasoning_effort,
@@ -510,13 +655,60 @@ class CodexInvestigator:
                 encoding="utf-8",
             )
             thread_file.chmod(0o600)
-            active = _ActiveDockerSession(agent_session, container, client, role)
+            active = _ActiveDockerSession(
+                agent_session,
+                container,
+                client,
+                role,
+                time.monotonic(),
+            )
             self._sessions[key] = active
+            self._busy_sessions.add(key)
             return active
 
+    def _wait_for_worker_capacity(
+        self,
+        scan_id: str,
+        *,
+        cancel_event: threading.Event | None,
+    ) -> None:
+        """Evict resumable idle workers or wait; capacity pressure never fails a task."""
+
+        while True:
+            scan_count = sum(1 for key in self._sessions if key[0] == scan_id)
+            global_full = len(self._sessions) >= self.settings.codex_max_sessions
+            scan_full = scan_count >= self.settings.codex_max_sessions_per_scan
+            if not global_full and not scan_full:
+                return
+            candidates = [
+                (key, active)
+                for key, active in self._sessions.items()
+                if key not in self._busy_sessions and (not scan_full or key[0] == scan_id)
+            ]
+            if candidates:
+                evicted_key, evicted = min(candidates, key=lambda item: item[1].last_used)
+                self._sessions.pop(evicted_key, None)
+                with suppress(Exception):
+                    evicted.client.close()
+                continue
+            if cancel_event is not None and cancel_event.is_set():
+                raise AgentCancelledError("Codex worker capacity wait was cancelled")
+            self._session_condition.wait(timeout=0.5)
+
+    def _release_active_session(self, key: tuple[str, str, int, str]) -> None:
+        with self._session_condition:
+            active = self._sessions.get(key)
+            if active is not None:
+                active.last_used = time.monotonic()
+            self._busy_sessions.discard(key)
+            self._session_condition.notify_all()
+
     def _discard_session(self, scan_id: str, task_id: str, attempt: int, role: str) -> None:
-        with self._session_lock:
-            active = self._sessions.pop((scan_id, task_id, attempt, role), None)
+        key = (scan_id, task_id, attempt, role)
+        with self._session_condition:
+            active = self._sessions.pop(key, None)
+            self._busy_sessions.discard(key)
+            self._session_condition.notify_all()
         if active is not None:
             active.client.kill()
 
@@ -537,15 +729,21 @@ class CodexInvestigator:
             "critic"
             if phase == "adversarial_review"
             else "rescue"
-            if phase in {"rescue_review", "rescue_exploration"}
+            if phase == "rescue_review"
+            else "rescue_explorer"
+            if phase == "rescue_exploration"
+            else "verifier"
+            if phase == "adaptive_verification"
             else "primary"
         )
 
     def close_scan(self, scan_id: str) -> None:
-        with self._session_lock:
+        with self._session_condition:
             sessions = [
                 self._sessions.pop(key) for key in list(self._sessions) if key[0] == scan_id
             ]
+            self._busy_sessions = {key for key in self._busy_sessions if key[0] != scan_id}
+            self._session_condition.notify_all()
         for active in sessions:
             with suppress(Exception):
                 active.client.close()
@@ -554,21 +752,29 @@ class CodexInvestigator:
 
     def close_task(self, scan_id: str, task_id: str) -> None:
         """Close all Agent roles owned by one terminal task and free its slots."""
-        with self._session_lock:
+        with self._session_condition:
             sessions = [
                 self._sessions.pop(key)
                 for key in list(self._sessions)
                 if key[0] == scan_id and key[1] == task_id
             ]
+            self._busy_sessions = {
+                key
+                for key in self._busy_sessions
+                if not (key[0] == scan_id and key[1] == task_id)
+            }
+            self._session_condition.notify_all()
         for active in sessions:
             with suppress(Exception):
                 active.client.close()
         self.workspaces.forget_task(scan_id, task_id)
 
     def shutdown(self) -> None:
-        with self._session_lock:
+        with self._session_condition:
             sessions = list(self._sessions.values())
             self._sessions.clear()
+            self._busy_sessions.clear()
+            self._session_condition.notify_all()
         for active in sessions:
             with suppress(Exception):
                 active.client.close()

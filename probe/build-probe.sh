@@ -33,8 +33,8 @@ mkdir -p "$classes" "$dex"
     --manifest /src/probe/app/src/main/AndroidManifest.xml \
     --min-sdk-version 26 \
     --target-sdk-version 36 \
-    --version-code 3 \
-    --version-name 0.3.0
+    --version-code 4 \
+    --version-name 0.4.0
 
 javac \
     -encoding UTF-8 \

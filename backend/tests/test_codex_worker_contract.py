@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
+
 import pytest
-from apkscanner.codex_worker import TurnCommand
+from apkscanner.codex_worker import PersistentCodexWorker, TurnCommand
 from apkscanner.schemas import AGENT_RESULT_JSON_SCHEMA
 from pydantic import ValidationError
 
@@ -43,3 +45,17 @@ def test_json_object_contract_requires_an_explicit_schema() -> None:
         _command(result_contract="json_object.v1", output_schema=schema)
     )
     assert command.resolved_output_schema() == schema
+
+
+def test_gateway_environment_accepts_only_known_adb_policy(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.delenv("APKSCANNER_ADB_POLICY", raising=False)
+
+    PersistentCodexWorker._install_gateway_environment(
+        {"APKSCANNER_ADB_POLICY": "adaptive"}
+    )
+
+    assert os.environ["APKSCANNER_ADB_POLICY"] == "adaptive"
+    with pytest.raises(ValueError, match="gateway ADB policy is invalid"):
+        PersistentCodexWorker._install_gateway_environment(
+            {"APKSCANNER_ADB_POLICY": "unrestricted"}
+        )

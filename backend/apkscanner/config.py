@@ -27,8 +27,11 @@ class Settings:
     scan_deadline_seconds: int = 24 * 60 * 60
     task_timeout_seconds: int = 4 * 60 * 60
     task_max_attempts: int = 2
-    agent_max_rounds: int = 3
-    agent_tests_per_round: int = 8
+    adaptive_verifier_enabled: bool = True
+    adaptive_verifier_min_severity: str = "info"
+    adaptive_verifier_timeout_seconds: int = 3_600
+    adaptive_verifier_copy_host_ssh: bool = True
+    adaptive_verifier_ssh_source: Path | None = None
     agent_permission_profile: str = "personal_lab"
     investigator_backend: str = "codex"
     codex_enabled: bool = False
@@ -44,8 +47,8 @@ class Settings:
     codex_web_search: str = "live"
     codex_shell_network: str = "public_egress"
     codex_max_containers: int = 2
-    codex_max_sessions: int = 6
-    codex_max_sessions_per_scan: int = 3
+    codex_max_sessions: int = 8
+    codex_max_sessions_per_scan: int = 6
     codex_uid_min: int = 21_000
     codex_uid_max: int = 21_999
     codex_cpu_limit: float = 6.0
@@ -95,6 +98,13 @@ class Settings:
         legacy_serial = (os.getenv("APKSCANNER_ADB_SERIAL") or "").strip() or None
         if not configured_serials and legacy_serial:
             configured_serials = (legacy_serial,)
+        configured_verifier_ssh = os.getenv("APKSCANNER_ADAPTIVE_VERIFIER_SSH_SOURCE")
+        if configured_verifier_ssh is None:
+            verifier_ssh_source: Path | None = (Path.home() / ".ssh").resolve()
+        elif configured_verifier_ssh.strip():
+            verifier_ssh_source = Path(configured_verifier_ssh.strip()).expanduser().resolve()
+        else:
+            verifier_ssh_source = None
         configured_host_adb = os.getenv("APKSCANNER_HOST_ADB")
         if configured_host_adb is None:
             host_adb_executable = "adb"
@@ -112,12 +122,23 @@ class Settings:
             scan_deadline_seconds=int(os.getenv("APKSCANNER_SCAN_DEADLINE", 86_400)),
             task_timeout_seconds=int(os.getenv("APKSCANNER_TASK_TIMEOUT", 14_400)),
             task_max_attempts=int(os.getenv("APKSCANNER_TASK_MAX_ATTEMPTS", 2)),
-            agent_max_rounds=max(
-                1, min(5, int(os.getenv("APKSCANNER_AGENT_MAX_ROUNDS", 3)))
+            adaptive_verifier_enabled=_env_bool(
+                "APKSCANNER_ADAPTIVE_VERIFIER_ENABLED", True
             ),
-            agent_tests_per_round=max(
-                1, min(1_000, int(os.getenv("APKSCANNER_AGENT_TESTS_PER_ROUND", 8)))
+            adaptive_verifier_min_severity=os.getenv(
+                "APKSCANNER_ADAPTIVE_VERIFIER_MIN_SEVERITY", "info"
+            ).lower(),
+            adaptive_verifier_timeout_seconds=max(
+                60,
+                min(
+                    24 * 60 * 60,
+                    int(os.getenv("APKSCANNER_ADAPTIVE_VERIFIER_TIMEOUT", 3_600)),
+                ),
             ),
+            adaptive_verifier_copy_host_ssh=_env_bool(
+                "APKSCANNER_ADAPTIVE_VERIFIER_COPY_HOST_SSH", True
+            ),
+            adaptive_verifier_ssh_source=verifier_ssh_source,
             agent_permission_profile=os.getenv(
                 "APKSCANNER_AGENT_PERMISSION_PROFILE", "personal_lab"
             ).lower(),
@@ -150,10 +171,10 @@ class Settings:
                 1, int(os.getenv("APKSCANNER_CODEX_MAX_CONTAINERS", 2))
             ),
             codex_max_sessions=max(
-                1, int(os.getenv("APKSCANNER_CODEX_MAX_SESSIONS", 6))
+                1, int(os.getenv("APKSCANNER_CODEX_MAX_SESSIONS", 8))
             ),
             codex_max_sessions_per_scan=max(
-                1, int(os.getenv("APKSCANNER_CODEX_MAX_SESSIONS_PER_SCAN", 3))
+                1, int(os.getenv("APKSCANNER_CODEX_MAX_SESSIONS_PER_SCAN", 6))
             ),
             codex_uid_min=int(os.getenv("APKSCANNER_CODEX_UID_MIN", 21_000)),
             codex_uid_max=int(os.getenv("APKSCANNER_CODEX_UID_MAX", 21_999)),
@@ -266,6 +287,16 @@ class Settings:
 
         if self.investigator_backend not in {"codex", "none"}:
             raise ValueError("APKSCANNER_INVESTIGATOR_BACKEND must be codex or none")
+        if self.adaptive_verifier_min_severity not in {
+            "critical",
+            "high",
+            "medium",
+            "low",
+            "info",
+        }:
+            raise ValueError(
+                "APKSCANNER_ADAPTIVE_VERIFIER_MIN_SEVERITY must be a valid severity"
+            )
         if self.codex_isolation not in {"docker", "host"}:
             raise ValueError("APKSCANNER_CODEX_ISOLATION must be docker or host")
         if self.codex_isolation == "host" and not self.codex_allow_host:

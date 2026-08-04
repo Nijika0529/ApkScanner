@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import zipfile
 from pathlib import Path
@@ -66,6 +67,32 @@ def test_rescuetest_fixture_contains_a_hidden_cross_component_chain() -> None:
     assert '"rescue-chain-secret"' in relay
 
 
+def test_adaptive_fixture_has_five_positive_cases_and_reproducible_identity() -> None:
+    apk = FIXTURE_ROOT / "adaptivecases.apk"
+    assert apk.is_file()
+    assert apk.stat().st_size < 64 * 1024
+    with zipfile.ZipFile(apk) as archive:
+        assert {"AndroidManifest.xml", "classes.dex"} <= set(archive.namelist())
+
+    truth = BenchmarkSpec.model_validate(
+        json.loads((FIXTURE_ROOT / "adaptivecases-ground-truth.json").read_text())
+    )
+    assert len(truth.vulnerabilities) == 5
+    assert hashlib.sha256(apk.read_bytes()).hexdigest() == truth.apk_sha256
+
+    source = FIXTURE_ROOT / "adaptivecases-src"
+    manifest = ElementTree.parse(source / "AndroidManifest.xml").getroot()
+    android = "{http://schemas.android.com/apk/res/android}"
+    uses_sdk = manifest.find("uses-sdk")
+    assert uses_sdk is not None
+    assert uses_sdk.get(f"{android}minSdkVersion") == "26"
+    assert uses_sdk.get(f"{android}targetSdkVersion") == "36"
+
+    build_script = (FIXTURE_ROOT / "build-adaptivecases.sh").read_text()
+    assert 'touch -t 198001010000 "$dex_dir/classes.dex"' in build_script
+    assert "--v1-signing-enabled false" in build_script
+
+
 def test_vulntest_source_contains_real_attack_paths_and_safe_control() -> None:
     manifest = ElementTree.parse(SOURCE_ROOT / "AndroidManifest.xml").getroot()
     android = "{http://schemas.android.com/apk/res/android}"
@@ -117,5 +144,8 @@ def test_platform_probe_supports_shell_gated_binder_transactions() -> None:
     assert 'android:permission="android.permission.DUMP"' in manifest
     assert "android.permission.QUERY_ALL_PACKAGES" in manifest
     assert '"binder_transact"' in receiver
+    assert '"binder_script"' in receiver
+    assert "applyBinderWrites" in receiver
+    assert "readBinderReplies" in receiver
     assert "service.transact" in receiver
     assert 'result.put("binderReply"' in receiver

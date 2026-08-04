@@ -120,7 +120,9 @@ export APKSCANNER_PROBE_APK="$PWD/probe/app/build/outputs/apk/debug/app-debug.ap
 The Probe receiver requires `android.permission.DUMP`, so only the ADB shell/platform can dispatch
 requests; target calls still originate from the Probe's ordinary application UID. Platform
 `binder_transact` reads a typed reply and evaluates a `binder_reply` Oracle without trusting a
-PoC-authored result log.
+PoC-authored result log. `binder_script` extends the same platform-owned ordinary-UID Probe with
+bounded primitive Parcel writes, byte arrays, multiple primitive reply reads, and exact/contains/
+regex/SHA-256 reply predicates.
 
 Without ADB, scans still complete from static evidence. Without the optional Probe APK, raw ADB
 exploration and Agent-built dedicated PoCs remain available; the platform reports a gap only when
@@ -169,16 +171,25 @@ scanctl evaluate --scan-id SCAN_ID --truth /path/to/private-ground-truth.json
 ```
 
 The primary score is precision-weighted F0.5. A successful Probe reachability result is tracked as
-`execution_demonstrated`, but dynamic benchmark credit additionally requires a domain Prover's
-platform-verifiable `security_impact_observed` signal. `candidate`, `inconclusive`, manually accepted
-findings, and model prose without platform proof never count as discoveries. Ground-truth cases
-default to `minimum_proof: dynamic`; a merely suspicious exported declaration therefore cannot earn
-credit. Confirmed findings that do not match the private ground truth count as false positives, while
+`execution_demonstrated`, while ordinary investigation needs a domain Prover's platform-verifiable
+`security_impact_observed` signal for dynamic credit. The terminal scan-level Adaptive Verifier is
+the exception for observations that cannot be reduced to a fixed Oracle: it can award dynamic status
+only after a real runtime experiment and stores its structured semantic assessment plus the complete
+tool timeline as Evidence. `candidate`, `inconclusive`, manually accepted findings, and model prose
+without runtime proof never count as discoveries. Ground-truth cases default to
+`minimum_proof: dynamic`; a merely suspicious exported declaration therefore cannot earn credit.
+Confirmed findings that do not match the private ground truth count as false positives, while
 unproven AI output is reported separately as noise.
 
-Likewise, a model may emit `not_reproduced` only when a correlated executed test case carries an
-explicit platform `oracle_refuted=true` result. Without that Oracle the platform retains an explicit
-static verdict instead of manufacturing a generic “insufficient information” conclusion.
+Each ground-truth file also carries a `quality_gate`. Its default is deliberately strict:
+precision 1.0, recall 1.0, and zero false positives. This makes “100%” a reproducible release gate
+for a pinned APK, device/profile, ground-truth revision, and scanner revision; it is not a claim that
+an open-ended audit of every APK can be guaranteed to find every possible vulnerability.
+
+Likewise, ordinary investigation may emit `not_reproduced` only when a correlated executed test case
+carries an explicit platform `oracle_refuted=true` result. The Adaptive Verifier may use that verdict
+only with `runtime_observed=true` and concrete counterevidence; without a relevant runtime attempt the
+platform retains the explicit static verdict.
 
 Every scan also seals an Android threat model that fixes the ordinary third-party app/guest attacker,
 assets, trust boundaries, and final-evidence policy. Agents close each tested hypothesis separately
@@ -232,8 +243,13 @@ Host mode is diagnostics-only and requires both `APKSCANNER_CODEX_ISOLATION=host
 
 Worker Protocol v3 uses one persistent, non-ephemeral Thread for each role session. Primary turns
 reuse that Thread; a replacement worker attempts `thread_resume` from its private `CODEX_HOME`.
-ADB and Proof credentials are issued only to a primary turn while its task owns the device lease;
-Critic and Rescue roles receive neither token. Extension manifests live under
+For ordinary tasks, ADB and Proof credentials are issued only to a primary turn while it owns the
+device lease; Critic and Rescue roles receive neither token. After ordinary tasks finish, one fresh scan-level
+Adaptive Verifier Thread batches the remaining configured `supported_static` findings. Its private
+HOME receives a runtime copy of the configured host SSH directory (host `~/.ssh` by default), so it
+uses `ssh`/`scp` directly; only this role receives that copy, and task cleanup deletes it. Its ADB
+policy permits full experiments on the leased serial while still rejecting transport/server control.
+Extension manifests live under
 `$APKSCANNER_DATA_DIR/capabilities/`, and hash-pinned scripts under
 `$APKSCANNER_DATA_DIR/capability-scripts/`. Python entries run in short-lived Docker sidecars with
 no network by default, a read-only root filesystem, and all Linux capabilities dropped. MCP
@@ -276,13 +292,18 @@ OpenCode design remains only for historical reference in
 | `APKSCANNER_CODEX_MODEL_CATALOG` | `config/deepseek-models.json` | Pinned DeepSeek model catalog |
 | `APKSCANNER_CODEX_WEB_SEARCH` | `live` | Codex Web Search mode; the current contract requires `live` |
 | `APKSCANNER_CODEX_MAX_CONTAINERS` | `2` | Global concurrent scan-container limit |
-| `APKSCANNER_CODEX_MAX_SESSIONS` | `6` | Global UID-session limit |
-| `APKSCANNER_CODEX_MAX_SESSIONS_PER_SCAN` | `3` | Per-scan role-session limit |
+| `APKSCANNER_CODEX_MAX_SESSIONS` | `8` | Global active Worker limit; idle resumable Workers are evicted and busy capacity waits instead of failing tasks |
+| `APKSCANNER_CODEX_MAX_SESSIONS_PER_SCAN` | `6` | Per-scan active Worker limit; retained audit workspaces do not consume it |
 | `APKSCANNER_CODEX_UID_MIN` / `APKSCANNER_CODEX_UID_MAX` | `21000` / `21999` | Non-reused session UID pool within a scan |
 | `APKSCANNER_CODEX_CPU_LIMIT` / `APKSCANNER_CODEX_MEMORY_LIMIT` | `6` / `12g` | Per-scan container limits |
 | `APKSCANNER_CODEX_TURN_TIMEOUT` | 3600 s | Hard timeout for one Codex invocation |
 | `APKSCANNER_CODEX_NO_EVENT_TIMEOUT` | 900 s | Silent-worker timeout |
 | `APKSCANNER_CODEX_BIN` | bundled SDK runtime | Explicit tested Codex binary override |
+| `APKSCANNER_ADAPTIVE_VERIFIER_ENABLED` | `true` | Run one terminal, scan-level Codex verifier for unresolved static findings |
+| `APKSCANNER_ADAPTIVE_VERIFIER_MIN_SEVERITY` | `info` | Lowest severity included; the default batches every `supported_static` finding |
+| `APKSCANNER_ADAPTIVE_VERIFIER_TIMEOUT` | 3600 s | Total timeout for the batch verification Turn |
+| `APKSCANNER_ADAPTIVE_VERIFIER_COPY_HOST_SSH` | `true` | Copy host OpenSSH material into the verifier's private HOME |
+| `APKSCANNER_ADAPTIVE_VERIFIER_SSH_SOURCE` | host `~/.ssh` | Optional SSH directory copied at runtime; an empty value disables it |
 | `APKSCANNER_DEEPSEEK_BASE_URL` | DeepSeek default | Optional trusted HTTP(S) gateway |
 | `DEEPSEEK_API_KEY` | unset | DeepSeek credential inherited only by the UID worker exec |
 | `APKSCANNER_ANDROID_VERSION` | `16` | Reported dynamic baseline |
@@ -294,8 +315,12 @@ OpenCode design remains only for historical reference in
 | `APKSCANNER_MAX_UPLOAD_BYTES` | 512 MiB | Intake limit |
 | `APKSCANNER_TASK_TIMEOUT` | 14400 s | Total investigation-task budget |
 | `APKSCANNER_TASK_MAX_ATTEMPTS` | 2 | Retry budget |
-| `APKSCANNER_AGENT_MAX_ROUNDS` | ignored | Retained for compatibility; adaptive Agent rounds are not count-capped |
-| `APKSCANNER_AGENT_TESTS_PER_ROUND` | 8 | Maximum accepted AI-requested tests per round (1–1000) |
+
+Investigation and Adaptive Verifier turns have no platform-imposed tool-call, PoC-rebuild,
+fallback-strategy, proof-replay, exploration-round, per-round-test, or candidate-count ceiling.
+Task/scan deadlines, cancellation, device leases, protocol validation, and isolation boundaries remain
+operational controls. Critic, Rescue, and Final phases remain single-start phases per task; this limits
+debate lifecycle fan-out without constraining the work performed inside an allowed turn.
 
 ## Verification
 

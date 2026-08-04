@@ -7,12 +7,13 @@ import stat
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from apkscanner.agent_workspace import AgentWorkspaceManager
 from apkscanner.codex_executor import CodexDockerExecutor, ScanContainer
 from apkscanner.codex_protocol import PersistentWorkerClient, PersistentWorkerError
-from apkscanner.codex_runner import CodexInvestigator
+from apkscanner.codex_runner import CodexInvestigator, _ActiveDockerSession
 
 SCAN_ID = "00000000-0000-0000-0000-000000000101"
 TASK_ID = "00000000-0000-0000-0000-000000000102"
@@ -150,6 +151,116 @@ def test_workspace_manager_releases_terminal_task_slot_without_reusing_uid(setti
     assert second.uid != first.uid
 
 
+def test_only_verifier_receives_a_private_copy_of_host_ssh(settings) -> None:  # noqa: ANN001
+    host_ssh = settings.data_dir / "host-ssh"
+    host_ssh.mkdir(mode=0o700)
+    (host_ssh / "config").write_text("Host aliyun\n  HostName 192.0.2.10\n", encoding="utf-8")
+    (host_ssh / "id_ed25519").write_text("test-private-key", encoding="utf-8")
+    configured = replace(
+        settings,
+        adaptive_verifier_copy_host_ssh=True,
+        adaptive_verifier_ssh_source=host_ssh,
+        codex_uid_min=21_115,
+        codex_uid_max=21_119,
+    )
+    source = configured.data_dir / "verifier-source"
+    source.mkdir()
+    manager = AgentWorkspaceManager(configured)
+
+    primary = manager.prepare_session(
+        scan_id=SCAN_ID,
+        task_id=TASK_ID,
+        attempt=1,
+        role="primary",
+        source_workspace=source,
+    )
+    verifier = manager.prepare_session(
+        scan_id=SCAN_ID,
+        task_id="11111111-0000-0000-0000-000000000104",
+        attempt=1,
+        role="verifier",
+        source_workspace=source,
+    )
+
+    assert not (primary.home / ".ssh").exists()
+    assert (verifier.home / ".ssh" / "config").read_text(encoding="utf-8").startswith(
+        "Host aliyun"
+    )
+    assert (verifier.home / ".ssh" / "id_ed25519").read_text(encoding="utf-8") == (
+        "test-private-key"
+    )
+    assert _mode(verifier.home / ".ssh") == 0o700
+    assert _mode(verifier.home / ".ssh" / "id_ed25519") == 0o600
+    assert (verifier.home / ".ssh" / "id_ed25519").stat().st_uid == verifier.uid
+
+    manager.forget_task(verifier.scan_id, verifier.task_id)
+    assert not (verifier.home / ".ssh").exists()
+
+
+def test_retained_audit_workspaces_do_not_consume_active_worker_limit(settings) -> None:  # noqa: ANN001
+    configured = replace(
+        settings,
+        codex_uid_min=21_130,
+        codex_uid_max=21_140,
+        codex_max_sessions=1,
+        codex_max_sessions_per_scan=1,
+    )
+    source = configured.data_dir / "source-many-roles"
+    source.mkdir()
+    manager = AgentWorkspaceManager(configured)
+
+    primary = manager.prepare_session(
+        scan_id=SCAN_ID,
+        task_id=TASK_ID,
+        attempt=1,
+        role="primary",
+        source_workspace=source,
+    )
+    critic = manager.prepare_session(
+        scan_id=SCAN_ID,
+        task_id=TASK_ID,
+        attempt=1,
+        role="critic",
+        source_workspace=source,
+    )
+
+    assert primary.uid != critic.uid
+    assert primary.root.is_dir()
+    assert critic.root.is_dir()
+
+
+def test_worker_capacity_evicts_an_idle_resumable_session_instead_of_failing(settings) -> None:  # noqa: ANN001
+    configured = replace(
+        settings,
+        codex_max_sessions=1,
+        codex_max_sessions_per_scan=1,
+    )
+    investigator = CodexInvestigator(configured)
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = FakeClient()
+    key = (SCAN_ID, TASK_ID, 1, "primary")
+    investigator._sessions[key] = _ActiveDockerSession(
+        workspace=SimpleNamespace(),
+        container=SimpleNamespace(),
+        client=client,  # type: ignore[arg-type]
+        role="primary",
+        last_used=1.0,
+    )
+
+    with investigator._session_condition:
+        investigator._wait_for_worker_capacity(SCAN_ID, cancel_event=None)
+
+    assert client.closed is True
+    assert investigator._sessions == {}
+
+
 def test_scan_container_command_has_scan_scope_and_no_provider_secret(settings) -> None:  # noqa: ANN001
     configured = replace(settings, codex_docker_image="test-worker:fixed")
     scan_workspace = configured.data_dir / "workspaces" / SCAN_ID
@@ -226,11 +337,19 @@ def test_worker_exec_injects_only_key_name_for_one_uid(settings, monkeypatch) ->
     reason="requires APKSCANNER_RUN_DOCKER_TESTS=1, root, and Docker",
 )
 def test_real_scan_container_shares_input_but_isolates_session_uids(settings) -> None:  # noqa: ANN001
+    host_ssh = settings.data_dir / "integration-host-ssh"
+    host_ssh.mkdir(mode=0o700)
+    (host_ssh / "config").write_text(
+        "Host aliyun-test\n  HostName 192.0.2.20\n",
+        encoding="utf-8",
+    )
     configured = replace(
         settings,
         codex_docker_image="apk-scanner-codex-worker:0.2.0",
         codex_uid_min=21_300,
         codex_uid_max=21_310,
+        adaptive_verifier_copy_host_ssh=True,
+        adaptive_verifier_ssh_source=host_ssh,
     )
     source = configured.data_dir / "source"
     source.mkdir()
@@ -254,6 +373,13 @@ def test_real_scan_container_shares_input_but_isolates_session_uids(settings) ->
         task_id=TASK_ID,
         attempt=1,
         role="critic",
+        source_workspace=source,
+    )
+    verifier = manager.prepare_session(
+        scan_id=SCAN_ID,
+        task_id="11111111-0000-0000-0000-000000000105",
+        attempt=1,
+        role="verifier",
         source_workspace=source,
     )
     executor = CodexDockerExecutor(configured)
@@ -292,6 +418,27 @@ def test_real_scan_container_shares_input_but_isolates_session_uids(settings) ->
                 docker,
                 "exec",
                 "--user",
+                f"{verifier.uid}:{verifier.gid}",
+                "--env",
+                f"HOME={verifier.container_home}",
+                "--workdir",
+                verifier.container_workspace,
+                container.container_id,
+                "/bin/sh",
+                "-c",
+                "test -x /usr/bin/ssh && test -r \"$HOME/.ssh/config\" && "
+                f"test ! -r {primary.container_workspace}/primary.txt",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        subprocess.run(
+            [
+                docker,
+                "exec",
+                "--user",
                 f"{critic.uid}:{critic.gid}",
                 "--workdir",
                 critic.container_workspace,
@@ -316,6 +463,8 @@ def test_real_scan_container_shares_input_but_isolates_session_uids(settings) ->
         assert "DEEPSEEK_API_KEY" not in inspected.stdout
         assert (primary.workspace / "primary.txt").read_text(encoding="utf-8") == "primary"
         assert (critic.workspace / "critic.txt").read_text(encoding="utf-8") == "critic"
+        assert not (primary.home / ".ssh").exists()
+        assert (verifier.home / ".ssh" / "config").is_file()
     finally:
         executor.close_scan(SCAN_ID)
 

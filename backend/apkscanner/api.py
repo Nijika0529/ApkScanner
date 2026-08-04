@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import (
     APIRouter,
@@ -18,7 +18,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
-from sqlalchemy import case, desc, select, update
+from sqlalchemy import case, desc, or_, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from . import __version__
@@ -1166,6 +1166,7 @@ def list_benchmark_evaluations(
 def list_agent_audits(
     scan_id: str,
     include_artifacts: bool = Query(default=True),
+    audit_id: str | None = Query(default=None, min_length=1, max_length=128),
     session: Session = Depends(get_session),
     store: ArtifactStore = Depends(get_store),
 ) -> list[dict[str, Any]]:
@@ -1176,6 +1177,7 @@ def list_agent_audits(
         store,
         scan_id,
         include_artifacts=include_artifacts,
+        audit_id=audit_id,
     )
 
 
@@ -1199,10 +1201,13 @@ def list_events(
     scan_id: str,
     after: int = Query(0, ge=0),
     limit: int = Query(300, ge=1, le=2_000),
+    detail: Literal["summary", "full"] = Query("full"),
     session: Session = Depends(get_session),
 ) -> list[ScanEvent]:
     require_scan(session, scan_id)
     statement = select(ScanEvent).where(ScanEvent.scan_id == scan_id)
+    if detail == "summary":
+        statement = statement.where(_console_summary_event_filter())
     if after:
         return list(
             session.scalars(
@@ -1224,6 +1229,7 @@ async def stream_events(
     request: Request,
     database: Database = Depends(get_database),
     after: int = Query(0, ge=0),
+    detail: Literal["summary", "full"] = Query("full"),
 ) -> StreamingResponse:
     with database.session_factory() as session:
         if session.get(Scan, scan_id) is None:
@@ -1241,12 +1247,15 @@ async def stream_events(
         cursor = initial_cursor
         while not await request.is_disconnected():
             with database.session_factory() as session:
+                statement = select(ScanEvent).where(
+                    ScanEvent.scan_id == scan_id,
+                    ScanEvent.id > cursor,
+                )
+                if detail == "summary":
+                    statement = statement.where(_console_summary_event_filter())
                 events = list(
                     session.scalars(
-                        select(ScanEvent)
-                        .where(ScanEvent.scan_id == scan_id, ScanEvent.id > cursor)
-                        .order_by(ScanEvent.id)
-                        .limit(200)
+                        statement.order_by(ScanEvent.id).limit(200)
                     )
                 )
                 scan = session.get(Scan, scan_id)
@@ -1268,6 +1277,26 @@ async def stream_events(
             await asyncio.sleep(1)
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+_SUMMARY_MODEL_EVENTS = {
+    "exploration.model.cancelled",
+    "exploration.model.completed",
+    "exploration.model.dispatched",
+    "exploration.model.failed",
+    "exploration.model.output.validated",
+}
+
+
+def _console_summary_event_filter():  # noqa: ANN202
+    """Exclude high-rate runtime telemetry from the interactive console stream."""
+    return (
+        or_(
+            ~ScanEvent.event_type.like("exploration.model.%"),
+            ScanEvent.event_type.in_(_SUMMARY_MODEL_EVENTS),
+        )
+        & (ScanEvent.event_type != "exploration.evidence.created")
+    )
 
 
 @router.post("/findings/{finding_id}/review", response_model=FindingOut)

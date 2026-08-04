@@ -40,6 +40,7 @@ RUN if [ -n "${DEBIAN_MIRROR}" ]; then \
         git \
         jq \
         openjdk-17-jdk-headless \
+        openssh-client \
         ripgrep \
         smali \
         sqlite3 \
@@ -97,6 +98,6 @@ RUN ln -s /usr/local/lib/python3.13/site-packages/codex_cli_bin/bin/codex \
     && test -x /usr/local/bin/apkscanner-adb-gateway \
     && ln -s /usr/local/bin/apkscanner-adb-gateway /usr/local/bin/adb
 
-LABEL io.apkscanner.worker-revision="20260803.1"
+LABEL io.apkscanner.worker-revision="20260804.1"
 
 ENTRYPOINT ["python", "-m", "apkscanner.codex_worker"]

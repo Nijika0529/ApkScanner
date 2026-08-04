@@ -278,7 +278,7 @@ source/control/sink/reachable path/boundary/counterevidence/proof gaps 证据元
 | `APKSCANNER_CODEX_WEB_SEARCH` | `live` | Codex Web Search 模式；当前契约要求 `live` |
 | `APKSCANNER_CODEX_MAX_CONTAINERS` | `2` | 全局并行扫描容器上限 |
 | `APKSCANNER_CODEX_MAX_SESSIONS` | `6` | 全局 UID session 上限 |
-| `APKSCANNER_CODEX_MAX_SESSIONS_PER_SCAN` | `3` | 单扫描 role session 上限 |
+| `APKSCANNER_CODEX_MAX_SESSIONS_PER_SCAN` | `6` | 单扫描活动 Worker 上限；空闲可恢复 Worker 不占配额 |
 | `APKSCANNER_CODEX_UID_MIN` / `APKSCANNER_CODEX_UID_MAX` | `21000` / `21999` | 扫描内不复用的 session UID 池 |
 | `APKSCANNER_CODEX_CPU_LIMIT` / `APKSCANNER_CODEX_MEMORY_LIMIT` | `6` / `12g` | 单扫描容器资源上限 |
 | `APKSCANNER_CODEX_TURN_TIMEOUT` | 3600 秒 | 单次 Codex 调用硬超时 |
@@ -295,8 +295,11 @@ source/control/sink/reachable path/boundary/counterevidence/proof gaps 证据元
 | `APKSCANNER_MAX_UPLOAD_BYTES` | 512 MiB | 上传大小限制 |
 | `APKSCANNER_TASK_TIMEOUT` | 14400 秒 | 每个调查任务的总时间预算 |
 | `APKSCANNER_TASK_MAX_ATTEMPTS` | 2 | 重试次数预算 |
-| `APKSCANNER_AGENT_MAX_ROUNDS` | 3 | 每任务最大自适应 AI/设备轮数（1–5） |
-| `APKSCANNER_AGENT_TESTS_PER_ROUND` | 8 | 每轮最多接受的 AI 测试数（1–1000） |
+
+调查 Agent 与终局 Adaptive Verifier 不设置工具调用、PoC 重建、fallback 策略、Proof Replay、
+探索轮次、单轮测试或候选数量上限。任务/扫描生命周期、取消、设备租约、协议校验和隔离边界仍是
+运行保障。Critic、Rescue、Final 每个阶段在单任务中仍最多启动一次；该限制只控制辩论阶段扇出，
+不限制获准 Turn 内的审查深度。
 
 ## 验证
 

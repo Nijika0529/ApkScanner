@@ -624,6 +624,10 @@ def test_one_platform_proof_does_not_close_other_hypotheses(settings) -> None:  
     progress = ledger.task_hypothesis_progress(task.id)
     assert progress["proven_hypothesis_ids"] == [hypotheses[0].id]
     assert progress["unresolved_hypothesis_ids"] == [hypotheses[1].id]
+    assert progress["proof_stage_by_hypothesis"][hypotheses[0].id]["stage"] == (
+        "impact_reproduced"
+    )
+    assert progress["proof_stage_by_hypothesis"][hypotheses[1].id]["stage"] == "untriaged"
     assert progress["all_platform_proven"] is False
     assert ledger.task_all_hypotheses_proven(task.id) is False
     assert ledger.task_proof_result(task.id) is not None
