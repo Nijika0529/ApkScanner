@@ -42,6 +42,13 @@ def partition_findings(
     confirmed: list[Finding] = []
     signals: list[Finding] = []
     for finding in items:
+        # Cross-task consolidation keeps source rows and their evidence for audit, but only the
+        # canonical record is a user-facing vulnerability or signal.
+        if isinstance(
+            (finding.metadata_json or {}).get("merged_into_finding_id"),
+            str,
+        ):
+            continue
         evidence_ids = {
             value
             for value in finding.evidence_ids

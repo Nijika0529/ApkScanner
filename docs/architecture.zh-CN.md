@@ -77,7 +77,9 @@ lease。默认只有 API 36+ 设备具备裁决资格；显式 legacy smoke 设�
 任务的设备关键事件。
 
 运行中的 ADB 子进程使用独立进程组；停止任务会终止当前命令，
-后续设备命令直接返回 canceled，但 `pm clear` 和 App Link reset 清理仍会忽略取消信号执行。
+后续设备命令直接返回 canceled。默认 `device_reset_policy=never` 时结束清理不会触碰目标应用
+数据或 App Link 状态；仅当操作者显式选择可丢弃 fixture 的 reset 策略时，`pm clear` 和 App
+Link reset 才会忽略取消信号完成清理。
 Web 健康检查使用真正的非阻塞锁；设备繁忙时读取最近一次能力结果，不会插入或等待当前
 设备会话。控制面重启时，历史 `awaiting_device` 任务安全恢复为 `queued`；
 `cancel_requested` 直接确认为 `canceled`；在模型或平台计算阶段中断的 `running` 任务可
@@ -91,7 +93,7 @@ Web 健康检查使用真正的非阻塞锁；设备繁忙时读取最近一次�
 | 本地控制面 | SQLite、APK、workspace、evidence | FastAPI 仅监听 loopback；变更 API 需要自定义请求头；内容寻址文件拒绝 symlink/摘要冲突 |
 | Codex 扫描级 Docker worker | 扫描只读输入、每 role 独立可写 workspace、DeepSeek/Web 网络 | 一个 scan 一个无密钥 keeper；每个 task/attempt/role 独立 UID/HOME/CODEX_HOME/TMPDIR；Codex `Sandbox.full_access`；rootfs 只读、capabilities 全丢弃、PID/CPU/内存限制；不挂 Docker socket 或设备 |
 | Codex host worker | 当前任务 attempt workspace、主机工具和模型网络 | 仅作为双开关启用的个人诊断模式；full-access sandbox，没有容器/UID/资源边界，不能作为默认部署 |
-| 云真机 | 目标 APK、可选 Probe APK、Agent PoC、测试账号 | 配置声明目标 Android/API；串行 lease；任务前后 `pm clear`；不声称完整快照复位 |
+| 云真机 | 目标 APK、可选 Probe APK、Agent PoC、测试账号 | 配置声明目标 Android/API；串行 lease；默认跨任务保留登录、协议和本地数据；可丢弃 fixture 可显式启用 `pm clear`，不声称完整快照复位 |
 | Probe APK | 可选的普通 App UID 通用入口快速执行器 | 只接受最初发送者为 shell/root 的调度；复杂 Binder/AIDL/漏洞链改用 Agent 专用 PoC；仍只允许安装在专用测试设备 |
 
 APK、反编译代码、资源、日志、网页和工具输出都属于不可信数据。Codex developer

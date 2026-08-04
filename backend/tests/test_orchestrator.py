@@ -16,6 +16,7 @@ from apkscanner.agent_events import AgentCancelledError, AgentRuntimeEvent
 from apkscanner.artifacts import ArtifactStore
 from apkscanner.db import Database
 from apkscanner.device import AdbDeviceAdapter
+from apkscanner.finding_policy import partition_findings
 from apkscanner.models import (
     AgentRuntimeEventRecord,
     CoverageItem,
@@ -34,6 +35,35 @@ from apkscanner.reports import ReportBuilder
 from apkscanner.schemas import AdaptiveVerificationResult, AgentInvestigationResult
 from apkscanner.tools import CommandResult, ToolRunner
 from sqlalchemy import select
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["shell", "pm", "clear", "com.example.target"],
+        ["shell", "sh", "-c", "pm clear com.example.target"],
+        ["uninstall", "com.example.target"],
+        ["shell", "run-as", "com.example.target", "rm", "databases/session.db"],
+    ],
+)
+def test_preserve_policy_recognizes_adaptive_adb_target_data_destruction(
+    args: list[str],
+) -> None:
+    assert ScanOrchestrator._adb_command_destroys_target_data(
+        args,
+        package_name="com.example.target",
+    )
+
+
+def test_preserve_policy_allows_target_launch_and_poc_cleanup() -> None:
+    assert not ScanOrchestrator._adb_command_destroys_target_data(
+        ["shell", "am", "start", "-n", "com.example.target/.MainActivity"],
+        package_name="com.example.target",
+    )
+    assert not ScanOrchestrator._adb_command_destroys_target_data(
+        ["uninstall", "io.apkscanner.poc.zipprobe"],
+        package_name="com.example.target",
+    )
 
 
 def test_adaptive_verifier_batches_high_value_static_findings_once(
@@ -251,6 +281,243 @@ def test_adaptive_verifier_semantic_result_updates_original_finding(
         assert scan.stats["adaptive_verification"][
             "compatibility_override_count"
         ] == (0 if android16_eligible else 1)
+
+
+def test_exact_finding_identity_is_consolidated_across_tasks(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="duplicates.apk",
+            package_name="com.example.duplicates",
+            artifact_sha256="d" * 64,
+            artifact_path=str(settings.data_dir / "duplicates.apk"),
+        )
+        first_task = InvestigationTask(scan=scan, task_type="component", status="completed")
+        second_task = InvestigationTask(scan=scan, task_type="static_review", status="completed")
+        first_entry = EntryPoint(
+            scan=scan,
+            kind="activity",
+            name="com.example.duplicates.BridgeActivity",
+            exported=True,
+        )
+        second_entry = EntryPoint(
+            scan=scan,
+            kind="static_surface",
+            name="static://web_content_boundary",
+            exported=False,
+        )
+        session.add_all([scan, first_task, second_task, first_entry, second_entry])
+        session.flush()
+        first_evidence = Evidence(
+            scan_id=scan.id,
+            task_id=first_task.id,
+            kind="blackbox.poc_ui_dump",
+            sha256="1" * 64,
+            path="first.json",
+            summary="Bridge token reached the attacker page",
+        )
+        second_evidence = Evidence(
+            scan_id=scan.id,
+            task_id=second_task.id,
+            kind="static.jadx",
+            sha256="2" * 64,
+            path="second.json",
+            summary="Static WebView bridge chain",
+        )
+        session.add_all([first_evidence, second_evidence])
+        session.flush()
+        shared_identity = {
+            "schema_version": "1.0",
+            "finding_id": "f" * 64,
+            "semantic_fingerprint": "f" * 64,
+            "occurrence_id": "e" * 64,
+        }
+        first_finding = Finding(
+            scan=scan,
+            dedupe_key=f"agent:{first_task.id}:hypothesis:first",
+            rule_id="AGENT-ENTRY-INVESTIGATION",
+            source="codex",
+            title="AccountBridge token disclosure",
+            description="Runtime proof",
+            remediation="Restrict the bridge and trusted origins.",
+            masvs="MASVS-PLATFORM",
+            severity="critical",
+            confidence="high",
+            status="reproduced_blackbox",
+            entry_point_ids=[first_entry.id],
+            evidence_ids=[first_evidence.id],
+            metadata_json={
+                "identity": shared_identity,
+                "harm_demonstrated": True,
+                "task_id": first_task.id,
+            },
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        second_finding = Finding(
+            scan=scan,
+            dedupe_key=f"agent:{second_task.id}:supported_static",
+            rule_id="AGENT-ENTRY-INVESTIGATION",
+            source="codex",
+            title="Web content boundary reaches AccountBridge",
+            description="Static proof",
+            remediation="Restrict the bridge and trusted origins.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            confidence="medium",
+            status="supported_static",
+            entry_point_ids=[second_entry.id],
+            evidence_ids=[second_evidence.id],
+            metadata_json={
+                "identity": shared_identity,
+                "harm_demonstrated": False,
+                "task_id": second_task.id,
+            },
+            created_at=datetime(2026, 1, 2, tzinfo=UTC),
+        )
+        session.add_all([first_finding, second_finding])
+        session.flush()
+        hypothesis = SecurityHypothesis(
+            scan_id=scan.id,
+            task_id=second_task.id,
+            fingerprint="3" * 64,
+            category="android.webview",
+            claim="Static ingress reaches the same AccountBridge sink",
+            final_finding_id=second_finding.id,
+        )
+        session.add(hypothesis)
+        session.flush()
+
+        merged = orchestrator._consolidate_findings(session, scan_id=scan.id)
+        session.flush()
+
+        assert merged == {second_finding.id: first_finding.id}
+        assert first_finding.status == "reproduced_blackbox"
+        assert first_finding.entry_point_ids == [first_entry.id, second_entry.id]
+        assert first_finding.evidence_ids == [first_evidence.id, second_evidence.id]
+        assert first_finding.metadata_json["harm_demonstrated"] is True
+        assert second_finding.metadata_json["merged_into_finding_id"] == first_finding.id
+        assert hypothesis.final_finding_id == first_finding.id
+        records = list(session.scalars(select(Finding).where(Finding.scan_id == scan.id)))
+        confirmed, signals = partition_findings(session, records)
+        assert [item.id for item in confirmed] == [first_finding.id]
+        assert signals == []
+
+
+def test_adaptive_verifier_merges_semantic_duplicate_ingress_findings(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="semantic-duplicates.apk",
+            package_name="com.example.semanticduplicates",
+            artifact_sha256="4" * 64,
+            artifact_path=str(settings.data_dir / "semantic-duplicates.apk"),
+        )
+        canonical = Finding(
+            scan=scan,
+            dedupe_key="component-bridge",
+            rule_id="AGENT-ENTRY-INVESTIGATION",
+            title="Explicit Intent reaches AccountBridge",
+            description="Component ingress",
+            remediation="Restrict bridge origins.",
+            masvs="MASVS-PLATFORM",
+            severity="critical",
+            confidence="medium",
+            status="supported_static",
+            metadata_json={"identity": {"finding_id": "5" * 64}},
+        )
+        duplicate = Finding(
+            scan=scan,
+            dedupe_key="deep-link-bridge",
+            rule_id="AGENT-ENTRY-INVESTIGATION",
+            title="Deep Link reaches AccountBridge",
+            description="Deep-link ingress",
+            remediation="Restrict bridge origins.",
+            masvs="MASVS-PLATFORM",
+            severity="critical",
+            confidence="medium",
+            status="supported_static",
+            metadata_json={"identity": {"finding_id": "6" * 64}},
+        )
+        task = InvestigationTask(scan=scan, task_type="adaptive_verification", status="running")
+        session.add_all([scan, canonical, duplicate, task])
+        session.flush()
+        response = orchestrator.evidence.json(
+            session,
+            scan_id=scan.id,
+            task_id=task.id,
+            kind="agent.adaptive_response",
+            value={"observed": "same AccountBridge token sink"},
+            summary="Adaptive duplicate response",
+        )
+        session.commit()
+        scan_id = scan.id
+        task_id = task.id
+        canonical_id = canonical.id
+        duplicate_id = duplicate.id
+        response_id = response.id
+
+    result = AdaptiveVerificationResult.model_validate(
+        {
+            "summary": "两个入口到达同一个 AccountBridge token sink，合并为一个漏洞。",
+            "assessments": [
+                {
+                    "finding_id": canonical_id,
+                    "verdict": "reproduced_blackbox",
+                    "confidence": "high",
+                    "runtime_observed": True,
+                    "summary": "恶意页面取得同一 token。",
+                    "attack_chain": "Intent -> WebView -> AccountBridge.getSessionToken",
+                    "security_impact": "会话令牌泄露。",
+                },
+                {
+                    "finding_id": duplicate_id,
+                    "duplicate_of_finding_id": canonical_id,
+                    "verdict": "reproduced_blackbox",
+                    "confidence": "high",
+                    "runtime_observed": True,
+                    "summary": "Deep Link 是同一 sink 的另一入口表述。",
+                    "attack_chain": "Deep Link -> WebView -> AccountBridge.getSessionToken",
+                    "security_impact": "会话令牌泄露。",
+                },
+            ],
+        }
+    )
+    orchestrator._apply_adaptive_verifier_result(
+        scan_id=scan_id,
+        task_id=task_id,
+        candidate_ids=[canonical_id, duplicate_id],
+        result=result,
+        thread_id="thread-duplicates",
+        turn_id="turn-duplicates",
+        response_evidence_id=response_id,
+        android16_verdict_eligible=True,
+    )
+
+    with database.session_factory() as session:
+        canonical = session.get(Finding, canonical_id)
+        duplicate = session.get(Finding, duplicate_id)
+        scan = session.get(Scan, scan_id)
+        task = session.get(InvestigationTask, task_id)
+        assert canonical is not None and duplicate is not None and scan is not None and task is not None
+        assert canonical.status == "reproduced_blackbox"
+        assert canonical.metadata_json["harm_demonstrated"] is True
+        assert duplicate.metadata_json["merged_into_finding_id"] == canonical_id
+        assert task.result["merged_finding_map"] == {duplicate_id: canonical_id}
+        assert scan.stats["adaptive_verification"]["verdict_counts"] == {
+            "reproduced_blackbox": 1
+        }
+        records = list(session.scalars(select(Finding).where(Finding.scan_id == scan_id)))
+        confirmed, signals = partition_findings(session, records)
+        assert [item.id for item in confirmed] == [canonical_id]
+        assert signals == []
 
 
 def test_runtime_event_projection_is_idempotent_across_spool_replay(settings) -> None:  # noqa: ANN001

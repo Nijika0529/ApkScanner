@@ -536,6 +536,17 @@ class ScanOrchestrator:
                 raise TimeoutError("task time budget is exhausted")
             timeout = min(request.timeout_seconds, max(1, context.budget.remaining(120)))
             forwarded_args = list(request.args)
+            if (
+                self.settings.device_reset_policy == "never"
+                and self._adb_command_destroys_target_data(
+                    forwarded_args,
+                    package_name=context.package_name,
+                )
+            ):
+                raise ValueError(
+                    "target application data is protected by "
+                    "APKSCANNER_DEVICE_RESET_POLICY=never"
+                )
             if context.adb_policy == "adaptive" and context.container_workspace:
                 forwarded_args = self._translate_adaptive_adb_paths(
                     forwarded_args,
@@ -582,6 +593,31 @@ class ScanOrchestrator:
                 },
             )
             return AdbGatewayResponse.from_command(result).model_dump(mode="json")
+
+    @staticmethod
+    def _adb_command_destroys_target_data(
+        args: list[str],
+        *,
+        package_name: str,
+    ) -> bool:
+        """Recognize normal ADB paths that can erase or rewrite the preserved target profile."""
+
+        normalized = [value.strip().lower() for value in args]
+        package = package_name.lower()
+        flattened = " ".join(normalized)
+        if package not in flattened:
+            return False
+        if normalized and normalized[0] == "uninstall":
+            return True
+        if "uninstall" in normalized:
+            return True
+        if "clear" in normalized and ("pm" in normalized or "package" in normalized):
+            return True
+        if f"run-as {package}" in flattened:
+            return True
+        return bool(
+            re.search(r"(?:^|\s)(?:pm\s+clear|cmd\s+package\s+clear)(?:\s|$)", flattened)
+        )
 
     @staticmethod
     def _translate_adaptive_adb_paths(
@@ -1635,6 +1671,7 @@ class ScanOrchestrator:
                 android_version=self.settings.device_android_version,
                 android_api=self.settings.device_android_api,
                 adb_configured=self.device_pool.configured,
+                device_reset_policy=self.settings.device_reset_policy,
             )
             investigation_plan = planner.plan_with_decisions(scan.id, entries)
             tasks = investigation_plan.tasks
@@ -1867,6 +1904,12 @@ class ScanOrchestrator:
     def _run_adaptive_verifier(self, scan_id: str) -> None:
         """Batch the strongest unresolved findings into one terminal Codex thread."""
 
+        # This method is also the post-investigation barrier. Run deterministic consolidation even
+        # when the optional Adaptive Verifier is disabled, so concurrent task commits cannot leave
+        # exact semantic duplicates in the final report.
+        with self.database.session_factory() as session:
+            self._consolidate_findings(session, scan_id=scan_id)
+            session.commit()
         if (
             not self.settings.adaptive_verifier_enabled
             or not self.settings.codex_enabled
@@ -1965,6 +2008,7 @@ class ScanOrchestrator:
                     TaskStatus.INCONCLUSIVE.value,
                 }
             ):
+                session.commit()
                 return
             candidate_ids = [item.id for item in candidates]
             entry_ids = list(
@@ -2077,6 +2121,270 @@ class ScanOrchestrator:
                 if self._task_cancellations.get(task_id) is cancel_event:
                     self._task_cancellations.pop(task_id, None)
 
+    @staticmethod
+    def _finding_semantic_identity(finding: Finding) -> str | None:
+        identity = (finding.metadata_json or {}).get("identity")
+        if not isinstance(identity, dict):
+            return None
+        for key in ("semantic_fingerprint", "finding_id"):
+            value = identity.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    @staticmethod
+    def _ordered_union(*groups: list[str]) -> list[str]:
+        return list(
+            dict.fromkeys(
+                value
+                for group in groups
+                for value in group
+                if isinstance(value, str) and value
+            )
+        )
+
+    def _consolidate_findings(
+        self,
+        session,  # noqa: ANN001
+        *,
+        scan_id: str,
+        explicit_duplicates: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        """Merge cross-task occurrences while retaining each original record for audit.
+
+        Exact ``finding_identity`` matches are deterministic. The terminal Adaptive Verifier may
+        additionally relate semantically identical attack chains that have different ingress
+        wording. Only links between active findings in the same scan are accepted.
+        """
+
+        findings = list(
+            session.scalars(
+                select(Finding)
+                .where(Finding.scan_id == scan_id)
+                .order_by(Finding.created_at, Finding.id)
+            )
+        )
+        active = [
+            finding
+            for finding in findings
+            if not isinstance((finding.metadata_json or {}).get("merged_into_finding_id"), str)
+        ]
+        by_id = {finding.id: finding for finding in active}
+        adjacency: dict[str, set[str]] = {finding.id: set() for finding in active}
+        identity_groups: dict[str, list[str]] = defaultdict(list)
+        for finding in active:
+            identity = self._finding_semantic_identity(finding)
+            if identity:
+                identity_groups[identity].append(finding.id)
+        for finding_ids in identity_groups.values():
+            if len(finding_ids) < 2:
+                continue
+            first = finding_ids[0]
+            for duplicate_id in finding_ids[1:]:
+                adjacency[first].add(duplicate_id)
+                adjacency[duplicate_id].add(first)
+
+        valid_explicit: dict[str, str] = {}
+        for duplicate_id, canonical_id in (explicit_duplicates or {}).items():
+            if duplicate_id == canonical_id or duplicate_id not in by_id or canonical_id not in by_id:
+                continue
+            valid_explicit[duplicate_id] = canonical_id
+            adjacency[duplicate_id].add(canonical_id)
+            adjacency[canonical_id].add(duplicate_id)
+
+        status_rank = {
+            FindingStatus.FALSE_POSITIVE.value: 0,
+            FindingStatus.REFUTED_STATIC.value: 1,
+            FindingStatus.NOT_REPRODUCED.value: 2,
+            FindingStatus.INCONCLUSIVE.value: 3,
+            FindingStatus.CANDIDATE.value: 4,
+            FindingStatus.SUPPORTED_STATIC.value: 5,
+            FindingStatus.ACCEPTED.value: 6,
+            FindingStatus.REPRODUCED_BLACKBOX.value: 7,
+        }
+        severity_rank = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+        confidence_rank = {"low": 0, "medium": 1, "high": 2}
+        merged_map: dict[str, str] = {}
+        visited: set[str] = set()
+
+        for start_id in adjacency:
+            if start_id in visited or not adjacency[start_id]:
+                continue
+            stack = [start_id]
+            component_ids: list[str] = []
+            while stack:
+                current_id = stack.pop()
+                if current_id in visited:
+                    continue
+                visited.add(current_id)
+                component_ids.append(current_id)
+                stack.extend(adjacency[current_id] - visited)
+            if len(component_ids) < 2:
+                continue
+
+            component = [by_id[finding_id] for finding_id in component_ids]
+            component.sort(key=lambda item: (item.created_at, item.id))
+            # Honor the verifier's direction when it has one unambiguous terminal target.
+            terminal_targets: set[str] = set()
+            for duplicate_id in component_ids:
+                if duplicate_id not in valid_explicit:
+                    continue
+                cursor = duplicate_id
+                chain_seen: set[str] = set()
+                while cursor in valid_explicit and cursor not in chain_seen:
+                    chain_seen.add(cursor)
+                    cursor = valid_explicit[cursor]
+                if cursor in by_id and cursor not in chain_seen:
+                    terminal_targets.add(cursor)
+            canonical = (
+                by_id[next(iter(terminal_targets))]
+                if len(terminal_targets) == 1
+                else component[0]
+            )
+            representative = max(
+                component,
+                key=lambda item: (
+                    status_rank.get(item.status, -1),
+                    severity_rank.get(item.severity, -1),
+                    confidence_rank.get(item.confidence, -1),
+                    -component.index(item),
+                ),
+            )
+            duplicates = [item for item in component if item.id != canonical.id]
+
+            canonical.title = representative.title
+            canonical.description = representative.description
+            canonical.remediation = representative.remediation
+            canonical.masvs = representative.masvs
+            canonical.cwe = representative.cwe
+            canonical.rule_id = representative.rule_id
+            canonical.source = representative.source
+            canonical.status = representative.status
+            canonical.severity = max(
+                (item.severity for item in component),
+                key=lambda value: severity_rank.get(value, -1),
+            )
+            canonical.confidence = max(
+                (item.confidence for item in component),
+                key=lambda value: confidence_rank.get(value, -1),
+            )
+            canonical.entry_point_ids = self._ordered_union(
+                *(list(item.entry_point_ids or []) for item in component)
+            )
+            canonical.evidence_ids = self._ordered_union(
+                *(list(item.evidence_ids or []) for item in component)
+            )
+            location_keys: set[str] = set()
+            merged_locations: list[dict[str, Any]] = []
+            for item in component:
+                for location in item.locations or []:
+                    if not isinstance(location, dict):
+                        continue
+                    key = json.dumps(location, sort_keys=True, ensure_ascii=False)
+                    if key in location_keys:
+                        continue
+                    location_keys.add(key)
+                    merged_locations.append(location)
+            canonical.locations = merged_locations
+
+            all_metadata = [dict(item.metadata_json or {}) for item in component]
+            histories = [
+                history_item
+                for metadata in all_metadata
+                for history_item in metadata.get("adaptive_verification_history", [])
+                if isinstance(history_item, dict)
+            ]
+            proof_attempt_ids = self._ordered_union(
+                *[
+                    list(metadata.get("proof_attempt_ids") or [])
+                    for metadata in all_metadata
+                ]
+            )
+            coverage_gaps = self._ordered_union(
+                *[list(metadata.get("coverage_gaps") or []) for metadata in all_metadata]
+            )
+            identities = [
+                identity
+                for metadata in all_metadata
+                if isinstance((identity := metadata.get("identity")), dict)
+            ]
+            occurrence_history = list(
+                (canonical.metadata_json or {}).get("merged_occurrences") or []
+            )
+            occurrence_history.extend(
+                {
+                    "finding_id": duplicate.id,
+                    "dedupe_key": duplicate.dedupe_key,
+                    "title": duplicate.title,
+                    "status": duplicate.status,
+                    "task_id": (duplicate.metadata_json or {}).get("task_id"),
+                    "hypothesis_id": (duplicate.metadata_json or {}).get("hypothesis_id"),
+                    "entry_point_ids": list(duplicate.entry_point_ids or []),
+                    "evidence_ids": list(duplicate.evidence_ids or []),
+                    "merge_basis": (
+                        "adaptive_verifier_semantic_duplicate"
+                        if duplicate.id in valid_explicit
+                        else "exact_finding_identity"
+                    ),
+                }
+                for duplicate in duplicates
+            )
+            canonical_metadata = dict(canonical.metadata_json or {})
+            canonical_metadata.update(
+                {
+                    "harm_demonstrated": any(
+                        metadata.get("harm_demonstrated") is True for metadata in all_metadata
+                    ),
+                    "merged_finding_ids": self._ordered_union(
+                        list(canonical_metadata.get("merged_finding_ids") or []),
+                        [item.id for item in duplicates],
+                    ),
+                    "merged_occurrences": occurrence_history[-50:],
+                    "equivalent_identities": identities,
+                    "coverage_gaps": coverage_gaps,
+                    "proof_attempt_ids": proof_attempt_ids,
+                }
+            )
+            if histories:
+                canonical_metadata["adaptive_verification_history"] = histories[-10:]
+                canonical_metadata["adaptive_verification"] = histories[-1]
+            if canonical_metadata["harm_demonstrated"]:
+                canonical_metadata["proof_backlog"] = {
+                    **dict(canonical_metadata.get("proof_backlog") or {}),
+                    "status": "verified",
+                }
+            canonical.metadata_json = canonical_metadata
+
+            for duplicate in duplicates:
+                original_metadata = dict(duplicate.metadata_json or {})
+                duplicate.status = FindingStatus.INCONCLUSIVE.value
+                duplicate.metadata_json = {
+                    **original_metadata,
+                    "harm_demonstrated": False,
+                    "merged_duplicate": True,
+                    "merged_into_finding_id": canonical.id,
+                    "merge_basis": (
+                        "adaptive_verifier_semantic_duplicate"
+                        if duplicate.id in valid_explicit
+                        else "exact_finding_identity"
+                    ),
+                    "proof_backlog": {
+                        **dict(original_metadata.get("proof_backlog") or {}),
+                        "status": "merged",
+                    },
+                }
+                duplicate.review_note = (
+                    f"该记录已跨任务归并到 finding {canonical.id}；原始证据与事件仍保留供审计。"
+                )
+                session.execute(
+                    update(SecurityHypothesis)
+                    .where(SecurityHypothesis.final_finding_id == duplicate.id)
+                    .values(final_finding_id=canonical.id)
+                )
+                merged_map[duplicate.id] = canonical.id
+
+        return merged_map
+
     def _run_adaptive_verifier_impl(
         self,
         scan_id: str,
@@ -2115,10 +2423,25 @@ class ScanOrchestrator:
                 )
             }
             entries = [entries_by_id[value] for value in entry_ids if value in entries_by_id]
+            source_task_ids_by_finding: dict[str, list[str]] = {}
+            for finding in findings:
+                metadata = dict(finding.metadata_json or {})
+                occurrence_task_ids = [
+                    str(occurrence["task_id"])
+                    for occurrence in metadata.get("merged_occurrences", [])
+                    if isinstance(occurrence, dict)
+                    and isinstance(occurrence.get("task_id"), str)
+                ]
+                source_task_ids_by_finding[finding.id] = self._ordered_union(
+                    [metadata["task_id"]]
+                    if isinstance(metadata.get("task_id"), str)
+                    else [],
+                    occurrence_task_ids,
+                )
             source_task_ids = {
-                str(task_id_value)
-                for finding in findings
-                if isinstance((task_id_value := (finding.metadata_json or {}).get("task_id")), str)
+                source_task_id
+                for values in source_task_ids_by_finding.values()
+                for source_task_id in values
             }
             hypotheses_by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
             if source_task_ids:
@@ -2169,11 +2492,14 @@ class ScanOrchestrator:
                     "locations": finding.locations,
                     "evidence_ids": finding.evidence_ids,
                     "source_task_id": (finding.metadata_json or {}).get("task_id"),
+                    "source_task_ids": source_task_ids_by_finding.get(finding.id, []),
                     "proof_backlog": (finding.metadata_json or {}).get("proof_backlog"),
                     "coverage_gaps": (finding.metadata_json or {}).get("coverage_gaps", []),
-                    "security_hypotheses": hypotheses_by_task.get(
-                        str((finding.metadata_json or {}).get("task_id")), []
-                    ),
+                    "security_hypotheses": [
+                        hypothesis
+                        for source_task_id in source_task_ids_by_finding.get(finding.id, [])
+                        for hypothesis in hypotheses_by_task.get(source_task_id, [])
+                    ],
                     "entry_points": [
                         {
                             "id": entry_id,
@@ -2580,6 +2906,7 @@ class ScanOrchestrator:
                         "compatibility_smoke_only": not android16_verdict_eligible,
                         "confidence": assessment.confidence,
                         "runtime_observed": assessment.runtime_observed,
+                        "duplicate_of_finding_id": assessment.duplicate_of_finding_id,
                         "summary": assessment.summary,
                         "attack_chain": assessment.attack_chain,
                         "security_impact": assessment.security_impact,
@@ -2626,12 +2953,45 @@ class ScanOrchestrator:
                         "verifier_task_id": task_id,
                     },
                 }
+            ignored_duplicate_relations: list[dict[str, str]] = []
+            explicit_duplicates: dict[str, str] = {}
+            for finding_id, assessment in assessments.items():
+                canonical_id = assessment.duplicate_of_finding_id
+                if canonical_id is None:
+                    continue
+                if canonical_id not in candidate_set or canonical_id not in assessments:
+                    ignored_duplicate_relations.append(
+                        {
+                            "finding_id": finding_id,
+                            "duplicate_of_finding_id": canonical_id,
+                            "reason": "canonical finding is not an assessed candidate",
+                        }
+                    )
+                    continue
+                explicit_duplicates[finding_id] = canonical_id
+            merged_findings = self._consolidate_findings(
+                session,
+                scan_id=scan_id,
+                explicit_duplicates=explicit_duplicates,
+            )
+            session.flush()
+            effective_finding_ids = {
+                merged_findings.get(finding_id, finding_id)
+                for finding_id in assessments
+            }
+            effective_verdict_counts: Counter[str] = Counter()
+            for finding_id in effective_finding_ids:
+                effective_finding = session.get(Finding, finding_id)
+                if effective_finding is not None:
+                    effective_verdict_counts[effective_finding.status] += 1
             missing = [value for value in candidate_ids if value not in assessments]
             output = result.model_dump(mode="json")
             output["verification_mode"] = "adaptive_agent"
             output["response_evidence_id"] = response_evidence_id
             output["missing_candidate_assessments"] = missing
             output["ignored_assessment_finding_ids"] = ignored
+            output["ignored_duplicate_relations"] = ignored_duplicate_relations
+            output["merged_finding_map"] = merged_findings
             output["android16_verdict_eligible"] = android16_verdict_eligible
             output["verdict_overrides"] = verdict_overrides
             task.thread_id = thread_id
@@ -2650,9 +3010,11 @@ class ScanOrchestrator:
                     "response_evidence_id": response_evidence_id,
                     "assessment_count": len(assessments),
                     "missing_assessment_count": len(missing),
-                    "verdict_counts": dict(verdict_counts),
+                    "verdict_counts": dict(effective_verdict_counts),
+                    "assessment_verdict_counts": dict(verdict_counts),
                     "model_verdict_counts": dict(model_verdict_counts),
                     "compatibility_override_count": len(verdict_overrides),
+                    "merged_duplicate_count": len(merged_findings),
                 },
             }
             add_event(
@@ -2665,9 +3027,11 @@ class ScanOrchestrator:
                     "candidate_count": len(candidate_ids),
                     "assessment_count": len(assessments),
                     "missing_assessment_count": len(missing),
-                    "verdict_counts": dict(verdict_counts),
+                    "verdict_counts": dict(effective_verdict_counts),
+                    "assessment_verdict_counts": dict(verdict_counts),
                     "model_verdict_counts": dict(model_verdict_counts),
                     "compatibility_override_count": len(verdict_overrides),
+                    "merged_duplicate_count": len(merged_findings),
                     "android16_verdict_eligible": android16_verdict_eligible,
                     "thread_id": thread_id,
                     "turn_id": turn_id,
@@ -3221,6 +3585,7 @@ class ScanOrchestrator:
             android_version=self.settings.device_android_version,
             android_api=self.settings.device_android_api,
             adb_configured=self.device_pool.configured,
+            device_reset_policy=self.settings.device_reset_policy,
         ).plan_with_decisions(scan_id, scan_entries)
         static_closures_by_entry = {
             closure.entry_point_id: closure for closure in scope_plan.static_closures
@@ -3475,6 +3840,7 @@ class ScanOrchestrator:
                             "provider_rows",
                             "binder_reply",
                             "target_uid_log_contains",
+                            "target_file_sha256",
                             "ui_text",
                             "process_crash",
                         ],
@@ -4720,6 +5086,7 @@ class ScanOrchestrator:
                     result_value,
                     agent_backend,
                 )
+                self._consolidate_findings(session, scan_id=scan_id)
             self._update_entry_coverage(
                 session,
                 scan_id,
@@ -5587,6 +5954,14 @@ class ScanOrchestrator:
                 if budget.expired:
                     gaps.append("Task budget expired before all agent-requested tests ran.")
                     break
+                requested_reset = request.reset
+                if (
+                    self.settings.device_reset_policy == "never"
+                    and request.reset != "preserve"
+                ):
+                    # ``never`` is a hard operator policy: model-authored Proof requests cannot
+                    # silently destroy an authenticated target session or first-run consent state.
+                    request = request.model_copy(update={"reset": "preserve"})
                 before = len(evidence_summaries)
                 proof_attempt_id = self.hypothesis_ledger.plan_proof(
                     task_id=task_id,
@@ -5609,6 +5984,8 @@ class ScanOrchestrator:
                         "poc_package": (request.poc.package_name if request.poc else None),
                         "operation": request.operation,
                         "reset": request.reset,
+                        "requested_reset": requested_reset,
+                        "reset_overridden_by_policy": requested_reset != request.reset,
                         "oracle": request.oracle.model_dump(mode="json"),
                     },
                 )
@@ -5635,8 +6012,12 @@ class ScanOrchestrator:
                         for kind, result, metadata in commands
                     ]
 
-                should_reset = request.reset == "clean" or (
-                    request.reset == "inherit" and self.settings.device_reset_policy == "per_test"
+                should_reset = self.settings.device_reset_policy != "never" and (
+                    request.reset == "clean"
+                    or (
+                        request.reset == "inherit"
+                        and self.settings.device_reset_policy == "per_test"
+                    )
                 )
                 if should_reset:
                     reset = tagged(active_device.reset_session(package_name, budget))
@@ -7347,6 +7728,13 @@ class ScanOrchestrator:
                     session.add(finding)
                     session.flush()
                 else:
+                    previous_metadata = dict(finding.metadata_json or {})
+                    for merge_key in (
+                        "merged_duplicate",
+                        "merged_into_finding_id",
+                        "merge_basis",
+                    ):
+                        previous_metadata.pop(merge_key, None)
                     finding.source = agent_backend
                     finding.title = f"Validated hypothesis: {hypothesis.claim}"
                     finding.description = proof_description
@@ -7355,10 +7743,11 @@ class ScanOrchestrator:
                     )
                     finding.confidence = payload.get("confidence", "medium")
                     finding.status = proof_status
+                    finding.review_note = None
                     finding.entry_point_ids = chain_entry_ids
                     finding.evidence_ids = proof_evidence_ids
                     finding.metadata_json = {
-                        **dict(finding.metadata_json or {}),
+                        **previous_metadata,
                         **metadata,
                     }
                 hypothesis.final_finding_id = finding.id
@@ -7535,6 +7924,7 @@ class ScanOrchestrator:
             )
             finding.confidence = payload.get("confidence", "medium")
             finding.status = signal_result_value
+            finding.review_note = None
             finding.entry_point_ids = signal_entry_ids
             finding.evidence_ids = signal_evidence_ids
             finding.metadata_json = {

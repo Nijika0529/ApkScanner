@@ -53,6 +53,28 @@ def test_live_proof_replay_requires_an_explicit_hypothesis() -> None:
         )
 
 
+def test_agent_device_tests_preserve_target_state_by_default() -> None:
+    hypothesis_id = "11111111-2222-4333-8444-555555555555"
+    entry_point_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    request = AgentRequestedTest(
+        hypothesis_id=hypothesis_id,
+        entry_point_id=entry_point_id,
+        uri=None,
+        extras={},
+        rationale="Exercise the target without clearing its authenticated state.",
+    )
+    replay = AgentProofReplay(
+        hypothesis_id=hypothesis_id,
+        entry_point_id=entry_point_id,
+        oracle=AgentOracleSpec(),
+        rationale="Replay without clearing the target profile.",
+        poc=poc_spec(),
+    )
+
+    assert request.reset == "preserve"
+    assert replay.reset == "preserve"
+
+
 def test_live_proof_replay_accepts_platform_binder_transaction_without_poc() -> None:
     replay = AgentProofReplay(
         hypothesis_id="11111111-2222-4333-8444-555555555555",
@@ -162,6 +184,35 @@ def test_impactful_binder_non_empty_match_is_rejected() -> None:
             kind="binder_reply",
             match_mode="non_empty",
             impact="unauthorized_data_access",
+        )
+
+
+def test_state_change_oracles_accept_safe_target_paths_and_target_owned_ui() -> None:
+    file_oracle = AgentOracleSpec(
+        kind="target_file_sha256",
+        target_path="shared_prefs/session.xml",
+        impact="unauthorized_state_change",
+    )
+    ui_oracle = AgentOracleSpec(
+        kind="ui_text",
+        expected_text="Imported entries: [../shared_prefs/session.xml]",
+        impact="unauthorized_state_change",
+    )
+
+    assert file_oracle.target_path == "shared_prefs/session.xml"
+    assert ui_oracle.impact == "unauthorized_state_change"
+
+
+@pytest.mark.parametrize(
+    "target_path",
+    ["../shared_prefs/session.xml", "/data/user/0/example/session.xml", "files//vault"],
+)
+def test_target_file_oracle_rejects_unsafe_paths(target_path: str) -> None:
+    with pytest.raises(ValueError, match="safe app-data-relative path"):
+        AgentOracleSpec(
+            kind="target_file_sha256",
+            target_path=target_path,
+            impact="unauthorized_state_change",
         )
 
 
@@ -1412,6 +1463,7 @@ def test_poc_execution_is_correlated_into_the_hypothesis_proof(
         state="guest",
         uri=None,
         extras={},
+        reset="clean",
         rationale="Execute the custom caller.",
         poc=poc_spec(),
     )
@@ -1428,7 +1480,9 @@ def test_poc_execution_is_correlated_into_the_hypothesis_proof(
     monkeypatch.setattr(
         orchestrator.device,
         "reset_session",
-        lambda *_args, **_kwargs: [("device.clear", CommandResult(["adb"], 0, "", ""), {})],
+        lambda *_args, **_kwargs: pytest.fail(
+            "device_reset_policy=never must suppress model-requested target clears"
+        ),
     )
     monkeypatch.setattr(
         orchestrator.device,
@@ -1470,6 +1524,7 @@ def test_poc_execution_is_correlated_into_the_hypothesis_proof(
     )
     assert not gaps
     assert len(executed) == 1
+    assert executed[0]["request"]["reset"] == "preserve"
     with database.session_factory() as session:
         proof = session.get(ProofAttempt, executed[0]["proof_attempt_id"])
         assert proof is not None

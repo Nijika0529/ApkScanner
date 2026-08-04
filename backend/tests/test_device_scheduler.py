@@ -536,6 +536,7 @@ def test_device_prepare_reuses_an_installed_system_package_after_install_failure
             settings,
             adb_serial="cloud-device:5555",
             device_install_policy="install_or_reuse",
+            device_reset_policy="per_round",
         ),
         SystemPackageRunner(),  # type: ignore[arg-type]
     )
@@ -547,6 +548,58 @@ def test_device_prepare_reuses_an_installed_system_package_after_install_failure
     assert by_kind["device.install"][0].exit_code == 0
     assert by_kind["device.install"][1]["install_mode"] == "reuse_after_install_failure"
     assert "device.clear" in by_kind
+
+
+def test_default_device_policy_preserves_target_application_data(settings) -> None:  # noqa: ANN001
+    calls: list[list[str]] = []
+
+    class PreserveRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @staticmethod
+        def run(argv, **_kwargs):  # noqa: ANN001, ANN205
+            calls.append(argv)
+            return CommandResult(argv, 0, "device", "")
+
+    assert settings.device_reset_policy == "never"
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        PreserveRunner(),  # type: ignore[arg-type]
+    )
+
+    prepare = adapter.prepare(Path("/tmp/sample.apk"), "com.example.target")
+    cleanup = adapter.cleanup("com.example.target")
+
+    assert all(kind != "device.clear" for kind, _result, _metadata in prepare)
+    assert cleanup == []
+    assert not any(command[-3:] == ["pm", "clear", "com.example.target"] for command in calls)
+
+
+def test_opt_in_per_round_policy_still_clears_disposable_target(settings) -> None:  # noqa: ANN001
+    class ResetRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @staticmethod
+        def run(argv, **_kwargs):  # noqa: ANN001, ANN205
+            return CommandResult(argv, 0, "Success", "")
+
+    adapter = AdbDeviceAdapter(
+        replace(
+            settings,
+            adb_serial="cloud-device:5555",
+            device_reset_policy="per_round",
+        ),
+        ResetRunner(),  # type: ignore[arg-type]
+    )
+
+    cleanup = adapter.cleanup("com.example.target")
+
+    assert cleanup[0][0] == "device.clear"
+    assert cleanup[0][1].argv[-3:] == ["pm", "clear", "com.example.target"]
 
 
 def test_typed_provider_oracle_emits_platform_impact_signal() -> None:
@@ -1270,6 +1323,116 @@ def test_preexisting_target_ui_text_is_not_a_new_impact() -> None:
     assert metadata["oracle"]["matched"] is True
     assert metadata["oracle"]["observation"]["target_text_transition"] is False
     assert metadata["security_impact_observed"] is False
+
+
+def test_new_target_ui_text_can_prove_unauthorized_state_change() -> None:
+    oracle = AgentOracleSpec(
+        kind="ui_text",
+        expected_text="Imported entries: [../shared_prefs/session.xml]",
+        impact="unauthorized_state_change",
+    )
+
+    metadata = AdbDeviceAdapter._evaluate_ui_oracle(
+        oracle,
+        (
+            '<hierarchy><node package="com.example.target" '
+            'text="Imported entries: [../shared_prefs/session.xml]" /></hierarchy>'
+        ),
+        package_name="com.example.target",
+        baseline_output='<hierarchy><node package="com.example.target" text="Ready" /></hierarchy>',
+        baseline_valid=True,
+    )
+
+    assert metadata["oracle"]["matched"] is True
+    assert metadata["oracle"]["observation"]["target_text_transition"] is True
+    assert metadata["security_impact_observed"] is True
+
+
+def test_target_file_hash_transition_proves_unauthorized_state_change() -> None:
+    oracle = AgentOracleSpec(
+        kind="target_file_sha256",
+        target_path="shared_prefs/session.xml",
+        impact="unauthorized_state_change",
+    )
+
+    metadata = AdbDeviceAdapter._evaluate_target_file_oracle(
+        oracle,
+        before={
+            "observer_available": True,
+            "file_exists": True,
+            "sha256": "a" * 64,
+        },
+        after={
+            "observer_available": True,
+            "file_exists": True,
+            "sha256": "b" * 64,
+        },
+    )
+
+    assert metadata["oracle"]["matched"] is True
+    assert metadata["oracle"]["observation"]["state_transition"] is True
+    assert metadata["security_impact_observed"] is True
+
+
+def test_unavailable_target_file_observer_is_a_gap_not_refutation() -> None:
+    oracle = AgentOracleSpec(
+        kind="target_file_sha256",
+        target_path="shared_prefs/session.xml",
+        impact="unauthorized_state_change",
+        refute_on_miss=True,
+    )
+
+    metadata = AdbDeviceAdapter._evaluate_target_file_oracle(
+        oracle,
+        before={"observer_available": False, "observer_gap": "not debuggable"},
+        after={"observer_available": False, "observer_gap": "not debuggable"},
+    )
+
+    assert metadata["oracle"]["matched"] is False
+    assert metadata["oracle_refuted"] is False
+    assert metadata["security_impact_observed"] is False
+
+
+@pytest.mark.parametrize(
+    ("stderr", "observer_available"),
+    [
+        (
+            "/system/bin/sha256sum: shared_prefs/session.xml: No such file or directory",
+            True,
+        ),
+        (
+            "run-as: exec failed for /system/bin/sha256sum: No such file or directory",
+            False,
+        ),
+    ],
+)
+def test_target_file_snapshot_distinguishes_missing_file_from_missing_observer(
+    settings,  # noqa: ANN001
+    stderr: str,
+    observer_available: bool,
+) -> None:
+    class SnapshotRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @staticmethod
+        def run(argv, **_kwargs):  # noqa: ANN001, ANN205
+            return CommandResult(argv, 1, "", stderr)
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        SnapshotRunner(),  # type: ignore[arg-type]
+    )
+
+    _result, snapshot = adapter._target_file_snapshot(
+        "com.example.target",
+        "shared_prefs/session.xml",
+        budget=None,
+    )
+
+    assert snapshot["observer_available"] is observer_available
+    assert snapshot["file_exists"] is False
 
 
 def test_process_crash_oracle_requires_the_target_process() -> None:

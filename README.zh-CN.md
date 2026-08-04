@@ -15,7 +15,7 @@ v1 产品是一个单用户、仅限本机（localhost）的 Web 应用。它接
 - 持久化 Hypothesis、Hunter/Critic 论证、Proof Attempt、危害 Oracle 和平台 Verdict；模型文字不能自证漏洞成立。
 - 私有 APK ground-truth 评测：只对平台确认的最终 Finding 计分，默认要求动态证明，并用 F0.5 重罚不匹配真值的高危结论。
 - 所有扫描全局只运行一个入口调查任务；该任务从设备准备、多轮 Agent/PoC 回放到清理始终独占 ADB。
-- 远程 ADB 适配器、可选普通 App UID Probe 快速路径、Agent 专用 PoC、客观 Oracle、`pm clear` 清理和 App Link 状态检查/重置。
+- 远程 ADB 适配器、可选普通 App UID Probe 快速路径、Agent 专用 PoC、客观 Oracle；默认保留待测应用数据，仅对一次性测试 fixture 显式启用 `pm clear`。
 - 官方 `openai-codex==0.144.4` + DeepSeek Responses 集成：严格 JSON Schema、完整事件线、无子 Agent fan-out、全权限 Codex sandbox 和证据支撑的结果降级。
 - 每个扫描一个无密钥 keeper 容器；每个 `task + attempt + role` 使用独立 Unix UID、HOME、`CODEX_HOME`、TMPDIR 和可写工作区，同时只读挂载 JADX/Apktool/archive 输入。
 - OpenCode 可执行运行时、critic、fallback 和 Node Worker 已删除；仅保留历史报告读取兼容与退役设计文档。
@@ -291,7 +291,7 @@ source/control/sink/reachable path/boundary/counterevidence/proof gaps 证据元
 | `APKSCANNER_DEVICE_MIN_API` / `APKSCANNER_DEVICE_MAX_API` | `36` / `99` | 可接受的云真机 API 范围；默认只接受 Android 16 及以上 |
 | `APKSCANNER_ALLOW_LEGACY_DEVICE_SMOKE` | `false` | 允许低于 API 36 的本地兼容性冒烟；证据不可产出 Android 16 裁决 |
 | `APKSCANNER_DEVICE_INSTALL_POLICY` | `install_or_reuse` | 目标安装策略：`replace`、`install_or_reuse` 或 `reuse_installed` |
-| `APKSCANNER_DEVICE_RESET_POLICY` | `per_round` | `per_test`、`per_round` 或 `never`；单条测试可覆盖 |
+| `APKSCANNER_DEVICE_RESET_POLICY` | `never` | `never` 是保留登录态、首次协议和本地数据的硬策略；`per_round`、`per_test` 仅用于可丢弃 fixture |
 | `APKSCANNER_MAX_UPLOAD_BYTES` | 512 MiB | 上传大小限制 |
 | `APKSCANNER_TASK_TIMEOUT` | 14400 秒 | 每个调查任务的总时间预算 |
 | `APKSCANNER_TASK_MAX_ATTEMPTS` | 2 | 重试次数预算 |
@@ -322,7 +322,7 @@ APKSCANNER_RUN_DOCKER_TESTS=1 pytest -q backend/tests/test_codex_executor.py
 - APK 代码、资源、字符串、日志和网页内容均为不可信的 prompt 数据。
 - Probe APK 是故意危险的工具，必须永远不保留在员工/生产设备上。
 - 无源码或服务端权限上下文可用；AUTH 和 PRIVACY 覆盖为部分覆盖。
-- v1 覆盖范围：单 APK、专用 Android 测试设备、`pm clear`（而非完整设备快照）。
+- v1 覆盖范围：单 APK、专用 Android 测试设备；默认保留目标应用数据，可丢弃 fixture 才显式使用 `pm clear`（而非完整设备快照）。
 - Codex Docker Worker 具有只读扫描输入和每 role 独立 UID 的可写工作区；Codex sandbox
   在容器内部为 full access。容器目前不直接挂载设备或 Docker socket。
 - Agent 容器对其所选模型 provider 仍保留出站网络连接。团队部署前需将每个 Worker 的出站流量限制到批准的 provider/网关。

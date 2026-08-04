@@ -78,7 +78,7 @@ class Settings:
     device_max_api: int = 99
     allow_legacy_device_smoke: bool = False
     device_install_policy: str = "install_or_reuse"
-    device_reset_policy: str = "per_round"
+    device_reset_policy: str = "never"
     frontend_dist: Path | None = None
 
     @classmethod
@@ -263,7 +263,7 @@ class Settings:
                 "APKSCANNER_DEVICE_INSTALL_POLICY", "install_or_reuse"
             ).lower(),
             device_reset_policy=os.getenv(
-                "APKSCANNER_DEVICE_RESET_POLICY", "per_round"
+                "APKSCANNER_DEVICE_RESET_POLICY", "never"
             ).lower(),
             frontend_dist=Path(frontend).resolve() if frontend else None,
         )
@@ -273,6 +273,10 @@ class Settings:
     def validate_codex_configuration(self) -> None:
         from .agent_execution import frozen_agent_configuration
 
+        if self.device_reset_policy not in {"never", "per_round", "per_test"}:
+            raise ValueError(
+                "APKSCANNER_DEVICE_RESET_POLICY must be never, per_round, or per_test"
+            )
         if self.device_android_api < 36:
             raise ValueError("APKScanner PoC target requires Android API 36 or newer")
         if self.device_min_api < 36 and not self.allow_legacy_device_smoke:

@@ -1060,6 +1060,11 @@ Gateway token 绑定：
 
 允许策略不是简单命令 allowlist。普通探索所需的 `shell am/pm/content/logcat/dumpsys`、安装 PoC、拉取任务允许的公共输出等可以使用，但必须绑定当前 serial、串行执行并进入事件线。
 
+目标应用状态默认采用硬保留策略 `device_reset_policy=never`：任务准备、Proof、任务结束和取消
+cleanup 都不得对目标包执行 `pm clear`、`uninstall` 或直接 `run-as`，模型请求的 `reset=clean`
+也会降为 `preserve`。平台仍可清理和卸载 `io.apkscanner.poc.*` 临时应用。只有操作者明确把
+专用 fixture 配置为 `per_round` 或 `per_test` 时，才允许破坏性重置目标数据。
+
 ### 13.4 资源和死锁
 
 - Agent 原始 ADB 命令和实时 Proof Replay 共用同一 task lease。
@@ -1100,6 +1105,8 @@ Gateway token 绑定：
 - `execution_demonstrated` 与 `harm_demonstrated` 分开。
 - 普通 App UID 能启动组件不等于危害成立。
 - 普通探索阶段只有领域 Oracle 观察到未授权数据返回、状态变化、权限边界绕过或其他具体影响，才能设置 `harm_demonstrated=true`；这是快速路径，不是全部漏洞类型的封闭枚举。
+- 文件导入、Zip Slip 等状态变更可使用 `target_file_sha256`：PoC 执行前后只对目标应用数据目录内经过校验的相对路径取 SHA-256，不回传文件内容。该 observer 依赖测试设备能够以 `run-as` 观察目标；量产非 debuggable APK 不可用时只能记录 coverage gap，不能把权限拒绝当成未复现。
+- `target_file_sha256` 对 PoC 异步触发的写入进行窗口内轮询；文件从不存在到存在、被删除或哈希变化都可证明 `unauthorized_state_change`。若私有文件不可观察，可使用目标应用新出现的 UI、目标 UID 日志或外部可读回查结果证明同一状态变化；PoC 自己的日志仍只能作为辅助证据。
 - 普通探索产生的 `reproduced_blackbox` 必须引用同一 Proof Attempt 的调用、身份、输出、Oracle 和制品 Evidence。
 - Critic 或模型文字不得推翻已经由平台签名的 Proof。
 
@@ -1110,6 +1117,7 @@ Gateway token 绑定：
 - 权限：verifier 具有私有可写工作区、完整只读反编译根、Bash/Python/Android 构建工具、Web Search、公网、分配设备上的扩展 ADB 策略，以及可选的宿主 SSH 运行时副本。ADB serial、租约和 server 所有权仍归平台。
 - 策略：固定 Proof、Probe 和 Oracle 仍可使用，但不是前置条件。Agent 可自行构建普通 App PoC、部署授权的 Aliyun HTML/回调、经真实 App 触发 JSB，并结合页面回调、应用行为、ADB 输出或 SSH 可见服务日志判断影响。
 - 语义：token/credential 是否真实不写死为正则；由 Agent 结合返回值来源、目标代码用法、账号/会话行为和授权后端响应综合判断。
+- 归并：组件、Deep Link 与静态边界可能分别产出同一漏洞。平台先按 `finding_identity.semantic_fingerprint` 做跨 task 确定性归并；identity 不同但实际到达同一敏感 sink、缺失同一安全控制且修复方式相同的候选，由 Adaptive Verifier 通过 `duplicate_of_finding_id` 指向一个 canonical Finding。原行、Evidence 和事件继续保存供审计，但重复行不再计入 Findings、Signals 和评测指标。
 - 准入：`reproduced_blackbox` 必须声明 `runtime_observed=true` 并描述具体实验与观测；纯静态推断只能保持 `supported_static`。平台校验候选 Finding ID 和引用 Evidence ID 的归属，但不再用固定 Oracle 重解释业务语义。
 - 失败：没有设备、SSH 不可用、Provider/Schema 失败或实验不充分时保留原 Finding，并显式记录 gap；不得因为 verifier 失败把可信静态风险删除。
 - 审计：请求、结构化 response、Thread/Turn、usage 和全量工具事件沿用 Protocol v3 事件线；隐藏思维链仍不保存。
@@ -1274,7 +1282,7 @@ Resource Scheduler 同时限制活跃扫描容器数和全局 AgentSession 数�
 4. 向该 session 进程组发送 SIGTERM；
 5. 仍未退出则通过可信 `session-control` 按 UID SIGKILL；仅在整次 scan 取消或容器不可信时 `docker rm -f`；
 6. 拒绝新的 ADB/Proof 请求；
-7. 平台使用 cleanup capability 清理设备；
+7. 平台使用 cleanup capability 清理 PoC 和临时资源；默认不清目标应用数据；
 8. 补读 host-only event spool，无法确认的尾部写入 `event.gap`；
 9. 写 `agent.cancellation` Evidence；
 10. 不把半成品输出转成 Finding。

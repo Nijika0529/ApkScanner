@@ -635,6 +635,10 @@ class AdbDeviceAdapter:
 
     def cleanup(self, package_name: str) -> list[tuple[str, CommandResult, dict]]:
         self._validate_package(package_name)
+        if self.settings.device_reset_policy == "never":
+            # Preserve the target's login, first-run consent, local databases, and app-link state.
+            # Temporary PoC applications are uninstalled by execute_poc() independently.
+            return []
         return [
             (
                 "device.clear",
@@ -1091,6 +1095,24 @@ class AdbDeviceAdapter:
                     30,
                 )
                 commands.append(("blackbox.poc_logcat_clear", log_clear, dict(common)))
+                target_file_baseline: dict[str, Any] | None = None
+                if oracle is not None and oracle.kind == "target_file_sha256":
+                    baseline_result, target_file_baseline = self._target_file_snapshot(
+                        target_package_name,
+                        oracle.target_path or "",
+                        budget=budget,
+                    )
+                    commands.append(
+                        (
+                            "blackbox.poc_target_file_baseline",
+                            baseline_result,
+                            {
+                                **common,
+                                "observation_role": "pre_action_baseline",
+                                **target_file_baseline,
+                            },
+                        )
+                    )
                 ui_baseline: CommandResult | None = None
                 if oracle is not None and oracle.kind == "ui_text":
                     ui_wake = self._adb_budget(
@@ -1265,6 +1287,32 @@ class AdbDeviceAdapter:
                         },
                     )
                 )
+                if oracle is not None and oracle.kind == "target_file_sha256":
+                    (
+                        target_file_result,
+                        target_file_oracle,
+                        target_file_poll_attempts,
+                        target_file_observation_seconds,
+                    ) = self._poll_target_file_change(
+                        oracle=oracle,
+                        package_name=target_package_name,
+                        baseline=target_file_baseline,
+                        timeout_seconds=spec.timeout_seconds,
+                        budget=budget,
+                    )
+                    commands.append(
+                        (
+                            "blackbox.poc_target_file_after",
+                            target_file_result,
+                            {
+                                **common,
+                                "observation_role": "post_action_observation",
+                                "poll_attempts": target_file_poll_attempts,
+                                "observation_window_seconds": target_file_observation_seconds,
+                                **target_file_oracle,
+                            },
+                        )
+                    )
                 if oracle is not None and oracle.kind == "ui_text":
                     ui_result, ui_oracle, ui_poll_attempts, ui_observation_seconds = (
                         self._poll_poc_ui(
@@ -1452,6 +1500,48 @@ class AdbDeviceAdapter:
             }
             if (
                 bool((metadata.get("oracle") or {}).get("matched"))
+                or time.monotonic() >= deadline
+                or (budget is not None and budget.expired)
+            ):
+                return last, metadata, attempts, time.monotonic() - started
+            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+
+    def _poll_target_file_change(
+        self,
+        *,
+        oracle: AgentOracleSpec,
+        package_name: str,
+        baseline: dict[str, Any] | None,
+        timeout_seconds: int,
+        budget: TimeBudget | None,
+    ) -> tuple[CommandResult, dict[str, Any], int, float]:
+        """Wait for an asynchronous target-private state transition after PoC dispatch."""
+
+        started = time.monotonic()
+        deadline = started + max(timeout_seconds, 1)
+        attempts = 0
+        last = self._budget_exhausted(
+            ["adb", "-s", self.serial or "", "shell", "run-as", package_name]
+        )
+        metadata: dict[str, Any] = {}
+        while True:
+            attempts += 1
+            last, observation = self._target_file_snapshot(
+                package_name,
+                oracle.target_path or "",
+                budget=budget,
+            )
+            metadata = self._evaluate_target_file_oracle(
+                oracle,
+                before=baseline,
+                after=observation,
+            )
+            observer_available = observation.get("observer_available") is True
+            baseline_available = (baseline or {}).get("observer_available") is True
+            if (
+                bool((metadata.get("oracle") or {}).get("matched"))
+                or not observer_available
+                or not baseline_available
                 or time.monotonic() >= deadline
                 or (budget is not None and budget.expired)
             ):
@@ -1657,6 +1747,54 @@ class AdbDeviceAdapter:
                 digest.update(chunk)
         return digest.hexdigest()
 
+    def _target_file_snapshot(
+        self,
+        package_name: str,
+        target_path: str,
+        *,
+        budget: TimeBudget | None,
+    ) -> tuple[CommandResult, dict[str, Any]]:
+        """Hash a target-private file without returning its contents.
+
+        Android permits this observer only for debuggable targets through ``run-as`` (or on a
+        separately authorized privileged test image). Failure to obtain the snapshot is recorded
+        as an Oracle capability gap and never treated as evidence that the file did not change.
+        """
+
+        result = self._adb_budget(
+            ["shell", "run-as", package_name, "/system/bin/sha256sum", target_path],
+            budget,
+            30,
+        )
+        combined = "\n".join(value for value in (result.stdout, result.stderr) if value)
+        normalized_output = combined.lower()
+        hash_match = re.search(r"(?m)^([a-fA-F0-9]{64})(?:\s|$)", result.stdout)
+        missing = bool(
+            result.exit_code != 0
+            and target_path.lower() in normalized_output
+            and any(
+                marker in normalized_output
+                for marker in ("no such file", "not found")
+            )
+            and "exec failed" not in normalized_output
+            and "not debuggable" not in normalized_output
+            and "is unknown" not in normalized_output
+        )
+        observer_available = bool(hash_match is not None or missing)
+        return result, {
+            "target_path": target_path,
+            "observer": "adb_run_as_sha256sum",
+            "observer_available": observer_available,
+            "file_exists": bool(hash_match is not None),
+            "sha256": hash_match.group(1).lower() if hash_match is not None else None,
+            "observer_gap": (
+                None
+                if observer_available
+                else "Target-private hash observation requires a debuggable target or an "
+                "explicitly authorized privileged test device."
+            ),
+        }
+
     @staticmethod
     def _last_json_payload(lines: list[str]) -> dict[str, Any] | None:
         for line in reversed(lines):
@@ -1856,6 +1994,44 @@ class AdbDeviceAdapter:
         return {}
 
     @classmethod
+    def _evaluate_target_file_oracle(
+        cls,
+        oracle: AgentOracleSpec,
+        *,
+        before: dict[str, Any] | None,
+        after: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if oracle.kind != "target_file_sha256":
+            return {}
+        baseline = dict(before or {})
+        observation = dict(after or {})
+        baseline_available = baseline.get("observer_available") is True
+        observation_available = observation.get("observer_available") is True
+        comparable = baseline_available and observation_available
+        before_state = (baseline.get("file_exists"), baseline.get("sha256"))
+        after_state = (observation.get("file_exists"), observation.get("sha256"))
+        changed = bool(comparable and before_state != after_state)
+        return cls._oracle_metadata(
+            oracle,
+            matched=changed,
+            observation={
+                "target_path": oracle.target_path,
+                "observer": "adb_run_as_sha256sum",
+                "baseline_available": baseline_available,
+                "observation_available": observation_available,
+                "file_existed_before": baseline.get("file_exists"),
+                "file_exists_after": observation.get("file_exists"),
+                "sha256_before": baseline.get("sha256"),
+                "sha256_after": observation.get("sha256"),
+                "state_transition": changed,
+                "observer_gap": baseline.get("observer_gap")
+                or observation.get("observer_gap"),
+            },
+            impact_observed=changed,
+            refutation_observed=comparable,
+        )
+
+    @classmethod
     def _evaluate_ui_oracle(
         cls,
         oracle: AgentOracleSpec | None,
@@ -1902,7 +2078,11 @@ class AdbDeviceAdapter:
                 "baseline_valid": baseline_valid,
                 "observation_valid": observation_valid,
             },
-            impact_observed=(target_transition and oracle.impact == "unauthorized_data_access"),
+            impact_observed=(
+                target_transition
+                and oracle.impact
+                in {"unauthorized_data_access", "unauthorized_state_change"}
+            ),
         )
 
     @staticmethod

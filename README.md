@@ -21,8 +21,8 @@ finding without platform evidence IDs.
   and usage.
 - One global investigation task at a time; it owns the single ADB device through all Agent,
   PoC replay, review, and cleanup rounds.
-- Remote ADB adapter, optional ordinary-app-UID Probe fast path, Agent PoCs, objective Oracles, `pm clear` cleanup,
-  and App Link state inspection/reset.
+- Remote ADB adapter, optional ordinary-app-UID Probe fast path, Agent PoCs, objective Oracles,
+  state-preserving target-app lifecycle by default, and opt-in `pm clear` for disposable fixtures.
 - Official `openai-codex==0.144.4` + DeepSeek Responses integration with strict JSON Schema,
   streamed events, a full-access Codex sandbox, no subagent fan-out, and evidence-backed result
   downgrades.
@@ -138,7 +138,10 @@ ordinary application UID, correlates its nonce-tagged result, and uninstalls it.
 `personal_lab` mode raw ADB is available for exploration, but only platform-correlated Probe/PoC
 execution can establish ordinary-app reachability. A PoC's own impact boolean remains a claim and
 cannot by itself satisfy the platform harm oracle; an objective UI, target-log, crash, or other
-platform observation is still required.
+platform observation is still required. File-import and Zip Slip replays can request a
+`target_file_sha256` Oracle for a validated app-data-relative path: the platform compares only the
+before/after hashes and treats an unavailable `run-as` observer as a coverage gap. A new
+target-owned UI transition remains a usable state-change Oracle for non-debuggable targets.
 
 The investigation pool follows the configured ADB device pool. Each task owns one device for its
 complete model, PoC replay, review, and cleanup lifecycle; with one serial, only one task runs at a
@@ -311,7 +314,7 @@ OpenCode design remains only for historical reference in
 | `APKSCANNER_DEVICE_MIN_API` / `APKSCANNER_DEVICE_MAX_API` | `36` / `99` | Verdict-device API range; Android 16+ by default |
 | `APKSCANNER_ALLOW_LEGACY_DEVICE_SMOKE` | `false` | Permit a pre-API-36 compatibility smoke device; its evidence cannot produce an Android 16 verdict |
 | `APKSCANNER_DEVICE_INSTALL_POLICY` | `install_or_reuse` | `replace`, `install_or_reuse`, or `reuse_installed` target policy |
-| `APKSCANNER_DEVICE_RESET_POLICY` | `per_round` | `per_test`, `per_round`, or `never`; each requested test may override it |
+| `APKSCANNER_DEVICE_RESET_POLICY` | `never` | `never` preserves target login/consent/data as a hard policy; `per_round` or `per_test` opt into destructive fixture resets |
 | `APKSCANNER_MAX_UPLOAD_BYTES` | 512 MiB | Intake limit |
 | `APKSCANNER_TASK_TIMEOUT` | 14400 s | Total investigation-task budget |
 | `APKSCANNER_TASK_MAX_ATTEMPTS` | 2 | Retry budget |
@@ -345,8 +348,8 @@ The server binds to `127.0.0.1` and rejects untrusted Host headers.
 - APK code, resources, strings, logs, and web content are untrusted prompt data.
 - The Probe APK is intentionally dangerous and must never remain on employee/production devices.
 - No source code or server authorization context is available; AUTH and PRIVACY remain partial.
-- v1 covers one APK, one dedicated Android test device, and `pm clear` rather than a
-  full device snapshot.
+- v1 covers one APK and one dedicated Android test device. Target-app data is preserved by default;
+  disposable fixtures may opt into `pm clear` rather than a full device snapshot.
 - The Codex worker gets read-only scan inputs and a writable per-role workspace under a distinct
   UID. The Codex sandbox is full access inside the container. No device or Docker socket is mounted.
 - Agent containers still have outbound networking for their selected model provider. Restrict each

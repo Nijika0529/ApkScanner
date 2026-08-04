@@ -192,7 +192,11 @@ def test_adaptive_verifier_prompt_uses_semantic_oracles_and_direct_host_ssh() ->
     assert "targetSdk API 36 or newer" in instructions
     assert "legacy dx-based fallback" in instructions
     assert "Do not lower targetSdk to match the phone" in instructions
+    assert "crafted ZIP" in instructions
+    assert "target_file_sha256" in instructions
+    assert "duplicate_of_finding_id" in instructions
     assert "每个 finding_id 必须且只能返回一条 assessment" in prompt
+    assert "duplicate_of_finding_id" in prompt
     assert candidate_id in prompt
     assert "最终由你对返回值、token、账号能力" in prompt
 

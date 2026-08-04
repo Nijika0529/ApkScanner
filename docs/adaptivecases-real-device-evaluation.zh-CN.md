@@ -8,6 +8,12 @@
 Adaptive Verifier 两次执行都在提交结构化结果前超时。因此这轮证明了调查能力已经具备，但也
 证明“发现并实际做出来”与“平台及时落成正式 Finding”之间仍有明显缺口。
 
+## 本轮后续修复
+
+- AC-002 不再把“无 archive 启动成功”当成有效动态尝试。常规调查与 Adaptive Verifier 都被要求构造带唯一 marker 和 `../` entry 的真实 ContentProvider ZIP PoC，并驱动 ACTION_SEND/URI grant 导入链。
+- Proof 增加 `target_file_sha256` 状态 Oracle，对安全的 app-data 相对路径执行 PoC 前后哈希比较并轮询异步写入；目标 APK 不允许 `run-as` 时明确保留 observer gap，同时允许目标应用新出现的导入结果 UI 证明 `unauthorized_state_change`。
+- Finding 在所有调查任务汇合后按 `finding_identity.semantic_fingerprint` 跨 task 归并；不同 identity 但同一 sink/缺失控制/修复方式的记录可由 Adaptive Verifier 用 `duplicate_of_finding_id` 归并。canonical Finding 合并入口和 Evidence，原记录保留审计但不再计入 Findings、Signals 或 TP/FP。
+
 ## 固件与环境
 
 - 当前可复现 fixture：`testapk/adaptivecases.apk`

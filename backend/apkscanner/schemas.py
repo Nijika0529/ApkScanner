@@ -460,6 +460,7 @@ class AgentOracleSpec(BaseModel):
         "ui_text",
         "log_contains",
         "target_uid_log_contains",
+        "target_file_sha256",
         "process_crash",
         "binder_reply",
     ] = "reachability"
@@ -467,6 +468,7 @@ class AgentOracleSpec(BaseModel):
     match_mode: Literal["exact", "contains", "regex", "sha256", "non_empty"] = "exact"
     reply_index: int = Field(default=0, ge=0, le=31)
     minimum_rows: int | None = Field(default=None, ge=1, le=1_000_000)
+    target_path: str | None = Field(default=None, min_length=1, max_length=512)
     impact: Literal[
         "none",
         "unauthorized_data_access",
@@ -509,10 +511,31 @@ class AgentOracleSpec(BaseModel):
             raise ValueError("binder_reply sha256 requires a lowercase SHA-256 expected_text")
         if self.kind == "provider_rows" and self.minimum_rows is None:
             self.minimum_rows = 1
+        if self.kind == "target_file_sha256":
+            if not self.target_path:
+                raise ValueError("target_file_sha256 requires target_path")
+            normalized_path = self.target_path.strip()
+            path_parts = normalized_path.split("/")
+            if (
+                normalized_path != self.target_path
+                or normalized_path.startswith("/")
+                or "\\" in normalized_path
+                or any(part in {"", ".", ".."} for part in path_parts)
+                or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in path_parts)
+            ):
+                raise ValueError(
+                    "target_file_sha256 target_path must be a safe app-data-relative path"
+                )
+        elif self.target_path is not None:
+            raise ValueError("target_path is supported only by target_file_sha256")
         allowed_impacts = {
             "reachability": {"none"},
             "provider_rows": {"none", "unauthorized_data_access"},
-            "ui_text": {"none", "unauthorized_data_access"},
+            "ui_text": {
+                "none",
+                "unauthorized_data_access",
+                "unauthorized_state_change",
+            },
             "log_contains": {
                 "none",
                 "unauthorized_data_access",
@@ -520,6 +543,7 @@ class AgentOracleSpec(BaseModel):
                 "privileged_action",
             },
             "target_uid_log_contains": {"none", "privileged_action"},
+            "target_file_sha256": {"unauthorized_state_change"},
             "process_crash": {"none", "denial_of_service"},
             "binder_reply": {"none", "unauthorized_data_access"},
         }
@@ -571,7 +595,7 @@ class AgentRequestedTest(BaseModel):
         pattern=r"^[A-Za-z][A-Za-z0-9_.]{0,254}$",
     )
     categories: list[str] = Field(default_factory=list, max_length=8)
-    reset: Literal["inherit", "clean", "preserve"] = "inherit"
+    reset: Literal["inherit", "clean", "preserve"] = "preserve"
     oracle: AgentOracleSpec = Field(default_factory=AgentOracleSpec)
     rationale: str = Field(min_length=1, max_length=1000)
     poc: AgentPocSpec | None = None
@@ -658,7 +682,7 @@ class AgentProofReplay(BaseModel):
         min_length=1,
         max_length=32,
     )
-    reset: Literal["inherit", "clean", "preserve"] = "clean"
+    reset: Literal["inherit", "clean", "preserve"] = "preserve"
     oracle: AgentOracleSpec
     rationale: str = Field(min_length=1, max_length=1000)
     poc: AgentPocSpec | None = None
@@ -963,6 +987,10 @@ class AdaptiveVerifierAssessment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     finding_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
+    duplicate_of_finding_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9-]{36}$",
+    )
     verdict: Literal[
         "reproduced_blackbox",
         "supported_static",
@@ -982,6 +1010,8 @@ class AdaptiveVerifierAssessment(BaseModel):
 
     @model_validator(mode="after")
     def validate_runtime_verdict(self) -> Self:
+        if self.duplicate_of_finding_id == self.finding_id:
+            raise ValueError("duplicate_of_finding_id cannot reference the same finding")
         if self.verdict == "reproduced_blackbox" and not self.runtime_observed:
             raise ValueError("reproduced_blackbox requires an actual runtime observation")
         if self.verdict == "not_reproduced" and not self.runtime_observed:

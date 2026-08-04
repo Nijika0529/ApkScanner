@@ -51,9 +51,14 @@ def developer_instructions(
         "adb usb, adb root, adb remount, start/stop adbd, change service.adb.tcp.port, create adb "
         "forward/reverse mappings, control debug WebServers or debug ports, or enable developer, "
         "unattended, sideload, hidden-debug, or feature-flag states. Root-only collection and those "
-        "state changes require explicit user approval recorded in the task context. Do not use "
-        "`su` or `run-as` to read the target application's private files: that identity is outside "
-        "the ordinary-app attacker model. A permission denial closes that collection path; do not "
+        "state changes require explicit user approval recorded in the task context. Do not invoke "
+        "`pm clear` or `uninstall` against the target package: preserve its login, "
+        "first-run consent, databases, and local configuration across tasks. "
+        "Do not invoke `su` or `run-as` directly to read the target application's private files: "
+        "that identity is "
+        "outside the ordinary-app attacker model. The platform-owned target_file_sha256 Oracle may "
+        "use run-as only as an independent before/after hash observer and never returns file data. "
+        "A permission denial closes direct collection; do not "
         "retry it through a stronger identity. Prefer "
         "non-destructive checks, clear logcat immediately before a reproduction, use unique request "
         "IDs, avoid unsafe adb-shell quoting, and test app behavior in the installed app process "
@@ -183,6 +188,15 @@ real application, invoke the bridge, and inspect page callbacks or server logs. 
 credential authenticity semantically from runtime provenance, code usage, session/account
 behavior, and authorized backend responses; do not rely on a hard-coded token regex.
 
+For archive extraction and file-import candidates, do not stop after launching the target without
+an archive. Build an ordinary-app PoC that serves a crafted ZIP through a ContentProvider or other
+real URI grant and drives the target import flow. Put a unique marker in the traversal entry so a
+before/after comparison cannot accidentally hash identical content. Prefer target_file_sha256 with
+an app-data-relative target_path, for example shared_prefs/session.xml, when the platform observer
+is available. Otherwise use a new target-owned UI transition, target-UID log, exported readback, or
+another independent effect that demonstrates the write; a PoC's own success log is supporting
+evidence only.
+
 For every candidate, record concrete actions and observations. A semantic verdict may rely on
 ADB output, application behavior, an ordinary-app PoC, a remote callback, SSH-visible server logs,
 or a combination. The platform will preserve your structured response and tool timeline; it will
@@ -191,8 +205,18 @@ runtime observation establishes the claimed impact. Use not_reproduced only when
 runtime attempt produced meaningful counterevidence. Keep supported_static when the static chain
 remains credible but execution is blocked or inconclusive.
 
+The same root vulnerability can be supplied more than once because component, deep-link, and
+static-surface tasks describe different ingress paths. When two candidates reach the same concrete
+sensitive sink through the same missing security control and have the same remediation, select one
+canonical candidate and set duplicate_of_finding_id on every duplicate assessment. Do not merge
+candidates merely because they mention the same Activity or security category. Each supplied
+finding_id still requires exactly one assessment, including duplicates.
+
 Work only on the supplied APK, assigned Android device, and SSH hosts already authorized by the
-host configuration. Do not spawn subagents or modify APKScanner itself. Keep generated files in
+host configuration. Preserve the target application's installed data, login, first-run consent,
+and local configuration; never run pm clear, uninstall, or run-as against the target package.
+Temporary PoC packages may still be installed, cleared, and removed. Do not spawn subagents or
+modify APKScanner itself. Keep generated files in
 the current workspace or /tmp. Clean up temporary remote pages/services and PoC APKs when doing so
 would not destroy the only useful evidence. Return only the requested JSON schema, with all
 human-readable conclusions in Simplified Chinese.
@@ -246,7 +270,10 @@ def adaptive_verification_prompt(
         "apkscanner-proof、原始 ADB、完整 PoC、远端 HTML/回调和 SSH 日志都只是可选证据来源。"
         "若第一次方案失败，依据具体错误改变实现、输入、时序或观测位置。每个 finding_id 必须"
         "且只能返回一条 assessment；不要创造新的 finding_id。最终由你对返回值、token、账号"
-        "能力或其他语义影响作综合判断。\n\nADAPTIVE_VERIFICATION_CONTEXT_JSON:\n"
+        "能力或其他语义影响作综合判断。若组件入口、Deep Link 和静态边界实际到达同一个敏感"
+        "sink、缺失同一安全控制且修复方式相同，保留一个 canonical finding，并在其余 assessment"
+        "中填写 duplicate_of_finding_id；不能只因组件名或漏洞类别相同就归并。\n\n"
+        "ADAPTIVE_VERIFICATION_CONTEXT_JSON:\n"
         + json.dumps(payload, ensure_ascii=False, indent=2)
     )
 
@@ -737,6 +764,14 @@ def investigation_prompt(
         "to the installed target package UID. Do not use /data/local/tmp as an app-writable Oracle. "
         "The uri field is Android Intent data, not an arbitrary WebView input: never submit a "
         "javascript: URI unless that exact origin is accepted by the entry's declared deep link. "
+        "For archive or file-import traversal hypotheses, launching the target with no archive is "
+        "only a reachability diagnostic. Build an ordinary-app PoC ContentProvider that returns a "
+        "crafted ZIP with a unique marker in a ../ entry, grant its content URI, and drive the real "
+        "import Intent. Prefer an Oracle such as "
+        '{"kind":"target_file_sha256","target_path":"shared_prefs/session.xml",'
+        '"impact":"unauthorized_state_change"}; when private hashing is unavailable, use a new '
+        "target-owned UI transition, target-UID log, or exported readback that independently "
+        "demonstrates the unauthorized write. "
         "Use an impact-bearing Oracle only when its concrete predicate would demonstrate the named "
         "unauthorized effect; reachability alone is never impact. Oracle impact mappings are strict: "
         "reachability supports impact=none only; provider_rows may use "
@@ -748,10 +783,14 @@ def investigation_prompt(
         "exactly matches expected_text. "
         "target_uid_log_contains may use "
         "privileged_action only and requires a marker emitted under the target package UID. "
-        "ui_text may use unauthorized_data_access only and becomes harm "
+        "target_file_sha256 uses an app-data-relative target_path and may prove "
+        "unauthorized_state_change only when the platform obtains comparable before/after hashes; "
+        "run-as unavailability is an Oracle gap, not negative evidence. "
+        "ui_text may use unauthorized_data_access or unauthorized_state_change and becomes harm "
         "evidence only for a new target-package-owned UI transition; process_crash may use "
-        "denial_of_service only and must identify the target process. No current Oracle independently "
-        "proves unauthorized_state_change; privileged_action requires a target-UID-attributed "
+        "denial_of_service only and must identify the target process. No Oracle independently "
+        "proves an invisible target-private state change when hashing is unavailable; in that case "
+        "seek a target-owned UI/log/readback effect. privileged_action requires a target-UID-attributed "
         "observation such as target_uid_log_contains. Deep-link and provider URI mutations "
         "must preserve the declared scheme and authority. Use requested_tests only when existing "
         "evidence cannot answer a concrete hypothesis, and adapt later requests to the executed "

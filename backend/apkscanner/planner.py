@@ -78,10 +78,12 @@ class InvestigationPlanner:
         android_version: str,
         adb_configured: bool,
         android_api: int = 36,
+        device_reset_policy: str = "never",
     ):
         self.android_version = android_version
         self.android_api = android_api
         self.adb_configured = adb_configured
+        self.device_reset_policy = device_reset_policy
 
     def plan(self, scan_id: str, entries: list[EntryPoint]) -> list[InvestigationTask]:
         return self.plan_with_decisions(scan_id, entries).tasks
@@ -253,25 +255,31 @@ class InvestigationPlanner:
         return grant_all == "true" or bool(metadata.get("grant_uri_permission_paths"))
 
     def _base(self) -> dict:
+        allowed_side_effects = [
+            "install_target_apk",
+            "install_probe_apk",
+            "build_agent_poc_apk",
+            "install_agent_poc_apk",
+            "uninstall_agent_poc_apk",
+            "test_backend_mutations_with_cleanup",
+            "adb_exploration",
+        ]
+        if self.device_reset_policy != "never":
+            allowed_side_effects.append("clear_application_data")
         return {
             "status": TaskStatus.QUEUED.value,
             "preconditions": {"ordinary_app_caller": True},
-            "allowed_side_effects": [
-                "install_target_apk",
-                "install_probe_apk",
-                "build_agent_poc_apk",
-                "install_agent_poc_apk",
-                "uninstall_agent_poc_apk",
-                "clear_application_data",
-                "test_backend_mutations_with_cleanup",
-                "adb_exploration",
-            ],
+            "allowed_side_effects": allowed_side_effects,
             "device_profile": {
                 "android_version": self.android_version,
                 "api_level": self.android_api,
                 "minimum_validation_api": 36,
                 "root_capable": True,
-                "reset_capability": "pm_clear_only",
+                "reset_capability": (
+                    "disabled_preserve_target_state"
+                    if self.device_reset_policy == "never"
+                    else "pm_clear_only"
+                ),
                 "configured": self.adb_configured,
             },
         }
