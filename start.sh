@@ -2,6 +2,63 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+load_env_file() {
+  local env_file="${APKSCANNER_ENV_FILE:-$PROJECT_DIR/.env}"
+  local mode owner_uid line key value
+  local line_number=0
+
+  if [[ "$env_file" != /* ]]; then
+    env_file="$PROJECT_DIR/$env_file"
+  fi
+  if [ ! -e "$env_file" ]; then
+    return
+  fi
+  if [ ! -f "$env_file" ] || [ ! -r "$env_file" ]; then
+    echo "APKScanner env file is not a readable regular file: $env_file" >&2
+    exit 1
+  fi
+
+  mode="$(stat -c '%a' "$env_file")"
+  owner_uid="$(stat -c '%u' "$env_file")"
+  if [ "$owner_uid" != "$(id -u)" ]; then
+    echo "refusing env file not owned by the current user: $env_file" >&2
+    exit 1
+  fi
+  if (( (8#$mode & 077) != 0 )); then
+    echo "env file permissions are too broad: $env_file (mode $mode)" >&2
+    echo "run: chmod 600 '$env_file'" >&2
+    exit 1
+  fi
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line_number=$((line_number + 1))
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ ! "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]]; then
+      echo "invalid assignment in $env_file:$line_number" >&2
+      exit 1
+    fi
+    key="${BASH_REMATCH[2]}"
+    value="${BASH_REMATCH[3]}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "$value" =~ ^\"(.*)\"$ ]] || [[ "$value" =~ ^\'(.*)\'$ ]]; then
+      value="${BASH_REMATCH[1]}"
+    fi
+
+    # Explicit caller variables take precedence over local convenience values.
+    if [[ -v "$key" ]]; then
+      continue
+    fi
+    printf -v "$key" '%s' "$value"
+    export "$key"
+  done <"$env_file"
+  echo "loaded local environment: $env_file"
+}
+
+load_env_file
 RUNTIME_DIR="${APKSCANNER_RUNTIME_DIR:-$PROJECT_DIR/.data/run}"
 DATA_DIR="${APKSCANNER_DATA_DIR:-$PROJECT_DIR/.data}"
 if [[ "$DATA_DIR" != /* ]]; then

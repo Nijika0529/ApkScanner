@@ -63,7 +63,7 @@ argv；Python 包只安装 `apkscanner-adb-gateway`，仅 Worker 镜像把它链
 | 操作 | API | 语义 |
 | --- | --- | --- |
 | 列表/探测 | `GET /devices?probe=true` | 读取设备、API、占用任务和错误 |
-| 接入 | `POST /devices` | 可执行 `adb connect`；默认仅 API 36+，显式 legacy smoke 设备不可产出裁决 |
+| 接入 | `POST /devices` | 可执行 `adb connect`；development 接受 API 26+ 范围化动态裁决，android16_release 仅接受 API 36+ |
 | 排空 | `POST /devices/{serial}/drain` | 停止新 lease；不打断当前任务 |
 | 重连 | `POST /devices/{serial}/reconnect` | 活跃设备拒绝重连；探测成功后恢复调度 |
 | 移除 | `DELETE /devices/{serial}` | 活跃设备拒绝移除；删除持久成员关系 |
@@ -71,15 +71,19 @@ argv；Python 包只安装 `apkscanner-adb-gateway`，仅 Worker 镜像把它链
 新增设备会唤醒设备条件队列，因此扫描过程中等待的第二、第三个 worker 可以立即扩容。设备操作投影为
 `device.pool.*` 扫描事件；任务自身继续记录 queued/acquired/released 完整事件线。
 
-本地兼容性冒烟必须同时设置：
+本地开发默认配置为：
 
 ```bash
-export APKSCANNER_DEVICE_MIN_API=33
+export APKSCANNER_VALIDATION_PROFILE=development
+export APKSCANNER_DEVICE_MIN_API=26
 export APKSCANNER_ALLOW_LEGACY_DEVICE_SMOKE=true
 ```
 
-`APKSCANNER_ANDROID_API`、PoC compileSdk 和 targetSdk 仍保持 36+。发布门禁、漏洞复现、平台缓解、
-版本“已修复/回归”结论仍只接受 API 36+ Proof。
+旧设备可以形成 `dynamic_verdict_eligible=true`、`verdict_scope=development_legacy` 的 Finding，
+避免本地验证永远无法落库；同时固定 `release_gate_eligible=false`。正式环境设置
+`APKSCANNER_VALIDATION_PROFILE=android16_release`，并要求 API 36+。`APKSCANNER_ANDROID_API`、
+PoC compileSdk 和 targetSdk 在两种 Profile 下都保持 36+。发布门禁、平台缓解、版本“已修复/回归”
+结论仍只接受 `release_gate_eligible=true` 的 Proof。
 
 ## 3.1 控制台事件性能契约
 

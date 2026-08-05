@@ -1,6 +1,7 @@
 # APK 版本差分与漏洞回归复验设计
 
-状态：已确认方向，待分阶段实现
+状态：早期完整设计；静态缓存、版本快照、语义 Diff、模式卡和 PoC 重放已完成第一阶段实现。
+当前运行契约以 [`version-security-evolution.md`](version-security-evolution.md) 为准。
 日期：2026-07-28
 
 ## 1. 目标

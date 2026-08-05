@@ -133,7 +133,7 @@ Pattern 匹配只产生 `candidate_match` 并提高任务优先级。新版本�
 - Agent 不可见的期望漏洞清单；
 - 自动匹配规则和人工复核记录。
 
-详细覆盖计划见 [blueclaw-detection-plan.zh-CN.md](blueclaw-detection-plan.zh-CN.md)。
+详细覆盖计划见 [私有已知漏洞集盲测计划](private-benchmark-plan.zh-CN.md)。
 
 ## 10. API 与验收
 

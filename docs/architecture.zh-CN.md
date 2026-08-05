@@ -29,8 +29,8 @@ flowchart LR
     M --> N[Web / JSON / HTML / SARIF + 人工复核]
 ```
 
-平台按风险优先级逐个领取入口任务；多个扫描共享同一个全局任务执行锁。一个导出组件对应
-一个任务；同一 handler 的 Deep Links 合并成一个任务。Agent 不能创建子 Agent，也不能
+平台按风险优先级领取入口任务；没有动态设备时保留一个静态分析 lane，动态任务并发随当前可用
+ADB 设备数变化。一个导出组件对应一个任务；同一 handler 的 Deep Links 合并成一个任务。Agent 不能创建子 Agent，也不能
 直接把自己的文字当作复现证据。调查过程不设置工具调用、PoC 重建、Proof Replay、探索
 轮次或单轮测试数量上限；平台校验本轮提交的全部测试。测试只能使用当前任务的入口 ID；
 Deep Link 和 Provider URI 必须保持 Manifest 声明的
@@ -45,11 +45,12 @@ scheme、host/authority 和 port；额外参数有数量、键名、类型和长
 规则和确定性动态验证；总开关开启后，任务级开关仍可关闭某个入口的 AI。运行中的任务保留
 启动瞬间解析出的配置，避免一次审计调用途中切换模型；新配置只影响未启动或重新分析的任务。
 
-一个任务以 `task_id + attempt` 作为平台逻辑探索运行。当前 Worker Protocol v2 的每次物理
-每个 `task + attempt + role` 使用一个持久 Codex Worker 和非 ephemeral Thread；primary 的
+一个任务以 `task_id + attempt` 作为平台逻辑探索运行。Worker Protocol v3 为每个
+`task + attempt + role` 使用一个持久 Codex Worker 和非 ephemeral Thread；primary 的
 下一轮会复用同一 Thread，同时重新装载累计 Evidence 和已执行测试。Critic/Rescue 使用独立
 UID、工作区和 Thread。扫描级 Docker 容器继续复用，Web 将物理 Turn 聚合到同一任务时间线。
-持久 Thread/resume 按专项架构文档的 Phase 4 实施。
+Worker 异常退出后，replacement generation 会在配置指纹一致时尝试 `thread_resume`；失败则保留
+旧审计记录并创建新 Thread，不会静默切换 Provider。
 
 静态阶段结束即发布 preliminary report，并继续动态任务。外部工具和每个任务都有超时；超过 4 小时 preliminary 目标或 24 小时整单预算会写入事件及 coverage gap。
 
@@ -68,8 +69,9 @@ JADX 的非零退出码不直接等同于反编译不可用。平台把结果归
 优先级让 Gateway 意外覆盖操作者和设备探测所需的真实客户端。
 
 设备池容量在任务运行期间动态读取，运行中接入设备会自动增加可提交 worker，排空设备会停止新的
-lease。默认只有 API 36+ 设备具备裁决资格；显式 legacy smoke 设备只验证工具链，平台在 Proof 层
-强制把其结果保持为 inconclusive。
+lease。`development` Profile 下旧设备可形成 `development_legacy` 范围化动态 Finding，供本地调试和
+检测链闭环，但不能进入发布门禁；`android16_release` Profile 仅允许 API 36+ 设备签发正式裁决。
+两类结论分别持久化 `dynamic_verdict_eligible`、`release_gate_eligible` 与 `verdict_scope`，不会靠 UI 文案区分。
 
 设备池保留全局优先级队列，每台适配器内部继续保留命令互斥。实时 PoC Proof Context 保存
 任务实际获得的 Device Adapter，API 回放不能落到另一台手机。任务结果继续记录
@@ -113,6 +115,22 @@ test-case/request ID 的 Probe/PoC 与客观 Oracle 作为复现证据。模型�
 - `Evidence`：内容摘要、不可变文件、命令 argv、退出码、调用身份、request/test-case ID。
 - `Finding`：规则、MASVS/CWE、严重性、置信度、结论级别、入口和 Evidence 引用、人工结论。
 - `CoverageItem`：每个 MASVS 域和每个入口在 static、deterministic、blackbox、agent 阶段的状态及 gap。
+- `AgentSessionRecord` / `AgentTurnRecord` / `ScanContainerRecord`：独立于高频事件流的运行生命周期台账。
+- `AdaptiveVerificationCheckpoint`：终局验证按候选持久化的恢复断点。
+- `RuntimeObservation` / `ValidationFixture`：自由实验的语义观测与账号、会话、Canary 测试状态。
+- `CampaignRun` / `CampaignEntryRecord`：监督控制面的持久目标、DAG、预算和执行状态。
+
+运行控制接口：
+
+- `GET /scans/{scan_id}/agent-runtime`：读取 Container、Session、Turn 与 Adaptive Checkpoint 台账；
+- `GET /scans/{scan_id}/runtime-observations`：读取 WebView/网络/Socket/SSH 等标准化语义观测；
+- `POST/GET/DELETE /validation-fixtures`：管理账号、会话、Canary 与应用状态夹具；
+- `POST /supervisor/campaigns/launch` 与 `GET /supervisor/campaigns/{id}`：创建、观察持久 Campaign；
+- `POST /supervisor/campaigns/{id}/entries|continue|cancel`：追加 DAG 节点、恢复失败节点或请求停止。
+
+Supervisor 生命周期由服务内第一方循环推进，不依赖浏览器保持连接。每次只启动依赖已完成且预算
+允许的节点；服务重启后从数据库继续观察已启动 Scan，并生成后续节点。Campaign 的并发预算只控制
+扫描级扇出，不改变单个扫描“可用 ADB 设备数即动态探索并发数”的调度规则。
 
 ## 结论和证据规则
 
@@ -242,11 +260,12 @@ Web 只允许删除已经 `final` 或 `failed` 的扫描；任务进入重试队
 - 设备供应商：保持 `prepare → reset/authenticate/probe → cleanup` 和 Evidence 输出契约，替换 ADB lease 实现。
 - 新判定级别：先定义所需的不可伪造 Evidence 条件，再扩展 Agent schema 和报告层，不能只改 prompt。
 
-## 上线前仍需完成
+## 生产化仍需完成
 
 - 用公司真实签名 APK 建立回归语料和误报基线。
 - 在目标云真机供应商上同时覆盖可选 Probe 快速路径和 Agent 专用 PoC 的 API 36 集成测试。
-- 构建并验证两个 Docker worker 镜像、企业 Codex/DeepSeek 凭据方式和各自网络出口策略。
+- 在自托管 Android 16 Runner 上持续执行已提供的正式回归工作流。
+- 为团队部署补充多用户身份、RBAC、集中 Secret Store 和 Provider 网络出口策略。
 - 业务账号态 fixture 作为后续专项能力，不阻塞普通入口审计。
 - 根据发布风险决定人工 gate；当前产品刻意不自动 gate。
 ## 威胁模型、逐假设收口与扫描封印

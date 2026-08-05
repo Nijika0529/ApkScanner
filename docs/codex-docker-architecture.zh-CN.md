@@ -139,15 +139,17 @@ Docker 容器共享宿主内核，镜像层在并发扫描间复用。`--memory`
 - Phase 5 已实现任务级 ADB/Proof Gateway：容器通过 `apkscanner-host:host-gateway` 到达随机内部端口，
   token 不进入 Prompt/审计/容器全局环境，serial 由设备 lease 固定，ADB 命令输出生成 Evidence；
 - Capability Registry 已实现 built-in、hash-pinned Python script 和显式 MCP binding；监督 REST 已提供
-  snapshot、catalog/invoke、Campaign validate/launch，作为未来独立监督 Agent 的窄控制面；
+  持久 Campaign、目标、DAG 依赖、预算、自动推进、追加、继续和取消。Agent Session/Turn/Container、
+  候选级 Adaptive Checkpoint、RuntimeObservation 与账号/会话/Canary Fixture 均独立持久化；
 - Worker 镜像 `apk-scanner-codex-worker:0.2.0` 标记 SDK `0.144.4` / Protocol `3` / Worker
   revision `20260804.1`，真实 Docker
   UID/Thread 和 Pixel 4 ADB Gateway 集成测试通过；
 - `vulntest.apk` 曾在 Pixel 4 Android 13/API 33 完成真实 DeepSeek/Codex 自动 PoC smoke：Codex 在独立
   UID 工作区读取宿主机反编译结果、生成源码 PoC，经平台构建/签名/安装后，以普通 App UID 触发
   DeepLink/WebView JS Bridge；平台从中性 Home 基线回读目标包 UI 并观察到秘密文本。该历史扫描在
-  旧策略下签发过 `reproduced_blackbox`，但当前策略已把 API 35 以下 Evidence 强制降为
-  `compatibility_smoke_only/inconclusive`，不得用于 Android 16 漏洞、修复或回归结论；
+  旧策略下签发过 `reproduced_blackbox`；当前 `development` Profile 允许同类旧机验证形成
+  `development_legacy` Finding，解决本地无法落地的问题，但仍不得用于 Android 16 漏洞、修复、
+  回归或发布门禁结论；
 - 真机 smoke 同时修复了三项边界缺陷：Proof 客户端重复拼接完整 URL、Windows ADB 桥接下
   `uiautomator dump /dev/tty` 无法返回 XML、以及模型最终 JSON 前带说明文字时的严格尾部对象提取；
 - 平台现强制源码 PoC 读取 `apkscanner_request_id` 并输出 `success`、
@@ -1115,7 +1117,7 @@ cleanup 都不得对目标包执行 `pm clear`、`uninstall` 或直接 `run-as`�
 - 触发时机：所有普通探索任务结束、扫描封印之前；选取全部严重度达到配置阈值且状态仍为 `supported_static` 的 Finding，不按候选数量截断。
 - 批处理：一个扫描创建一个特殊 `adaptive_verification` task、一个 verifier UID 和一个全新 Codex Thread；约 4—5 个候选应一次输入，禁止每个风险各建 Agent。
 - 权限：verifier 具有私有可写工作区、完整只读反编译根、Bash/Python/Android 构建工具、Web Search、公网、分配设备上的扩展 ADB 策略，以及可选的宿主 SSH 运行时副本。ADB serial、租约和 server 所有权仍归平台。
-- 策略：固定 Proof、Probe 和 Oracle 仍可使用，但不是前置条件。Agent 可自行构建普通 App PoC、部署授权的 Aliyun HTML/回调、经真实 App 触发 JSB，并结合页面回调、应用行为、ADB 输出或 SSH 可见服务日志判断影响。
+- 策略：固定 Proof、Probe 和 Oracle 仍可使用，但不是前置条件。Agent 可自行构建普通 App PoC、部署授权的远端 HTML/回调、经真实 App 触发 JSB，并结合页面回调、应用行为、ADB 输出或 SSH 可见服务日志判断影响。
 - 语义：token/credential 是否真实不写死为正则；由 Agent 结合返回值来源、目标代码用法、账号/会话行为和授权后端响应综合判断。
 - 归并：组件、Deep Link 与静态边界可能分别产出同一漏洞。平台先按 `finding_identity.semantic_fingerprint` 做跨 task 确定性归并；identity 不同但实际到达同一敏感 sink、缺失同一安全控制且修复方式相同的候选，由 Adaptive Verifier 通过 `duplicate_of_finding_id` 指向一个 canonical Finding。原行、Evidence 和事件继续保存供审计，但重复行不再计入 Findings、Signals 和评测指标。
 - 准入：`reproduced_blackbox` 必须声明 `runtime_observed=true` 并描述具体实验与观测；纯静态推断只能保持 `supported_static`。平台校验候选 Finding ID 和引用 Evidence ID 的归属，但不再用固定 Oracle 重解释业务语义。
