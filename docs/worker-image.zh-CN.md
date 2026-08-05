@@ -63,7 +63,7 @@ docker image inspect apk-scanner-codex-worker:0.2.0 \
   --format '{{json .Config.Labels}}'
 ```
 
-当前镜像约 650 MB，首次构建还需要下载 Android Platform 与 Build Tools。后续只修改宿主控制面或
+当前镜像约 650 MB，首次构建还需要下载 Android Platform 与 Build Tools。仅修改宿主控制面或
 前端时通常不需要重建 Worker；修改 `Dockerfile.worker`、`pyproject.toml`、`codex_worker.py`、
 容器包装器或固定工具版本后应重建并运行 Docker 契约测试。
 

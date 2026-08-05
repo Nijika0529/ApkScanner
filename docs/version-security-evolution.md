@@ -38,7 +38,8 @@ artifact_sha256 + analysis_profile_digest
 <data_dir>/static-cache/<sha-prefix>/<artifact_sha256>/<analysis_profile>/
 ```
 
-工具版本或索引算法变化后自然产生新缓存，不覆盖旧缓存。发布阶段还应增加 LRU/容量回收、缓存清单哈希和只读挂载；不能按文件名或 package 名复用反编译目录。
+工具版本或索引算法变化后自然产生新缓存，不覆盖旧缓存。当前缓存没有自动 LRU/容量回收，运维侧必须
+监控 Data 目录容量；反编译目录不能按文件名或 package 名复用。
 
 ### 2.3 Security Fact / Proof Recipe 复用
 
@@ -70,7 +71,9 @@ artifact_sha256 + analysis_profile_digest
 
 `security_weakened` 和新入口进入最高优先级。普通实现变化进入高优先级语义复核。安全资源变化会交给静态安全任务，重点检查风控规则、网络配置、Web 内容、脚本、插件、迁移文件和硬编码凭据。
 
-后续应继续加入方法级调用图 Diff：不仅比较组件类，还要比较从入口可达的 helper、Binder stub、JSBridge handler、Tool dispatcher、风险评估器和配置加载器。类名混淆变化时，以调用/字符串/控制事实组合匹配，禁止只靠名字猜测。
+当前 Diff 以组件和安全事实为主，不提供完整的方法级调用图比较。对从入口可达的 helper、Binder
+stub、JSBridge handler、Tool dispatcher、风险评估器和配置加载器，平台只在现有代码索引能够形成
+稳定事实时参与匹配；类名混淆变化时禁止只靠名称推断。
 
 ## 5. 调度矩阵
 
@@ -86,7 +89,7 @@ artifact_sha256 + analysis_profile_digest
 
 ## 6. Finding 的跨版本状态
 
-平台应使用稳定 `finding_id` 表示同一漏洞语义，用 scan-specific `occurrence_id` 表示某个 APK 上的一次结论。版本演进视图展示：
+平台使用稳定 `finding_id` 表示同一漏洞语义，用 scan-specific `occurrence_id` 表示某个 APK 上的一次结论。版本演进视图展示：
 
 - `persisting`：当前版本重新证明仍存在；
 - `fixed_verified`：当前版本在同等或更强前置条件下，旧 PoC 和 Agent 适配均被平台 Oracle 明确反驳；
@@ -126,7 +129,8 @@ Pattern 匹配只产生 `candidate_match` 并提高任务优先级。新版本�
 
 ## 9. 盲测与已知漏洞集
 
-`special/` 中的已知报告只作为 Benchmark Oracle 和验收标准，不应挂载到被测 Agent workspace。否则模型可能复述报告而不是真正发现漏洞。盲测流程应分别保存：
+私有已知报告只作为 Benchmark Oracle 和验收标准，不挂载到被测 Agent workspace。否则模型可能
+复述报告而不是真正发现漏洞。盲测流程分别保存：
 
 - APK 输入；
 - Agent 可见的反编译与平台证据；

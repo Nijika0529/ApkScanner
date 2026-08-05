@@ -1,8 +1,8 @@
 # APK Scanner 架构与判定模型
 
-> Codex 迁移后的扫描级 Docker、多 UID 工作区、SDK 选型、Thread、事件线、ADB/Proof、
-> DeepSeek Provider、可插拔测试入口、监督 Agent 接口和分阶段实施规范，统一见
-> [Codex + DeepSeek Docker 执行架构与迁移规范](codex-docker-architecture.zh-CN.md)。
+> 扫描级 Docker、多 UID 工作区、Thread、事件线、ADB/Proof、DeepSeek Provider、
+> 可插拔测试入口和监督 Campaign 的运行规范见
+> [Codex + DeepSeek Docker 执行架构](codex-docker-architecture.zh-CN.md)。
 
 ## 目标与边界
 
@@ -224,7 +224,7 @@ Finding 数量或 SARIF。默认真值要求 `dynamic`，因此只有静态猜�
 Codex 审计额外记录冻结的执行 profile、ProviderProfile、PhaseRoute 及其 SHA-256、固定
 SDK/CLI/源码基线、reasoning effort、容器 generation、session UID/role、thread/turn、
 结构化校验和 usage。未知 SDK notification 会归一化为不含原始秘密载荷的安全摘要；事件
-带 schema version 与去重键。失败不会静默切换模型或恢复 OpenCode 路由。
+带 schema version 与去重键。失败不会静默切换模型、Provider 或调查后端。
 
 Codex app-server notification 会先归一化为 `exploration.*` 平台事件。Web 只展示假设、
 阶段、动作、证据和结论等关键事件，不展示或
@@ -260,14 +260,12 @@ Web 只允许删除已经 `final` 或 `failed` 的扫描；任务进入重试队
 - 设备供应商：保持 `prepare → reset/authenticate/probe → cleanup` 和 Evidence 输出契约，替换 ADB lease 实现。
 - 新判定级别：先定义所需的不可伪造 Evidence 条件，再扩展 Agent schema 和报告层，不能只改 prompt。
 
-## 生产化仍需完成
+## 部署边界
 
-- 用公司真实签名 APK 建立回归语料和误报基线。
-- 在目标云真机供应商上同时覆盖可选 Probe 快速路径和 Agent 专用 PoC 的 API 36 集成测试。
-- 在自托管 Android 16 Runner 上持续执行已提供的正式回归工作流。
-- 为团队部署补充多用户身份、RBAC、集中 Secret Store 和 Provider 网络出口策略。
-- 业务账号态 fixture 作为后续专项能力，不阻塞普通入口审计。
-- 根据发布风险决定人工 gate；当前产品刻意不自动 gate。
+当前发行形态是单用户、localhost 控制面，不提供多用户身份、RBAC、集中 Secret Store 或企业网络
+出口治理。Android 16 正式回归依赖带真实 API 36+ 设备的自托管 Runner；普通 CI 模拟器和本地旧机
+只能产生开发范围结果。平台输出用于安全人员复核，不自动替代发布审批。
+
 ## 威胁模型、逐假设收口与扫描封印
 
 静态分析完成后，控制面从 APK 元数据和入口点生成确定性的 Android 威胁模型。它固定
@@ -278,7 +276,7 @@ Web 只允许删除已经 `final` 或 `failed` 的扫描；任务进入重试队
 Agent 的结构化结果包含逐 `hypothesis_id` 的 assessment。平台按 hypothesis 单独记录
 source、control、sink、reachable path、boundary、counterevidence、proof gaps、Evidence
 引用与 verdict。未评估的 hypothesis 会得到明确的 closure receipt，而不会继承同任务
-其他 hypothesis 的总判定。旧 worker 输出仍可走兼容路径，但新提示词要求精确 UUID。
+其他 hypothesis 的总判定。缺少精确 hypothesis UUID 的结果不能批量套用到其他主张。
 
 Finding 元数据同时保存稳定 `finding_id`、单次扫描 `occurrence_id` 与 semantic
 fingerprint。稳定身份由包名、签名者、规则、类别、入口语义和 claim 生成，不依赖源码

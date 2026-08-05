@@ -9,25 +9,21 @@
 因此 APKScanner 将职责分开：
 
 - 平台确定性枚举入口并保存 Coverage；
-- Agent 决定下一步最有价值的实验；
+- Agent 根据当前证据选择信息增益最高的实验；
 - ADB/Proof Gateway 执行有身份边界的操作；
 - Oracle 观察 UI、日志、Binder、Provider、文件状态或网络语义；
 - Finding Policy 校验 Evidence ID、调用身份和危害等级。
 
 这使得模型升级可以改善探索能力，却不会改变“什么才算漏洞”的底层口径。
 
-## 2. 为什么从 OpenCode 迁移到 Codex SDK
+## 2. 为什么使用 Codex SDK 与 Responses API
 
-早期 OpenCode 路径需要 Python Orchestrator、Node Worker、本地 HTTP Server、OpenCode Session
-和 Provider 之间同步生命周期。实际运行中容易出现最终文本轮询、thinking/structured output、
-server fetch、session idle 和工具完成但文本未终态等问题。
-
-当前路径固定使用 Codex SDK 和 Responses API，直接获得：
+当前路径固定使用 Codex SDK 和 Responses API，统一提供：
 
 - 原生 Bash、文件、补丁和 Web Search；
 - 持久 Thread、Turn interrupt 和 `thread_resume`；
 - `output_schema` 结构化结果；
-- 单一事件协议和更短的故障链。
+- 单一事件协议和持久运行时台账。
 
 结构化输出仍可能出现类型漂移或 JSON 后附加自然语言，因此 Worker 先提取完整 JSON 候选，再用
 Pydantic Schema 校验并规范化已知兼容字段。解析放宽不等于降低结论门槛：Evidence 和 Verdict

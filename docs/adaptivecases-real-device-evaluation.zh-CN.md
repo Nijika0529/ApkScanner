@@ -1,130 +1,93 @@
-# AdaptiveCases 真机评测（2026-08-04）
+# AdaptiveCases 真机兼容性评测
 
-## 结论
+评测日期：2026-08-04
 
-本轮使用真实 DeepSeek API、Codex Docker 后端和一台 Pixel 4 真机完成了端到端扫描。
-目标 APK 的五个正例均被 Codex 静态语义分析覆盖，也都由普通应用 PoC 在真机上触发出预期行为；
-但平台最终严格分数仍为 0/5，因为设备是 Android 13 / API 33，只能作为兼容性烟测，且终局
-Adaptive Verifier 两次执行都在提交结构化结果前超时。因此这轮证明了调查能力已经具备，但也
-证明“发现并实际做出来”与“平台及时落成正式 Finding”之间仍有明显缺口。
+评测性质：Android 13 / API 33 开发烟测，不是 Android 16 正式回归。
 
-## 本轮后续修复
+## 1. 目的
 
-- AC-002 不再把“无 archive 启动成功”当成有效动态尝试。常规调查与 Adaptive Verifier 都被要求构造带唯一 marker 和 `../` entry 的真实 ContentProvider ZIP PoC，并驱动 ACTION_SEND/URI grant 导入链。
-- Proof 增加 `target_file_sha256` 状态 Oracle，对安全的 app-data 相对路径执行 PoC 前后哈希比较并轮询异步写入；目标 APK 不允许 `run-as` 时明确保留 observer gap，同时允许目标应用新出现的导入结果 UI 证明 `unauthorized_state_change`。
-- Finding 在所有调查任务汇合后按 `finding_identity.semantic_fingerprint` 跨 task 归并；不同 identity 但同一 sink/缺失控制/修复方式的记录可由 Adaptive Verifier 用 `duplicate_of_finding_id` 归并。canonical Finding 合并入口和 Evidence，原记录保留审计但不再计入 Findings、Signals 或 TP/FP。
+`testapk/adaptivecases.apk` 是公开的合成漏洞集，用于验证静态语义、Codex 调查、普通 App UID
+PoC、ADB Gateway 和 Oracle 能否形成完整链路。该 APK 的 minSdk 为 26，compileSdk/targetSdk 为
+36，并使用可复现构建。
 
-## 固件与环境
+本次使用固定 Codex Docker Worker、DeepSeek V4 Flash 和一台 Pixel 4/API 33 设备。设备序列号、
+扫描 UUID、API Key 和本地数据目录不属于评测口径，不记录在公开文档中。
 
-- 当前可复现 fixture：`testapk/adaptivecases.apk`
-- 当前 SHA-256：`64538a7792ff3d0b28ac00c779bcf8b566e16d3cc7627933b9df730a94acd755`
-- package：`io.apkscanner.adaptivecases`
-- minSdk 26，compileSdk/targetSdk 36，APK Signature Scheme v2/v3
-- 模型：`deepseek-v4-flash`，reasoning `high`
-- 后端：Codex SDK、Docker、scan-scoped container、真实 API key
-- 真机：Pixel 4，Android 13 / API 33，serial `9B081FFAZ00BX6`
-- scan ID：`c539fba1-b9a9-4705-90d1-38597e4a5528`
-- 数据目录：`.data/adaptivecases-real-20260804-1`
+## 2. 用例
 
-真机扫描时 APK 的容器 SHA-256 为
-`b84cd34bd6658447e18870a6fb242bbf612a010238b89653fd25f7fd586cf888`。测试后发现旧构建会把
-当前时间写入 ZIP/签名元数据，因此修复为可复现构建；当前 APK 与被扫描 APK 的
-`AndroidManifest.xml` 和 `classes.dex` 内容哈希完全一致，变化仅为打包元数据。正式基准仍应
-在 Android 16 设备上以当前可复现 APK 重新跑一轮。
+| ID | 攻击链 | 静态识别 | API 33 普通应用观察 | Android 16 正式结论 |
+| --- | --- | ---: | --- | --- |
+| AC-002 | ACTION_SEND Zip Slip | 是 | 恶意 ZIP 越界写入 canary 状态，目标 WebView 随后读取 | 未判定 |
+| AC-003 | exported dynamic Receiver | 是 | 攻击者 Receiver 收到目标账号和会话字段 | 未判定 |
+| AC-004 | unauthenticated localhost TCP | 是 | 普通应用连接本地端口并收到账号和会话字段 | 未判定 |
+| AC-005 | external URL → WebView → JSBridge | 是 | 授权测试页面调用桥，回调端收到账号和会话字段 | 未判定 |
+| AC-006 | exported Binder transaction | 是 | 普通应用读取多值 Binder reply | 未判定 |
 
-## 用例与真机观察
+测试集还包含两个安全对照组：
 
-| ID | 用例 | 静态发现 | API 33 普通应用烟测 | 正式 Android 16 判定 |
-|---|---|---:|---:|---:|
-| AC-002 | ACTION_SEND ZIP Slip | 是 | 恶意 ZIP 的 `../shared_prefs/session.xml` 被成功处理并写出；同批文件被目标 WebView 读取并回调 | 未判定 |
-| AC-003 | exported dynamic Receiver + attacker PendingIntent | 是 | 攻击者 Receiver 收到目标账号和 session token | 未判定 |
-| AC-004 | unauthenticated localhost TCP | 是 | 普通应用连接 `127.0.0.1:48765`，收到账号、token、expiry | 未判定 |
-| AC-005 | external URL -> WebView -> AccountBridge | 是 | 页面调用 JSB 后，回调端收到账号、token、expiry | 未判定 |
-| AC-006 | exported Binder transaction 7 | 是 | 普通应用收到 `code=200`、账号、token、expiry | 未判定 |
+- Mutable implicit PendingIntent 可以被重定向，但接收方没有打开私有 Provider 的 URI 权限；
+- signature permission 与 immutable PendingIntent 保护的 Activity 应保持不可利用。
 
-另有两个对抗性控制：
+对照组用于阻止模型把“可重定向”直接解释为“已泄露”。
 
-- Mutable implicit PendingIntent 可以被重定向，攻击者 Receiver 也能看到 content URI 与
-  ClipData，但打开非导出 `VaultProvider` 时得到 `SecurityException`。它不是有效的 URI 泄露
-  正例，已从 ground truth 正例集中删除，保留用于检查模型是否把“可重定向”误判成“已泄露”。
-- `SafeCapabilityActivity` 使用 signature permission 和 immutable PendingIntent，作为明确负例。
+## 3. 结果口径
 
-Android 官方说明 Intent 的 grant flag 会把 data/ClipData URI 权限授予接收方，同时也明确提醒
-PendingIntent creator 与实际 sender 不等价。本轮以普通应用 UID 做的反例结果优先于静态推断。
+### 3.1 正式严格指标
 
-## 指标
+- Ground truth：5；
+- `reproduced_blackbox`：0；
+- TP / FP / FN：0 / 0 / 5；
+- Precision / Recall / F0.5：0 / 0 / 0。
 
-### 平台严格指标
+严格指标为 0 的原因是设备低于 API 36，所有动态观察只能进入 development scope。该结果不能解释为
+“模型没有找到漏洞”，也不能用 API 33 行为替代 Android 16 发布结论。
 
-- Ground truth：5
-- `reproduced_blackbox`：0
-- TP/FP/FN：0 / 0 / 5
-- Precision/Recall/F0.5：0 / 0 / 0
-- `supported_static` Agent 风险：8，均被严格评测列为 unproven AI noise
+### 3.2 静态诊断指标
 
-严格分数不能解释为“模型一个都没找到”。它表示没有 API 36+ 的平台证据与成功落库的终局
-Adaptive 结果，符合当前正式证据策略。
+将同一 ground truth 临时降为 static proof，仅用于诊断静态覆盖：
 
-### 静态发现诊断指标（非正式分数）
+- TP / FP / FN：5 / 3 / 0；
+- Precision：0.625；
+- Recall：1.0；
+- F0.5：0.675676。
 
-把相同 ground truth 临时降为 static proof 只用于诊断：
+三个额外结果来自 ZIP 链重复 Finding 和 PendingIntent 近似漏洞对照组。这一指标促成了跨任务
+`semantic_fingerprint` 归并和对照组反证约束，但不作为项目正式检出率。
 
-- TP/FP/FN：5 / 3 / 0
-- Precision：0.625
-- Recall：1.0
-- F0.5：0.675676（67.57）
+## 4. 运行数据
 
-三个额外 Finding 来自 ZIP 链重复生成两次，以及 PendingIntent 近似漏洞反例。说明静态语义
-覆盖已经达到 5/5，但 Finding 去重和“风险可能性/实际危害”收口仍需加强。
+- preliminary 静态阶段约 2.3 秒；
+- 常规入口任务在约 69 分钟内结束；
+- 全扫描约 118 分钟，主要耗时来自终局开放式验证；
+- 扫描事件约 3,083 条，Evidence 约 497 条，artifact 约 22.3 MB；
+- Provider 发生一次 stream reconnect，SDK 自动恢复；
+- 常规入口任务没有发生本地 Server、fetch 或 session-idle 生命周期故障。
 
-### 耗时与可靠性
+事件规模验证了前端的摘要化设计：总览不加载完整事件线，任务页按 cursor 增量读取，高频工具事件
+批量合并，Evidence 正文和大型 artifact 按需加载。
 
-- 扫描总耗时：7078.6 秒（约 118 分钟，包含三次 Adaptive 尝试）
-- preliminary：2.3 秒
-- 4 个 static-review：64.1、84.9、134.3、146.7 秒
-- 5 个 component：378.8～902.7 秒；4 completed、1 inconclusive
-- 常规九任务到 Adaptive 开始：约 69 分钟；8 completed、1 inconclusive
-- 常规 Codex 流程没有出现 OpenCode server/fetch/session-idle 生命周期故障
-- 出现一次 DeepSeek stream reconnect，自动恢复
-- Adaptive attempt 1：worker 环境变量 allowlist 缺少 `APKSCANNER_ADB_POLICY`，立即失败；已修复
-- Adaptive attempt 2：约 28.5 分钟，152 次 tool、172 条 ADB Evidence、6 次 web search，超时
-- Adaptive attempt 3：成功复用前轮 180 条 Evidence，但仍执行 114 次 tool、96 条 ADB Evidence、
-  4 次 web search，约 14.3 分钟后超时
+## 5. 评测暴露的问题及当前处理
 
-当时提示词中的“最多 80 次工具调用”既限制自主探索，也没有形成可靠的运行控制，现已删除。
-平台不再用工具、PoC 重建、重放、轮次、单轮测试或候选数量阈值终止探索；真正的终止条件是
-Agent 判断没有进一步实质动作、全部假设已有 Proof、用户取消或任务生命周期到期。checkpoint
-仍值得实现，但它只用于逐项持久化成功 assessment 和超时/进程故障后的续跑，不能变成新的
-隐式探索次数上限。
+| 问题 | 当前处理 |
+| --- | --- |
+| Zip Slip 只证明入口可达，没有证明文件变化 | 增加 `target_file_sha256`，比较执行前后文件存在性和摘要 |
+| 同一 WebView/JSBridge 根因跨任务生成多条 Finding | 按 `finding_identity.semantic_fingerprint` 归并，Adaptive Verifier 可指定 canonical Finding |
+| 终局候选过多导致上下文超限 | 按字符预算拆批并持久化 assessment/checkpoint |
+| Verifier 失败后从零开始 | 同一 task 读取已完成批次和历史 Evidence，只恢复未完成部分 |
+| 旧设备结果可能被误写为正式漏洞 | Verdict 保存 `development_legacy` / `android16_release` scope，API 36 是发布硬门槛 |
+| 工具调用次数限制导致复杂链提前结束 | 移除固定工具/PoC/轮次上限，保留生命周期、取消和无事件超时 |
+| 目标应用数据在任务间被清空 | 默认 `APKSCANNER_DEVICE_RESET_POLICY=never` |
 
-### 事件与前端负载
+## 6. 可复现性
 
-- scan events：3083 条，序列化体积约 1.31 MB
-- agent runtime events：2126 条，约 0.26 MB
-- Evidence：497 条，artifact 文件合计约 22.3 MB
-- Evidence artifact 中 31 个大于 100 KB，10 个大于 1 MB
-- 仅 `model.tool.started/completed`、reasoning start/completed 和 ADB completed 就贡献了大部分事件
+APK、源码和 ground truth 位于：
 
-这验证了前端不应一次性拉取/渲染完整事件线。事件列表必须分页/虚拟化；tool start+completed 应
-折叠为一个逻辑节点；Evidence 正文只能按需打开，base64 上传命令必须摘要化。
+```text
+testapk/adaptivecases.apk
+testapk/adaptivecases-src/
+testapk/adaptivecases-ground-truth.json
+```
 
-## 本轮触发的修复
-
-- Codex worker 接受并严格校验 `APKSCANNER_ADB_POLICY={scoped,adaptive}`。
-- Adaptive retry 会读取同一 task 的历史 Evidence，避免从零开始。
-- Adaptive 提示词要求 PoC compile/target API 36+，只允许降低 minSdk 兼容旧机；dx fallback 仍可用，
-  但不得把 targetSdk 降到手机版本。本轮修复前生成的 PoC targetSdk 为 33，暴露了该契约缺口。
-- Adaptive 结果落库增加 Android 16 硬门槛：API < 36 上即使模型返回 `reproduced_blackbox`，
-  平台也只保留 `supported_static` 和 compatibility-smoke 元数据。
-- fixture 构建改为固定 ZIP 时间并禁用 v1 签名，连续构建 SHA-256 一致。
-- Ground truth 调整为五个真实正例，PendingIntent URI grant 近似用例改为对抗性控制。
-
-## 后续优先级
-
-1. 为 Adaptive Verifier 增加按候选 checkpoint 和部分结果持久化，使生命周期到期或进程故障后
-   能从同一证据状态继续，而不是限制 Agent 的工具调用次数。
-2. 在进入 Adaptive 前按攻击链语义合并重复 Finding；一个实验可以更新多个关联 Finding。
-3. 将 Adaptive 的普通应用 PoC、回调日志等动态 Evidence 转成平台可直接接受的证据引用，而不是
-   只有 Agent 最终 JSON 返回后才生效。
-4. 在 Android 16 / API 36+ 真机上用当前可复现 APK 重跑，取得正式 5-case 指标。
-5. 前端默认只展示结论事件，工具/Reasoning/ADB 事件按 task 分页、折叠和虚拟化。
+构建脚本固定 ZIP 时间并禁用 v1 签名，使相同源码能够产生稳定 APK SHA-256。正式 Benchmark 必须
+记录 commit、模型、ground truth 版本、Validation Profile 和设备 API；API 33 烟测与 API 36 发布回归
+必须分别展示。

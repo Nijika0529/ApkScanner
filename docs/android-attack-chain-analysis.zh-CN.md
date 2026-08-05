@@ -61,7 +61,9 @@ PIVAT/PIAnalyzer 一类工作强调从 PendingIntent 创建点追踪 base Intent
 
 参考：[Highly Precise and Efficient Analysis of PendingIntent Vulnerabilities for Android Apps](https://onlinelibrary.wiley.com/doi/10.1155/2024/8663701)、[Android PendingIntent security guidance](https://developer.android.com/privacy-and-security/risks/pending-intent)。
 
-`getCreatorPackage()`/`getCreatorUid()` 只说明令牌创建者，不能单独证明当前呈递者身份。扫描器为这种使用保留了 provenance 信号，后续应结合 Binder calling UID 或不可转移会话凭据复核。参考：[Exploiting PendingIntent Provenance Confusion to Spoof Android SDK Authentication](https://arxiv.org/abs/2603.02539)。
+`getCreatorPackage()`/`getCreatorUid()` 只说明令牌创建者，不能单独证明当前呈递者身份。扫描器为这种
+使用保留 provenance 信号；动态复核必须结合 Binder calling UID 或不可转移会话凭据。参考：
+[Exploiting PendingIntent Provenance Confusion to Spoof Android SDK Authentication](https://arxiv.org/abs/2603.02539)。
 
 ### 3.3 文件链必须同时建模程序路径和授予能力
 
@@ -88,7 +90,8 @@ SAUSAGE 对 Android Unix-domain socket 的研究将 socket 地址恢复、系统
 - `0.0.0.0` 等宽 bind；
 - `SO_PEERCRED`/peer credentials 或应用层 token/auth 信号。
 
-当后续保存设备镜像或 SELinux policy 时，可在同一 chain schema 中加入 `platform_access_control`，不需要改变入口模型。
+当前分析不读取设备镜像或 SELinux policy，因此 `platform_access_control` 保持 unknown，并作为动态
+Coverage Gap 展示；不能仅凭应用层未发现认证逻辑判定 Unix Socket 可被第三方 UID 访问。
 
 参考：[SAUSAGE: Security Analysis of Unix domain Socket Usage in Android](https://arxiv.org/abs/2204.01516)。
 
@@ -96,7 +99,8 @@ SAUSAGE 对 Android Unix-domain socket 的研究将 socket 地址恢复、系统
 
 单独发现 `addJavascriptInterface()` 或 `loadUrl()` 不足以说明外部可控。当前实现先连接 Intent、URI、ContentResolver、ACTION_SEND 和 navigation callback 到 WebView load/bridge API，并记录 origin guard。
 
-研究表明 WebView 的 iframe/popup、AppID/domain/capability identity、运行时脚本注入与 Java/JavaScript 信息交换都会破坏只看 Java API 的分析。后续动态阶段应在通用测试器中记录：
+研究表明 WebView 的 iframe/popup、AppID/domain/capability identity、运行时脚本注入与
+Java/JavaScript 信息交换都会破坏只看 Java API 的分析。动态验证证据需要记录：
 
 - 最终 URL、redirect chain、main frame 与子 frame；
 - bridge 注册、移除、方法调用和当前 frame origin；
@@ -141,9 +145,7 @@ SAUSAGE 对 Android Unix-domain socket 的研究将 socket 地址恢复、系统
 - Receiver 结果必须记录 `RECEIVER_EXPORTED`、`RECEIVER_NOT_EXPORTED`、sender permission 和实际注册生命周期；
 - URI grant 结果必须记录 read/write/prefix/persisted flag、接收包、ClipData 和撤销时机。
 
-## 7. 当前限制与下一步
-
-当前限制：
+## 7. 分析边界
 
 - 是类级引用图，不是 method/context/field-sensitive 污点分析；
 - 不解析反射、动态 class loading、Rx/coroutine/Handler 的完整异步边；
@@ -153,11 +155,5 @@ SAUSAGE 对 Android Unix-domain socket 的研究将 socket 地址恢复、系统
 - 普通 APK 的 Unix socket 结果暂未联合设备 SELinux policy；
 - ZIP/TAR 路径检查暂未做逐语句 def-use 和 TOCTOU/symlink 证明。
 
-建议后续顺序：
-
-1. 增加 method-level def-use slice，优先处理 `Intent`、`Uri`、`File` 和 WebView URL；
-2. 把现有 Smali 局部常量恢复扩展为跨基本块/字段的 Intent 状态传播；
-3. 增加通用攻击者 APK：PendingIntent 捕获/重放、恶意 ContentProvider、动态广播、localhost/Unix client；
-4. 扩展现有 Frida trace，记录 WebView final URL/frame/bridge 与动态 Receiver 注册参数；
-5. 用静态链生成最小动态输入矩阵，并将命中的 runtime edge 回写到 chain evidence；
-6. 在有设备策略输入后，将 socket 文件权限、SELinux domain 和 peer credential 联合判定。
+这些边界会作为 Coverage Gap 进入报告。平台不会因为有界图未观察到路径，就把反射、异步边、
+动态 Web 内容或 SELinux 相关风险判定为安全。

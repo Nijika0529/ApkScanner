@@ -121,7 +121,7 @@ PoC compileSdk 和 targetSdk 在两种 Profile 下都保持 36+。发布门禁�
 `pending_revalidation` occurrence；无法唯一映射则是 `unmappable`。旧证据只用于生成回放配方，新版本必须
 产生自己的 Proof/Evidence 后才能判断“仍存在”；回放失败只能是 `inconclusive`，不能单独证明“已修复”。
 
-## 5. 特殊调查入口与未来监督 Agent
+## 5. 扩展调查入口与监督 Campaign
 
 Python/MCP 能力仍通过 hash-pinned Capability Manifest 注册。任意非标准测试先创建
 `InvestigationBrief`，必须包含目标、scope、attacker model、前置条件、可执行 Campaign Plan 和
@@ -136,7 +136,7 @@ Evidence kind。
 4. `POST /investigation-briefs/{id}/evaluate`：逐项绑定 Evidence 并形成 passed/failed/inconclusive。
 
 `passed` 必须满足全部 success criteria，且 Evidence kind 覆盖契约要求；模型摘要不能替代平台 Evidence。
-因此 AST 解析、登录流程、应用内部业务能力或未来 MCP 测试不需要硬编码成新的导出组件类型，同时仍有
+因此 AST 解析、登录流程、应用内部业务能力或 MCP 测试不需要硬编码成新的导出组件类型，同时仍有
 可复核的完成标准。
 
 监督 Agent 使用 `/supervisor/snapshot`、Capability catalog、Campaign validate/launch 和

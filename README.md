@@ -17,7 +17,7 @@ Deep Link 和代码攻击面，再让 Codex Agent 沿真实调用链探索、生
 证据审计和版本回归组合成一条可复核的工程流水线。
 
 > 当前定位：个人研究型工程与安全测试控制面，不是面向不可信租户的 SaaS。仅用于已授权的
-> APK、测试账号、测试设备和测试后端。使用前请阅读 [安全边界](SECURITY.md)。
+> APK、测试账号、测试设备和测试后端。
 
 [快速开始](#快速开始) · [系统架构](#系统架构) · [证据模型](#证据模型) ·
 [公开测试 APK](#公开测试-apk) · [完整文档](docs/README.md)
@@ -106,6 +106,10 @@ flowchart LR
 以及 Web/网络/Socket/SSH 等标准化语义观察。无法形成客观动态证据时，结论保持
 `supported_static` 或待验证状态，不会被模型自行提升。
 
+## 演示
+
+![APKScanner 探索任务与证据状态控制台](assets/apkscanner-task-console.png)
+
 ## 快速开始
 
 ### 1. 无 API Key 的静态体验
@@ -128,7 +132,7 @@ export APKSCANNER_FRONTEND_DIST="$PWD/frontend/dist"
 scanctl serve
 ```
 
-访问 `http://127.0.0.1:8000`，可以上传自己的授权 APK，也可以直接运行仓库内的合成夹具：
+访问 `http://127.0.0.1:8000`，可以上传自己的授权 APK，也可以直接运行仓库内的合成测试 APK：
 
 ```bash
 scanctl scan "$PWD/testapk/vulntest.apk" --investigator none
@@ -197,7 +201,7 @@ PoC 的 compileSdk/targetSdk 始终保持 API 36+；开发 Profile 只降低 min
 | `adaptivecases.apk` | Zip Slip、动态 Receiver、localhost、JSBridge Token、Binder 多值返回和安全对照组 |
 | `specialcases.apk` | 大型特权应用常见语义边界的静态压力测试 |
 
-每个夹具都保留可复现源码和 ground truth。Benchmark 只统计平台确认的最终 Finding，默认要求动态
+每个测试项都保留可复现源码和 ground truth。Benchmark 只统计平台确认的最终 Finding，默认要求动态
 证明，并将没有命中真值的已确认 Finding 计入 false positive；模型候选不会混入指标。
 
 ```bash
@@ -222,7 +226,7 @@ APKSCANNER_RUN_REAL_PROVIDER_TESTS=1 \
   pytest -q backend/tests/test_real_provider_integration.py
 ```
 
-仓库不会在 README 中填写未经固定数据集复验的召回率或“100% 检出率”。可公开复现的测试夹具、
+仓库不会在 README 中填写未经固定数据集复验的召回率或“100% 检出率”。可公开复现的测试样本、
 ground truth、Evidence 准入规则和评测命令构成当前的结果口径。
 
 ## 当前状态与路线图
@@ -260,7 +264,7 @@ probe/                  普通 App UID 通用验证 Probe
 testapk/                故意脆弱的公开 APK、源码和 ground truth
 config/                 模型目录、SDK 基线和 benchmark 示例
 docker/                 Worker 包装器与本地 vendored 工具目录
-docs/                   架构、运行时、攻击链、版本演进与历史设计文档
+docs/                   架构、运行时、攻击链、评测与版本演进文档
 ```
 
 ## 安全与使用范围
@@ -271,5 +275,3 @@ docs/                   架构、运行时、攻击链、版本演进与历史�
 - Provider 会接收任务上下文和反编译证据，生产使用前应确认数据处理与网络出口策略；
 - Probe 和测试 APK 均为故意危险工具，测试结束后应从设备卸载；
 - 仓库当前未声明开源许可证；公开可见不等于获得复制、修改或分发授权。
-
-漏洞报告和凭据处理方式见 [SECURITY.md](SECURITY.md)。
