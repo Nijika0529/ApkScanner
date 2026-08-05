@@ -451,10 +451,15 @@ class CodexInvestigator:
         cancel_event: threading.Event | None = None,
         gateway_environment: dict[str, str] | None = None,
     ) -> CodexAdaptiveRunResult:
-        """Run the one scan-level adaptive verifier in its own persistent thread."""
+        """Run one transport-budgeted batch in an Adaptive Verifier thread."""
 
         if self.settings.codex_isolation != "docker":
             raise RuntimeError("the Adaptive Verifier requires Docker isolation")
+        if len(prompt) > self.settings.adaptive_verifier_prompt_max_chars:
+            raise ValueError(
+                "Adaptive Verifier prompt exceeds the configured transport-safe limit: "
+                f"{len(prompt)} > {self.settings.adaptive_verifier_prompt_max_chars} characters"
+            )
         capability = self._docker_capability(
             {
                 "available": True,
@@ -776,6 +781,24 @@ class CodexInvestigator:
             with suppress(Exception):
                 active.client.close()
         self.workspaces.forget_task(scan_id, task_id)
+
+    def close_task_role(
+        self,
+        scan_id: str,
+        task_id: str,
+        attempt: int,
+        role: str,
+    ) -> None:
+        """Close one role between transport batches without deleting its workspace."""
+
+        key = (scan_id, task_id, attempt, role)
+        with self._session_condition:
+            active = self._sessions.pop(key, None)
+            self._busy_sessions.discard(key)
+            self._session_condition.notify_all()
+        if active is not None:
+            with suppress(Exception):
+                active.client.close()
 
     def shutdown(self) -> None:
         with self._session_condition:

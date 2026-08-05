@@ -158,6 +158,198 @@ def test_adaptive_verifier_batches_high_value_static_findings_once(
         assert tasks[0].target_entry_ids
 
 
+def test_adaptive_verifier_splits_transport_safe_turns_and_merges_results(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    configured = replace(
+        settings,
+        codex_enabled=True,
+        adaptive_verifier_enabled=True,
+        adaptive_verifier_prompt_max_chars=25_000,
+    )
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="large-adaptive.apk",
+            package_name="com.example.largeadaptive",
+            artifact_sha256="a" * 64,
+            artifact_path=str(configured.data_dir / "large-adaptive.apk"),
+            stats={"investigator": "codex"},
+        )
+        entry = EntryPoint(
+            scan=scan,
+            kind="activity",
+            name="com.example.largeadaptive.EntryActivity",
+            owner_component="com.example.largeadaptive.EntryActivity",
+            exported=True,
+        )
+        session.add_all([scan, entry])
+        session.flush()
+        findings = [
+            Finding(
+                scan=scan,
+                dedupe_key=f"large-adaptive-{index}",
+                rule_id="AGENT-ENTRY-INVESTIGATION",
+                title=f"候选风险 {index}",
+                description=(f"候选 {index} 的完整静态攻击链。" + "证据上下文" * 1500),
+                masvs="MASVS-PLATFORM",
+                severity="high",
+                confidence="medium",
+                status="supported_static",
+                entry_point_ids=[entry.id],
+            )
+            for index in range(6)
+        ]
+        session.add_all(findings)
+        session.flush()
+        candidate_ids = [finding.id for finding in findings]
+        task = InvestigationTask(
+            scan=scan,
+            task_type="adaptive_verification",
+            status="running",
+            priority=100,
+            target_entry_ids=[entry.id],
+            preconditions={"candidate_finding_ids": candidate_ids},
+            attempts=1,
+            started_at=datetime.now(UTC),
+        )
+        session.add(task)
+        session.commit()
+        scan_id = scan.id
+        task_id = task.id
+
+    orchestrator = ScanOrchestrator(configured, database, ArtifactStore(configured))
+    monkeypatch.setattr(
+        orchestrator.codex,
+        "capability",
+        lambda *, deep=False: {"available": True, "deep": deep},
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_target_code_context",
+        lambda _scan_id, _entries: {
+            "schema_version": "1.0",
+            "global_decompilation": {"status": "complete"},
+            "components": [],
+        },
+    )
+
+    def materialize(_scan_id, actual_task_id, attempt, summaries, *, platform_context=None):  # noqa: ANN001, ANN202
+        root = configured.data_dir / "adaptive-test-workspace" / actual_task_id / str(attempt)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "context.json").write_text(
+            json.dumps(
+                {
+                    "evidence": summaries,
+                    "platform_context": platform_context or {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return root
+
+    monkeypatch.setattr(orchestrator, "_materialize_agent_evidence", materialize)
+    monkeypatch.setattr(
+        orchestrator.codex,
+        "prepare_session_workspace",
+        lambda **kwargs: kwargs["workspace"],
+    )
+    closed_batch_threads: list[tuple[str, str, int, str]] = []
+    monkeypatch.setattr(
+        orchestrator.codex,
+        "close_task_role",
+        lambda scan_id, task_id, attempt, role: closed_batch_threads.append(
+            (scan_id, task_id, attempt, role)
+        ),
+    )
+    dispatched: list[dict[str, object]] = []
+
+    def verify_batch(**kwargs):  # noqa: ANN003, ANN202
+        prompt = kwargs["prompt"]
+        payload = json.loads(prompt.split("ADAPTIVE_VERIFICATION_CONTEXT_JSON:\n", 1)[1])
+        batch_ids = [item["finding_id"] for item in payload["candidates"]]
+        dispatched.append(
+            {
+                "prompt_characters": len(prompt),
+                "candidate_ids": batch_ids,
+            }
+        )
+        batch_number = len(dispatched)
+        return SimpleNamespace(
+            thread_id=f"thread-budgeted-adaptive-{batch_number}",
+            turn_id=f"turn-{batch_number}",
+            usage={"input_tokens": 1, "output_tokens": 1},
+            result=AdaptiveVerificationResult.model_validate(
+                {
+                    "summary": f"第 {batch_number} 批候选已完成语义检查。",
+                    "assessments": [
+                        {
+                            "finding_id": finding_id,
+                            "verdict": "supported_static",
+                            "confidence": "medium",
+                            "runtime_observed": False,
+                            "summary": "静态攻击链仍成立，但当前没有足够运行态证据。",
+                            "attack_chain": "exported entry -> sensitive sink",
+                            "security_impact": "需要进一步真机证明。",
+                            "counterevidence": [],
+                            "remaining_gaps": ["缺少运行态危害观测。"],
+                            "evidence_ids": [],
+                            "experiments": [],
+                        }
+                        for finding_id in batch_ids
+                    ],
+                    "shared_observations": [],
+                    "cleanup_actions": [],
+                    "coverage_gaps": [],
+                }
+            ),
+        )
+
+    monkeypatch.setattr(orchestrator.codex, "verify_batch", verify_batch)
+
+    orchestrator._run_adaptive_verifier_impl(scan_id, task_id, threading.Event())
+
+    assert len(dispatched) > 1
+    assert all(
+        int(item["prompt_characters"])
+        <= configured.adaptive_verifier_prompt_max_chars
+        for item in dispatched
+    )
+    assert [
+        finding_id
+        for item in dispatched
+        for finding_id in item["candidate_ids"]
+    ] == candidate_ids
+    assert len(closed_batch_threads) == len(dispatched) - 1
+    assert all(item[3] == "verifier" for item in closed_batch_threads)
+    with database.session_factory() as session:
+        completed = session.get(InvestigationTask, task_id)
+        persisted_scan = session.get(Scan, scan_id)
+        persisted_findings = list(
+            session.scalars(select(Finding).where(Finding.id.in_(candidate_ids)))
+        )
+        assert completed is not None and persisted_scan is not None
+        assert completed.status == "completed"
+        assert len(completed.result["adaptive_batches"]) == len(dispatched)
+        assert len(completed.result["response_evidence_ids"]) == len(dispatched)
+        assert persisted_scan.stats["adaptive_verification"]["batch_count"] == len(
+            dispatched
+        )
+        assert {finding.status for finding in persisted_findings} == {"supported_static"}
+        assert all(finding.evidence_ids for finding in persisted_findings)
+        assert {
+            finding.metadata_json["adaptive_verification"]["thread_id"]
+            for finding in persisted_findings
+        } == {
+            f"thread-budgeted-adaptive-{index}"
+            for index in range(1, len(dispatched) + 1)
+        }
+
+
 @pytest.mark.parametrize(
     ("android16_eligible", "expected_status", "expected_backlog"),
     [

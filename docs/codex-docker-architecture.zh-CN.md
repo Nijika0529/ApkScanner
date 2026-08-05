@@ -1383,9 +1383,10 @@ started_at, completed_at
 | `APKSCANNER_CODEX_TMPFS_SIZE` | `1g` | 扫描容器共享 `/tmp` 上限；session 使用私有 TMPDIR |
 | `APKSCANNER_CODEX_TURN_TIMEOUT` | `3600` | 单 Turn 上限 |
 | `APKSCANNER_CODEX_NO_EVENT_TIMEOUT` | `900` | 包括 heartbeat |
-| `APKSCANNER_ADAPTIVE_VERIFIER_ENABLED` | `true` | 扫描末尾是否启动一个批量语义验证 Thread |
+| `APKSCANNER_ADAPTIVE_VERIFIER_ENABLED` | `true` | 扫描末尾是否启动一个批量语义验证任务 |
 | `APKSCANNER_ADAPTIVE_VERIFIER_MIN_SEVERITY` | `info` | 默认纳入全部 `supported_static` Finding；需要收窄时再提高阈值 |
-| `APKSCANNER_ADAPTIVE_VERIFIER_TIMEOUT` | `3600` | 批量 verifier Turn 总超时 |
+| `APKSCANNER_ADAPTIVE_VERIFIER_TIMEOUT` | `3600` | 所有字符预算批次共享的 verifier 总超时 |
+| `APKSCANNER_ADAPTIVE_VERIFIER_PROMPT_MAX_CHARS` | `400000` | 单批 prompt 传输安全上限，范围 `100000..900000`；超量候选自动拆批并使用新 Thread |
 | `APKSCANNER_ADAPTIVE_VERIFIER_COPY_HOST_SSH` | `true` | 是否把宿主 SSH 目录复制给 verifier |
 | `APKSCANNER_ADAPTIVE_VERIFIER_SSH_SOURCE` | 启动用户 `~/.ssh` | SSH 复制来源；空值禁用 |
 | `APKSCANNER_TASK_TIMEOUT` | `14400` | task attempt 总预算建议值 |

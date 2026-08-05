@@ -30,6 +30,7 @@ class Settings:
     adaptive_verifier_enabled: bool = True
     adaptive_verifier_min_severity: str = "info"
     adaptive_verifier_timeout_seconds: int = 3_600
+    adaptive_verifier_prompt_max_chars: int = 400_000
     adaptive_verifier_copy_host_ssh: bool = True
     adaptive_verifier_ssh_source: Path | None = None
     agent_permission_profile: str = "personal_lab"
@@ -133,6 +134,13 @@ class Settings:
                 min(
                     24 * 60 * 60,
                     int(os.getenv("APKSCANNER_ADAPTIVE_VERIFIER_TIMEOUT", 3_600)),
+                ),
+            ),
+            adaptive_verifier_prompt_max_chars=max(
+                100_000,
+                min(
+                    900_000,
+                    int(os.getenv("APKSCANNER_ADAPTIVE_VERIFIER_PROMPT_MAX_CHARS", 400_000)),
                 ),
             ),
             adaptive_verifier_copy_host_ssh=_env_bool(

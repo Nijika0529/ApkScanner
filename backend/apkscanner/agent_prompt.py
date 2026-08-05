@@ -233,7 +233,11 @@ def adaptive_verification_prompt(
 
     compact_evidence = [
         {
-            key: item.get(key)
+            key: (
+                str(item.get(key))[:2000]
+                if key in {"summary", "artifact"}
+                else item.get(key)
+            )
             for key in ("id", "kind", "task_id", "exit_code", "summary", "artifact")
             if item.get(key) is not None
         }
@@ -262,8 +266,20 @@ def adaptive_verification_prompt(
             "返回全部 assessment；即使某项仍有缺口，也必须用 supported_static 或"
             " not_reproduced 明确收尾。\n"
         )
+    batch = platform_context.get("batch")
+    batch_instruction = ""
+    if isinstance(batch, dict) and int(batch.get("count") or 1) > 1:
+        batch_instruction = (
+            f"这是同一扫描高权限验证的第 {batch.get('index')}/{batch.get('count')} 批。"
+            "只为本批 candidates 返回 assessment，不要重复前序批次已经返回的 finding_id。"
+            "完整候选上下文已物化在当前工作区的 "
+            f"{batch.get('candidate_context_file')}；先读取该文件，再按需打开 /scan-input 下"
+            "的完整反编译文件。平台为每批使用新的 Codex Thread，避免历史上下文累计溢出；"
+            "前序批次生成的工作区文件仍会保留，可按 candidate catalog 和文件证据复用。\n"
+        )
     return (
         recovery_instruction
+        + batch_instruction
         + "批量验证下面所有候选风险。先读取当前工作区的 context.json，再按风险和共享攻击链"
         "制定验证顺序；可以把同一 WebView、组件或登录态相关候选合并到一次实验中。不要重复"
         "普通调查 Agent 已完成的静态摘要，而要补齐外部攻击者到真实影响的链路。固定 Probe、"

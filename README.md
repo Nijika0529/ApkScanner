@@ -289,6 +289,12 @@ source/control/sink/reachable path/boundary/counterevidence/proof gaps 证据元
 | `APKSCANNER_CODEX_TURN_TIMEOUT` | 3600 秒 | 单次 Codex 调用硬超时 |
 | `APKSCANNER_CODEX_NO_EVENT_TIMEOUT` | 900 秒 | Worker 无事件超时 |
 | `APKSCANNER_CODEX_BIN` | 内置 SDK 运行时 | 显式测试过的 Codex 二进制覆盖 |
+| `APKSCANNER_ADAPTIVE_VERIFIER_ENABLED` | `true` | 为仍未闭环的静态风险运行一个扫描终局 Codex 验证任务 |
+| `APKSCANNER_ADAPTIVE_VERIFIER_MIN_SEVERITY` | `info` | 纳入终局验证的最低严重等级；默认覆盖全部 `supported_static` Finding |
+| `APKSCANNER_ADAPTIVE_VERIFIER_TIMEOUT` | 3600 秒 | 所有按提示词预算拆分的验证批次共享的总超时 |
+| `APKSCANNER_ADAPTIVE_VERIFIER_PROMPT_MAX_CHARS` | `400000` | 单批传输安全提示词字符上限；有效范围为 `100000..900000` |
+| `APKSCANNER_ADAPTIVE_VERIFIER_COPY_HOST_SSH` | `true` | 将宿主 OpenSSH 配置复制到终局验证器的私有 HOME |
+| `APKSCANNER_ADAPTIVE_VERIFIER_SSH_SOURCE` | 宿主 `~/.ssh` | 运行时复制的 SSH 目录；设为空值可禁用 |
 | `APKSCANNER_DEEPSEEK_BASE_URL` | DeepSeek 默认地址 | 可选的可信 HTTP(S) 网关 |
 | `DEEPSEEK_API_KEY` | 未设置 | DeepSeek 凭据；只在 UID worker 的 exec 环境中注入 |
 | `APKSCANNER_ANDROID_VERSION` | `16` | 报告的动态基线 Android 版本 |

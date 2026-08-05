@@ -2005,7 +2005,6 @@ class ScanOrchestrator:
                 in {
                     TaskStatus.COMPLETED.value,
                     TaskStatus.NOT_REPRODUCED.value,
-                    TaskStatus.INCONCLUSIVE.value,
                 }
             ):
                 session.commit()
@@ -2029,6 +2028,12 @@ class ScanOrchestrator:
                 task.started_at = now()
                 task.completed_at = None
                 task.error = None
+                task.preconditions = {
+                    **dict(task.preconditions or {}),
+                    "candidate_finding_ids": candidate_ids,
+                    "candidate_fingerprint": fingerprint,
+                    "batch_policy": "transport_budgeted_fresh_threads_per_scan_task",
+                }
             else:
                 task = InvestigationTask(
                     scan_id=scan_id,
@@ -2040,7 +2045,7 @@ class ScanOrchestrator:
                     preconditions={
                         "candidate_finding_ids": candidate_ids,
                         "candidate_fingerprint": fingerprint,
-                        "batch_policy": "one_thread_per_scan",
+                        "batch_policy": "transport_budgeted_fresh_threads_per_scan_task",
                     },
                     allowed_side_effects=[
                         "build_and_install_poc",
@@ -2078,7 +2083,7 @@ class ScanOrchestrator:
                     "task_id": task_id,
                     "candidate_count": len(candidate_ids),
                     "candidate_finding_ids": candidate_ids,
-                    "thread_policy": "one_thread_per_scan",
+                    "thread_policy": "transport_budgeted_fresh_threads_per_scan_task",
                 },
             )
             session.commit()
@@ -2385,6 +2390,218 @@ class ScanOrchestrator:
 
         return merged_map
 
+    @staticmethod
+    def _adaptive_prompt_candidate(
+        candidate: dict[str, Any],
+        *,
+        context_file: str,
+    ) -> dict[str, Any]:
+        """Keep routing facts inline and leave unbounded details in the workspace."""
+
+        hypotheses = candidate.get("security_hypotheses")
+        if not isinstance(hypotheses, list):
+            hypotheses = []
+        entry_points = candidate.get("entry_points")
+        if not isinstance(entry_points, list):
+            entry_points = []
+        evidence_ids = candidate.get("evidence_ids")
+        if not isinstance(evidence_ids, list):
+            evidence_ids = []
+        coverage_gaps = candidate.get("coverage_gaps")
+        if not isinstance(coverage_gaps, list):
+            coverage_gaps = []
+        proof_backlog = candidate.get("proof_backlog")
+        return {
+            "finding_id": candidate.get("finding_id"),
+            "title": str(candidate.get("title") or "")[:2000],
+            "description": str(candidate.get("description") or "")[:8000],
+            "severity": candidate.get("severity"),
+            "confidence": candidate.get("confidence"),
+            "status": candidate.get("status"),
+            "entry_point_ids": candidate.get("entry_point_ids") or [],
+            "entry_points": [
+                {
+                    key: entry.get(key)
+                    for key in ("id", "kind", "name", "owner_component", "exported", "permission")
+                    if entry.get(key) is not None
+                }
+                for entry in entry_points
+                if isinstance(entry, dict)
+            ],
+            "evidence_ids": evidence_ids[:64],
+            "evidence_id_count": len(evidence_ids),
+            "source_task_ids": candidate.get("source_task_ids") or [],
+            "proof_backlog_status": (
+                proof_backlog.get("status") if isinstance(proof_backlog, dict) else None
+            ),
+            "coverage_gaps": [str(value)[:1200] for value in coverage_gaps[:12]],
+            "security_hypotheses": [
+                {
+                    "id": hypothesis.get("id"),
+                    "category": hypothesis.get("category"),
+                    "claim": str(hypothesis.get("claim") or "")[:3000],
+                    "impact": str(hypothesis.get("impact") or "")[:2000],
+                    "status": hypothesis.get("status"),
+                }
+                for hypothesis in hypotheses[:12]
+                if isinstance(hypothesis, dict)
+            ],
+            "full_context_file": context_file,
+        }
+
+    @staticmethod
+    def _adaptive_batch_evidence(
+        evidence: list[dict[str, Any]],
+        candidates: list[dict[str, Any]],
+        *,
+        verifier_task_id: str,
+    ) -> list[dict[str, Any]]:
+        explicit_ids = {
+            str(evidence_id)
+            for candidate in candidates
+            for evidence_id in (candidate.get("evidence_ids") or [])
+            if isinstance(evidence_id, str)
+        }
+        source_task_ids = {
+            str(source_task_id)
+            for candidate in candidates
+            for source_task_id in (candidate.get("source_task_ids") or [])
+            if isinstance(source_task_id, str)
+        }
+        for candidate in candidates:
+            for hypothesis in candidate.get("security_hypotheses") or []:
+                if not isinstance(hypothesis, dict):
+                    continue
+                explicit_ids.update(
+                    str(evidence_id)
+                    for field_name in ("support_evidence_ids", "refute_evidence_ids")
+                    for evidence_id in (hypothesis.get(field_name) or [])
+                    if isinstance(evidence_id, str)
+                )
+        return [
+            item
+            for item in evidence
+            if item.get("task_id") is None
+            or item.get("task_id") == verifier_task_id
+            or item.get("task_id") in source_task_ids
+            or item.get("id") in explicit_ids
+        ]
+
+    def _build_adaptive_verifier_batches(
+        self,
+        *,
+        scan: Scan,
+        task_id: str,
+        candidates: list[dict[str, Any]],
+        evidence: list[dict[str, Any]],
+        base_platform_context: dict[str, Any],
+        entries_by_id: dict[str, EntryPoint],
+    ) -> list[dict[str, Any]]:
+        if not candidates:
+            return []
+        prompt_limit = self.settings.adaptive_verifier_prompt_max_chars
+        count_hint = len(candidates)
+        code_context_cache: dict[tuple[str, ...], dict[str, Any]] = {}
+
+        def build(
+            values: list[dict[str, Any]],
+            *,
+            index: int,
+            count: int,
+        ) -> dict[str, Any]:
+            context_file = f"adaptive_verification/batch-{index:03d}.json"
+            entry_ids = list(
+                dict.fromkeys(
+                    str(entry_id)
+                    for candidate in values
+                    for entry_id in (candidate.get("entry_point_ids") or [])
+                    if isinstance(entry_id, str)
+                )
+            )
+            batch_entries = [
+                entries_by_id[entry_id]
+                for entry_id in entry_ids
+                if entry_id in entries_by_id
+            ]
+            code_context_key = tuple(entry_ids)
+            target_code_context = code_context_cache.get(code_context_key)
+            if target_code_context is None:
+                target_code_context = self._target_code_context(scan.id, batch_entries)
+                code_context_cache[code_context_key] = target_code_context
+            batch_evidence = self._adaptive_batch_evidence(
+                evidence,
+                values,
+                verifier_task_id=task_id,
+            )
+            context = {
+                **deepcopy(base_platform_context),
+                "candidate_count": len(values),
+                "candidate_finding_ids": [str(value["finding_id"]) for value in values],
+                "total_candidate_count": len(candidates),
+                "target_code_context": deepcopy(target_code_context),
+                "batch": {
+                    "index": index,
+                    "count": count,
+                    "candidate_context_file": context_file,
+                    "all_candidate_catalog_file": (
+                        "adaptive_verification/candidate-catalog.json"
+                    ),
+                    "prompt_transport_limit_characters": prompt_limit,
+                },
+            }
+            prompt_candidates = [
+                self._adaptive_prompt_candidate(value, context_file=context_file)
+                for value in values
+            ]
+            prompt = adaptive_verification_prompt(
+                scan,
+                prompt_candidates,
+                batch_evidence,
+                context,
+            )
+            return {
+                "index": index,
+                "count": count,
+                "candidate_ids": [str(value["finding_id"]) for value in values],
+                "candidates": values,
+                "evidence": batch_evidence,
+                "platform_context": context,
+                "context_file": context_file,
+                "prompt": prompt,
+                "prompt_characters": len(prompt),
+            }
+
+        groups: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        for candidate in candidates:
+            trial = [*current, candidate]
+            trial_batch = build(
+                trial,
+                index=len(groups) + 1,
+                count=count_hint,
+            )
+            if current and trial_batch["prompt_characters"] > prompt_limit:
+                groups.append(current)
+                current = [candidate]
+            else:
+                current = trial
+        if current:
+            groups.append(current)
+
+        batches = [
+            build(values, index=index, count=len(groups))
+            for index, values in enumerate(groups, start=1)
+        ]
+        oversized = [batch for batch in batches if batch["prompt_characters"] > prompt_limit]
+        if oversized:
+            batch = oversized[0]
+            raise ValueError(
+                "one Adaptive Verifier candidate exceeds the transport-safe prompt budget: "
+                f"batch={batch['index']} characters={batch['prompt_characters']} "
+                f"limit={prompt_limit}"
+            )
+        return batches
+
     def _run_adaptive_verifier_impl(
         self,
         scan_id: str,
@@ -2479,7 +2696,13 @@ class ScanOrchestrator:
                 or item.task_id == task_id
                 or item.id in explicit_evidence_ids
             ]
-            evidence_summaries = [self._evidence_summary(item) for item in selected_evidence]
+            evidence_summaries = [
+                {
+                    **self._evidence_summary(item),
+                    "task_id": item.task_id,
+                }
+                for item in selected_evidence
+            ]
             candidate_payload = [
                 {
                     "finding_id": finding.id,
@@ -2561,11 +2784,9 @@ class ScanOrchestrator:
                     health_commands,
                     evidence_summaries,
                 )
-            platform_context = {
+            base_platform_context = {
                 "phase": "adaptive_verification",
                 "output_language": "zh-CN",
-                "candidate_count": len(candidate_payload),
-                "candidate_finding_ids": candidate_ids,
                 "device": device_context,
                 "adb_gateway": {
                     "available": task_device is not None,
@@ -2594,7 +2815,6 @@ class ScanOrchestrator:
                     ],
                     "target_apk": "/scan-input/target.apk",
                 },
-                "target_code_context": self._target_code_context(scan_id, entries),
                 "proof_policy": {
                     "mode": "model_semantic_judgment",
                     "fixed_oracle_required": False,
@@ -2612,6 +2832,35 @@ class ScanOrchestrator:
                     ),
                 },
             }
+            batches = self._build_adaptive_verifier_batches(
+                scan=scan,
+                task_id=task_id,
+                candidates=candidate_payload,
+                evidence=evidence_summaries,
+                base_platform_context=base_platform_context,
+                entries_by_id=entries_by_id,
+            )
+            platform_context = {
+                **base_platform_context,
+                "candidate_count": len(candidate_payload),
+                "candidate_finding_ids": candidate_ids,
+                "batching": {
+                    "policy": "transport_character_budget",
+                    "batch_count": len(batches),
+                    "prompt_max_characters": (
+                        self.settings.adaptive_verifier_prompt_max_chars
+                    ),
+                    "batches": [
+                        {
+                            "index": batch["index"],
+                            "candidate_finding_ids": batch["candidate_ids"],
+                            "prompt_characters": batch["prompt_characters"],
+                            "candidate_context_file": batch["context_file"],
+                        }
+                        for batch in batches
+                    ],
+                },
+            }
             source_workspace = self._materialize_agent_evidence(
                 scan_id,
                 task_id,
@@ -2619,48 +2868,52 @@ class ScanOrchestrator:
                 evidence_summaries,
                 platform_context=platform_context,
             )
+            batch_context_root = source_workspace / "adaptive_verification"
+            batch_context_root.mkdir(parents=True, exist_ok=True)
+            (batch_context_root / "candidate-catalog.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "1.0",
+                        "candidate_count": len(candidate_payload),
+                        "candidates": [
+                            {
+                                "finding_id": candidate["finding_id"],
+                                "title": candidate["title"],
+                                "severity": candidate["severity"],
+                                "entry_point_ids": candidate["entry_point_ids"],
+                            }
+                            for candidate in candidate_payload
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            for batch in batches:
+                (source_workspace / batch["context_file"]).write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "1.0",
+                            "batch": {
+                                "index": batch["index"],
+                                "count": batch["count"],
+                                "candidate_finding_ids": batch["candidate_ids"],
+                            },
+                            "candidates": batch["candidates"],
+                            "evidence": batch["evidence"],
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
             runtime_workspace = self.codex.prepare_session_workspace(
                 scan=scan,
                 task=task,
                 workspace=source_workspace,
                 phase="adaptive_verification",
             )
-            prompt = adaptive_verification_prompt(
-                scan,
-                candidate_payload,
-                evidence_summaries,
-                platform_context,
-            )
-            audit_id = str(uuid.uuid4())
-            with self.database.session_factory() as session:
-                self.evidence.json(
-                    session,
-                    scan_id=scan_id,
-                    task_id=task_id,
-                    kind="agent.request",
-                    value={
-                        "schema_version": "1.0",
-                        "audit_id": audit_id,
-                        "phase": "adaptive_verification",
-                        "developer_instructions": adaptive_verifier_developer_instructions(
-                            ssh_available=platform_context["ssh"]["available"]
-                        ),
-                        "prompt": prompt,
-                        "output_schema": ADAPTIVE_VERIFIER_RESULT_JSON_SCHEMA,
-                        "candidate_finding_ids": candidate_ids,
-                    },
-                    summary="Codex scan-level Adaptive Verifier request",
-                    metadata={
-                        "audit_id": audit_id,
-                        "phase": "adaptive_verification",
-                        "attempt": task.attempts,
-                        "backend": "codex",
-                        "provider": self.settings.codex_provider,
-                        "model": self.settings.codex_model,
-                        "isolation": self.settings.codex_isolation,
-                    },
-                )
-                session.commit()
             gateway_token: str | None = None
             gateway_environment: dict[str, str] | None = None
             if task_device is not None:
@@ -2709,114 +2962,355 @@ class ScanOrchestrator:
                     "APKSCANNER_ADB_TOKEN": gateway_token,
                     "APKSCANNER_ADB_POLICY": "adaptive",
                 }
-            runtime_events: list[dict[str, Any]] = []
+            successful_results: list[Any] = []
+            batch_receipts: list[dict[str, Any]] = []
+            response_evidence_ids_by_finding: dict[str, str] = {}
 
-            def on_runtime_event(event: AgentRuntimeEvent) -> None:
-                if not self._record_agent_runtime_event(
+            def close_batch_thread_for_next_turn() -> None:
+                self.codex.close_task_role(
                     scan_id,
                     task_id,
-                    event,
-                    phase="adaptive_verification",
-                    round_index=0,
-                    agent_backend="codex",
-                ):
-                    return
-                runtime_events.append(
-                    {
-                        "schema_version": "1.0",
-                        "sequence": len(runtime_events) + 1,
-                        "dedupe_key": event.dedupe_key,
-                        "event_type": event.event_type,
-                        "message": event.message,
-                        "data": event.data,
-                        "created_at": datetime.now(UTC).isoformat(),
-                    }
+                    task.attempts,
+                    "verifier",
                 )
+                (runtime_workspace.parent / "thread.json").unlink(missing_ok=True)
 
             try:
-                try:
-                    result = self.codex.verify_batch(
-                        scan=scan,
-                        task=task,
-                        workspace=source_workspace,
-                        prompt=prompt,
-                        timeout_seconds=max(1, budget.remaining()),
-                        event_callback=on_runtime_event,
-                        cancel_event=cancel_event,
-                        gateway_environment=gateway_environment,
-                    )
-                except AgentCancelledError as exc:
-                    self._record_agent_cancellation(
+                for batch in batches:
+                    self._raise_if_cancelled(cancel_event)
+                    if budget.expired:
+                        batch_receipts.append(
+                            {
+                                "index": batch["index"],
+                                "candidate_finding_ids": batch["candidate_ids"],
+                                "prompt_characters": batch["prompt_characters"],
+                                "status": "timed_out_before_dispatch",
+                            }
+                        )
+                        break
+                    audit_id = str(uuid.uuid4())
+                    with self.database.session_factory() as session:
+                        self.evidence.json(
+                            session,
+                            scan_id=scan_id,
+                            task_id=task_id,
+                            kind="agent.request",
+                            value={
+                                "schema_version": "1.0",
+                                "audit_id": audit_id,
+                                "phase": "adaptive_verification",
+                                "batch": {
+                                    "index": batch["index"],
+                                    "count": batch["count"],
+                                    "prompt_characters": batch["prompt_characters"],
+                                    "prompt_limit_characters": (
+                                        self.settings.adaptive_verifier_prompt_max_chars
+                                    ),
+                                },
+                                "developer_instructions": (
+                                    adaptive_verifier_developer_instructions(
+                                        ssh_available=base_platform_context["ssh"]["available"]
+                                    )
+                                ),
+                                "prompt": batch["prompt"],
+                                "output_schema": ADAPTIVE_VERIFIER_RESULT_JSON_SCHEMA,
+                                "candidate_finding_ids": batch["candidate_ids"],
+                            },
+                            summary=(
+                                "Codex scan-level Adaptive Verifier request "
+                                f"batch {batch['index']}/{batch['count']}"
+                            ),
+                            metadata={
+                                "audit_id": audit_id,
+                                "phase": "adaptive_verification",
+                                "attempt": task.attempts,
+                                "batch_index": batch["index"],
+                                "batch_count": batch["count"],
+                                "backend": "codex",
+                                "provider": self.settings.codex_provider,
+                                "model": self.settings.codex_model,
+                                "isolation": self.settings.codex_isolation,
+                            },
+                        )
+                        add_event(
+                            session,
+                            scan_id,
+                            "adaptive_verification.batch_started",
+                            (
+                                f"高权限验证开始第 {batch['index']}/{batch['count']} 批，"
+                                f"包含 {len(batch['candidate_ids'])} 个候选"
+                            ),
+                            {
+                                "task_id": task_id,
+                                "batch_index": batch["index"],
+                                "batch_count": batch["count"],
+                                "candidate_finding_ids": batch["candidate_ids"],
+                                "prompt_characters": batch["prompt_characters"],
+                            },
+                        )
+                        session.commit()
+
+                    runtime_events: list[dict[str, Any]] = []
+
+                    def on_runtime_event(
+                        event: AgentRuntimeEvent,
+                        *,
+                        batch_index: int = int(batch["index"]),
+                        event_sink: list[dict[str, Any]] = runtime_events,
+                    ) -> None:
+                        if not self._record_agent_runtime_event(
+                            scan_id,
+                            task_id,
+                            event,
+                            phase="adaptive_verification",
+                            round_index=batch_index - 1,
+                            agent_backend="codex",
+                        ):
+                            return
+                        event_sink.append(
+                            {
+                                "schema_version": "1.0",
+                                "sequence": len(event_sink) + 1,
+                                "dedupe_key": event.dedupe_key,
+                                "event_type": event.event_type,
+                                "message": event.message,
+                                "data": event.data,
+                                "created_at": datetime.now(UTC).isoformat(),
+                            }
+                        )
+
+                    try:
+                        result = self.codex.verify_batch(
+                            scan=scan,
+                            task=task,
+                            workspace=source_workspace,
+                            prompt=batch["prompt"],
+                            timeout_seconds=max(1, budget.remaining()),
+                            event_callback=on_runtime_event,
+                            cancel_event=cancel_event,
+                            gateway_environment=gateway_environment,
+                        )
+                    except AgentCancelledError as exc:
+                        self._record_agent_cancellation(
+                            scan_id=scan_id,
+                            task_id=task_id,
+                            audit_id=audit_id,
+                            backend="codex",
+                            phase="adaptive_verification",
+                            attempt=task.attempts,
+                            error=exc,
+                        )
+                        raise
+                    except Exception as exc:
+                        self._record_agent_error(
+                            scan_id=scan_id,
+                            task_id=task_id,
+                            audit_id=audit_id,
+                            backend="codex",
+                            phase="adaptive_verification",
+                            attempt=task.attempts,
+                            error=exc,
+                        )
+                        self._record_agent_runtime_events(
+                            scan_id=scan_id,
+                            task_id=task_id,
+                            audit_id=audit_id,
+                            backend="codex",
+                            phase="adaptive_verification",
+                            attempt=task.attempts,
+                            events=runtime_events,
+                        )
+                        batch_receipts.append(
+                            {
+                                "index": batch["index"],
+                                "candidate_finding_ids": batch["candidate_ids"],
+                                "prompt_characters": batch["prompt_characters"],
+                                "status": "failed",
+                                "error": str(exc)[:2000],
+                            }
+                        )
+                        with self.database.session_factory() as session:
+                            add_event(
+                                session,
+                                scan_id,
+                                "adaptive_verification.batch_failed",
+                                (
+                                    f"高权限验证第 {batch['index']}/{batch['count']} 批失败，"
+                                    "其余批次将继续"
+                                ),
+                                {
+                                    "task_id": task_id,
+                                    "batch_index": batch["index"],
+                                    "batch_count": batch["count"],
+                                    "candidate_finding_ids": batch["candidate_ids"],
+                                    "error": str(exc)[:2000],
+                                },
+                            )
+                            session.commit()
+                        if batch["index"] < batch["count"]:
+                            close_batch_thread_for_next_turn()
+                        continue
+
+                    with self.database.session_factory() as session:
+                        response_evidence = self.evidence.json(
+                            session,
+                            scan_id=scan_id,
+                            task_id=task_id,
+                            kind="agent.response",
+                            value={
+                                "schema_version": "1.0",
+                                "audit_id": audit_id,
+                                "batch": {
+                                    "index": batch["index"],
+                                    "count": batch["count"],
+                                },
+                                "thread_id": result.thread_id,
+                                "turn_id": result.turn_id,
+                                "structured_output": result.result.model_dump(mode="json"),
+                                "usage": result.usage,
+                            },
+                            summary=(
+                                "Codex scan-level Adaptive Verifier semantic result "
+                                f"batch {batch['index']}/{batch['count']}"
+                            ),
+                            metadata={
+                                "audit_id": audit_id,
+                                "phase": "adaptive_verification",
+                                "attempt": task.attempts,
+                                "batch_index": batch["index"],
+                                "batch_count": batch["count"],
+                                "backend": "codex",
+                                "provider": self.settings.codex_provider,
+                                "model": self.settings.codex_model,
+                                "isolation": self.settings.codex_isolation,
+                                "thread_id": result.thread_id,
+                                "turn_id": result.turn_id,
+                                "verification_mode": "adaptive_agent",
+                            },
+                        )
+                        add_event(
+                            session,
+                            scan_id,
+                            "adaptive_verification.batch_completed",
+                            (
+                                f"高权限验证第 {batch['index']}/{batch['count']} 批完成，"
+                                f"返回 {len(result.result.assessments)} 项判断"
+                            ),
+                            {
+                                "task_id": task_id,
+                                "batch_index": batch["index"],
+                                "batch_count": batch["count"],
+                                "candidate_count": len(batch["candidate_ids"]),
+                                "assessment_count": len(result.result.assessments),
+                            },
+                        )
+                        session.commit()
+                        response_evidence_id = response_evidence.id
+                    self._record_agent_runtime_events(
                         scan_id=scan_id,
                         task_id=task_id,
                         audit_id=audit_id,
                         backend="codex",
                         phase="adaptive_verification",
                         attempt=task.attempts,
-                        error=exc,
+                        events=runtime_events,
                     )
-                    raise
-                except Exception as exc:
-                    self._record_agent_error(
-                        scan_id=scan_id,
-                        task_id=task_id,
-                        audit_id=audit_id,
-                        backend="codex",
-                        phase="adaptive_verification",
-                        attempt=task.attempts,
-                        error=exc,
+                    successful_results.append(result)
+                    response_evidence_ids_by_finding.update(
+                        {
+                            finding_id: response_evidence_id
+                            for finding_id in batch["candidate_ids"]
+                        }
                     )
-                    raise
+                    batch_receipts.append(
+                        {
+                            "index": batch["index"],
+                            "candidate_finding_ids": batch["candidate_ids"],
+                            "prompt_characters": batch["prompt_characters"],
+                            "status": "completed",
+                            "audit_id": audit_id,
+                            "thread_id": result.thread_id,
+                            "turn_id": result.turn_id,
+                            "response_evidence_id": response_evidence_id,
+                            "assessment_count": len(result.result.assessments),
+                        }
+                    )
+                    if batch["index"] < batch["count"]:
+                        close_batch_thread_for_next_turn()
             finally:
                 if gateway_token is not None:
                     self._unregister_live_proof_context(task_id, gateway_token)
-            with self.database.session_factory() as session:
-                response_evidence = self.evidence.json(
-                    session,
-                    scan_id=scan_id,
-                    task_id=task_id,
-                    kind="agent.response",
-                    value={
-                        "schema_version": "1.0",
-                        "audit_id": audit_id,
-                        "thread_id": result.thread_id,
-                        "turn_id": result.turn_id,
-                        "structured_output": result.result.model_dump(mode="json"),
-                        "usage": result.usage,
-                    },
-                    summary="Codex scan-level Adaptive Verifier semantic result",
-                    metadata={
-                        "audit_id": audit_id,
-                        "phase": "adaptive_verification",
-                        "attempt": task.attempts,
-                        "backend": "codex",
-                        "provider": self.settings.codex_provider,
-                        "model": self.settings.codex_model,
-                        "isolation": self.settings.codex_isolation,
-                        "thread_id": result.thread_id,
-                        "turn_id": result.turn_id,
-                        "verification_mode": "adaptive_agent",
-                    },
+
+            if not successful_results:
+                errors = [
+                    str(receipt.get("error"))
+                    for receipt in batch_receipts
+                    if receipt.get("error")
+                ]
+                raise RuntimeError(
+                    "all Adaptive Verifier prompt batches failed"
+                    + (f": {errors[-1]}" if errors else "")
                 )
-                session.commit()
-                response_evidence_id = response_evidence.id
-            self._record_agent_runtime_events(
-                scan_id=scan_id,
-                task_id=task_id,
-                audit_id=audit_id,
-                backend="codex",
-                phase="adaptive_verification",
-                attempt=task.attempts,
-                events=runtime_events,
+            combined_result = AdaptiveVerificationResult(
+                summary=(
+                    "高权限批量验证已按传输字符预算分批完成。"
+                    + "；".join(item.result.summary for item in successful_results)
+                )[:12_000],
+                assessments=[
+                    assessment
+                    for item in successful_results
+                    for assessment in item.result.assessments
+                ],
+                shared_observations=list(
+                    dict.fromkeys(
+                        observation
+                        for item in successful_results
+                        for observation in item.result.shared_observations
+                    )
+                ),
+                cleanup_actions=list(
+                    dict.fromkeys(
+                        action
+                        for item in successful_results
+                        for action in item.result.cleanup_actions
+                    )
+                ),
+                coverage_gaps=list(
+                    dict.fromkeys(
+                        [
+                            gap
+                            for item in successful_results
+                            for gap in item.result.coverage_gaps
+                        ]
+                        + [
+                            (
+                                f"Adaptive Verifier batch {receipt['index']} failed: "
+                                f"{receipt.get('error')}"
+                            )
+                            for receipt in batch_receipts
+                            if receipt.get("status") == "failed"
+                        ]
+                    )
+                ),
+            )
+            last_result = successful_results[-1]
+            response_evidence_id = str(
+                next(
+                    receipt["response_evidence_id"]
+                    for receipt in reversed(batch_receipts)
+                    if receipt.get("response_evidence_id")
+                )
             )
             self._apply_adaptive_verifier_result(
                 scan_id=scan_id,
                 task_id=task_id,
                 candidate_ids=candidate_ids,
-                result=result.result,
-                thread_id=result.thread_id,
-                turn_id=result.turn_id,
+                result=combined_result,
+                thread_id=last_result.thread_id,
+                turn_id=last_result.turn_id,
                 response_evidence_id=response_evidence_id,
+                response_evidence_ids_by_finding=response_evidence_ids_by_finding,
+                batch_receipts=batch_receipts,
                 android16_verdict_eligible=bool(
                     device_context.get("android16_verdict_eligible")
                 ),
@@ -2836,7 +3330,18 @@ class ScanOrchestrator:
         turn_id: str,
         response_evidence_id: str,
         android16_verdict_eligible: bool,
+        response_evidence_ids_by_finding: dict[str, str] | None = None,
+        batch_receipts: list[dict[str, Any]] | None = None,
     ) -> None:
+        response_evidence_ids_by_finding = response_evidence_ids_by_finding or {}
+        batch_receipts = batch_receipts or []
+        batch_execution_by_finding = {
+            finding_id: receipt
+            for receipt in batch_receipts
+            if receipt.get("status") == "completed"
+            for finding_id in receipt.get("candidate_finding_ids", [])
+            if isinstance(finding_id, str)
+        }
         candidate_set = set(candidate_ids)
         assessments: dict[str, Any] = {}
         ignored: list[str] = []
@@ -2888,7 +3393,14 @@ class ScanOrchestrator:
                     for evidence_id in assessment.evidence_ids
                     if evidence_id in known_evidence_ids
                 ]
-                accepted_evidence_ids.append(response_evidence_id)
+                candidate_response_evidence_id = response_evidence_ids_by_finding.get(
+                    finding_id,
+                    response_evidence_id,
+                )
+                candidate_execution = batch_execution_by_finding.get(finding_id, {})
+                candidate_thread_id = str(candidate_execution.get("thread_id") or thread_id)
+                candidate_turn_id = str(candidate_execution.get("turn_id") or turn_id)
+                accepted_evidence_ids.append(candidate_response_evidence_id)
                 history = list(
                     (finding.metadata_json or {}).get("adaptive_verification_history") or []
                 )
@@ -2896,8 +3408,8 @@ class ScanOrchestrator:
                     {
                         "schema_version": "1.0",
                         "task_id": task_id,
-                        "thread_id": thread_id,
-                        "turn_id": turn_id,
+                        "thread_id": candidate_thread_id,
+                        "turn_id": candidate_turn_id,
                         "verification_mode": "adaptive_agent",
                         "model_verdict": model_verdict,
                         "verdict": verdict,
@@ -2916,7 +3428,7 @@ class ScanOrchestrator:
                             experiment.model_dump(mode="json")
                             for experiment in assessment.experiments
                         ],
-                        "response_evidence_id": response_evidence_id,
+                        "response_evidence_id": candidate_response_evidence_id,
                     }
                 )
                 finding.status = verdict
@@ -2988,6 +3500,10 @@ class ScanOrchestrator:
             output = result.model_dump(mode="json")
             output["verification_mode"] = "adaptive_agent"
             output["response_evidence_id"] = response_evidence_id
+            output["response_evidence_ids"] = list(
+                dict.fromkeys(response_evidence_ids_by_finding.values())
+            ) or [response_evidence_id]
+            output["adaptive_batches"] = deepcopy(batch_receipts)
             output["missing_candidate_assessments"] = missing
             output["ignored_assessment_finding_ids"] = ignored
             output["ignored_duplicate_relations"] = ignored_duplicate_relations
@@ -2997,17 +3513,27 @@ class ScanOrchestrator:
             task.thread_id = thread_id
             task.turn_id = turn_id
             task.result = output
-            task.status = TaskStatus.COMPLETED.value
+            task.status = (
+                TaskStatus.INCONCLUSIVE.value
+                if missing
+                else TaskStatus.COMPLETED.value
+            )
             task.completed_at = now()
             scan.stats = {
                 **dict(scan.stats or {}),
                 "adaptive_verification": {
                     **dict((scan.stats or {}).get("adaptive_verification") or {}),
-                    "status": "completed",
+                    "status": "partial" if missing else "completed",
                     "task_id": task_id,
                     "thread_id": thread_id,
                     "turn_id": turn_id,
                     "response_evidence_id": response_evidence_id,
+                    "response_evidence_ids": output["response_evidence_ids"],
+                    "batch_count": len(batch_receipts) or 1,
+                    "failed_batch_count": sum(
+                        receipt.get("status") != "completed"
+                        for receipt in batch_receipts
+                    ),
                     "assessment_count": len(assessments),
                     "missing_assessment_count": len(missing),
                     "verdict_counts": dict(effective_verdict_counts),
@@ -3020,8 +3546,17 @@ class ScanOrchestrator:
             add_event(
                 session,
                 scan_id,
-                "adaptive_verification.completed",
-                f"高权限验证 Agent 已完成 {len(assessments)} 个候选的语义判断",
+                (
+                    "adaptive_verification.partial"
+                    if missing
+                    else "adaptive_verification.completed"
+                ),
+                (
+                    f"高权限验证 Agent 已完成 {len(assessments)} 个候选，"
+                    f"仍有 {len(missing)} 个候选待补充"
+                    if missing
+                    else f"高权限验证 Agent 已完成 {len(assessments)} 个候选的语义判断"
+                ),
                 {
                     "task_id": task_id,
                     "candidate_count": len(candidate_ids),
@@ -3033,6 +3568,11 @@ class ScanOrchestrator:
                     "compatibility_override_count": len(verdict_overrides),
                     "merged_duplicate_count": len(merged_findings),
                     "android16_verdict_eligible": android16_verdict_eligible,
+                    "batch_count": len(batch_receipts) or 1,
+                    "failed_batch_count": sum(
+                        receipt.get("status") != "completed"
+                        for receipt in batch_receipts
+                    ),
                     "thread_id": thread_id,
                     "turn_id": turn_id,
                 },
