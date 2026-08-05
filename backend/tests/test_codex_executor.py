@@ -15,6 +15,7 @@ from apkscanner.codex_executor import CodexDockerExecutor, ScanContainer
 from apkscanner.codex_protocol import PersistentWorkerClient, PersistentWorkerError
 from apkscanner.codex_runner import CodexInvestigator, _ActiveDockerSession
 from apkscanner.codex_worker import WorkerConfiguration
+from pydantic import ValidationError
 
 SCAN_ID = "00000000-0000-0000-0000-000000000101"
 TASK_ID = "00000000-0000-0000-0000-000000000102"
@@ -52,11 +53,81 @@ def test_codex_response_accepts_one_schema_valid_trailing_json_object() -> None:
 
     assert parsed.result == "refuted_static"
     assert parsed.summary == payload["summary"]
+    assert parsed.normalization_repairs[-1]["repair"] == (
+        "selected_schema_valid_json_from_mixed_response"
+    )
+    assert parsed.normalization_repairs[-1]["prefix_characters_ignored"] > 0
 
 
-def test_codex_response_rejects_prose_without_a_complete_trailing_object() -> None:
-    with pytest.raises(ValueError, match="complete trailing JSON object"):
+def test_codex_response_accepts_natural_language_after_valid_json() -> None:
+    payload = _valid_agent_result()
+
+    parsed = CodexInvestigator._parse_response(
+        json.dumps(payload, ensure_ascii=False) + "\n以上是分析结果。"
+    )
+
+    assert parsed.summary == payload["summary"]
+    repair = parsed.normalization_repairs[-1]
+    assert repair["top_level_candidate_count"] == 1
+    assert repair["selected_candidate_ordinal"] == 1
+    assert repair["suffix_characters_ignored"] == len("以上是分析结果。")
+
+
+def test_codex_response_selects_schema_valid_object_instead_of_later_partial_json() -> None:
+    payload = _valid_agent_result()
+    partial = {"schema_version": "1.0", "note": "这不是最终业务结果"}
+
+    parsed = CodexInvestigator._parse_response(
+        "结果如下：\n"
+        + json.dumps(payload, ensure_ascii=False)
+        + "\n附注："
+        + json.dumps(partial, ensure_ascii=False)
+    )
+
+    assert parsed.summary == payload["summary"]
+    repair = parsed.normalization_repairs[-1]
+    assert repair["top_level_candidate_count"] == 2
+    assert repair["selected_candidate_ordinal"] == 1
+
+
+def test_codex_response_prefers_latest_of_multiple_schema_valid_objects() -> None:
+    first = _valid_agent_result()
+    second = {**_valid_agent_result(), "summary": "第二个完整结论应当胜出。"}
+
+    parsed = CodexInvestigator._parse_response(
+        json.dumps(first, ensure_ascii=False)
+        + "\n修订后的最终结果：\n"
+        + json.dumps(second, ensure_ascii=False)
+    )
+
+    assert parsed.summary == second["summary"]
+    assert parsed.normalization_repairs[-1]["selected_candidate_ordinal"] == 2
+
+
+def test_codex_response_rejects_complete_but_schema_invalid_object() -> None:
+    with pytest.raises(ValidationError, match="summary"):
         CodexInvestigator._parse_response('说明 {"schema_version":"1.0"} trailing')
+
+
+def test_codex_response_rejects_text_without_any_complete_object() -> None:
+    with pytest.raises(ValueError, match="complete JSON object"):
+        CodexInvestigator._parse_response('说明 {"schema_version":"1.0" trailing')
+
+
+def test_generic_json_parser_prefers_candidate_with_required_schema_keys() -> None:
+    expected = {"ok": True, "summary": "完成"}
+    response = (
+        json.dumps(expected, ensure_ascii=False)
+        + "\n补充说明："
+        + json.dumps({"note": "不是主结果"}, ensure_ascii=False)
+    )
+
+    parsed = CodexInvestigator._parse_json_object(
+        response,
+        required_keys={"ok", "summary"},
+    )
+
+    assert parsed == expected
 
 
 def test_workspace_manager_reuses_role_session_and_isolates_critic_uid(settings) -> None:  # noqa: ANN001

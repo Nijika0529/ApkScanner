@@ -287,7 +287,16 @@ class PersistentCodexWorker:
                     "normalization_repairs": parsed_result.normalization_repairs,
                 }
             else:
-                parsed = CodexInvestigator._parse_json_object(turn.final_response)
+                required = command.resolved_output_schema().get("required")
+                required_keys = (
+                    {item for item in required if isinstance(item, str)}
+                    if isinstance(required, list)
+                    else None
+                )
+                parsed = CodexInvestigator._parse_json_object(
+                    turn.final_response,
+                    required_keys=required_keys,
+                )
             usage = turn.usage.model_dump(mode="json") if turn.usage else {}
             self.emit(
                 {

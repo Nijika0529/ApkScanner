@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from .agent_events import (
     AgentCancelledError,
     AgentEventCallback,
@@ -59,6 +61,13 @@ class CodexAdaptiveRunResult:
     turn_id: str
     result: AdaptiveVerificationResult
     usage: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _JsonObjectCandidate:
+    value: dict[str, Any]
+    start: int
+    end: int
 
 
 @dataclass(slots=True)
@@ -378,8 +387,7 @@ class CodexInvestigator:
             workspace_write=not restricted_review,
             adb_access=adb_access,
             network_access=(
-                not restricted_review
-                and self.settings.codex_shell_network == "public_egress"
+                not restricted_review and self.settings.codex_shell_network == "public_egress"
             ),
         )
         active = self._prepare_active_session(
@@ -761,9 +769,7 @@ class CodexInvestigator:
                 if key[0] == scan_id and key[1] == task_id
             ]
             self._busy_sessions = {
-                key
-                for key in self._busy_sessions
-                if not (key[0] == scan_id and key[1] == task_id)
+                key for key in self._busy_sessions if not (key[0] == scan_id and key[1] == task_id)
             }
             self._session_condition.notify_all()
         for active in sessions:
@@ -809,7 +815,9 @@ class CodexInvestigator:
         return Codex(config=config)
 
     @staticmethod
-    def _parse_json_object(response: str | None) -> dict[str, Any]:
+    def _json_object_candidates(
+        response: str | None,
+    ) -> tuple[str, list[_JsonObjectCandidate]]:
         if not response:
             raise ValueError("Codex returned no final response")
         text = response.strip()
@@ -819,32 +827,99 @@ class CodexInvestigator:
         try:
             value = json.loads(text)
         except json.JSONDecodeError as direct_error:
-            value = None
             decoder = json.JSONDecoder()
-            # DeepSeek may prepend a short natural-language handoff despite a
-            # Responses output schema. Accept only one complete trailing JSON
-            # object; Pydantic still enforces the full closed business schema.
-            for match in re.finditer(r"\{", text):
+            candidates: list[_JsonObjectCandidate] = []
+            cursor = 0
+            while match := re.search(r"\{", text[cursor:]):
+                start = cursor + match.start()
                 try:
-                    candidate, end = decoder.raw_decode(text, match.start())
+                    candidate, end = decoder.raw_decode(text, start)
                 except json.JSONDecodeError:
+                    cursor = start + 1
                     continue
-                if isinstance(candidate, dict) and text[end:].strip() in {"", "```"}:
-                    value = candidate
-                    break
-            if value is None:
+                if isinstance(candidate, dict):
+                    # Advancing to the decoded boundary prevents nested objects
+                    # from competing with their complete outer result object.
+                    candidates.append(_JsonObjectCandidate(candidate, start, end))
+                    cursor = end
+                else:
+                    cursor = start + 1
+            if not candidates:
                 raise ValueError(
-                    "Codex final response did not contain a complete trailing JSON object"
+                    "Codex final response did not contain a complete JSON object"
                 ) from direct_error
+            return text, candidates
         if not isinstance(value, dict):
             raise ValueError("Codex final response must be a JSON object")
-        return value
+        return text, [_JsonObjectCandidate(value, 0, len(text))]
 
-    @staticmethod
-    def _parse_response(response: str | None) -> AgentInvestigationResult:
-        return AgentInvestigationResult.model_validate(
-            CodexInvestigator._parse_json_object(response)
+    @classmethod
+    def _parse_json_object(
+        cls,
+        response: str | None,
+        *,
+        required_keys: set[str] | None = None,
+    ) -> dict[str, Any]:
+        _text, candidates = cls._json_object_candidates(response)
+        if required_keys:
+            matching = [
+                candidate for candidate in candidates if required_keys.issubset(candidate.value)
+            ]
+            if matching:
+                return matching[-1].value
+            # Return the most schema-shaped candidate so the authoritative
+            # downstream validator can report its precise missing fields.
+            return max(
+                candidates,
+                key=lambda candidate: (
+                    len(required_keys.intersection(candidate.value)),
+                    candidate.start,
+                ),
+            ).value
+        return candidates[-1].value
+
+    @classmethod
+    def _parse_response(cls, response: str | None) -> AgentInvestigationResult:
+        text, candidates = cls._json_object_candidates(response)
+        validation_errors: list[tuple[_JsonObjectCandidate, ValidationError]] = []
+        for candidate in reversed(candidates):
+            try:
+                parsed = AgentInvestigationResult.model_validate(candidate.value)
+            except ValidationError as exc:
+                validation_errors.append((candidate, exc))
+                continue
+
+            prefix = text[: candidate.start].strip()
+            suffix = text[candidate.end :].strip()
+            if prefix or suffix or len(candidates) > 1:
+                parsed.apply_model_validation_audit(
+                    {
+                        "rejected_requested_tests": parsed.rejected_requested_tests,
+                        "normalization_repairs": [
+                            *parsed.normalization_repairs,
+                            {
+                                "location": "$response",
+                                "repair": "selected_schema_valid_json_from_mixed_response",
+                                "top_level_candidate_count": len(candidates),
+                                "selected_candidate_ordinal": candidates.index(candidate) + 1,
+                                "prefix_characters_ignored": len(prefix),
+                                "suffix_characters_ignored": len(suffix),
+                            },
+                        ],
+                    }
+                )
+            return parsed
+
+        model_fields = set(AgentInvestigationResult.model_fields)
+        best_candidate, best_error = max(
+            validation_errors,
+            key=lambda item: (
+                len(model_fields.intersection(item[0].value)),
+                item[0].start,
+            ),
         )
+        del best_candidate
+        raise best_error
 
     @staticmethod
     def _developer_instructions() -> str:
@@ -918,8 +993,5 @@ def codex_config_overrides(
             '"TERM","SHELL","USER","LOGNAME","ANDROID_SERIAL","APKSCANNER_ADB_*",'
             '"APKSCANNER_PROOF_*","HTTP_PROXY","HTTPS_PROXY","NO_PROXY"]'
         ),
-        (
-            'shell_environment_policy.exclude=["DEEPSEEK_API_KEY",'
-            '"OPENAI_API_KEY","CODEX_API_KEY"]'
-        ),
+        ('shell_environment_policy.exclude=["DEEPSEEK_API_KEY","OPENAI_API_KEY","CODEX_API_KEY"]'),
     )
