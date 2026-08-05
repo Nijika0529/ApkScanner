@@ -4,7 +4,7 @@ import hashlib
 import json
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from .db import Database
@@ -291,10 +291,23 @@ class HypothesisLedger:
             return
         with self.database.session_factory() as session:
             attempt = session.get(ProofAttempt, proof_attempt_id)
-            if attempt is None:
+            if attempt is None or attempt.status != ProofAttemptStatus.PLANNED.value:
                 return
-            attempt.status = ProofAttemptStatus.EXECUTING.value
-            attempt.started_at = now()
+            started_at = now()
+            changed = session.execute(
+                update(ProofAttempt)
+                .where(
+                    ProofAttempt.id == proof_attempt_id,
+                    ProofAttempt.status == ProofAttemptStatus.PLANNED.value,
+                )
+                .values(
+                    status=ProofAttemptStatus.EXECUTING.value,
+                    started_at=started_at,
+                )
+            )
+            if changed.rowcount != 1:
+                session.rollback()
+                return
             hypothesis = session.get(SecurityHypothesis, attempt.hypothesis_id)
             if hypothesis is not None and hypothesis.status != HypothesisStatus.PROVEN.value:
                 hypothesis.status = HypothesisStatus.EXECUTING.value
@@ -370,9 +383,41 @@ class HypothesisLedger:
             item.get("metadata", {}).get("android16_verdict_eligible") is False
             for item in evidence
         )
-        compatibility_smoke_only = not android16_verdict_eligible
+        dynamic_verdict_eligible = not any(
+            item.get("metadata", {}).get(
+                "dynamic_verdict_eligible",
+                item.get("metadata", {}).get("android16_verdict_eligible", True),
+            )
+            is False
+            for item in evidence
+        )
+        release_gate_eligible = not any(
+            item.get("metadata", {}).get(
+                "release_gate_eligible",
+                item.get("metadata", {}).get("android16_verdict_eligible", True),
+            )
+            is False
+            for item in evidence
+        )
+        verdict_scopes = list(
+            dict.fromkeys(
+                str(item.get("metadata", {}).get("verdict_scope"))
+                for item in evidence
+                if item.get("metadata", {}).get("verdict_scope")
+            )
+        )
+        verdict_scope = (
+            "android16_release"
+            if release_gate_eligible
+            else "development_legacy"
+            if dynamic_verdict_eligible
+            else "non_verdict_smoke"
+        )
+        if verdict_scopes:
+            verdict_scope = verdict_scopes[0]
+        compatibility_smoke_only = not dynamic_verdict_eligible
         harm_demonstrated = (
-            android16_verdict_eligible
+            dynamic_verdict_eligible
             and execution_demonstrated
             and impact_observed
         )
@@ -382,15 +427,17 @@ class HypothesisLedger:
             else ProofAttemptStatus.PROVEN.value
             if harm_demonstrated
             else ProofAttemptStatus.REFUTED.value
-            if oracle_refuted and android16_verdict_eligible
+            if oracle_refuted and dynamic_verdict_eligible
             else ProofAttemptStatus.INCONCLUSIVE.value
         )
         with self.database.session_factory() as session:
             attempt = session.get(ProofAttempt, proof_attempt_id)
-            if attempt is None:
+            if attempt is None or attempt.status not in {
+                ProofAttemptStatus.PLANNED.value,
+                ProofAttemptStatus.EXECUTING.value,
+            }:
                 return
-            attempt.status = status
-            attempt.oracle = {
+            oracle = {
                 "schema_version": "1.0",
                 "correlated_probe_result": correlated,
                 "probe_succeeded": probe_succeeded,
@@ -402,20 +449,43 @@ class HypothesisLedger:
                 "security_impact_observed": impact_observed,
                 "oracle_refuted": oracle_refuted,
                 "android16_verdict_eligible": android16_verdict_eligible,
+                "dynamic_verdict_eligible": dynamic_verdict_eligible,
+                "release_gate_eligible": release_gate_eligible,
                 "compatibility_smoke_only": compatibility_smoke_only,
+                "verdict_scope": verdict_scope,
                 "harm_demonstrated": harm_demonstrated,
                 "policy": (
                     "A model claim and successful reachability test are not proof of harm. "
                     "Harm requires both demonstrated execution and a platform Prover's "
-                    "security_impact_observed signal on Android 16 / API 36 or newer. "
-                    "Legacy-device smoke evidence can validate the toolchain but cannot "
-                    "prove or refute the Android 16 hypothesis."
+                    "security_impact_observed signal on a device eligible for the selected "
+                    "validation profile. Development legacy verdicts become Findings but "
+                    "remain ineligible for the Android 16 release gate."
                 ),
             }
-            attempt.evidence_ids = evidence_ids
-            attempt.harm_demonstrated = harm_demonstrated
-            attempt.error = error
-            attempt.completed_at = now()
+            completed_at = now()
+            changed = session.execute(
+                update(ProofAttempt)
+                .where(
+                    ProofAttempt.id == proof_attempt_id,
+                    ProofAttempt.status.in_(
+                        [
+                            ProofAttemptStatus.PLANNED.value,
+                            ProofAttemptStatus.EXECUTING.value,
+                        ]
+                    ),
+                )
+                .values(
+                    status=status,
+                    oracle=oracle,
+                    evidence_ids=evidence_ids,
+                    harm_demonstrated=harm_demonstrated,
+                    error=error,
+                    completed_at=completed_at,
+                )
+            )
+            if changed.rowcount != 1:
+                session.rollback()
+                return
             hypothesis = session.get(SecurityHypothesis, attempt.hypothesis_id)
             if hypothesis is not None:
                 if harm_demonstrated:
@@ -426,7 +496,7 @@ class HypothesisLedger:
                     )
                 elif (
                     oracle_refuted
-                    and android16_verdict_eligible
+                    and dynamic_verdict_eligible
                     and hypothesis.status != HypothesisStatus.PROVEN.value
                 ):
                     hypothesis.status = HypothesisStatus.CHALLENGED.value

@@ -334,7 +334,11 @@ class AdbDeviceOut(BaseModel):
     android_version: str | None
     available: bool
     android16_verdict_eligible: bool
+    dynamic_verdict_eligible: bool
+    release_gate_eligible: bool
     compatibility_smoke_only: bool
+    validation_profile: str
+    verdict_scope: str
     busy: bool
     active_task_id: str | None
     last_error: str | None
@@ -723,6 +727,28 @@ class AgentProofReplay(BaseModel):
         ):
             raise ValueError("binder_interface_descriptor contains a control character")
         return self
+
+
+class AgentRuntimeObservation(BaseModel):
+    """A normalized semantic fact collected during free-form Agent validation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str = Field(pattern=r"^[a-z][a-z0-9_.-]{2,127}$")
+    source: Literal[
+        "adb",
+        "poc",
+        "webview_callback",
+        "network_callback",
+        "localhost_client",
+        "unix_socket_client",
+        "ssh_remote",
+        "agent",
+    ]
+    finding_id: str | None = Field(default=None, pattern=r"^[a-f0-9-]{36}$")
+    evidence_ids: list[str] = Field(default_factory=list, max_length=64)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    environment: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentHypothesisAssessment(BaseModel):
@@ -1192,6 +1218,9 @@ class BenchmarkSpec(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
     name: str = Field(min_length=1, max_length=256)
     apk_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    required_dynamic_scope: Literal["android16_release", "any_dynamic"] = (
+        "android16_release"
+    )
     vulnerabilities: list[GroundTruthVulnerability] = Field(min_length=1, max_length=500)
     quality_gate: BenchmarkQualityGate = Field(default_factory=BenchmarkQualityGate)
 
@@ -1251,6 +1280,32 @@ class InvestigationBriefOut(ApiModel):
     plan: dict[str, Any]
     evaluation_contract: dict[str, Any]
     result: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+class ValidationFixtureCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scan_id: StrictStr = Field(pattern=r"^[a-f0-9-]{36}$")
+    task_id: StrictStr | None = Field(default=None, pattern=r"^[a-f0-9-]{36}$")
+    name: StrictStr = Field(min_length=1, max_length=128)
+    fixture_type: Literal["account", "session", "canary", "app_state"]
+    payload: dict[str, Any] = Field(default_factory=dict)
+    setup_instructions: list[StrictStr] = Field(default_factory=list, max_length=64)
+    cleanup_instructions: list[StrictStr] = Field(default_factory=list, max_length=64)
+
+
+class ValidationFixtureOut(ApiModel):
+    id: str
+    scan_id: str
+    task_id: str | None
+    name: str
+    fixture_type: str
+    status: str
+    payload: dict[str, Any]
+    setup_instructions: list[str]
+    cleanup_instructions: list[str]
     created_at: datetime
     updated_at: datetime
 

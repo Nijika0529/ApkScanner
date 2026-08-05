@@ -215,6 +215,9 @@ class EntryPoint(Base):
 
 class Finding(Base):
     __tablename__ = "findings"
+    __table_args__ = (
+        UniqueConstraint("scan_id", "dedupe_key", name="uq_findings_scan_dedupe"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     scan_id: Mapped[str] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
@@ -591,3 +594,241 @@ class AgentRuntimeEventRecord(Base):
     data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     delivery_source: Mapped[str] = mapped_column(String(32), default="live", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ScanContainerRecord(Base):
+    """Durable lifecycle record for a scan-scoped worker container/workspace."""
+
+    __tablename__ = "scan_container_records"
+    __table_args__ = (
+        UniqueConstraint("container_key", name="uq_scan_container_record_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scan_id: Mapped[str] = mapped_column(
+        ForeignKey("scans.id", ondelete="CASCADE"), index=True
+    )
+    task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("investigation_tasks.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    container_key: Mapped[str] = mapped_column(String(768), unique=True)
+    isolation: Mapped[str] = mapped_column(String(32), default="docker")
+    workspace_path: Mapped[str] = mapped_column(Text, default="")
+    container_name: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="prepared", index=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class AgentSessionRecord(Base):
+    """Stable Agent session identity independent from verbose runtime events."""
+
+    __tablename__ = "agent_session_records"
+    __table_args__ = (
+        UniqueConstraint("session_key", name="uq_agent_session_record_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scan_id: Mapped[str] = mapped_column(
+        ForeignKey("scans.id", ondelete="CASCADE"), index=True
+    )
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("investigation_tasks.id", ondelete="CASCADE"), index=True
+    )
+    container_record_id: Mapped[str | None] = mapped_column(
+        ForeignKey("scan_container_records.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    session_key: Mapped[str] = mapped_column(String(768), unique=True)
+    role: Mapped[str] = mapped_column(String(64), index=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    backend: Mapped[str] = mapped_column(String(32), default="codex")
+    provider: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    thread_id: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class AgentTurnRecord(Base):
+    """One auditable provider turn; the audit ID is its idempotency key."""
+
+    __tablename__ = "agent_turn_records"
+    __table_args__ = (UniqueConstraint("audit_id", name="uq_agent_turn_audit_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scan_id: Mapped[str] = mapped_column(
+        ForeignKey("scans.id", ondelete="CASCADE"), index=True
+    )
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("investigation_tasks.id", ondelete="CASCADE"), index=True
+    )
+    session_record_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_session_records.id", ondelete="CASCADE"), index=True
+    )
+    audit_id: Mapped[str] = mapped_column(String(36), unique=True)
+    phase: Mapped[str] = mapped_column(String(64), index=True)
+    round_index: Mapped[int] = mapped_column(Integer, default=0)
+    turn_id: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="running", index=True)
+    request_evidence_id: Mapped[str | None] = mapped_column(
+        ForeignKey("evidence.id", ondelete="SET NULL"), nullable=True
+    )
+    response_evidence_id: Mapped[str | None] = mapped_column(
+        ForeignKey("evidence.id", ondelete="SET NULL"), nullable=True
+    )
+    usage_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AdaptiveVerificationCheckpoint(Base):
+    """Per-candidate checkpoint so one failed batch never discards completed judgments."""
+
+    __tablename__ = "adaptive_verification_checkpoints"
+    __table_args__ = (
+        UniqueConstraint("task_id", "finding_id", name="uq_adaptive_checkpoint_candidate"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scan_id: Mapped[str] = mapped_column(
+        ForeignKey("scans.id", ondelete="CASCADE"), index=True
+    )
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("investigation_tasks.id", ondelete="CASCADE"), index=True
+    )
+    finding_id: Mapped[str] = mapped_column(
+        ForeignKey("findings.id", ondelete="CASCADE"), index=True
+    )
+    batch_index: Mapped[int] = mapped_column(Integer)
+    audit_id: Mapped[str] = mapped_column(String(36), index=True)
+    response_evidence_id: Mapped[str] = mapped_column(
+        ForeignKey("evidence.id", ondelete="CASCADE"), index=True
+    )
+    thread_id: Mapped[str] = mapped_column(String(512), default="")
+    turn_id: Mapped[str] = mapped_column(String(512), default="")
+    assessment_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    environment_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class RuntimeObservation(Base):
+    """Normalized runtime fact emitted by ADB, a PoC, WebView, socket, or callback sink."""
+
+    __tablename__ = "runtime_observations"
+    __table_args__ = (
+        UniqueConstraint("observation_key", name="uq_runtime_observation_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scan_id: Mapped[str] = mapped_column(
+        ForeignKey("scans.id", ondelete="CASCADE"), index=True
+    )
+    task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("investigation_tasks.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    finding_id: Mapped[str | None] = mapped_column(
+        ForeignKey("findings.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    observation_key: Mapped[str] = mapped_column(String(128), unique=True)
+    kind: Mapped[str] = mapped_column(String(128), index=True)
+    source: Mapped[str] = mapped_column(String(64), default="platform", index=True)
+    evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    environment: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ValidationFixture(Base):
+    """Operator-provided account/session/canary state for repeatable dynamic tests."""
+
+    __tablename__ = "validation_fixtures"
+    __table_args__ = (
+        UniqueConstraint("scan_id", "name", name="uq_validation_fixture_scan_name"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scan_id: Mapped[str] = mapped_column(
+        ForeignKey("scans.id", ondelete="CASCADE"), index=True
+    )
+    task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("investigation_tasks.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    name: Mapped[str] = mapped_column(String(128))
+    fixture_type: Mapped[str] = mapped_column(String(32), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    setup_instructions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    cleanup_instructions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class CampaignRun(Base):
+    """Persistent supervisor campaign with an explicit goal and execution budget."""
+
+    __tablename__ = "campaign_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(256), index=True)
+    goal: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(32), default="running", index=True)
+    plan_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    max_parallel_scans: Mapped[int] = mapped_column(Integer, default=1)
+    total_budget_seconds: Mapped[int] = mapped_column(Integer, default=86_400)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class CampaignEntryRecord(Base):
+    """Persistent DAG node controlled by the supervisor reconciliation loop."""
+
+    __tablename__ = "campaign_entry_records"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "entry_key", name="uq_campaign_entry_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    campaign_id: Mapped[str] = mapped_column(
+        ForeignKey("campaign_runs.id", ondelete="CASCADE"), index=True
+    )
+    entry_key: Mapped[str] = mapped_column(String(64), index=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    depends_on: Mapped[list[str]] = mapped_column(JSON, default=list)
+    source_scan_id: Mapped[str | None] = mapped_column(
+        ForeignKey("scans.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    launched_scan_id: Mapped[str | None] = mapped_column(
+        ForeignKey("scans.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    capability_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    input_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )

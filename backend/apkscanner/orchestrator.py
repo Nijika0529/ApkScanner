@@ -32,6 +32,7 @@ from .agent_prompt import (
     investigation_prompt,
 )
 from .artifacts import ArtifactStore
+from .attacker_templates import attacker_template_catalog, materialize_attacker_templates
 from .codex_runner import CodexInvestigator, CodexRunResult
 from .config import Settings
 from .db import Database
@@ -48,16 +49,22 @@ from .evidence import EvidenceRecorder
 from .finding_policy import partition_findings
 from .manifest import parse_manifest
 from .models import (
+    AdaptiveVerificationCheckpoint,
     AdbDeviceRecord,
     AgentRuntimeEventRecord,
+    AgentSessionRecord,
+    AgentTurnRecord,
     CoverageItem,
     EntryPoint,
     Evidence,
     Finding,
     InvestigationTask,
     ProofAttempt,
+    RuntimeObservation,
     Scan,
+    ScanContainerRecord,
     SecurityHypothesis,
+    ValidationFixture,
 )
 from .planner import InvestigationPlanner
 from .poc import PocBuilder, PocBuildResult
@@ -67,10 +74,12 @@ from .schemas import (
     ADAPTIVE_VERIFIER_RESULT_JSON_SCHEMA,
     AGENT_RESULT_JSON_SCHEMA,
     AdaptiveVerificationResult,
+    AdaptiveVerifierAssessment,
     AgentInvestigationResult,
     AgentOracleSpec,
     AgentProofReplay,
     AgentRequestedTest,
+    AgentRuntimeObservation,
 )
 from .security_design import build_android_threat_model, finding_identity
 from .security_pipeline import HypothesisLedger
@@ -248,15 +257,20 @@ class ScanOrchestrator:
                         "api_level": record.api_level,
                         "android_version": record.android_version,
                         "available": bool(capability.get("available")),
-                        "android16_verdict_eligible": bool(
-                            capability.get("android16_verdict_eligible")
+                        **(
+                            {
+                                key: capability.get(key)
+                                for key in (
+                                    "android16_verdict_eligible",
+                                    "dynamic_verdict_eligible",
+                                    "release_gate_eligible",
+                                    "compatibility_smoke_only",
+                                    "validation_profile",
+                                    "verdict_scope",
+                                )
+                            }
                             if capability
-                            else record.api_level is not None and record.api_level >= 36
-                        ),
-                        "compatibility_smoke_only": bool(
-                            capability.get("compatibility_smoke_only")
-                            if capability
-                            else record.api_level is not None and record.api_level < 36
+                            else self.settings.verdict_metadata(record.api_level)
                         ),
                         "busy": record.serial in active,
                         "active_task_id": active.get(record.serial),
@@ -295,10 +309,11 @@ class ScanOrchestrator:
         api_level = int(api_text) if api_text.isdigit() else None
         if api_level is None:
             raise RuntimeError("Could not determine the Android API level")
-        if api_level < 36 and not self.settings.allow_legacy_device_smoke:
+        verdict_metadata = self.settings.verdict_metadata(api_level)
+        if not verdict_metadata["dynamic_verdict_eligible"]:
             raise RuntimeError(
-                "Only Android 16 / API 36 or newer verdict devices are accepted; "
-                "legacy devices require explicit non-verdict smoke mode"
+                "The selected validation profile does not permit this Android API "
+                "to issue a scoped dynamic verdict"
             )
         with self.database.session_factory() as session:
             record = session.scalar(
@@ -309,7 +324,7 @@ class ScanOrchestrator:
                 session.add(record)
             record.label = label.strip() if label and label.strip() else record.label
             record.enabled = True
-            record.state = "ready" if api_level >= 36 else "compatibility_smoke"
+            record.state = "ready"
             record.api_level = api_level
             record.android_version = str(capability.get("android_version") or "") or None
             record.last_error = None
@@ -317,7 +332,7 @@ class ScanOrchestrator:
             record.metadata_json = {
                 **dict(record.metadata_json or {}),
                 "source": "runtime_api",
-                "android16_verdict_eligible": api_level >= 36,
+                **verdict_metadata,
             }
             session.commit()
             record_id = record.id
@@ -330,7 +345,7 @@ class ScanOrchestrator:
             {
                 "serial": serial,
                 "api_level": api_level,
-                "android16_verdict_eligible": api_level >= 36,
+                **verdict_metadata,
             },
         )
         return next(item for item in self.list_adb_devices() if item["id"] == record_id)
@@ -448,7 +463,11 @@ class ScanOrchestrator:
                         r"/api/v1/internal/tasks/([a-f0-9-]{36})/adb",
                         self.path,
                     )
-                    if proof_match is None and adb_match is None:
+                    observation_match = re.fullmatch(
+                        r"/api/v1/internal/tasks/([a-f0-9-]{36})/observations",
+                        self.path,
+                    )
+                    if proof_match is None and adb_match is None and observation_match is None:
                         self._respond(404, {"detail": "not found"})
                         return
                     try:
@@ -468,13 +487,21 @@ class ScanOrchestrator:
                                 self.headers.get("X-APKScanner-Proof-Token", ""),
                                 replay,
                             )
-                        else:
+                        elif adb_match is not None:
                             assert adb_match is not None
                             request = AdbGatewayRequest.model_validate_json(body)
                             response = orchestrator.execute_live_adb(
                                 adb_match.group(1),
                                 self.headers.get("X-APKScanner-ADB-Token", ""),
                                 request,
+                            )
+                        else:
+                            assert observation_match is not None
+                            observation = AgentRuntimeObservation.model_validate_json(body)
+                            response = orchestrator.record_live_runtime_observation(
+                                observation_match.group(1),
+                                self.headers.get("X-APKScanner-Proof-Token", ""),
+                                observation,
                             )
                     except PermissionError as exc:
                         self._respond(403, {"detail": str(exc)})
@@ -1043,6 +1070,112 @@ class ScanOrchestrator:
             )
             return response
 
+    def record_live_runtime_observation(
+        self,
+        task_id: str,
+        token: str,
+        observation: AgentRuntimeObservation,
+    ) -> dict[str, Any]:
+        """Persist a flexible runtime fact without pretending it is a proof verdict."""
+
+        with self._live_proof_lock:
+            context = self._live_proof_contexts.get(task_id)
+        if context is None or not secrets.compare_digest(context.token, token):
+            raise PermissionError("runtime observation intake is not active for this task")
+        self._raise_if_cancelled(context.cancel_event)
+        value = observation.model_dump(mode="json")
+        observation_key = hashlib.sha256(
+            json.dumps(
+                {
+                    "scan_id": context.scan_id,
+                    "task_id": task_id,
+                    **value,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        with self.database.session_factory() as session:
+            existing = session.scalar(
+                select(RuntimeObservation).where(
+                    RuntimeObservation.observation_key == observation_key
+                )
+            )
+            if existing is not None:
+                return {
+                    "schema_version": "1.0",
+                    "id": existing.id,
+                    "observation_key": existing.observation_key,
+                    "deduplicated": True,
+                }
+            if observation.finding_id is not None:
+                finding = session.get(Finding, observation.finding_id)
+                if finding is None or finding.scan_id != context.scan_id:
+                    raise ValueError("runtime observation finding is outside this scan")
+            known_evidence_ids = set(
+                session.scalars(
+                    select(Evidence.id).where(Evidence.scan_id == context.scan_id)
+                )
+            )
+            if not set(observation.evidence_ids) <= known_evidence_ids:
+                raise ValueError("runtime observation references unknown evidence")
+            evidence = self.evidence.json(
+                session,
+                scan_id=context.scan_id,
+                task_id=task_id,
+                kind="runtime.observation",
+                value={
+                    "schema_version": "1.0",
+                    "observation_key": observation_key,
+                    **value,
+                },
+                summary=f"Runtime observation: {observation.kind}",
+                metadata={
+                    "source": observation.source,
+                    "kind": observation.kind,
+                    "finding_id": observation.finding_id,
+                },
+            )
+            record = RuntimeObservation(
+                scan_id=context.scan_id,
+                task_id=task_id,
+                finding_id=observation.finding_id,
+                observation_key=observation_key,
+                kind=observation.kind,
+                source=observation.source,
+                evidence_ids=[*observation.evidence_ids, evidence.id],
+                payload=observation.payload,
+                environment={
+                    **observation.environment,
+                    "device_serial": context.device.serial,
+                    "validation": context.device.capability(non_blocking=False),
+                },
+            )
+            session.add(record)
+            add_event(
+                session,
+                context.scan_id,
+                "runtime.observation.recorded",
+                "Agent 已提交一项标准化运行时观测",
+                {
+                    "task_id": task_id,
+                    "observation_id": record.id,
+                    "kind": record.kind,
+                    "source": record.source,
+                    "finding_id": record.finding_id,
+                },
+            )
+            session.commit()
+            context.evidence_summaries.append(self._evidence_summary(evidence))
+            self._materialize_live_evidence(context, [context.evidence_summaries[-1]])
+            return {
+                "schema_version": "1.0",
+                "id": record.id,
+                "observation_key": observation_key,
+                "evidence_id": evidence.id,
+                "deduplicated": False,
+            }
+
     def resolve_investigator(self, requested: str = "configured") -> str:
         backend = (
             self.settings.investigator_backend
@@ -1332,7 +1465,54 @@ class ScanOrchestrator:
                 )
             session.commit()
 
+    def _ensure_scan_container_record(self, scan_id: str) -> None:
+        if not self.settings.codex_enabled or self.settings.codex_isolation != "docker":
+            return
+        container_key = f"{scan_id}:scan-container"
+        with self.database.session_factory() as session:
+            record = session.scalar(
+                select(ScanContainerRecord).where(
+                    ScanContainerRecord.container_key == container_key
+                )
+            )
+            if record is None:
+                record = ScanContainerRecord(
+                    scan_id=scan_id,
+                    container_key=container_key,
+                    isolation="docker",
+                    status="prepared",
+                    metadata_json={"session_workspaces": {}},
+                )
+                session.add(record)
+            else:
+                record.status = "prepared"
+                record.completed_at = None
+            session.commit()
+
+    def _close_scan_container_record(self, scan_id: str) -> None:
+        with self.database.session_factory() as session:
+            record = session.scalar(
+                select(ScanContainerRecord).where(
+                    ScanContainerRecord.container_key == f"{scan_id}:scan-container"
+                )
+            )
+            if record is None:
+                return
+            scan = session.get(Scan, scan_id)
+            record.status = "failed" if scan is not None and scan.status == "failed" else "closed"
+            record.completed_at = now()
+            session.execute(
+                update(AgentSessionRecord)
+                .where(
+                    AgentSessionRecord.scan_id == scan_id,
+                    AgentSessionRecord.status.in_({"active", "idle"}),
+                )
+                .values(status=record.status, completed_at=record.completed_at)
+            )
+            session.commit()
+
     def _run_sync(self, scan_id: str) -> None:
+        self._ensure_scan_container_record(scan_id)
         try:
             self._run_static(scan_id)
             self._run_tasks(scan_id)
@@ -1385,6 +1565,7 @@ class ScanOrchestrator:
                     session.commit()
         finally:
             self.codex.close_scan(scan_id)
+            self._close_scan_container_record(scan_id)
 
     def _run_static(self, scan_id: str) -> None:
         with self.database.session_factory() as session:
@@ -2685,6 +2866,36 @@ class ScanOrchestrator:
             prior_adaptive_evidence = [
                 item for item in all_evidence if item.task_id == task_id
             ]
+            checkpoint_records = list(
+                session.scalars(
+                    select(AdaptiveVerificationCheckpoint).where(
+                        AdaptiveVerificationCheckpoint.task_id == task_id,
+                        AdaptiveVerificationCheckpoint.finding_id.in_(candidate_ids),
+                    )
+                )
+            )
+            checkpoint_assessments = [
+                AdaptiveVerifierAssessment.model_validate(item.assessment_json)
+                for item in checkpoint_records
+            ]
+            checkpoint_finding_ids = {item.finding_id for item in checkpoint_records}
+            checkpoint_evidence_ids_by_finding = {
+                item.finding_id: item.response_evidence_id for item in checkpoint_records
+            }
+            checkpoint_receipts = [
+                {
+                    "index": item.batch_index,
+                    "candidate_finding_ids": [item.finding_id],
+                    "status": "restored_checkpoint",
+                    "audit_id": item.audit_id,
+                    "thread_id": item.thread_id,
+                    "turn_id": item.turn_id,
+                    "response_evidence_id": item.response_evidence_id,
+                    "assessment_count": 1,
+                    **dict(item.environment_json or {}),
+                }
+                for item in checkpoint_records
+            ]
             explicit_evidence_ids = {
                 evidence_id for finding in findings for evidence_id in finding.evidence_ids
             }
@@ -2740,6 +2951,7 @@ class ScanOrchestrator:
                     ],
                 }
                 for finding in findings
+                if finding.id not in checkpoint_finding_ids
             ]
 
         capability = self.codex.capability(deep=True)
@@ -2820,13 +3032,19 @@ class ScanOrchestrator:
                     "fixed_oracle_required": False,
                     "runtime_evidence_required_for_reproduced_blackbox": True,
                 },
+                "attacker_templates": {
+                    "catalog_path": "attacker-templates/catalog.json",
+                    "templates": attacker_template_catalog(),
+                },
+                "validation_fixtures": self._validation_fixture_context(scan_id, task_id),
                 "recovery": {
                     "is_retry": task.attempts > 1 and bool(prior_adaptive_evidence),
                     "attempt": task.attempts,
                     "previous_attempt_evidence_count": len(prior_adaptive_evidence),
+                    "restored_candidate_checkpoints": sorted(checkpoint_finding_ids),
                     "instruction": (
-                        "Reuse prior Adaptive Verifier evidence and finalize all candidates; "
-                        "do not repeat successful experiments."
+                        "Per-candidate checkpoints were restored. Do not repeat those "
+                        "completed candidates; finalize only the candidates in this batch."
                         if task.attempts > 1 and prior_adaptive_evidence
                         else "No previous Adaptive Verifier evidence is available."
                     ),
@@ -2961,10 +3179,16 @@ class ScanOrchestrator:
                     ),
                     "APKSCANNER_ADB_TOKEN": gateway_token,
                     "APKSCANNER_ADB_POLICY": "adaptive",
+                    "APKSCANNER_OBSERVATION_URL": (
+                        f"{docker_base}/api/v1/internal/tasks/{task_id}/observations"
+                    ),
+                    "APKSCANNER_OBSERVATION_TOKEN": gateway_token,
                 }
             successful_results: list[Any] = []
-            batch_receipts: list[dict[str, Any]] = []
-            response_evidence_ids_by_finding: dict[str, str] = {}
+            batch_receipts: list[dict[str, Any]] = list(checkpoint_receipts)
+            response_evidence_ids_by_finding: dict[str, str] = dict(
+                checkpoint_evidence_ids_by_finding
+            )
 
             def close_batch_thread_for_next_turn() -> None:
                 self.codex.close_task_role(
@@ -2990,7 +3214,7 @@ class ScanOrchestrator:
                         break
                     audit_id = str(uuid.uuid4())
                     with self.database.session_factory() as session:
-                        self.evidence.json(
+                        request_evidence = self.evidence.json(
                             session,
                             scan_id=scan_id,
                             task_id=task_id,
@@ -3031,6 +3255,17 @@ class ScanOrchestrator:
                                 "model": self.settings.codex_model,
                                 "isolation": self.settings.codex_isolation,
                             },
+                        )
+                        self._start_agent_turn_record(
+                            session,
+                            scan_id=scan_id,
+                            task_id=task_id,
+                            attempt=task.attempts,
+                            phase="adaptive_verification",
+                            audit_id=audit_id,
+                            request_evidence_id=request_evidence.id,
+                            round_index=int(batch["index"]) - 1,
+                            workspace_path=str(runtime_workspace),
                         )
                         add_event(
                             session,
@@ -3204,8 +3439,71 @@ class ScanOrchestrator:
                                 "assessment_count": len(result.result.assessments),
                             },
                         )
-                        session.commit()
                         response_evidence_id = response_evidence.id
+                        self._finish_agent_turn_record(
+                            session,
+                            audit_id=audit_id,
+                            status="completed",
+                            response_evidence_id=response_evidence.id,
+                            thread_id=result.thread_id,
+                            turn_id=result.turn_id,
+                            usage=result.usage,
+                        )
+                        assessments_by_finding = {
+                            assessment.finding_id: assessment
+                            for assessment in result.result.assessments
+                            if assessment.finding_id in set(batch["candidate_ids"])
+                        }
+                        for finding_id, assessment in assessments_by_finding.items():
+                            checkpoint = session.scalar(
+                                select(AdaptiveVerificationCheckpoint).where(
+                                    AdaptiveVerificationCheckpoint.task_id == task_id,
+                                    AdaptiveVerificationCheckpoint.finding_id == finding_id,
+                                )
+                            )
+                            if checkpoint is None:
+                                checkpoint = AdaptiveVerificationCheckpoint(
+                                    scan_id=scan_id,
+                                    task_id=task_id,
+                                    finding_id=finding_id,
+                                    batch_index=int(batch["index"]),
+                                    audit_id=audit_id,
+                                    response_evidence_id=response_evidence.id,
+                                    thread_id=result.thread_id,
+                                    turn_id=result.turn_id,
+                                    assessment_json=assessment.model_dump(mode="json"),
+                                    environment_json={
+                                        key: device_context.get(key)
+                                        for key in (
+                                            "validation_profile",
+                                            "android16_verdict_eligible",
+                                            "dynamic_verdict_eligible",
+                                            "release_gate_eligible",
+                                            "compatibility_smoke_only",
+                                            "verdict_scope",
+                                        )
+                                    },
+                                )
+                                session.add(checkpoint)
+                            else:
+                                checkpoint.batch_index = int(batch["index"])
+                                checkpoint.audit_id = audit_id
+                                checkpoint.response_evidence_id = response_evidence.id
+                                checkpoint.thread_id = result.thread_id
+                                checkpoint.turn_id = result.turn_id
+                                checkpoint.assessment_json = assessment.model_dump(mode="json")
+                                checkpoint.environment_json = {
+                                    key: device_context.get(key)
+                                    for key in (
+                                        "validation_profile",
+                                        "android16_verdict_eligible",
+                                        "dynamic_verdict_eligible",
+                                        "release_gate_eligible",
+                                        "compatibility_smoke_only",
+                                        "verdict_scope",
+                                    )
+                                }
+                        session.commit()
                     self._record_agent_runtime_events(
                         scan_id=scan_id,
                         task_id=task_id,
@@ -3233,6 +3531,17 @@ class ScanOrchestrator:
                             "turn_id": result.turn_id,
                             "response_evidence_id": response_evidence_id,
                             "assessment_count": len(result.result.assessments),
+                            **{
+                                key: device_context.get(key)
+                                for key in (
+                                    "validation_profile",
+                                    "android16_verdict_eligible",
+                                    "dynamic_verdict_eligible",
+                                    "release_gate_eligible",
+                                    "compatibility_smoke_only",
+                                    "verdict_scope",
+                                )
+                            },
                         }
                     )
                     if batch["index"] < batch["count"]:
@@ -3241,7 +3550,7 @@ class ScanOrchestrator:
                 if gateway_token is not None:
                     self._unregister_live_proof_context(task_id, gateway_token)
 
-            if not successful_results:
+            if not successful_results and not checkpoint_assessments:
                 errors = [
                     str(receipt.get("error"))
                     for receipt in batch_receipts
@@ -3253,13 +3562,21 @@ class ScanOrchestrator:
                 )
             combined_result = AdaptiveVerificationResult(
                 summary=(
-                    "高权限批量验证已按传输字符预算分批完成。"
+                    (
+                        f"已恢复 {len(checkpoint_assessments)} 个候选断点；"
+                        if checkpoint_assessments
+                        else ""
+                    )
+                    + "高权限批量验证已按传输字符预算分批完成。"
                     + "；".join(item.result.summary for item in successful_results)
                 )[:12_000],
                 assessments=[
-                    assessment
-                    for item in successful_results
-                    for assessment in item.result.assessments
+                    *checkpoint_assessments,
+                    *(
+                        assessment
+                        for item in successful_results
+                        for assessment in item.result.assessments
+                    ),
                 ],
                 shared_observations=list(
                     dict.fromkeys(
@@ -3293,7 +3610,8 @@ class ScanOrchestrator:
                     )
                 ),
             )
-            last_result = successful_results[-1]
+            last_result = successful_results[-1] if successful_results else None
+            last_checkpoint = checkpoint_records[-1] if checkpoint_records else None
             response_evidence_id = str(
                 next(
                     receipt["response_evidence_id"]
@@ -3306,13 +3624,30 @@ class ScanOrchestrator:
                 task_id=task_id,
                 candidate_ids=candidate_ids,
                 result=combined_result,
-                thread_id=last_result.thread_id,
-                turn_id=last_result.turn_id,
+                thread_id=(
+                    last_result.thread_id
+                    if last_result is not None
+                    else str(last_checkpoint.thread_id if last_checkpoint else "checkpoint")
+                ),
+                turn_id=(
+                    last_result.turn_id
+                    if last_result is not None
+                    else str(last_checkpoint.turn_id if last_checkpoint else "checkpoint")
+                ),
                 response_evidence_id=response_evidence_id,
                 response_evidence_ids_by_finding=response_evidence_ids_by_finding,
                 batch_receipts=batch_receipts,
                 android16_verdict_eligible=bool(
                     device_context.get("android16_verdict_eligible")
+                ),
+                dynamic_verdict_eligible=bool(
+                    device_context.get("dynamic_verdict_eligible")
+                ),
+                release_gate_eligible=bool(
+                    device_context.get("release_gate_eligible")
+                ),
+                verdict_scope=str(
+                    device_context.get("verdict_scope") or "non_verdict_smoke"
                 ),
             )
         finally:
@@ -3330,15 +3665,30 @@ class ScanOrchestrator:
         turn_id: str,
         response_evidence_id: str,
         android16_verdict_eligible: bool,
+        dynamic_verdict_eligible: bool | None = None,
+        release_gate_eligible: bool | None = None,
+        verdict_scope: str | None = None,
         response_evidence_ids_by_finding: dict[str, str] | None = None,
         batch_receipts: list[dict[str, Any]] | None = None,
     ) -> None:
         response_evidence_ids_by_finding = response_evidence_ids_by_finding or {}
         batch_receipts = batch_receipts or []
+        if dynamic_verdict_eligible is None:
+            dynamic_verdict_eligible = android16_verdict_eligible
+        if release_gate_eligible is None:
+            release_gate_eligible = android16_verdict_eligible
+        if verdict_scope is None:
+            verdict_scope = (
+                "android16_release"
+                if release_gate_eligible
+                else "development_legacy"
+                if dynamic_verdict_eligible
+                else "non_verdict_smoke"
+            )
         batch_execution_by_finding = {
             finding_id: receipt
             for receipt in batch_receipts
-            if receipt.get("status") == "completed"
+            if receipt.get("status") in {"completed", "restored_checkpoint"}
             for finding_id in receipt.get("candidate_finding_ids", [])
             if isinstance(finding_id, str)
         }
@@ -3368,16 +3718,38 @@ class ScanOrchestrator:
                     continue
                 model_verdict = assessment.verdict
                 model_verdict_counts[model_verdict] += 1
+                candidate_execution = batch_execution_by_finding.get(finding_id, {})
+                candidate_android16_eligible = bool(
+                    candidate_execution.get(
+                        "android16_verdict_eligible",
+                        android16_verdict_eligible,
+                    )
+                )
+                candidate_dynamic_eligible = bool(
+                    candidate_execution.get(
+                        "dynamic_verdict_eligible",
+                        dynamic_verdict_eligible,
+                    )
+                )
+                candidate_release_eligible = bool(
+                    candidate_execution.get(
+                        "release_gate_eligible",
+                        release_gate_eligible,
+                    )
+                )
+                candidate_verdict_scope = str(
+                    candidate_execution.get("verdict_scope") or verdict_scope
+                )
                 verdict = model_verdict
                 verdict_override_reason: str | None = None
                 if (
                     model_verdict == FindingStatus.REPRODUCED_BLACKBOX.value
-                    and not android16_verdict_eligible
+                    and not candidate_dynamic_eligible
                 ):
                     verdict = FindingStatus.SUPPORTED_STATIC.value
                     verdict_override_reason = (
-                        "Adaptive runtime evidence came from a compatibility-smoke device below "
-                        "Android 16 / API 36 and cannot issue a reproduced verdict."
+                        "Adaptive runtime evidence came from a device outside the selected "
+                        "dynamic-verdict profile and cannot issue a reproduced verdict."
                     )
                     verdict_overrides.append(
                         {
@@ -3397,7 +3769,6 @@ class ScanOrchestrator:
                     finding_id,
                     response_evidence_id,
                 )
-                candidate_execution = batch_execution_by_finding.get(finding_id, {})
                 candidate_thread_id = str(candidate_execution.get("thread_id") or thread_id)
                 candidate_turn_id = str(candidate_execution.get("turn_id") or turn_id)
                 accepted_evidence_ids.append(candidate_response_evidence_id)
@@ -3414,8 +3785,11 @@ class ScanOrchestrator:
                         "model_verdict": model_verdict,
                         "verdict": verdict,
                         "verdict_override_reason": verdict_override_reason,
-                        "android16_verdict_eligible": android16_verdict_eligible,
-                        "compatibility_smoke_only": not android16_verdict_eligible,
+                        "android16_verdict_eligible": candidate_android16_eligible,
+                        "dynamic_verdict_eligible": candidate_dynamic_eligible,
+                        "release_gate_eligible": candidate_release_eligible,
+                        "compatibility_smoke_only": not candidate_dynamic_eligible,
+                        "verdict_scope": candidate_verdict_scope,
                         "confidence": assessment.confidence,
                         "runtime_observed": assessment.runtime_observed,
                         "duplicate_of_finding_id": assessment.duplicate_of_finding_id,
@@ -3445,6 +3819,13 @@ class ScanOrchestrator:
                     **dict(finding.metadata_json or {}),
                     "harm_demonstrated": verdict
                     == FindingStatus.REPRODUCED_BLACKBOX.value,
+                    "android16_verdict_eligible": candidate_android16_eligible,
+                    "dynamic_verdict_eligible": candidate_dynamic_eligible,
+                    "release_gate_eligible": bool(
+                        verdict == FindingStatus.REPRODUCED_BLACKBOX.value
+                        and candidate_release_eligible
+                    ),
+                    "verdict_scope": candidate_verdict_scope,
                     "verification_mode": "adaptive_agent",
                     "adaptive_verification": history[-1],
                     "adaptive_verification_history": history[-10:],
@@ -3509,6 +3890,9 @@ class ScanOrchestrator:
             output["ignored_duplicate_relations"] = ignored_duplicate_relations
             output["merged_finding_map"] = merged_findings
             output["android16_verdict_eligible"] = android16_verdict_eligible
+            output["dynamic_verdict_eligible"] = dynamic_verdict_eligible
+            output["release_gate_eligible"] = release_gate_eligible
+            output["verdict_scope"] = verdict_scope
             output["verdict_overrides"] = verdict_overrides
             task.thread_id = thread_id
             task.turn_id = turn_id
@@ -3531,7 +3915,8 @@ class ScanOrchestrator:
                     "response_evidence_ids": output["response_evidence_ids"],
                     "batch_count": len(batch_receipts) or 1,
                     "failed_batch_count": sum(
-                        receipt.get("status") != "completed"
+                        receipt.get("status")
+                        not in {"completed", "restored_checkpoint"}
                         for receipt in batch_receipts
                     ),
                     "assessment_count": len(assessments),
@@ -3540,6 +3925,8 @@ class ScanOrchestrator:
                     "assessment_verdict_counts": dict(verdict_counts),
                     "model_verdict_counts": dict(model_verdict_counts),
                     "compatibility_override_count": len(verdict_overrides),
+                    "verdict_scope": verdict_scope,
+                    "release_gate_eligible": release_gate_eligible,
                     "merged_duplicate_count": len(merged_findings),
                 },
             }
@@ -3568,6 +3955,9 @@ class ScanOrchestrator:
                     "compatibility_override_count": len(verdict_overrides),
                     "merged_duplicate_count": len(merged_findings),
                     "android16_verdict_eligible": android16_verdict_eligible,
+                    "dynamic_verdict_eligible": dynamic_verdict_eligible,
+                    "release_gate_eligible": release_gate_eligible,
+                    "verdict_scope": verdict_scope,
                     "batch_count": len(batch_receipts) or 1,
                     "failed_batch_count": sum(
                         receipt.get("status") != "completed"
@@ -4332,6 +4722,7 @@ class ScanOrchestrator:
                     "phase": phase,
                     "round_index": round_index,
                     "output_language": "zh-CN",
+                    "validation_fixtures": self._validation_fixture_context(scan_id, task_id),
                     "device": current_device_capability(),
                     "poc_builder": self.poc_builder.capability(),
                     "coverage_gaps": ([] if blind_rescue or critic_turn else coverage_gaps),
@@ -4386,6 +4777,20 @@ class ScanOrchestrator:
                             "process_crash",
                         ],
                         "poc_log_is_auxiliary_only": True,
+                        "runtime_observation_intake": {
+                            "available": gateway_available,
+                            "url_env": "APKSCANNER_OBSERVATION_URL",
+                            "token_env": "APKSCANNER_OBSERVATION_TOKEN",
+                            "supported_sources": [
+                                "webview_callback",
+                                "network_callback",
+                                "localhost_client",
+                                "unix_socket_client",
+                                "ssh_remote",
+                                "agent",
+                            ],
+                            "policy": "observation_is_evidence_not_an_automatic_verdict",
+                        },
                     },
                     "continuation": continuation_context or None,
                     "context_policy": (
@@ -4510,6 +4915,7 @@ class ScanOrchestrator:
                     backend=agent_backend,
                     phase=phase,
                     capability=capability,
+                    runtime_workspace=agent_runtime_workspace,
                 )
                 proof_token: str | None = None
                 gateway_environment: dict[str, str] | None = None
@@ -4548,6 +4954,10 @@ class ScanOrchestrator:
                             f"{docker_base}/api/v1/internal/tasks/{task_id}/proof-replay"
                         ),
                         "APKSCANNER_PROOF_TOKEN": proof_token,
+                        "APKSCANNER_OBSERVATION_URL": (
+                            f"{docker_base}/api/v1/internal/tasks/{task_id}/observations"
+                        ),
+                        "APKSCANNER_OBSERVATION_TOKEN": proof_token,
                     }
 
                 def on_runtime_event(event: AgentRuntimeEvent) -> None:
@@ -6538,9 +6948,17 @@ class ScanOrchestrator:
             return [], ["No task-scoped ADB device lease is available."]
         active_device = device
         device_profile = active_device.capability(non_blocking=False)
-        android16_verdict_eligible = bool(
-            device_profile.get("android16_verdict_eligible")
-        )
+        runtime_verdict_metadata = {
+            key: device_profile.get(key)
+            for key in (
+                "validation_profile",
+                "android16_verdict_eligible",
+                "dynamic_verdict_eligible",
+                "release_gate_eligible",
+                "compatibility_smoke_only",
+                "verdict_scope",
+            )
+        }
         device_api_level = device_profile.get("api_level")
         poc_artifacts = poc_artifacts or {}
         entries_by_id = {entry.id: entry for entry in entries}
@@ -6604,12 +7022,7 @@ class ScanOrchestrator:
                                 "device_api": (
                                     dict(metadata).get("device_api") or device_api_level
                                 ),
-                                "android16_verdict_eligible": (
-                                    android16_verdict_eligible
-                                ),
-                                "compatibility_smoke_only": (
-                                    not android16_verdict_eligible
-                                ),
+                                **runtime_verdict_metadata,
                             },
                         )
                         for kind, result, metadata in commands
@@ -6684,12 +7097,7 @@ class ScanOrchestrator:
                                     "poc_build_evidence_id": artifact.metadata.get(
                                         "build_evidence_id"
                                     ),
-                                    "android16_verdict_eligible": (
-                                        android16_verdict_eligible
-                                    ),
-                                    "compatibility_smoke_only": (
-                                        not android16_verdict_eligible
-                                    ),
+                                    **runtime_verdict_metadata,
                                 },
                             )
                     else:
@@ -6774,6 +7182,136 @@ class ScanOrchestrator:
                 )
         return executed, gaps
 
+    @staticmethod
+    def _agent_role_for_phase(phase: str) -> str:
+        return (
+            "critic"
+            if phase == "adversarial_review"
+            else "rescue"
+            if phase == "rescue_review"
+            else "rescue_explorer"
+            if phase == "rescue_exploration"
+            else "verifier"
+            if phase == "adaptive_verification"
+            else "primary"
+        )
+
+    def _start_agent_turn_record(
+        self,
+        session,  # noqa: ANN001
+        *,
+        scan_id: str,
+        task_id: str,
+        attempt: int,
+        phase: str,
+        audit_id: str,
+        request_evidence_id: str,
+        round_index: int = 0,
+        workspace_path: str = "",
+    ) -> AgentTurnRecord:
+        role = self._agent_role_for_phase(phase)
+        container_key = f"{scan_id}:scan-container"
+        container = session.scalar(
+            select(ScanContainerRecord).where(
+                ScanContainerRecord.container_key == container_key
+            )
+        )
+        if container is None:
+            container = ScanContainerRecord(
+                scan_id=scan_id,
+                task_id=None,
+                container_key=container_key,
+                isolation=self.settings.codex_isolation,
+                workspace_path=workspace_path,
+                status="running",
+                metadata_json={"session_workspaces": {}},
+            )
+            session.add(container)
+            session.flush()
+        else:
+            container.status = "running"
+            container.completed_at = None
+            if workspace_path:
+                container.workspace_path = workspace_path
+        container_metadata = dict(container.metadata_json or {})
+        session_workspaces = dict(container_metadata.get("session_workspaces") or {})
+        session_key = f"{scan_id}:{task_id}:{attempt}:{role}"
+        if workspace_path:
+            session_workspaces[session_key] = workspace_path
+        container.metadata_json = {
+            **container_metadata,
+            "session_workspaces": session_workspaces,
+        }
+        agent_session = session.scalar(
+            select(AgentSessionRecord).where(
+                AgentSessionRecord.session_key == session_key
+            )
+        )
+        if agent_session is None:
+            agent_session = AgentSessionRecord(
+                scan_id=scan_id,
+                task_id=task_id,
+                container_record_id=container.id,
+                session_key=session_key,
+                role=role,
+                attempt=attempt,
+                backend="codex",
+                provider=self.settings.codex_provider,
+                model=self.settings.codex_model,
+                status="active",
+            )
+            session.add(agent_session)
+            session.flush()
+        else:
+            agent_session.status = "active"
+            agent_session.completed_at = None
+        turn = AgentTurnRecord(
+            scan_id=scan_id,
+            task_id=task_id,
+            session_record_id=agent_session.id,
+            audit_id=audit_id,
+            phase=phase,
+            round_index=round_index,
+            status="running",
+            request_evidence_id=request_evidence_id,
+        )
+        session.add(turn)
+        return turn
+
+    @staticmethod
+    def _finish_agent_turn_record(
+        session,  # noqa: ANN001
+        *,
+        audit_id: str,
+        status: str,
+        response_evidence_id: str | None = None,
+        thread_id: str | None = None,
+        turn_id: str | None = None,
+        usage: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        turn = session.scalar(
+            select(AgentTurnRecord).where(AgentTurnRecord.audit_id == audit_id)
+        )
+        if turn is None or turn.status != "running":
+            return
+        turn.status = status
+        turn.response_evidence_id = response_evidence_id
+        turn.turn_id = turn_id
+        turn.usage_json = usage or {}
+        turn.error = error
+        turn.completed_at = now()
+        agent_session = session.get(AgentSessionRecord, turn.session_record_id)
+        if agent_session is not None:
+            agent_session.status = "idle" if status == "completed" else status
+            agent_session.thread_id = thread_id or agent_session.thread_id
+            agent_session.completed_at = turn.completed_at
+            container = session.get(ScanContainerRecord, agent_session.container_record_id)
+            if container is not None:
+                # A task turn ending does not imply the shared scan container ended.
+                container.status = "running"
+                container.completed_at = None
+
     def _record_agent_request(
         self,
         *,
@@ -6785,6 +7323,7 @@ class ScanOrchestrator:
         backend: str,
         phase: str,
         capability: dict[str, Any],
+        runtime_workspace: Path | None = None,
     ) -> str:
         if backend != "codex":
             raise ValueError("OpenCode and other agent backends are not executable")
@@ -6897,7 +7436,7 @@ class ScanOrchestrator:
             },
         }
         with self.database.session_factory() as session:
-            self.evidence.json(
+            request_evidence = self.evidence.json(
                 session,
                 scan_id=scan.id,
                 task_id=task.id,
@@ -6905,6 +7444,17 @@ class ScanOrchestrator:
                 value=request,
                 summary=f"{backend} {phase} request",
                 metadata=metadata,
+            )
+            self._start_agent_turn_record(
+                session,
+                scan_id=scan.id,
+                task_id=task.id,
+                attempt=task.attempts,
+                phase=phase,
+                audit_id=audit_id,
+                request_evidence_id=request_evidence.id,
+                round_index=int(platform_context.get("round_index") or 0),
+                workspace_path=str(runtime_workspace or ""),
             )
             session.commit()
         return audit_id
@@ -6944,7 +7494,7 @@ class ScanOrchestrator:
             "output_transport": getattr(result, "output_transport", {}),
         }
         with self.database.session_factory() as session:
-            self.evidence.json(
+            response_evidence = self.evidence.json(
                 session,
                 scan_id=scan_id,
                 task_id=task_id,
@@ -6952,6 +7502,15 @@ class ScanOrchestrator:
                 value=response,
                 summary=f"{backend} {phase} structured response",
                 metadata=metadata,
+            )
+            self._finish_agent_turn_record(
+                session,
+                audit_id=audit_id,
+                status="completed",
+                response_evidence_id=response_evidence.id,
+                thread_id=result.thread_id,
+                turn_id=result.turn_id,
+                usage=result.usage,
             )
             session.commit()
 
@@ -7028,6 +7587,12 @@ class ScanOrchestrator:
                 summary=f"{backend} {phase} failed",
                 metadata=metadata,
             )
+            self._finish_agent_turn_record(
+                session,
+                audit_id=audit_id,
+                status="failed",
+                error=error_message,
+            )
             session.commit()
 
     def _record_agent_cancellation(
@@ -7064,6 +7629,12 @@ class ScanOrchestrator:
                 },
                 summary=f"{backend} {phase} cancelled by user",
                 metadata=metadata,
+            )
+            self._finish_agent_turn_record(
+                session,
+                audit_id=audit_id,
+                status="canceled",
+                error=str(error),
             )
             session.commit()
 
@@ -7388,6 +7959,7 @@ class ScanOrchestrator:
             task_root,
             platform_context or {},
         )
+        materialize_attacker_templates(task_root)
         scan_workspace = (self.settings.data_dir / "workspaces" / scan_id).resolve()
         expose_shared_workspace = self.settings.agent_permission_profile == "personal_lab"
         shared_names = [
@@ -7422,6 +7994,10 @@ class ScanOrchestrator:
         }
         if platform_context is not None:
             platform_context["workspace"] = workspace_policy
+            platform_context["attacker_templates"] = {
+                "catalog_path": "attacker-templates/catalog.json",
+                "templates": attacker_template_catalog(),
+            }
         self._copy_evidence_artifacts(task_root, summaries)
         context = {
             "schema_version": "1.0",
@@ -7436,6 +8012,39 @@ class ScanOrchestrator:
             json.dumps(context, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         return task_root
+
+    def _validation_fixture_context(
+        self,
+        scan_id: str,
+        task_id: str,
+    ) -> list[dict[str, Any]]:
+        with self.database.session_factory() as session:
+            fixtures = list(
+                session.scalars(
+                    select(ValidationFixture)
+                    .where(
+                        ValidationFixture.scan_id == scan_id,
+                        ValidationFixture.status == "active",
+                        (
+                            ValidationFixture.task_id.is_(None)
+                            | (ValidationFixture.task_id == task_id)
+                        ),
+                    )
+                    .order_by(ValidationFixture.created_at)
+                )
+            )
+        return [
+            {
+                "id": fixture.id,
+                "name": fixture.name,
+                "type": fixture.fixture_type,
+                "payload": fixture.payload,
+                "setup_instructions": fixture.setup_instructions,
+                "cleanup_instructions": fixture.cleanup_instructions,
+                "state_policy": "preserve_target_app_data_unless_fixture_explicitly_allows_reset",
+            }
+            for fixture in fixtures
+        ]
 
     @staticmethod
     def _is_static_review_context(
@@ -8282,6 +8891,28 @@ class ScanOrchestrator:
                     "summary",
                     hypothesis.impact or "Platform harm Oracle succeeded.",
                 )
+                release_gate_eligible = any(
+                    bool((attempt.oracle or {}).get("release_gate_eligible"))
+                    for attempt in attempts
+                )
+                android16_verdict_eligible = any(
+                    bool((attempt.oracle or {}).get("android16_verdict_eligible"))
+                    for attempt in attempts
+                )
+                proof_scopes = list(
+                    dict.fromkeys(
+                        str((attempt.oracle or {}).get("verdict_scope"))
+                        for attempt in attempts
+                        if (attempt.oracle or {}).get("verdict_scope")
+                    )
+                )
+                verdict_scope = (
+                    "android16_release"
+                    if release_gate_eligible
+                    else proof_scopes[0]
+                    if proof_scopes
+                    else "development_legacy"
+                )
                 dedupe = f"agent:{task.id}:hypothesis:{hypothesis.id}"
                 finding = session.scalar(
                     select(Finding).where(
@@ -8296,6 +8927,9 @@ class ScanOrchestrator:
                     "model": model,
                     "coverage_gaps": payload.get("coverage_gaps", []),
                     "harm_demonstrated": True,
+                    "android16_verdict_eligible": android16_verdict_eligible,
+                    "release_gate_eligible": release_gate_eligible,
+                    "verdict_scope": verdict_scope,
                     "proof_attempt_ids": [attempt.id for attempt in attempts],
                     "proof_rationales": proof_rationales,
                     "identity": finding_identity(
@@ -8355,10 +8989,14 @@ class ScanOrchestrator:
                         **metadata,
                     }
                 hypothesis.final_finding_id = finding.id
-                pattern = self.security_evolution.create_pattern_from_finding(
-                    session,
-                    scan=scan,
-                    finding=finding,
+                pattern = (
+                    self.security_evolution.create_pattern_from_finding(
+                        session,
+                        scan=scan,
+                        finding=finding,
+                    )
+                    if release_gate_eligible
+                    else None
                 )
                 if pattern is not None:
                     all_entries = list(

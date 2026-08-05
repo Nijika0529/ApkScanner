@@ -895,7 +895,7 @@ def test_missing_optional_probe_does_not_emit_a_failed_probe_broadcast(settings)
     assert not any("io.apkscanner.probe/.ProbeReceiver" in argv for argv in calls)
 
 
-def test_android13_device_runs_only_in_explicit_non_verdict_smoke_mode(
+def test_android13_device_is_local_verdict_but_not_release_gate_eligible(
     settings,
     tmp_path,
 ) -> None:  # noqa: ANN001
@@ -928,7 +928,13 @@ def test_android13_device_runs_only_in_explicit_non_verdict_smoke_mode(
         timeout_seconds=5,
     )
     strict = AdbDeviceAdapter(
-        replace(settings, adb_serial="legacy-device"),
+        replace(
+            settings,
+            adb_serial="legacy-device",
+            validation_profile="android16_release",
+            device_min_api=36,
+            allow_legacy_device_smoke=False,
+        ),
         LegacyRunner(),  # type: ignore[arg-type]
     )
     rejected = strict.execute_poc(
@@ -960,7 +966,10 @@ def test_android13_device_runs_only_in_explicit_non_verdict_smoke_mode(
     metadata = accepted.commands[0][2]
     assert metadata["device_api"] == "33"
     assert metadata["android16_verdict_eligible"] is False
-    assert metadata["compatibility_smoke_only"] is True
+    assert metadata["dynamic_verdict_eligible"] is True
+    assert metadata["release_gate_eligible"] is False
+    assert metadata["verdict_scope"] == "development_legacy"
+    assert metadata["compatibility_smoke_only"] is False
 
 
 def test_dedicated_poc_collects_an_independent_platform_ui_oracle(

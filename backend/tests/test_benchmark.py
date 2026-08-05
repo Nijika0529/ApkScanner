@@ -6,6 +6,7 @@ from apkscanner.db import Database
 from apkscanner.models import BenchmarkEvaluation, EntryPoint, Evidence, Finding, Scan
 from apkscanner.schemas import BenchmarkSpec
 from pydantic import ValidationError
+from sqlalchemy import select
 
 
 def test_private_benchmark_rewards_proven_harm_and_penalizes_confirmed_noise(
@@ -157,6 +158,25 @@ def test_private_benchmark_rewards_proven_harm_and_penalizes_confirmed_noise(
     assert evaluation.investigator_backend == "opencode"
     assert evaluation.model == "deepseek-v4-pro"
     assert evaluation.result["model_attribution"]["source"] == "finding_metadata"
+
+    with database.session_factory() as session:
+        local_only = session.scalar(
+            select(Finding).where(Finding.dedupe_key == "agent:dynamic")
+        )
+        assert local_only is not None
+        local_only.metadata_json = {
+            **local_only.metadata_json,
+            "release_gate_eligible": False,
+            "verdict_scope": "development_legacy",
+        }
+        session.commit()
+    formal = BenchmarkEvaluator(settings, database).evaluate(scan_id, spec)
+    assert formal.result["metrics"]["true_positives"] == 0
+    development = BenchmarkEvaluator(settings, database).evaluate(
+        scan_id,
+        spec.model_copy(update={"required_dynamic_scope": "any_dynamic"}),
+    )
+    assert development.result["metrics"]["true_positives"] == 1
 
 
 def test_benchmark_uses_maximum_matching_instead_of_truth_file_order(settings) -> None:  # noqa: ANN001

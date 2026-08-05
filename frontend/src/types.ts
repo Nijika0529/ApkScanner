@@ -277,7 +277,11 @@ export interface AdbDevice {
   android_version: string | null
   available: boolean
   android16_verdict_eligible: boolean
+  dynamic_verdict_eligible: boolean
+  release_gate_eligible: boolean
   compatibility_smoke_only: boolean
+  validation_profile: string
+  verdict_scope: string
   busy: boolean
   active_task_id: string | null
   last_error: string | null

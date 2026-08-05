@@ -30,6 +30,9 @@ from .db import Database
 from .enums import FindingStatus, ScanStatus, TaskStatus
 from .finding_policy import partition_findings
 from .models import (
+    AdaptiveVerificationCheckpoint,
+    AgentSessionRecord,
+    AgentTurnRecord,
     ApplicationRecord,
     ApplicationRelease,
     BenchmarkEvaluation,
@@ -40,10 +43,13 @@ from .models import (
     InvestigationBrief,
     InvestigationTask,
     PatternMatch,
+    RuntimeObservation,
     Scan,
+    ScanContainerRecord,
     ScanEvent,
     SecurityHypothesis,
     SecuritySnapshot,
+    ValidationFixture,
     VersionDiff,
     VulnerabilityCase,
     VulnerabilityOccurrence,
@@ -57,6 +63,7 @@ from .schemas import (
     AdbDeviceOut,
     AgentAuditOut,
     AgentProofReplay,
+    AgentRuntimeObservation,
     BenchmarkEvaluationOut,
     BenchmarkSpec,
     Capability,
@@ -83,12 +90,14 @@ from .schemas import (
     TaskAgentControl,
     TaskDeleteResult,
     TaskReanalysisRequest,
+    ValidationFixtureCreate,
+    ValidationFixtureOut,
     VersionDiffOut,
     VulnerabilityCaseOut,
     VulnerabilityOccurrenceOut,
     VulnerabilityPatternOut,
 )
-from .supervisor import CampaignPlan, SupervisorService
+from .supervisor import CampaignAppendRequest, CampaignPlan, SupervisorService
 
 router = APIRouter(prefix="/api/v1")
 reports = ReportBuilder()
@@ -138,11 +147,164 @@ def execute_live_proof_replay(
         raise HTTPException(409, str(exc)) from exc
 
 
+@router.post("/internal/tasks/{task_id}/observations", status_code=201)
+def record_live_runtime_observation(
+    task_id: str,
+    observation: AgentRuntimeObservation,
+    x_apkscanner_proof_token: str = Header(default=""),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> dict[str, Any]:
+    try:
+        return orchestrator.record_live_runtime_observation(
+            task_id,
+            x_apkscanner_proof_token,
+            observation,
+        )
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except (TimeoutError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
 @router.get("/capabilities/catalog")
 def capability_catalog(
     registry: CapabilityRegistry = Depends(get_capability_registry),
 ) -> list[dict[str, Any]]:
     return registry.catalog()
+
+
+@router.get("/scans/{scan_id}/agent-runtime")
+def scan_agent_runtime(
+    scan_id: str,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    if session.get(Scan, scan_id) is None:
+        raise HTTPException(404, "scan not found")
+    containers = list(
+        session.scalars(
+            select(ScanContainerRecord)
+            .where(ScanContainerRecord.scan_id == scan_id)
+            .order_by(ScanContainerRecord.started_at)
+        )
+    )
+    sessions = list(
+        session.scalars(
+            select(AgentSessionRecord)
+            .where(AgentSessionRecord.scan_id == scan_id)
+            .order_by(AgentSessionRecord.started_at)
+        )
+    )
+    turns = list(
+        session.scalars(
+            select(AgentTurnRecord)
+            .where(AgentTurnRecord.scan_id == scan_id)
+            .order_by(AgentTurnRecord.started_at)
+        )
+    )
+    checkpoints = list(
+        session.scalars(
+            select(AdaptiveVerificationCheckpoint)
+            .where(AdaptiveVerificationCheckpoint.scan_id == scan_id)
+            .order_by(AdaptiveVerificationCheckpoint.created_at)
+        )
+    )
+    return {
+        "schema_version": "1.0",
+        "containers": [
+            {
+                "id": item.id,
+                "task_id": item.task_id,
+                "container_key": item.container_key,
+                "isolation": item.isolation,
+                "workspace_path": item.workspace_path,
+                "container_name": item.container_name,
+                "status": item.status,
+                "started_at": item.started_at.isoformat(),
+                "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+            }
+            for item in containers
+        ],
+        "sessions": [
+            {
+                "id": item.id,
+                "task_id": item.task_id,
+                "container_record_id": item.container_record_id,
+                "role": item.role,
+                "attempt": item.attempt,
+                "backend": item.backend,
+                "provider": item.provider,
+                "model": item.model,
+                "thread_id": item.thread_id,
+                "status": item.status,
+                "started_at": item.started_at.isoformat(),
+                "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+            }
+            for item in sessions
+        ],
+        "turns": [
+            {
+                "id": item.id,
+                "task_id": item.task_id,
+                "session_record_id": item.session_record_id,
+                "audit_id": item.audit_id,
+                "phase": item.phase,
+                "round_index": item.round_index,
+                "turn_id": item.turn_id,
+                "status": item.status,
+                "request_evidence_id": item.request_evidence_id,
+                "response_evidence_id": item.response_evidence_id,
+                "usage": item.usage_json,
+                "error": item.error,
+                "started_at": item.started_at.isoformat(),
+                "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+            }
+            for item in turns
+        ],
+        "adaptive_checkpoints": [
+            {
+                "id": item.id,
+                "task_id": item.task_id,
+                "finding_id": item.finding_id,
+                "batch_index": item.batch_index,
+                "audit_id": item.audit_id,
+                "response_evidence_id": item.response_evidence_id,
+                "thread_id": item.thread_id,
+                "turn_id": item.turn_id,
+                "updated_at": item.updated_at.isoformat(),
+            }
+            for item in checkpoints
+        ],
+    }
+
+
+@router.get("/scans/{scan_id}/runtime-observations")
+def list_runtime_observations(
+    scan_id: str,
+    task_id: str | None = Query(default=None),
+    session: Session = Depends(get_session),
+) -> list[dict[str, Any]]:
+    statement = (
+        select(RuntimeObservation)
+        .where(RuntimeObservation.scan_id == scan_id)
+        .order_by(RuntimeObservation.created_at)
+    )
+    if task_id is not None:
+        statement = statement.where(RuntimeObservation.task_id == task_id)
+    return [
+        {
+            "id": item.id,
+            "task_id": item.task_id,
+            "finding_id": item.finding_id,
+            "observation_key": item.observation_key,
+            "kind": item.kind,
+            "source": item.source,
+            "evidence_ids": item.evidence_ids,
+            "payload": item.payload,
+            "environment": item.environment,
+            "created_at": item.created_at.isoformat(),
+        }
+        for item in session.scalars(statement)
+    ]
 
 
 @router.post("/capabilities/reload")
@@ -206,6 +368,84 @@ async def launch_campaign(
     return result
 
 
+@router.get("/supervisor/campaigns")
+def list_campaigns(
+    supervisor: SupervisorService = Depends(get_supervisor),
+) -> list[dict[str, Any]]:
+    return supervisor.list_campaigns()
+
+
+@router.get("/supervisor/campaigns/{campaign_id}")
+def get_campaign(
+    campaign_id: str,
+    supervisor: SupervisorService = Depends(get_supervisor),
+) -> dict[str, Any]:
+    try:
+        return supervisor.get_campaign(campaign_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+def _schedule_campaign_scans(
+    request: Request,
+    orchestrator: ScanOrchestrator,
+    scan_ids: list[str],
+) -> None:
+    for scan_id in scan_ids:
+        task = asyncio.create_task(
+            orchestrator.submit(scan_id),
+            name=f"campaign-scan-{scan_id}",
+        )
+        request.app.state.background_tasks.add(task)
+        task.add_done_callback(request.app.state.background_tasks.discard)
+
+
+@router.post("/supervisor/campaigns/{campaign_id}/cancel")
+def cancel_campaign(
+    campaign_id: str,
+    supervisor: SupervisorService = Depends(get_supervisor),
+) -> dict[str, Any]:
+    try:
+        return supervisor.cancel(campaign_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.post("/supervisor/campaigns/{campaign_id}/continue", status_code=202)
+def continue_campaign(
+    campaign_id: str,
+    request: Request,
+    supervisor: SupervisorService = Depends(get_supervisor),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> dict[str, Any]:
+    try:
+        result = supervisor.continue_campaign(campaign_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    _schedule_campaign_scans(request, orchestrator, result["scan_ids"])
+    return result
+
+
+@router.post("/supervisor/campaigns/{campaign_id}/entries", status_code=202)
+def append_campaign_entries(
+    campaign_id: str,
+    payload: CampaignAppendRequest,
+    request: Request,
+    supervisor: SupervisorService = Depends(get_supervisor),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> dict[str, Any]:
+    try:
+        result = supervisor.append_entries(campaign_id, payload)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    _schedule_campaign_scans(request, orchestrator, result["scan_ids"])
+    return result
+
+
 @router.get("/investigation-briefs", response_model=list[InvestigationBriefOut])
 def list_investigation_briefs(
     scan_id: str | None = Query(default=None),
@@ -215,6 +455,74 @@ def list_investigation_briefs(
     if scan_id is not None:
         statement = statement.where(InvestigationBrief.scan_id == scan_id)
     return list(session.scalars(statement))
+
+
+@router.get("/validation-fixtures", response_model=list[ValidationFixtureOut])
+def list_validation_fixtures(
+    scan_id: str = Query(...),
+    task_id: str | None = Query(default=None),
+    session: Session = Depends(get_session),
+) -> list[ValidationFixture]:
+    statement = (
+        select(ValidationFixture)
+        .where(ValidationFixture.scan_id == scan_id)
+        .order_by(ValidationFixture.created_at)
+    )
+    if task_id is not None:
+        statement = statement.where(
+            or_(ValidationFixture.task_id.is_(None), ValidationFixture.task_id == task_id)
+        )
+    return list(session.scalars(statement))
+
+
+@router.post(
+    "/validation-fixtures",
+    response_model=ValidationFixtureOut,
+    status_code=201,
+)
+def create_validation_fixture(
+    payload: ValidationFixtureCreate,
+    session: Session = Depends(get_session),
+) -> ValidationFixture:
+    if session.get(Scan, payload.scan_id) is None:
+        raise HTTPException(404, "scan not found")
+    if payload.task_id is not None:
+        task = session.get(InvestigationTask, payload.task_id)
+        if task is None or task.scan_id != payload.scan_id:
+            raise HTTPException(409, "fixture task is outside the selected scan")
+    existing = session.scalar(
+        select(ValidationFixture).where(
+            ValidationFixture.scan_id == payload.scan_id,
+            ValidationFixture.name == payload.name,
+        )
+    )
+    if existing is not None:
+        raise HTTPException(409, "fixture name already exists in this scan")
+    fixture = ValidationFixture(
+        scan_id=payload.scan_id,
+        task_id=payload.task_id,
+        name=payload.name,
+        fixture_type=payload.fixture_type,
+        payload=payload.payload,
+        setup_instructions=list(payload.setup_instructions),
+        cleanup_instructions=list(payload.cleanup_instructions),
+    )
+    session.add(fixture)
+    session.commit()
+    session.refresh(fixture)
+    return fixture
+
+
+@router.delete("/validation-fixtures/{fixture_id}", status_code=204)
+def delete_validation_fixture(
+    fixture_id: str,
+    session: Session = Depends(get_session),
+) -> None:
+    fixture = session.get(ValidationFixture, fixture_id)
+    if fixture is None:
+        raise HTTPException(404, "validation fixture not found")
+    session.delete(fixture)
+    session.commit()
 
 
 @router.post(

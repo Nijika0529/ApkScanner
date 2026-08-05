@@ -83,15 +83,43 @@ def test_settings_reject_host_without_explicit_diagnostic_override(settings) -> 
         configured.validate_codex_configuration()
 
 
-def test_legacy_device_requires_explicit_non_verdict_smoke_mode(settings) -> None:  # noqa: ANN001
-    with pytest.raises(ValueError, match="ALLOW_LEGACY_DEVICE_SMOKE"):
-        replace(settings, device_min_api=33).validate_codex_configuration()
-
+def test_validation_profiles_separate_local_legacy_proof_from_release_gate(settings) -> None:  # noqa: ANN001
     replace(
         settings,
+        validation_profile="development",
         device_min_api=33,
         allow_legacy_device_smoke=True,
     ).validate_codex_configuration()
+    with pytest.raises(ValueError, match="ALLOW_LEGACY_DEVICE_SMOKE"):
+        replace(
+            settings,
+            validation_profile="development",
+            device_min_api=33,
+            allow_legacy_device_smoke=False,
+        ).validate_codex_configuration()
+
+    local_low = replace(settings, validation_profile="development").verdict_metadata(33)
+    assert local_low["dynamic_verdict_eligible"] is True
+    assert local_low["release_gate_eligible"] is False
+    assert local_low["verdict_scope"] == "development_legacy"
+    local_high = replace(settings, validation_profile="development").verdict_metadata(36)
+    assert local_high["dynamic_verdict_eligible"] is True
+    assert local_high["release_gate_eligible"] is False
+    assert local_high["verdict_scope"] == "development_android16"
+    formal = replace(
+        settings,
+        validation_profile="android16_release",
+        device_min_api=36,
+        allow_legacy_device_smoke=False,
+    ).verdict_metadata(36)
+    assert formal["release_gate_eligible"] is True
+    assert formal["verdict_scope"] == "android16_release"
+    with pytest.raises(ValueError, match="android16_release"):
+        replace(
+            settings,
+            validation_profile="android16_release",
+            device_min_api=33,
+        ).validate_codex_configuration()
 
 
 def test_execution_contract_rejects_unknown_fields() -> None:

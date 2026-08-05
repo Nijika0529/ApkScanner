@@ -13,7 +13,7 @@ from .enums import EntryPointKind, Severity
 from .manifest import ManifestDocument
 
 ANALYSIS_SCHEMA_VERSION = "1.0"
-ANALYSIS_ENGINE_VERSION = "bounded-android-chain-v2"
+ANALYSIS_ENGINE_VERSION = "bounded-android-chain-v3-method-flow"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1190,6 +1190,11 @@ class AndroidAttackChainAnalyzer:
             for marker in sorted(relevant):
                 locations.extend(node.markers[marker][:1])
 
+        method_dataflow = AndroidAttackChainAnalyzer._method_dataflow(
+            path_nodes,
+            spec,
+        )
+
         inferred_risks: list[str] = []
         if spec.chain_kind == "pending_intent_delegation":
             if "pending_intent_immutable" not in guard_markers:
@@ -1244,6 +1249,7 @@ class AndroidAttackChainAnalyzer:
             "risks": sorted(risk_markers),
             "guards": sorted(guard_markers),
             "inferred_risks": inferred_risks,
+            "method_dataflow": method_dataflow,
         }
         fingerprint = hashlib.sha256(
             json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()
@@ -1275,8 +1281,130 @@ class AndroidAttackChainAnalyzer:
             "risk_markers": sorted(risk_markers),
             "guard_markers": sorted(guard_markers),
             "inferred_risks": inferred_risks,
+            "method_dataflow": method_dataflow,
             "locations": AndroidAttackChainAnalyzer._unique_locations(locations)[:16],
             "fingerprint": fingerprint,
+        }
+
+    @staticmethod
+    def _method_dataflow(
+        path_nodes: list[CodeNode],
+        spec: ChainSpec,
+    ) -> dict[str, Any]:
+        """Build conservative method-local source/alias/sink facts.
+
+        This deliberately records confidence and never turns a heuristic alias into a
+        vulnerability verdict.  It gives the investigator method-sized slices instead
+        of forcing it to rediscover every Intent/URI/File/WebView assignment in a full
+        decompiled class.
+        """
+
+        slices: list[dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
+        for node in path_nodes:
+            source_locations = [
+                item
+                for marker in spec.sources
+                for item in node.markers.get(marker, [])
+                if item.get("analysis_scope") == "app_code"
+            ]
+            sink_locations = [
+                item
+                for marker in spec.sinks
+                for item in node.markers.get(marker, [])
+                if item.get("analysis_scope") == "app_code"
+            ]
+            relevant_locations = [
+                item
+                for marker in spec.sources | spec.sinks | spec.risks | spec.guards
+                for item in node.markers.get(marker, [])
+                if item.get("analysis_scope") == "app_code"
+            ]
+            by_method: dict[str, list[dict[str, Any]]] = {}
+            for item in relevant_locations:
+                method = str(item.get("method") or "<unknown>")
+                by_method.setdefault(method, []).append(item)
+            lines = node.content.splitlines()
+            for method, values in sorted(by_method.items()):
+                marker_lines = sorted(
+                    {
+                        int(item.get("line") or 0)
+                        for item in values
+                        if int(item.get("line") or 0) > 0
+                    }
+                )
+                if not marker_lines:
+                    continue
+                start = max(1, marker_lines[0] - 8)
+                end = min(len(lines), marker_lines[-1] + 12)
+                slices.append(
+                    {
+                        "class_name": node.class_name,
+                        "method": method,
+                        "path": node.path,
+                        "line_start": start,
+                        "line_end": end,
+                        "markers": sorted({str(item["marker"]) for item in values}),
+                        "excerpt": "\n".join(lines[start - 1 : end])[:8_000],
+                    }
+                )
+            for source in source_locations:
+                for sink in sink_locations:
+                    source_method = source.get("method")
+                    if not source_method or source_method != sink.get("method"):
+                        continue
+                    source_line = int(source.get("line") or 0)
+                    sink_line = int(sink.get("line") or 0)
+                    if source_line <= 0 or sink_line <= 0:
+                        continue
+                    low, high = sorted((source_line, sink_line))
+                    region = "\n".join(lines[max(0, low - 2) : min(len(lines), high + 2)])
+                    assignments = re.findall(
+                        r"\b([A-Za-z_$][\w$]*)\s*=\s*([^;\n]+)",
+                        region,
+                    )
+                    aliases = {
+                        name: sorted(
+                            set(re.findall(r"\b[A-Za-z_$][\w$]*\b", expression))
+                        )[:12]
+                        for name, expression in assignments[:40]
+                    }
+                    source_line_text = lines[source_line - 1] if source_line <= len(lines) else ""
+                    sink_line_text = lines[sink_line - 1] if sink_line <= len(lines) else ""
+                    source_variables = set(
+                        re.findall(r"\b[A-Za-z_$][\w$]*\b", source_line_text)
+                    )
+                    sink_variables = set(
+                        re.findall(r"\b[A-Za-z_$][\w$]*\b", sink_line_text)
+                    )
+                    connected = bool(source_variables & sink_variables)
+                    if not connected:
+                        connected = any(
+                            name in sink_variables
+                            and bool(source_variables & set(inputs))
+                            for name, inputs in aliases.items()
+                        )
+                    edges.append(
+                        {
+                            "class_name": node.class_name,
+                            "method": source_method,
+                            "source_marker": source.get("marker"),
+                            "source_line": source_line,
+                            "sink_marker": sink.get("marker"),
+                            "sink_line": sink_line,
+                            "kind": (
+                                "local_alias_supported"
+                                if connected
+                                else "same_method_requires_semantic_review"
+                            ),
+                            "aliases": aliases,
+                        }
+                    )
+        return {
+            "analysis": "conservative_method_local_def_use",
+            "slices": slices[:16],
+            "edges": edges[:24],
+            "cross_method_policy": "class-reference path only; investigator confirmation required",
         }
 
     def _fileprovider_configuration_chains(

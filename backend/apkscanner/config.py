@@ -75,9 +75,10 @@ class Settings:
     poc_min_api: int = 21
     poc_target_api: int | None = None
     proof_replay_base_url: str = "http://127.0.0.1:8000"
-    device_min_api: int = 36
+    validation_profile: str = "development"
+    device_min_api: int = 26
     device_max_api: int = 99
-    allow_legacy_device_smoke: bool = False
+    allow_legacy_device_smoke: bool = True
     device_install_policy: str = "install_or_reuse"
     device_reset_policy: str = "never"
     frontend_dist: Path | None = None
@@ -100,6 +101,9 @@ class Settings:
         if not configured_serials and legacy_serial:
             configured_serials = (legacy_serial,)
         configured_verifier_ssh = os.getenv("APKSCANNER_ADAPTIVE_VERIFIER_SSH_SOURCE")
+        validation_profile = os.getenv(
+            "APKSCANNER_VALIDATION_PROFILE", "development"
+        ).strip().lower()
         if configured_verifier_ssh is None:
             verifier_ssh_source: Path | None = (Path.home() / ".ssh").resolve()
         elif configured_verifier_ssh.strip():
@@ -262,10 +266,20 @@ class Settings:
                 "APKSCANNER_PROOF_REPLAY_BASE_URL",
                 "http://127.0.0.1:8000",
             ).rstrip("/"),
-            device_min_api=max(1, int(os.getenv("APKSCANNER_DEVICE_MIN_API", 36))),
+            validation_profile=validation_profile,
+            device_min_api=max(
+                1,
+                int(
+                    os.getenv(
+                        "APKSCANNER_DEVICE_MIN_API",
+                        "36" if validation_profile == "android16_release" else "26",
+                    )
+                ),
+            ),
             device_max_api=max(1, int(os.getenv("APKSCANNER_DEVICE_MAX_API", 99))),
             allow_legacy_device_smoke=_env_bool(
-                "APKSCANNER_ALLOW_LEGACY_DEVICE_SMOKE"
+                "APKSCANNER_ALLOW_LEGACY_DEVICE_SMOKE",
+                validation_profile == "development",
             ),
             device_install_policy=os.getenv(
                 "APKSCANNER_DEVICE_INSTALL_POLICY", "install_or_reuse"
@@ -287,10 +301,22 @@ class Settings:
             )
         if self.device_android_api < 36:
             raise ValueError("APKScanner PoC target requires Android API 36 or newer")
-        if self.device_min_api < 36 and not self.allow_legacy_device_smoke:
+        if self.validation_profile not in {"development", "android16_release"}:
             raise ValueError(
-                "APKScanner verdict devices require Android API 36 or newer; "
-                "set APKSCANNER_ALLOW_LEGACY_DEVICE_SMOKE=true only for non-verdict smoke tests"
+                "APKSCANNER_VALIDATION_PROFILE must be development or android16_release"
+            )
+        if self.validation_profile == "android16_release" and self.device_min_api < 36:
+            raise ValueError(
+                "android16_release requires APKSCANNER_DEVICE_MIN_API=36 or newer"
+            )
+        if (
+            self.validation_profile == "development"
+            and self.device_min_api < 36
+            and not self.allow_legacy_device_smoke
+        ):
+            raise ValueError(
+                "development devices below API 36 require "
+                "APKSCANNER_ALLOW_LEGACY_DEVICE_SMOKE=true"
             )
         if self.poc_compile_api is not None and self.poc_compile_api < 36:
             raise ValueError("APKSCANNER_POC_COMPILE_API must be at least 36")
@@ -345,6 +371,37 @@ class Settings:
         if self.adb_serials:
             return tuple(dict.fromkeys(self.adb_serials))
         return (self.adb_serial,) if self.adb_serial else ()
+
+    def verdict_metadata(self, api_level: int | None) -> dict[str, object]:
+        """Return the runtime verdict scope without conflating local and release proof."""
+
+        android16_eligible = api_level is not None and api_level >= 36
+        development_legacy = bool(
+            api_level is not None
+            and api_level < 36
+            and self.validation_profile == "development"
+            and self.allow_legacy_device_smoke
+        )
+        dynamic_eligible = android16_eligible or development_legacy
+        release_gate_eligible = bool(
+            android16_eligible and self.validation_profile == "android16_release"
+        )
+        return {
+            "validation_profile": self.validation_profile,
+            "android16_verdict_eligible": android16_eligible,
+            "dynamic_verdict_eligible": dynamic_eligible,
+            "release_gate_eligible": release_gate_eligible,
+            "compatibility_smoke_only": bool(api_level is not None and not dynamic_eligible),
+            "verdict_scope": (
+                "android16_release"
+                if release_gate_eligible
+                else "development_android16"
+                if android16_eligible
+                else "development_legacy"
+                if development_legacy
+                else "non_verdict_smoke"
+            ),
+        }
 
     def ensure_directories(self) -> None:
         for path in (

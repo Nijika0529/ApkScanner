@@ -18,6 +18,7 @@ from apkscanner.db import Database
 from apkscanner.device import AdbDeviceAdapter
 from apkscanner.finding_policy import partition_findings
 from apkscanner.models import (
+    AdaptiveVerificationCheckpoint,
     AgentRuntimeEventRecord,
     CoverageItem,
     EntryPoint,
@@ -25,6 +26,7 @@ from apkscanner.models import (
     Finding,
     HypothesisArgument,
     InvestigationTask,
+    RuntimeObservation,
     Scan,
     ScanEvent,
     SecurityHypothesis,
@@ -32,7 +34,11 @@ from apkscanner.models import (
 from apkscanner.orchestrator import ScanOrchestrator
 from apkscanner.planner import StaticEntryClosure
 from apkscanner.reports import ReportBuilder
-from apkscanner.schemas import AdaptiveVerificationResult, AgentInvestigationResult
+from apkscanner.schemas import (
+    AdaptiveVerificationResult,
+    AgentInvestigationResult,
+    AgentRuntimeObservation,
+)
 from apkscanner.tools import CommandResult, ToolRunner
 from sqlalchemy import select
 
@@ -348,6 +354,31 @@ def test_adaptive_verifier_splits_transport_safe_turns_and_merges_results(
             f"thread-budgeted-adaptive-{index}"
             for index in range(1, len(dispatched) + 1)
         }
+        checkpoint_count = len(
+            list(
+                session.scalars(
+                    select(AdaptiveVerificationCheckpoint).where(
+                        AdaptiveVerificationCheckpoint.task_id == task_id
+                    )
+                )
+            )
+        )
+        assert checkpoint_count == len(candidate_ids)
+        completed.status = "running"
+        completed.attempts += 1
+        completed.completed_at = None
+        session.commit()
+
+    dispatch_count = len(dispatched)
+    orchestrator._run_adaptive_verifier_impl(scan_id, task_id, threading.Event())
+    assert len(dispatched) == dispatch_count
+    with database.session_factory() as session:
+        resumed = session.get(InvestigationTask, task_id)
+        assert resumed is not None
+        assert resumed.status == "completed"
+        assert {
+            item["status"] for item in resumed.result["adaptive_batches"]
+        } == {"restored_checkpoint"}
 
 
 @pytest.mark.parametrize(
@@ -710,6 +741,70 @@ def test_adaptive_verifier_merges_semantic_duplicate_ingress_findings(settings) 
         confirmed, signals = partition_findings(session, records)
         assert [item.id for item in confirmed] == [canonical_id]
         assert signals == []
+
+
+def test_live_runtime_observation_is_persisted_and_deduplicated(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="observation.apk",
+            package_name="com.example.observation",
+            artifact_sha256="e" * 64,
+            artifact_path="observation.apk",
+        )
+        task = InvestigationTask(scan=scan, task_type="component", status="running")
+        session.add_all([scan, task])
+        session.commit()
+        scan_id = scan.id
+        task_id = task.id
+    workspace = settings.data_dir / "observation-context"
+    workspace.mkdir()
+    (workspace / "context.json").write_text('{"evidence": []}', encoding="utf-8")
+    device = SimpleNamespace(
+        serial="legacy-device",
+        capability=lambda **_kwargs: {
+            "api_level": "33",
+            "dynamic_verdict_eligible": True,
+            "release_gate_eligible": False,
+            "verdict_scope": "development_legacy",
+        },
+    )
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    token = "observation-token"
+    orchestrator._register_live_proof_context(
+        SimpleNamespace(
+            token=token,
+            scan_id=scan_id,
+            task_id=task_id,
+            cancel_event=threading.Event(),
+            device=device,
+            evidence_summaries=[],
+            workspace=workspace,
+        )
+    )
+    payload = AgentRuntimeObservation(
+        kind="webview.bridge.callback",
+        source="webview_callback",
+        payload={"canary": "APKSCANNER-CANARY", "returned_token": "runtime-value"},
+    )
+    first = orchestrator.record_live_runtime_observation(task_id, token, payload)
+    second = orchestrator.record_live_runtime_observation(task_id, token, payload)
+    assert first["deduplicated"] is False
+    assert second["deduplicated"] is True
+    assert second["id"] == first["id"]
+    with database.session_factory() as session:
+        observations = list(
+            session.scalars(
+                select(RuntimeObservation).where(RuntimeObservation.task_id == task_id)
+            )
+        )
+        assert len(observations) == 1
+        assert observations[0].environment["validation"]["verdict_scope"] == (
+            "development_legacy"
+        )
 
 
 def test_runtime_event_projection_is_idempotent_across_spool_replay(settings) -> None:  # noqa: ANN001

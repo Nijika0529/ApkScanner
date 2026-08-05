@@ -62,6 +62,47 @@ def test_local_api_requires_console_marker_for_mutations(settings) -> None:  # n
         assert {item["name"] for item in health["capabilities"]} >= {"codex"}
 
 
+def test_validation_fixture_registry_preserves_account_and_canary_context(settings) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    with app.state.database.session_factory() as session:
+        scan = Scan(
+            filename="fixture.apk",
+            artifact_sha256="f" * 64,
+            artifact_path="fixture.apk",
+        )
+        session.add(scan)
+        session.commit()
+        scan_id = scan.id
+
+    headers = {"X-APKScanner-Request": "console"}
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/validation-fixtures",
+            headers=headers,
+            json={
+                "scan_id": scan_id,
+                "name": "logged-in-canary",
+                "fixture_type": "session",
+                "payload": {"account": "test-user", "canary": "APKSCANNER-123"},
+                "setup_instructions": ["keep the existing app login state"],
+                "cleanup_instructions": [],
+            },
+        )
+        assert created.status_code == 201
+        fixture_id = created.json()["id"]
+        listed = client.get(
+            "/api/v1/validation-fixtures",
+            params={"scan_id": scan_id},
+        )
+        assert listed.status_code == 200
+        assert listed.json()[0]["payload"]["canary"] == "APKSCANNER-123"
+        removed = client.delete(
+            f"/api/v1/validation-fixtures/{fixture_id}",
+            headers=headers,
+        )
+        assert removed.status_code == 204
+
+
 def test_health_reports_a_leased_adb_pool_as_busy_not_unavailable(
     settings,
     monkeypatch,

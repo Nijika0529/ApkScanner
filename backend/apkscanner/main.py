@@ -34,6 +34,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(application: FastAPI):
         application.state.background_tasks = set()
         orchestrator.recover_interrupted_device_tasks()
+
+        async def reconcile_campaigns() -> None:
+            while True:
+                try:
+                    launched = await asyncio.to_thread(supervisor.advance_all)
+                    for launched_scan_id in launched:
+                        task = asyncio.create_task(
+                            orchestrator.submit(launched_scan_id),
+                            name=f"campaign-scan-{launched_scan_id}",
+                        )
+                        application.state.background_tasks.add(task)
+                        task.add_done_callback(application.state.background_tasks.discard)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # A malformed external capability must not kill the persistent
+                    # supervisor; its campaign entry records the failure on reconcile.
+                    pass
+                await asyncio.sleep(2)
+
+        supervisor_task = asyncio.create_task(
+            reconcile_campaigns(),
+            name="campaign-supervisor",
+        )
+        application.state.background_tasks.add(supervisor_task)
+        supervisor_task.add_done_callback(application.state.background_tasks.discard)
         with database.session_factory() as session:
             resumable = list(
                 session.scalars(
@@ -55,6 +81,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             application.state.background_tasks.add(task)
             task.add_done_callback(application.state.background_tasks.discard)
         yield
+        supervisor_task.cancel()
+        await asyncio.gather(supervisor_task, return_exceptions=True)
         orchestrator.shutdown()
         pending = list(application.state.background_tasks)
         if pending:

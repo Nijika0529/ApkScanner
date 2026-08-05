@@ -81,6 +81,9 @@ def test_capability_analyzer_joins_pending_nested_intent_and_uri_grant(tmp_path)
     nested = by_kind["nested_intent_redirection"]
     assert nested["hop_count"] == 0
     assert "intent_sanitizer" not in nested["guard_markers"]
+    assert nested["method_dataflow"]["slices"]
+    assert nested["method_dataflow"]["edges"][0]["method"] == "relay"
+    assert nested["method_dataflow"]["edges"][0]["kind"] == "local_alias_supported"
 
 
 def test_file_ingress_joins_manifest_send_saf_archive_and_fileprovider(tmp_path) -> None:

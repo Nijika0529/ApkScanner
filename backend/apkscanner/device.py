@@ -457,6 +457,7 @@ class AdbDeviceAdapter:
                 f"{self.settings.device_max_api}, found {version.stdout.strip()} / API "
                 f"{actual_api or 'unknown'}"
             )
+        verdict_metadata = self.settings.verdict_metadata(actual_api_number)
         result = {
             "available": ready,
             "state": state.stdout.strip(),
@@ -465,12 +466,19 @@ class AdbDeviceAdapter:
             "root": root.exit_code == 0 and root.stdout.strip() == "0",
             "serial": self.serial,
             "detail": detail,
-            "android16_verdict_eligible": bool(
-                ready and actual_api_number is not None and actual_api_number >= 36
-            ),
-            "compatibility_smoke_only": bool(
-                ready and actual_api_number is not None and actual_api_number < 36
-            ),
+            **{
+                key: value if ready else False
+                for key, value in verdict_metadata.items()
+                if key
+                in {
+                    "android16_verdict_eligible",
+                    "dynamic_verdict_eligible",
+                    "release_gate_eligible",
+                    "compatibility_smoke_only",
+                }
+            },
+            "validation_profile": verdict_metadata["validation_profile"],
+            "verdict_scope": verdict_metadata["verdict_scope"] if ready else "unavailable",
         }
         self._last_capability = dict(result)
         self._last_capability_at = time.monotonic()
@@ -1018,20 +1026,15 @@ class AdbDeviceAdapter:
                 # compatibility checks; this flag only captures the hard
                 # minSdk boundary.
                 common["poc_runtime_compatible"] = device_api_number >= minimum_api_number
-            android16_verdict_eligible = device_api_number >= 36
-            common["android16_verdict_eligible"] = android16_verdict_eligible
-            common["compatibility_smoke_only"] = bool(
-                self.settings.allow_legacy_device_smoke
-                and not android16_verdict_eligible
-            )
+            verdict_metadata = self.settings.verdict_metadata(device_api_number)
+            common.update(verdict_metadata)
             commands.append(("blackbox.device_profile", device_api, dict(common)))
             if (
                 device_api.exit_code != 0
                 or common.get("poc_runtime_compatible") is not True
                 or built_target_api_number < 36
                 or (
-                    device_api_number < 36
-                    and not self.settings.allow_legacy_device_smoke
+                    not bool(common.get("dynamic_verdict_eligible"))
                 )
             ):
                 return DeviceProbeResult(
@@ -1040,9 +1043,9 @@ class AdbDeviceAdapter:
                     summary={
                         **common,
                         "error": (
-                            "PoC/runtime profile is incompatible; targetSdkVersion 36+ "
-                            "is required and devices below API 36 are permitted only in "
-                            "explicit non-verdict smoke mode"
+                            "PoC/runtime profile is incompatible; targetSdkVersion 36+ is "
+                            "required, and the selected validation profile does not permit "
+                            "this device to issue a scoped dynamic verdict"
                         ),
                     },
                 )

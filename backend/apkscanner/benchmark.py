@@ -294,7 +294,12 @@ class BenchmarkEvaluator:
             candidates = [
                 finding
                 for finding in confirmed
-                if cls._matches(truth, finding, entry_names)
+                if cls._matches(
+                    truth,
+                    finding,
+                    entry_names,
+                    required_dynamic_scope=spec.required_dynamic_scope,
+                )
             ]
             candidates.sort(
                 key=lambda finding: (
@@ -447,12 +452,20 @@ class BenchmarkEvaluator:
         truth: GroundTruthVulnerability,
         finding: Finding,
         entry_names: dict[str, str],
+        *,
+        required_dynamic_scope: str = "android16_release",
     ) -> bool:
         required_rank = _MINIMUM_PROOF_RANK[truth.minimum_proof]
         if _PROOF_RANK.get(finding.status, 0) < required_rank:
             return False
         if truth.minimum_proof == "dynamic" and not bool(
             finding.metadata_json.get("harm_demonstrated")
+        ):
+            return False
+        if (
+            truth.minimum_proof == "dynamic"
+            and required_dynamic_scope == "android16_release"
+            and finding.metadata_json.get("release_gate_eligible") is False
         ):
             return False
         selector = truth.match

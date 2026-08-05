@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from apkscanner.db import Database
 from apkscanner.models import (
     EntryPoint,
@@ -92,6 +93,13 @@ def test_hypothesis_ledger_tracks_arguments_and_concrete_proof(settings) -> None
             },
         ],
     )
+    # A delayed duplicate completion cannot overwrite the first terminal receipt.
+    ledger.complete_proof(proof_id, [])
+    with database.session_factory() as session:
+        completed_once = session.get(ProofAttempt, proof_id)
+        assert completed_once is not None
+        assert completed_once.status == "proven"
+        assert completed_once.harm_demonstrated is True
     reachability_only_id = ledger.plan_proof(
         task_id=task_id,
         test_case_id="agent-2",
@@ -633,7 +641,19 @@ def test_one_platform_proof_does_not_close_other_hypotheses(settings) -> None:  
     assert ledger.task_proof_result(task.id) is not None
 
 
-def test_legacy_device_smoke_cannot_prove_or_refute_android16_hypothesis(settings) -> None:  # noqa: ANN001
+@pytest.mark.parametrize(
+    ("dynamic_eligible", "expected_proof", "expected_hypothesis"),
+    [
+        (False, "inconclusive", "inconclusive"),
+        (True, "proven", "proven"),
+    ],
+)
+def test_legacy_device_verdict_depends_on_selected_validation_profile(
+    settings,
+    dynamic_eligible,
+    expected_proof,
+    expected_hypothesis,
+) -> None:  # noqa: ANN001
     settings.ensure_directories()
     database = Database(settings)
     database.create_all()
@@ -678,6 +698,11 @@ def test_legacy_device_smoke_cannot_prove_or_refute_android16_hypothesis(setting
                 "metadata": {
                     "request_id": "legacy-request",
                     "android16_verdict_eligible": False,
+                    "dynamic_verdict_eligible": dynamic_eligible,
+                    "release_gate_eligible": False,
+                    "verdict_scope": (
+                        "development_legacy" if dynamic_eligible else "non_verdict_smoke"
+                    ),
                 },
             },
             {
@@ -691,6 +716,11 @@ def test_legacy_device_smoke_cannot_prove_or_refute_android16_hypothesis(setting
                     "security_impact_observed": True,
                     "oracle_refuted": True,
                     "android16_verdict_eligible": False,
+                    "dynamic_verdict_eligible": dynamic_eligible,
+                    "release_gate_eligible": False,
+                    "verdict_scope": (
+                        "development_legacy" if dynamic_eligible else "non_verdict_smoke"
+                    ),
                 },
             },
         ],
@@ -701,11 +731,63 @@ def test_legacy_device_smoke_cannot_prove_or_refute_android16_hypothesis(setting
         persisted_hypothesis = session.get(SecurityHypothesis, hypothesis.id)
         assert proof is not None
         assert persisted_hypothesis is not None
-        assert proof.status == "inconclusive"
-        assert proof.harm_demonstrated is False
+        assert proof.status == expected_proof
+        assert proof.harm_demonstrated is dynamic_eligible
         assert proof.oracle["android16_verdict_eligible"] is False
-        assert proof.oracle["compatibility_smoke_only"] is True
-        assert persisted_hypothesis.status == "inconclusive"
+        assert proof.oracle["dynamic_verdict_eligible"] is dynamic_eligible
+        assert proof.oracle["release_gate_eligible"] is False
+        assert proof.oracle["compatibility_smoke_only"] is (not dynamic_eligible)
+        assert persisted_hypothesis.status == expected_hypothesis
+
+
+def test_database_recovery_closes_stale_executing_proof(settings) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="interrupted.apk",
+            artifact_sha256="9" * 64,
+            artifact_path="interrupted.apk",
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            target_entry_ids=[],
+            hypotheses=["Interrupted proof"],
+        )
+        session.add_all([scan, task])
+        session.flush()
+        hypothesis = SecurityHypothesis(
+            scan_id=scan.id,
+            task_id=task.id,
+            fingerprint="a" * 64,
+            category="test",
+            claim="Interrupted proof",
+            status="executing",
+        )
+        session.add(hypothesis)
+        session.flush()
+        proof = ProofAttempt(
+            scan_id=scan.id,
+            task_id=task.id,
+            hypothesis_id=hypothesis.id,
+            test_case_id="interrupted",
+            status="executing",
+        )
+        session.add(proof)
+        session.commit()
+        proof_id = proof.id
+        hypothesis_id = hypothesis.id
+
+    database._recover_interrupted_runtime_records()
+    with database.session_factory() as session:
+        recovered = session.get(ProofAttempt, proof_id)
+        recovered_hypothesis = session.get(SecurityHypothesis, hypothesis_id)
+        assert recovered is not None
+        assert recovered.status == "inconclusive"
+        assert recovered.completed_at is not None
+        assert recovered_hypothesis is not None
+        assert recovered_hypothesis.status == "inconclusive"
 
 
 def test_finalize_closes_each_hypothesis_from_its_own_receipt(settings) -> None:  # noqa: ANN001
