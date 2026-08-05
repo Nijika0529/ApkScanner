@@ -123,7 +123,11 @@ fi
 build_frontend
 stop_existing
 
-: "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY in the caller environment}"
+if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
+  echo "DEEPSEEK_API_KEY is not set in the caller environment." >&2
+  echo "export DEEPSEEK_API_KEY=sk-... before running start.sh" >&2
+  exit 1
+fi
 export APKSCANNER_CODEX_ENABLED="${APKSCANNER_CODEX_ENABLED:-true}"
 export APKSCANNER_INVESTIGATOR_BACKEND="${APKSCANNER_INVESTIGATOR_BACKEND:-codex}"
 export APKSCANNER_CODEX_ISOLATION="${APKSCANNER_CODEX_ISOLATION:-docker}"
@@ -133,7 +137,7 @@ export APKSCANNER_AGENT_PERMISSION_PROFILE="personal_lab"
 export APKSCANNER_ADB_SERIALS="${APKSCANNER_ADB_SERIALS:-$(detect_adb_serials)}"
 export APKSCANNER_ADB_SERIAL="${APKSCANNER_ADB_SERIAL:-${APKSCANNER_ADB_SERIALS%%,*}}"
 export APKSCANNER_DEVICE_INSTALL_POLICY="install_or_reuse"
-export APKSCANNER_DEVICE_RESET_POLICY="per_round"
+export APKSCANNER_DEVICE_RESET_POLICY="${APKSCANNER_DEVICE_RESET_POLICY:-never}"
 export APKSCANNER_FRONTEND_DIST="$PROJECT_DIR/frontend/dist"
 export APKSCANNER_TASK_TIMEOUT="${APKSCANNER_TASK_TIMEOUT:-3600}"
 
@@ -159,18 +163,29 @@ SERVICE_PID=$!
 umask 077
 printf '%s\n' "$SERVICE_PID" >"$PID_FILE"
 echo "started PID=$SERVICE_PID"
-for i in $(seq 1 10); do
+# Cold start can be slow (SDK/worker image validation, ADB capability probe).
+# Give the service up to 30s; if it is merely slow we keep it running and
+# only warn, because killing a healthy-but-slow boot is worse than waiting.
+for i in $(seq 1 30); do
   sleep 1
+  if ! kill -0 "$SERVICE_PID" 2>/dev/null; then
+    echo "startup failed: process exited early; see /tmp/apkscanner.log" >&2
+    rm -f "$PID_FILE"
+    exit 1
+  fi
   result=$(curl -s --connect-timeout 1 --max-time 3 \
     http://127.0.0.1:8000/api/v1/health 2>/dev/null || true)
   if [ -n "$result" ]; then
     echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'status={d[\"status\"]} enabled={d[\"enabled_investigators\"]}')" 2>/dev/null && break
   fi
-  if [ "$i" -eq 10 ]; then
-    echo "startup timeout" >&2
-    kill -TERM "$SERVICE_PID" 2>/dev/null || true
-    rm -f "$PID_FILE"
-    exit 1
+  if [ "$i" -eq 30 ]; then
+    echo "health check did not pass within 30s; service is still running, check /tmp/apkscanner.log" >&2
   fi
 done
 echo "http://$(hostname -I | awk '{print $1}'):8000"
+
+# If the caller provided an explicit device pool that the ADB server already
+# knows, print a registration hint when the platform reports none online.
+if [ -z "${APKSCANNER_ADB_SERIALS:-}" ]; then
+  echo "no APKSCANNER_ADB_SERIALS set; register devices after boot via POST /api/v1/devices" >&2
+fi
