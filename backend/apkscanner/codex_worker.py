@@ -278,11 +278,16 @@ class PersistentCodexWorker:
             finally:
                 heartbeat_stop.set()
                 heartbeat.join(timeout=1)
-            parsed = (
-                CodexInvestigator._parse_response(turn.final_response).model_dump(mode="json")
-                if command.result_contract == "agent_investigation.v1"
-                else CodexInvestigator._parse_json_object(turn.final_response)
-            )
+            model_validation: dict[str, Any] = {}
+            if command.result_contract == "agent_investigation.v1":
+                parsed_result = CodexInvestigator._parse_response(turn.final_response)
+                parsed = parsed_result.model_dump(mode="json")
+                model_validation = {
+                    "rejected_requested_tests": parsed_result.rejected_requested_tests,
+                    "normalization_repairs": parsed_result.normalization_repairs,
+                }
+            else:
+                parsed = CodexInvestigator._parse_json_object(turn.final_response)
             usage = turn.usage.model_dump(mode="json") if turn.usage else {}
             self.emit(
                 {
@@ -313,6 +318,7 @@ class PersistentCodexWorker:
                         "turn_id": turn.id,
                         "result": parsed,
                         "result_contract": command.result_contract,
+                        "model_validation": model_validation,
                         "usage": usage,
                     },
                 }

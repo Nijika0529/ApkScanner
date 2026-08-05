@@ -263,7 +263,13 @@ class AgentWorkspaceManager:
     @staticmethod
     def _workspace_key(task_id: str, attempt: int, role: str) -> str:
         compact = task_id.replace("-", "")[:16]
-        return f"{compact}-a{attempt}-{role}"
+        # Logical role names use snake_case, while the worker deliberately
+        # accepts only a narrow, shell-safe path alphabet.  Keep the logical
+        # role on SessionWorkspace, but canonicalize its path component here so
+        # roles such as ``rescue_explorer`` cannot create a workspace that the
+        # worker later rejects.
+        path_role = role.replace("_", "-")
+        return f"{compact}-a{attempt}-{path_role}"
 
     def _write_context(self, session: SessionWorkspace, value: dict[str, Any]) -> None:
         target = session.context / "session.json"

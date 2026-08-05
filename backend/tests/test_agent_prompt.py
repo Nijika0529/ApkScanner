@@ -362,6 +362,91 @@ def test_requested_tests_can_be_omitted_when_no_platform_replay_is_needed() -> N
     assert result.requested_tests == []
 
 
+def test_agent_result_repairs_unambiguous_structured_output_variance() -> None:
+    hypothesis_id = "00000000-0000-0000-0000-000000000001"
+    payload = {
+        "summary": "静态证据反驳了该攻击链，模型返回格式存在可安全修复的偏差。",
+        "result": "refuted_static",
+        "hypotheses_tested": [hypothesis_id],
+        "hypothesis_assessments": [
+            {
+                "hypothesis_id": hypothesis_id,
+                "verdict": "refuted_static",
+                "counterevidence": "调用前存在签名权限校验。",
+                "proof_gaps": "",
+            }
+        ],
+        "test_cases": [],
+        "evidence_ids": [],
+        "severity_proposal": "high",
+        "confidence": "high",
+        "coverage_gaps": [],
+        "followups": [],
+    }
+
+    result = AgentInvestigationResult.model_validate(payload)
+
+    assert result.severity_proposal == "info"
+    assert result.hypothesis_assessments[0].counterevidence == [
+        "调用前存在签名权限校验。"
+    ]
+    assert result.hypothesis_assessments[0].proof_gaps == []
+    assert result.normalization_repairs == [
+        {
+            "location": "hypothesis_assessments.0.counterevidence",
+            "repair": "string_wrapped_as_list",
+            "original_type": "string",
+        },
+        {
+            "location": "hypothesis_assessments.0.proof_gaps",
+            "repair": "string_wrapped_as_list",
+            "original_type": "string",
+        },
+        {
+            "location": "severity_proposal",
+            "repair": "forced_info_for_refuted_static",
+            "original_value": "high",
+        },
+    ]
+
+
+def test_agent_result_does_not_coerce_ambiguous_assessment_types() -> None:
+    payload = _result("模型返回不可安全修复的字段类型。 ").model_dump(mode="json")
+    payload["hypothesis_assessments"] = [
+        {
+            "hypothesis_id": "00000000-0000-0000-0000-000000000001",
+            "verdict": "supported_static",
+            "counterevidence": 42,
+        }
+    ]
+
+    with pytest.raises(ValidationError, match="counterevidence"):
+        AgentInvestigationResult.model_validate(payload)
+
+
+def test_agent_result_restores_validation_audit_from_worker_protocol() -> None:
+    result = _result("结构化结论已经由容器 worker 校验。")
+    result.apply_model_validation_audit(
+        {
+            "rejected_requested_tests": [{"index": 2, "errors": []}],
+            "normalization_repairs": [
+                {
+                    "location": "severity_proposal",
+                    "repair": "forced_info_for_refuted_static",
+                }
+            ],
+        }
+    )
+
+    assert result.rejected_requested_tests == [{"index": 2, "errors": []}]
+    assert result.normalization_repairs == [
+        {
+            "location": "severity_proposal",
+            "repair": "forced_info_for_refuted_static",
+        }
+    ]
+
+
 def test_single_critic_turn_can_report_every_material_objection() -> None:
     payload = _result("Critic 只应保留可能改变最终结论的实质异议。").model_dump(mode="json")
     payload["review_objections"] = [

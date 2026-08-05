@@ -2218,7 +2218,17 @@ def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(
         )
         assert tasks
         assert sum(task.task_type == "static_review" for task in tasks) == 1
-        assert {task.status for task in tasks} == {"blocked_device"}
+        static_task = next(task for task in tasks if task.task_type == "static_review")
+        assert static_task.status == "inconclusive"
+        assert static_task.result["failure_category"] == "agent_unavailable"
+        assert {
+            task.status for task in tasks if task.task_type != "static_review"
+        } == {"blocked_device"}
+        assert all(
+            task.result["failure_category"] == "device_unavailable"
+            for task in tasks
+            if task.task_type != "static_review"
+        )
         assert (
             len(list(session.scalars(select(CoverageItem).where(CoverageItem.scan_id == scan_id))))
             >= 16
@@ -2248,6 +2258,57 @@ def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(
             )
         )
         assert len(seals) == 2
+
+
+def test_agent_schema_failure_is_not_misreported_as_device_blocking(
+    settings,
+    fixture_apk,
+) -> None:  # noqa: ANN001
+    configured = replace(settings, codex_enabled=True, adaptive_verifier_enabled=False)
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    target_dir = configured.data_dir / "artifacts" / "fixture"
+    target_dir.mkdir(parents=True)
+    target = target_dir / "fixture.apk"
+    shutil.copyfile(fixture_apk, target)
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="fixture.apk",
+            artifact_sha256=hashlib.sha256(target.read_bytes()).hexdigest(),
+            artifact_path=str(target),
+            stats={"investigator": "codex"},
+        )
+        session.add(scan)
+        session.commit()
+        scan_id = scan.id
+
+    class InvalidSchemaInvestigator:
+        @staticmethod
+        def capability(*, deep=False):  # noqa: ANN001, ANN205
+            return {"available": True, "version": "fake-sdk", "deep": deep}
+
+        @staticmethod
+        def investigate(**_kwargs):  # noqa: ANN003, ANN205
+            raise ValueError(
+                "hypothesis_assessments.0.counterevidence: Input should be a valid list"
+            )
+
+    orchestrator = ScanOrchestrator(configured, database, ArtifactStore(configured))
+    orchestrator.investigators["codex"] = InvalidSchemaInvestigator()
+    orchestrator._run_sync(scan_id)
+
+    with database.session_factory() as session:
+        tasks = list(
+            session.scalars(select(InvestigationTask).where(InvestigationTask.scan_id == scan_id))
+        )
+    assert tasks
+    assert {task.status for task in tasks} == {"failed"}
+    assert all(
+        task.result["failure_category"] == "agent_structured_output_or_runtime"
+        for task in tasks
+    )
+    assert all("counterevidence" in str(task.error) for task in tasks)
 
 
 def test_isolated_fresh_run_does_not_load_version_or_pattern_history(

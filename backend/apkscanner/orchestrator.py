@@ -3678,6 +3678,7 @@ class ScanOrchestrator:
 
         agent_result = None
         agent_error = None
+        agent_failures: list[dict[str, str]] = []
         executed_agent_tests: list[dict[str, Any]] = []
         agent_round_history: list[dict[str, Any]] = []
         debate_context: dict[str, Any] = {}
@@ -4079,10 +4080,12 @@ class ScanOrchestrator:
                     result=result,
                 )
                 rejected_requested_tests = self._rejected_requested_tests(result.result)
+                normalization_repairs = self._normalization_repairs(result.result)
                 argument_payload = result.result.model_dump(mode="json")
-                if rejected_requested_tests:
+                if rejected_requested_tests or normalization_repairs:
                     argument_payload["platform_model_validation"] = {
                         "rejected_requested_tests": rejected_requested_tests,
+                        "normalization_repairs": normalization_repairs,
                     }
                 role = (
                     "critic"
@@ -4124,6 +4127,7 @@ class ScanOrchestrator:
                         "turn_id": result.turn_id,
                         "requested_test_count": len(result.result.requested_tests),
                         "rejected_requested_test_count": len(rejected_requested_tests),
+                        "normalization_repair_count": len(normalization_repairs),
                     },
                 )
                 for hypothesis in result.result.hypotheses_tested[:12]:
@@ -4167,6 +4171,7 @@ class ScanOrchestrator:
                         "model_result": result.result.model_dump(mode="json"),
                         "model_validation": {
                             "rejected_requested_tests": rejected_requested_tests,
+                            "normalization_repairs": normalization_repairs,
                         },
                         "test_validation": None,
                     }
@@ -4207,6 +4212,13 @@ class ScanOrchestrator:
                 )
                 raise
             except Exception as exc:
+                agent_failures.append(
+                    {
+                        "phase": phase,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc)[:2000],
+                    }
+                )
                 if audit_id is not None and runtime_events:
                     self._record_agent_runtime_events(
                         scan_id=scan_id,
@@ -4952,6 +4964,7 @@ class ScanOrchestrator:
                                 "device": current_device_capability(),
                                 "executed_agent_tests": executed_agent_tests,
                                 "agent_round_history": agent_round_history,
+                                "agent_failures": deepcopy(agent_failures),
                                 "hypothesis_progress": (
                                     self.hypothesis_ledger.task_hypothesis_progress(
                                         task_id
@@ -4984,6 +4997,27 @@ class ScanOrchestrator:
                         },
                     },
                 )
+            elif agent_failures:
+                terminal_values.update(
+                    {
+                        "status": TaskStatus.FAILED.value,
+                        "error": agent_error or agent_failures[-1]["error"],
+                        "result": {
+                            **existing_result,
+                            "deterministic_evidence": evidence_summaries,
+                            "coverage_gaps": coverage_gaps,
+                            "failure_category": "agent_structured_output_or_runtime",
+                            "agent_failures": deepcopy(agent_failures),
+                            "agent_backend": agent_backend,
+                            "device": current_device_capability(),
+                            "negative_closure_rescue": deepcopy(rescue_gate),
+                            "debate_policy": deepcopy(debate_policy),
+                            "hypothesis_progress": (
+                                self.hypothesis_ledger.task_hypothesis_progress(task_id)
+                            ),
+                        },
+                    },
+                )
             elif stages["device_attempted"]:
                 terminal_values.update(
                     {
@@ -5000,6 +5034,27 @@ class ScanOrchestrator:
                                 ),
                             ],
                             "agent_backend": agent_backend,
+                            "failure_category": "evidence_inconclusive",
+                            "negative_closure_rescue": deepcopy(rescue_gate),
+                            "debate_policy": deepcopy(debate_policy),
+                            "hypothesis_progress": (
+                                self.hypothesis_ledger.task_hypothesis_progress(task_id)
+                            ),
+                        },
+                    },
+                )
+            elif task.task_type != TaskType.STATIC_REVIEW.value:
+                terminal_values.update(
+                    {
+                        "status": TaskStatus.BLOCKED_DEVICE.value,
+                        "error": agent_error or str(device_capability.get("detail")),
+                        "result": {
+                            **existing_result,
+                            "coverage_gaps": coverage_gaps,
+                            "failure_category": "device_unavailable",
+                            "device": current_device_capability(),
+                            "static_agent_attempted": agent_enabled,
+                            "agent_backend": agent_backend,
                             "negative_closure_rescue": deepcopy(rescue_gate),
                             "debate_policy": deepcopy(debate_policy),
                             "hypothesis_progress": (
@@ -5011,12 +5066,13 @@ class ScanOrchestrator:
             else:
                 terminal_values.update(
                     {
-                        "status": TaskStatus.BLOCKED_DEVICE.value,
-                        "error": agent_error or str(device_capability.get("detail")),
+                        "status": TaskStatus.INCONCLUSIVE.value,
+                        "error": agent_error or "static semantic investigation is unavailable",
                         "result": {
                             **existing_result,
+                            "deterministic_evidence": evidence_summaries,
                             "coverage_gaps": coverage_gaps,
-                            "static_agent_attempted": agent_enabled,
+                            "failure_category": "agent_unavailable",
                             "agent_backend": agent_backend,
                             "negative_closure_rescue": deepcopy(rescue_gate),
                             "debate_policy": deepcopy(debate_policy),
@@ -5403,6 +5459,13 @@ class ScanOrchestrator:
         if not isinstance(rejected, list):
             return []
         return deepcopy([item for item in rejected if isinstance(item, dict)])
+
+    @staticmethod
+    def _normalization_repairs(result: Any) -> list[dict[str, Any]]:
+        repairs = getattr(result, "normalization_repairs", [])
+        if not isinstance(repairs, list):
+            return []
+        return deepcopy([item for item in repairs if isinstance(item, dict)])
 
     @classmethod
     def _has_requested_test_work(cls, result: Any) -> bool:
@@ -6335,6 +6398,7 @@ class ScanOrchestrator:
             "structured_output": result.result.model_dump(mode="json"),
             "model_validation": {
                 "rejected_requested_tests": self._rejected_requested_tests(result.result),
+                "normalization_repairs": self._normalization_repairs(result.result),
             },
             "usage": result.usage,
             "output_transport": getattr(result, "output_transport", {}),

@@ -1123,6 +1123,12 @@ function taskTypeLabel(taskType: string) {
   }[taskType] ?? "导出组件探索"
 }
 
+function compactTaskError(error: string | null, fallback: string) {
+  const normalized = error?.replace(/\s+/g, " ").trim()
+  if (!normalized) return fallback
+  return normalized.length > 240 ? `${normalized.slice(0, 237)}...` : normalized
+}
+
 function taskVisualState(task: InvestigationTask) {
   if (task.status === "awaiting_device") {
     const queue = recordValue(task.result.device_queue)
@@ -1132,11 +1138,17 @@ function taskVisualState(task: InvestigationTask) {
   if (task.status === "queued") return { group: "waiting", label: "等待判断", description: "等待调度，尚未占用云真机或调用 AI", card: "border-cyan-200", banner: "border-cyan-200 bg-cyan-50 text-cyan-950" }
   if (task.status === "running") return { group: "active", label: "正在分析", description: "平台正在执行设备验证或 SDK 探索，并持续记录关键事件", card: "border-violet-300 shadow-[0_12px_35px_rgba(124,58,237,.10)]", banner: "border-violet-200 bg-violet-50 text-violet-950" }
   if (task.status === "cancel_requested") return { group: "active", label: "正在停止", description: "已发送中止请求，等待设备或模型运行时确认", card: "border-amber-300", banner: "border-amber-200 bg-amber-50 text-amber-950" }
-  if (task.status === "timed_out") return { group: "unresolved", label: "本轮预算已用尽", description: "可复用历次证据继续下一轮深度探索", card: "border-amber-300", banner: "border-amber-200 bg-amber-50 text-amber-950" }
+  if (task.status === "timed_out") return { group: "unresolved", label: "本轮预算已用尽", description: compactTaskError(task.error, "可复用历次证据继续下一轮深度探索"), card: "border-amber-300", banner: "border-amber-200 bg-amber-50 text-amber-950" }
+  if (task.status === "failed") {
+    const category = textValue(task.result.failure_category)
+    return { group: "unresolved", label: category === "agent_structured_output_or_runtime" ? "Agent 结果无效" : "任务执行失败", description: compactTaskError(task.error, "任务 worker 异常退出，详情已记录到事件与审计证据"), card: "border-rose-300", banner: "border-rose-200 bg-rose-50 text-rose-950" }
+  }
+  if (task.status === "blocked_device") return { group: "unresolved", label: "设备不可用", description: compactTaskError(task.error, "当前没有通过健康检查的可分配设备，可连接设备后补扫"), card: "border-amber-300", banner: "border-amber-200 bg-amber-50 text-amber-950" }
+  if (task.status === "inconclusive") return { group: "unresolved", label: "证据未收口", description: compactTaskError(task.error, "设备或 Agent 已执行，但现有证据不足以形成终态判断"), card: "border-amber-200", banner: "border-amber-200 bg-amber-50 text-amber-950" }
   if (task.status === "completed" && textValue(task.result.result) === "inconclusive") return { group: "unresolved", label: "信息不全", description: "平台结论为证据不足，可在能力恢复后补扫", card: "border-amber-200", banner: "border-amber-200 bg-amber-50 text-amber-950" }
   if (task.status === "completed" || task.status === "not_reproduced") return { group: "judged", label: "已判断", description: task.result.result ? `平台结论：${statusLabel(String(task.result.result))}` : "平台已完成证据校验", card: "border-emerald-200", banner: "border-emerald-200 bg-emerald-50 text-emerald-950" }
   if (task.status === "canceled") return { group: "stopped", label: "已停止", description: "用户主动终止，未产生新的最终结论", card: "border-slate-300", banner: "border-slate-200 bg-slate-100 text-slate-800" }
-  return { group: "unresolved", label: "未形成判断", description: task.status === "blocked_device" ? "设备或 AI 能力阻塞，可修复后重试" : "证据、工具或预算不足", card: "border-amber-200", banner: "border-amber-200 bg-amber-50 text-amber-950" }
+  return { group: "unresolved", label: "未形成判断", description: compactTaskError(task.error, `任务以 ${task.status} 状态结束，未产生平台结论`), card: "border-amber-200", banner: "border-amber-200 bg-amber-50 text-amber-950" }
 }
 
 function taskAgentEnabled(task: InvestigationTask) {

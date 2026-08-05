@@ -422,10 +422,12 @@ class CodexInvestigator:
             raise RuntimeError(f"containerized Codex worker failed: {exc}") from exc
         finally:
             self._release_active_session(session_key)
+        parsed_result = AgentInvestigationResult.model_validate(result["result"])
+        parsed_result.apply_model_validation_audit(result.get("model_validation"))
         return CodexRunResult(
             thread_id=str(result["thread_id"]),
             turn_id=str(result["turn_id"]),
-            result=AgentInvestigationResult.model_validate(result["result"]),
+            result=parsed_result,
             usage=result.get("usage") or {},
         )
 

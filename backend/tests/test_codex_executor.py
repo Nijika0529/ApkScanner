@@ -14,6 +14,7 @@ from apkscanner.agent_workspace import AgentWorkspaceManager
 from apkscanner.codex_executor import CodexDockerExecutor, ScanContainer
 from apkscanner.codex_protocol import PersistentWorkerClient, PersistentWorkerError
 from apkscanner.codex_runner import CodexInvestigator, _ActiveDockerSession
+from apkscanner.codex_worker import WorkerConfiguration
 
 SCAN_ID = "00000000-0000-0000-0000-000000000101"
 TASK_ID = "00000000-0000-0000-0000-000000000102"
@@ -110,6 +111,33 @@ def test_workspace_manager_reuses_role_session_and_isolates_critic_uid(settings)
     assert json.loads((primary.context / "session.json").read_text(encoding="utf-8"))[
         "context"
     ] == {"phase": "final_evaluation"}
+
+
+def test_workspace_manager_canonicalizes_snake_case_roles_for_worker_paths(settings) -> None:  # noqa: ANN001
+    configured = replace(settings, codex_uid_min=21_100, codex_uid_max=21_110)
+    source = configured.data_dir / "source"
+    source.mkdir()
+
+    workspace = AgentWorkspaceManager(configured).prepare_session(
+        scan_id=SCAN_ID,
+        task_id=TASK_ID,
+        attempt=1,
+        role="rescue_explorer",
+        source_workspace=source,
+    )
+
+    assert workspace.role == "rescue_explorer"
+    assert workspace.workspace_key.endswith("-rescue-explorer")
+    configuration = WorkerConfiguration(
+        developer_instructions="Analyze the assigned APK.",
+        model="deepseek-v4-flash",
+        model_provider="deepseek",
+        reasoning_effort="high",
+        provider_base_url="https://api.deepseek.com/",
+        model_catalog_path="/opt/apk-scanner/config/deepseek-models.json",
+        workspace_path=workspace.container_workspace,
+    )
+    assert configuration.workspace_path == workspace.container_workspace
 
 
 def test_workspace_manager_releases_terminal_task_slot_without_reusing_uid(settings) -> None:  # noqa: ANN001

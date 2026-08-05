@@ -830,6 +830,7 @@ class AgentInvestigationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     _rejected_requested_tests: list[dict[str, Any]] = PrivateAttr(default_factory=list)
+    _normalization_repairs: list[dict[str, Any]] = PrivateAttr(default_factory=list)
 
     schema_version: Literal["1.0"] = "1.0"
     summary: str = Field(
@@ -861,13 +862,55 @@ class AgentInvestigationResult(BaseModel):
     @model_validator(mode="wrap")
     @classmethod
     def isolate_invalid_requested_tests(cls, value: Any, handler):  # noqa: ANN001, ANN206
-        """Keep malformed optional actions as auditable feedback for the next turn."""
+        """Repair unambiguous wire variance and retain malformed optional actions."""
 
         if not isinstance(value, dict):
             return handler(value)
-        requested_tests = value.get("requested_tests")
+        normalized = dict(value)
+        repairs: list[dict[str, Any]] = []
+
+        assessments = normalized.get("hypothesis_assessments")
+        if isinstance(assessments, list):
+            normalized_assessments: list[Any] = []
+            for index, assessment in enumerate(assessments):
+                if not isinstance(assessment, dict):
+                    normalized_assessments.append(assessment)
+                    continue
+                normalized_assessment = dict(assessment)
+                for field_name in ("counterevidence", "proof_gaps"):
+                    field_value = normalized_assessment.get(field_name)
+                    if not isinstance(field_value, str):
+                        continue
+                    stripped = field_value.strip()
+                    normalized_assessment[field_name] = [stripped] if stripped else []
+                    repairs.append(
+                        {
+                            "location": f"hypothesis_assessments.{index}.{field_name}",
+                            "repair": "string_wrapped_as_list",
+                            "original_type": "string",
+                        }
+                    )
+                normalized_assessments.append(normalized_assessment)
+            normalized["hypothesis_assessments"] = normalized_assessments
+
+        if (
+            normalized.get("result") == "refuted_static"
+            and normalized.get("severity_proposal") != "info"
+        ):
+            repairs.append(
+                {
+                    "location": "severity_proposal",
+                    "repair": "forced_info_for_refuted_static",
+                    "original_value": normalized.get("severity_proposal"),
+                }
+            )
+            normalized["severity_proposal"] = "info"
+
+        requested_tests = normalized.get("requested_tests")
         if not isinstance(requested_tests, list):
-            return handler(value)
+            result = handler(normalized)
+            result._normalization_repairs = repairs
+            return result
         accepted: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
         for index, request in enumerate(requested_tests):
@@ -934,20 +977,19 @@ class AgentInvestigationResult(BaseModel):
                         ],
                     }
                 )
-        normalized = dict(value)
         normalized["requested_tests"] = accepted
-        if not rejected:
-            return handler(normalized)
-        gaps = normalized.get("coverage_gaps")
-        normalized["coverage_gaps"] = [
-            *(gaps if isinstance(gaps, list) else []),
-            (
-                f"平台拒绝了 {len(rejected)} 个格式或能力不受支持的补充测试请求；"
-                "具体校验错误已保留，下一轮必须修正或改用其他验证策略。"
-            ),
-        ]
+        if rejected:
+            gaps = normalized.get("coverage_gaps")
+            normalized["coverage_gaps"] = [
+                *(gaps if isinstance(gaps, list) else []),
+                (
+                    f"平台拒绝了 {len(rejected)} 个格式或能力不受支持的补充测试请求；"
+                    "具体校验错误已保留，下一轮必须修正或改用其他验证策略。"
+                ),
+            ]
         result = handler(normalized)
         result._rejected_requested_tests = rejected
+        result._normalization_repairs = repairs
         return result
 
     @property
@@ -955,6 +997,29 @@ class AgentInvestigationResult(BaseModel):
         """Malformed model actions excluded from execution but retained for audit."""
 
         return [dict(item) for item in self._rejected_requested_tests]
+
+    @property
+    def normalization_repairs(self) -> list[dict[str, Any]]:
+        """Unambiguous model-output repairs retained for response auditing."""
+
+        return [dict(item) for item in self._normalization_repairs]
+
+    def apply_model_validation_audit(self, audit: Any) -> Self:
+        """Restore validation receipts transported across the worker boundary."""
+
+        if not isinstance(audit, dict):
+            return self
+        rejected = audit.get("rejected_requested_tests")
+        if isinstance(rejected, list):
+            self._rejected_requested_tests = [
+                dict(item) for item in rejected if isinstance(item, dict)
+            ]
+        repairs = audit.get("normalization_repairs")
+        if isinstance(repairs, list):
+            self._normalization_repairs = [
+                dict(item) for item in repairs if isinstance(item, dict)
+            ]
+        return self
 
     @model_validator(mode="after")
     def validate_explicit_verdict(self) -> Self:
