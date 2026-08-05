@@ -223,6 +223,12 @@ scanctl capabilities --deep
 ./start.sh
 ```
 
+Build notes for restricted networks: the Dockerfile already pins the Aliyun PyPI index
+(`PIP_INDEX_URL`) and every `curl` download uses `--retry`. The JADX and Apktool layers are copied
+from `docker/vendor/` (checked out locally, ignored by git) instead of downloading from GitHub, so
+a slow GitHub route cannot stall the build. If you need to refresh those vendored tools, drop the
+replacement trees under `docker/vendor/jadx/` and `docker/vendor/apktool/` and rebuild.
+
 `start.sh` contains no default credential and fails closed unless the caller exports
 `DEEPSEEK_API_KEY`.
 

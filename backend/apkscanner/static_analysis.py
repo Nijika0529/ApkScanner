@@ -167,6 +167,8 @@ class ApkInspector:
                     "--no-res",
                     "--deobf",
                     "--show-bad-code",
+                    "--rename-flags",
+                    "valid",
                     "--output-dir",
                     str(jadx_dir),
                     str(apk_path),

@@ -162,6 +162,11 @@ scanctl capabilities --deep
 
 `start.sh` 不读取 `.env`，也不包含默认 Key；调用者未设置 `DEEPSEEK_API_KEY` 时会立即拒绝启动。
 
+受限网络下的构建提示：Dockerfile 已默认固定阿里云 PyPI 索引（`PIP_INDEX_URL`），且每个 `curl`
+下载都带 `--retry`。JADX 与 Apktool 层从 `docker/vendor/`（本地检出、已被 git 忽略）复制而非
+从 GitHub 下载，因此缓慢的 GitHub 路由不会卡住构建。如需刷新这些 vendored 工具，将替换后的
+目录放到 `docker/vendor/jadx/` 与 `docker/vendor/apktool/` 下重新构建即可。
+
 一次完整扫描只创建一个无密钥 keeper 容器，不会为每个小探索反复创建容器。每个
 `task + attempt + role` 分配不复用的 Unix UID 与私有 HOME、`CODEX_HOME`、TMPDIR、cache
 和可写 workspace；不同 role 依赖 Unix 权限互相隔离。扫描级 `jadx/`、`apktool/` 和
