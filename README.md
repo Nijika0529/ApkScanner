@@ -38,6 +38,7 @@ APKScanner 的核心设计是：**平台保证覆盖和事实，Agent 负责探�
 | 能力 | 实现方式 |
 | --- | --- |
 | 确定性攻击面 | 解析生效 Manifest，枚举 Activity、Service、Receiver、Provider、Alias、权限与 Deep Link；结合 Apktool/Smali、JADX 和归档规则生成 Security IR |
+| 产品资产图谱 | 递归拆解内嵌 APK 与 H5/JS 资源；枚举 SO 并生成 ELF、动态符号、JNI 摘要，连接 Java native 声明、`loadLibrary`、JNI 导出与具体 ABI 库 |
 | 深度 Agent 调查 | `openai-codex==0.144.4` + DeepSeek Responses API；持久 Thread、多轮证据回灌、Critic/Rescue/Final 有界扇出、终局 Adaptive Verifier |
 | Docker 隔离 | 一次扫描一个无密钥 keeper 容器；每个 `task + attempt + role` 使用独立 Unix UID、HOME、`CODEX_HOME`、临时目录和可写工作区 |
 | 真机验证 | ADB 设备池支持 USB 与 IP:Port 动态接入；一个任务在完整生命周期内独占一个 serial，并可运行 Probe 或 Agent 生成的普通 App UID PoC |
@@ -138,8 +139,9 @@ scanctl serve
 scanctl scan "$PWD/testapk/vulntest.apk" --investigator none
 ```
 
-静态分析质量取决于宿主工具。最小推荐工具为 `aapt2`、`apksigner` 和 `apktool`，安装 JADX
-后可以获得更好的源码检索。缺失工具会作为 Coverage Gap 展示，而不是伪装成完整覆盖。
+静态分析质量取决于宿主工具。最小推荐工具为 `aapt2`、`apksigner`、`apktool` 和
+Binutils `readelf`，安装 JADX 后可以获得源码检索以及 Java↔JNI↔SO 链接。缺失工具会作为
+Coverage Gap 展示，而不是伪装成完整覆盖。
 
 ### 2. Codex + Docker 完整调查
 
@@ -239,9 +241,10 @@ ground truth、Evidence 准入规则和评测命令构成当前的结果口径�
 | 动态设备池、运行时接入、任务级独占租约 | 已实现 |
 | Adaptive Verifier、语义实验、MCP/Python Capability 入口 | 已实现第一阶段 |
 | 静态缓存、版本快照、语义 Diff、历史 PoC 重放 | 已实现第一阶段 |
+| 内嵌 APK/JS/SO ArtifactGraph、Java↔JNI↔SO 静态链接 | 已实现第一阶段 |
 | Android 16 自托管正式回归 | 工作流已提供，需要实际设备与仓库 Secret |
 | 企业多用户、RBAC、Provider egress 治理 | 不属于当前个人版本，保留架构接口 |
-| Native 深度分析、IDA MCP、应用内部业务流程测试 | 后续扩展方向 |
+| Native 函数级数据流、动态脱壳、IDA MCP、应用内部业务流程测试 | 后续扩展方向 |
 
 ## 文档导航
 

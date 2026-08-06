@@ -734,16 +734,38 @@ class BuiltinRuleEngine:
                 )
             )
         if result.file_inventory.get("native_libraries"):
+            graph_summary = dict(result.artifact_graph.get("summary") or {})
             findings.append(
                 FindingDraft(
                     rule_id="APK-NATIVE-CODE-INVENTORY",
                     title="APK contains native code requiring separate review",
-                    description="Native libraries are outside the high-level decompiler's complete coverage.",
-                    remediation="Run native hardening and memory-safety checks for the listed libraries.",
+                    description=(
+                        "Native libraries cross the Java decompiler boundary. The ArtifactGraph "
+                        "contains normalized ELF, dynamic-symbol, JNI and Java loading links for "
+                        "targeted follow-up."
+                    ),
+                    remediation=(
+                        "Follow linked Java/JNI/SO boundaries and review the concrete native "
+                        "operation reached from application input."
+                    ),
                     masvs="MASVS-CODE",
                     severity=Severity.INFO.value,
                     confidence=Confidence.HIGH.value,
-                    metadata={"libraries": result.file_inventory["native_libraries"]},
+                    metadata={
+                        "libraries": result.file_inventory["native_libraries"],
+                        "artifact_graph_path": "artifact_graph.json",
+                        "native_summary": {
+                            key: graph_summary.get(key)
+                            for key in (
+                                "native_library_count",
+                                "java_native_bridge_count",
+                                "java_native_method_count",
+                                "linked_java_native_method_count",
+                                "jni_symbol_count",
+                                "native_libraries_by_abi",
+                            )
+                        },
+                    },
                 )
             )
         return findings

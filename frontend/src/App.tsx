@@ -36,7 +36,7 @@ import { MarkdownContent } from "./components/MarkdownContent"
 import { Badge, Button, Card, Dialog, DialogContent, DialogDescription, DialogTitle, Progress, Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui"
 import { cn, formatDate, shortHash, statusLabel } from "./lib"
 import { markdownToPlainText } from "./markdown"
-import type { AdbDevice, AgentAudit, BenchmarkEvaluation, CoverageItem, EntryPoint, Finding, Health, InvestigationTask, InvestigatorChoice, PatternMatch, Scan, ScanEvent, SecurityHypothesis, SecuritySnapshot, VersionDiff } from "./types"
+import type { AdbDevice, AgentAudit, ArtifactGraph, BenchmarkEvaluation, CoverageItem, EntryPoint, Finding, Health, InvestigationTask, InvestigatorChoice, PatternMatch, Scan, ScanEvent, SecurityHypothesis, SecuritySnapshot, VersionDiff } from "./types"
 
 const severityTone = {
   critical: "danger",
@@ -456,6 +456,10 @@ function ScanDetailView({ data, health, subscribeEvents, onRefresh, onDelete, on
   const [versionData, setVersionData] = useState<{ snapshot: SecuritySnapshot | null; diff: VersionDiff | null; matches: PatternMatch[] } | null>(null)
   const [versionLoading, setVersionLoading] = useState(false)
   const [versionLoadError, setVersionLoadError] = useState<string | null>(null)
+  const [artifactGraph, setArtifactGraph] = useState<ArtifactGraph | null>(null)
+  const [artifactGraphLoaded, setArtifactGraphLoaded] = useState(false)
+  const [artifactGraphLoading, setArtifactGraphLoading] = useState(false)
+  const [artifactGraphError, setArtifactGraphError] = useState<string | null>(null)
   const loadVersionData = useCallback(async () => {
     if (versionData || versionLoading) return
     setVersionLoading(true)
@@ -473,6 +477,24 @@ function ScanDetailView({ data, health, subscribeEvents, onRefresh, onDelete, on
       setVersionLoading(false)
     }
   }, [scan.id, versionData, versionLoading])
+  const loadArtifactGraph = useCallback(async () => {
+    if (artifactGraphLoaded || artifactGraphLoading) return
+    setArtifactGraphLoading(true)
+    setArtifactGraphError(null)
+    try {
+      setArtifactGraph(await api.artifactGraph(scan.id))
+      setArtifactGraphLoaded(true)
+    } catch (reason) {
+      setArtifactGraphError(reason instanceof Error ? reason.message : "资产图谱加载失败")
+    } finally {
+      setArtifactGraphLoading(false)
+    }
+  }, [artifactGraphLoaded, artifactGraphLoading, scan.id])
+  useEffect(() => {
+    setArtifactGraph(null)
+    setArtifactGraphLoaded(false)
+    setArtifactGraphError(null)
+  }, [scan.id])
   const verificationCandidates = signals.filter(isVerificationCandidate)
   const staticSignals = signals.filter((signal) => !isVerificationCandidate(signal))
   const high = findings.filter((item) => ["critical", "high"].includes(item.severity)).length
@@ -505,11 +527,13 @@ function ScanDetailView({ data, health, subscribeEvents, onRefresh, onDelete, on
       <Card className="p-4 sm:p-6">
         <Tabs defaultValue="overview" onValueChange={(value) => {
           if (value === "versions") void loadVersionData()
+          if (value === "assets") void loadArtifactGraph()
         }}>
           <TabsList aria-label="扫描详情">
-            <TabsTrigger value="overview">总览</TabsTrigger><TabsTrigger value="entries">攻击面 <span className="ml-1 text-xs text-slate-500">{entries.length}</span></TabsTrigger><TabsTrigger value="findings">已证实 Finding <span className="ml-1 text-xs text-slate-500">{findings.length}</span></TabsTrigger><TabsTrigger value="proof-backlog">待验证风险 <span className="ml-1 text-xs text-slate-500">{verificationCandidates.length}</span></TabsTrigger><TabsTrigger value="signals">静态线索 <span className="ml-1 text-xs text-slate-500">{staticSignals.length}</span></TabsTrigger><TabsTrigger value="versions">版本演进{versionData && <span className="ml-1 text-xs text-slate-500">{versionData.matches.length}</span>}</TabsTrigger><TabsTrigger value="coverage">覆盖矩阵</TabsTrigger><TabsTrigger value="tasks">探索任务</TabsTrigger><TabsTrigger value="proofs">验证链 <span className="ml-1 text-xs text-slate-500">{hypotheses.length}</span></TabsTrigger><TabsTrigger value="audits">AI 审计 <span className="ml-1 text-xs text-slate-500">{audits.length}</span></TabsTrigger>
+            <TabsTrigger value="overview">总览</TabsTrigger><TabsTrigger value="assets">资产图谱</TabsTrigger><TabsTrigger value="entries">攻击面 <span className="ml-1 text-xs text-slate-500">{entries.length}</span></TabsTrigger><TabsTrigger value="findings">已证实 Finding <span className="ml-1 text-xs text-slate-500">{findings.length}</span></TabsTrigger><TabsTrigger value="proof-backlog">待验证风险 <span className="ml-1 text-xs text-slate-500">{verificationCandidates.length}</span></TabsTrigger><TabsTrigger value="signals">静态线索 <span className="ml-1 text-xs text-slate-500">{staticSignals.length}</span></TabsTrigger><TabsTrigger value="versions">版本演进{versionData && <span className="ml-1 text-xs text-slate-500">{versionData.matches.length}</span>}</TabsTrigger><TabsTrigger value="coverage">覆盖矩阵</TabsTrigger><TabsTrigger value="tasks">探索任务</TabsTrigger><TabsTrigger value="proofs">验证链 <span className="ml-1 text-xs text-slate-500">{hypotheses.length}</span></TabsTrigger><TabsTrigger value="audits">AI 审计 <span className="ml-1 text-xs text-slate-500">{audits.length}</span></TabsTrigger>
           </TabsList>
           <TabsContent value="overview"><Overview scan={scan} health={health} coverage={coverage} /></TabsContent>
+          <TabsContent value="assets">{artifactGraphLoading ? <LoadingState /> : artifactGraphError ? <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">{artifactGraphError}<Button className="ml-3" variant="secondary" size="sm" onClick={() => { setArtifactGraphLoaded(false); void loadArtifactGraph() }}>重试</Button></div> : artifactGraph ? <ArtifactGraphView graph={artifactGraph} /> : <EmptyRow text={artifactGraphLoaded ? "当前扫描没有资产图谱" : "正在准备资产图谱"} />}</TabsContent>
           <TabsContent value="entries"><EntryPoints entries={entries} /></TabsContent>
           <TabsContent value="findings"><Findings findings={findings} verificationCandidates={verificationCandidates} scanStatus={scan.status} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="proof-backlog"><ProofBacklog signals={verificationCandidates} tasks={tasks} onRefresh={onRefresh} /></TabsContent>
@@ -531,6 +555,74 @@ function Overview({ scan, health, coverage }: { scan: Scan; health: Health | nul
     <DevicePoolPanel />
     <div className="space-y-6"><div><SectionTitle icon={ListChecks} title="MASVS 基线" description="APK-only 初始覆盖" /><div className="mt-4 space-y-3">{baselines.map((item) => <div key={item.id} className="rounded-xl border border-slate-200 bg-slate-50 p-3"><div className="mb-2 flex items-center justify-between gap-3"><span className="text-xs font-semibold text-slate-700">{item.domain.replace("MASVS-", "")}</span><Badge tone={statusTone(item.status)}>{statusLabel(item.status)}</Badge></div><p className="text-xs leading-relaxed text-slate-500">{item.gap_reason ?? item.title}</p></div>)}</div></div><div><SectionTitle icon={ServerCog} title="运行能力" description="缺失能力会形成覆盖缺口" /><div className="mt-4 grid grid-cols-2 gap-2">{health?.capabilities.map((item) => <div key={item.name} title={item.detail ?? undefined} className="flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-xs"><span className={cn("h-2 w-2 rounded-full", item.busy ? "bg-amber-400" : item.available ? "bg-emerald-400" : "bg-slate-300")} /><span className="truncate text-slate-600">{item.name}{item.busy ? " · 忙碌" : ""}</span></div>)}</div></div></div>
     {scan.error && <p className="text-rose-700">{scan.error}</p>}
+  </div>
+}
+
+function ArtifactGraphView({ graph }: { graph: ArtifactGraph }) {
+  const [visibleLibraries, setVisibleLibraries] = useState(80)
+  const nodesById = useMemo(
+    () => new Map(graph.nodes.map((node) => [node.id, node])),
+    [graph.nodes],
+  )
+  const apkNodes = graph.nodes.filter((node) => node.kind === "apk")
+  const nativeNodes = graph.nodes.filter((node) => node.kind === "native_library")
+  const bridgeNodes = graph.nodes.filter((node) => node.kind === "java_native_bridge")
+  const summary = graph.summary ?? {}
+  const abiCounts = asRecord(summary.native_libraries_by_abi) ?? {}
+  const bridgeOwnership = asRecord(summary.java_bridges_by_ownership) ?? {}
+  const bindings = graph.edges
+    .filter((edge) => ["binds_to_jni", "possible_dynamic_registration"].includes(edge.relation))
+    .map((edge) => {
+      const bridge = nodesById.get(edge.from)
+      const library = nodesById.get(edge.to)
+      return { edge, bridge, library }
+    })
+  const loadEdges = graph.edges.filter((edge) => edge.relation === "loads_native_library")
+  const embeddedEdges = graph.edges.filter((edge) => edge.relation === "contains")
+  return <div className="space-y-6">
+    <div className="rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-sm leading-6 text-cyan-950">
+      这里展示的是可追踪的产品资产关系，不是简单文件数量：主 APK、内嵌 APK、Java Native 声明、JNI 导出符号和具体 ABI 的 SO 都使用稳定节点连接。Agent 可沿同一组节点 ID 和路径继续读取反编译代码或执行 readelf、nm、strings。
+    </div>
+    <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+      <Metric label="APK / 插件" value={numberValue(summary.apk_count) ?? apkNodes.length} icon={FileArchive} tone="cyan" />
+      <Metric label="Native SO" value={numberValue(summary.native_library_count) ?? nativeNodes.length} icon={Box} tone="violet" />
+      <Metric label="Java Native 方法" value={numberValue(summary.java_native_method_count) ?? 0} icon={Code2} tone="cyan" />
+      <Metric label="已链接方法" value={numberValue(summary.linked_java_native_method_count) ?? bindings.length} icon={Link2} tone="emerald" />
+      <Metric label="JNI 导出" value={numberValue(summary.jni_symbol_count) ?? 0} icon={Network} tone="rose" />
+    </div>
+    <div className="grid gap-5 xl:grid-cols-2">
+      <section className="rounded-xl border border-slate-200 p-4">
+        <SectionTitle icon={FileArchive} title="产品包层级" description="主包、内嵌 APK 与 ABI 分布" />
+        <div className="mt-4 space-y-2">
+          {apkNodes.map((node) => <div key={node.id} className="rounded-lg bg-slate-50 px-3 py-2"><div className="flex flex-wrap items-center justify-between gap-2"><p className="font-mono text-xs font-semibold text-slate-800">{textValue(node.package_name) ?? textValue(node.name) ?? node.id}</p><Badge tone={node.id === graph.root_id ? "info" : "warning"}>{node.id === graph.root_id ? "主 APK" : "内嵌 APK"}</Badge></div><p className="mt-1 truncate text-[11px] text-slate-500" title={node.path}>{node.path}</p></div>)}
+          {!apkNodes.length && <EmptyRow text="没有 APK 资产节点" />}
+        </div>
+        {embeddedEdges.length > 0 && <p className="mt-3 text-xs text-slate-500">检测到 {embeddedEdges.length} 条嵌套包含关系；相同 SHA-256 的插件只分析一次，但保留全部嵌入位置。</p>}
+        <div className="mt-4 flex flex-wrap gap-2">{Object.entries(abiCounts).map(([abi, count]) => <Badge key={abi}>{abi} · {String(count)}</Badge>)}{!Object.keys(abiCounts).length && <span className="text-xs text-slate-500">没有 Native ABI</span>}</div>
+      </section>
+      <section className="rounded-xl border border-slate-200 p-4">
+        <SectionTitle icon={Link2} title="Java ↔ JNI ↔ SO" description="静态装载与符号绑定链" />
+        <div className="mt-4 space-y-2">
+          {bindings.slice(0, 80).map(({ edge, bridge, library }, index) => <div key={`${edge.from}:${edge.to}:${index}`} className="rounded-lg border border-slate-200 bg-slate-50 p-3"><div className="grid gap-2 text-xs sm:grid-cols-[1fr_auto_1fr_auto_1fr] sm:items-center"><div className="min-w-0"><p className="truncate font-mono font-semibold text-slate-800" title={textValue(bridge?.class_name)}>{textValue(bridge?.class_name) ?? "未知 Java 类"}</p><p className="truncate text-slate-500">{textValue(edge.method_name) ?? edge.from}</p></div><ChevronRight className="hidden h-4 w-4 text-slate-400 sm:block" /><div className="min-w-0"><p className="truncate font-mono text-slate-700" title={textValue(edge.jni_symbol)}>{textValue(edge.jni_symbol) ?? "RegisterNatives 候选"}</p><p className="text-slate-500">{edge.relation === "binds_to_jni" ? "静态 JNI 导出" : "动态注册推断"}</p></div><ChevronRight className="hidden h-4 w-4 text-slate-400 sm:block" /><div className="min-w-0"><p className="truncate font-mono font-semibold text-violet-800">{textValue(library?.name) ?? edge.to}</p><p className="text-slate-500">{textValue(library?.abi) ?? "ABI 未知"} · {textValue(edge.confidence) ?? "unknown"}</p></div></div></div>)}
+          {!bindings.length && <EmptyRow text="尚未把 Java native 方法解析到静态 JNI 导出或动态注册候选" />}
+        </div>
+        {bindings.length > 80 && <p className="mt-3 text-xs text-slate-500">当前仅展示前 80 条绑定，完整关系保存在 ArtifactGraph API 中。</p>}
+        {loadEdges.length > 0 && <p className="mt-3 text-xs text-slate-500">另有 {loadEdges.length} 条 System.loadLibrary / System.load 装载关系，覆盖 {bridgeNodes.length} 个 Java Native 桥类。</p>}
+        <div className="mt-3 flex flex-wrap gap-2">{Object.entries(bridgeOwnership).map(([scope, count]) => <Badge key={scope} tone={scope === "application" ? "good" : scope === "vendor" ? "info" : "neutral"}>{scope} · {String(count)}</Badge>)}</div>
+      </section>
+    </div>
+    <section>
+      <SectionTitle icon={Box} title="Native 库总览" description="标准化 ELF、动态符号、JNI 与基础加固摘要" />
+      <div className="mt-4 overflow-x-auto rounded-xl border border-slate-200"><table className="w-full min-w-[980px] text-left text-sm"><thead className="bg-slate-50 text-xs text-slate-500"><tr><th className="px-4 py-3 font-medium">SO / ABI</th><th className="px-4 py-3 font-medium">ELF</th><th className="px-4 py-3 font-medium">依赖</th><th className="px-4 py-3 font-medium">符号</th><th className="px-4 py-3 font-medium">JNI</th><th className="px-4 py-3 font-medium">加固摘要</th></tr></thead><tbody className="divide-y divide-slate-200">{nativeNodes.slice(0, visibleLibraries).map((node) => {
+        const elf = asRecord(node.elf) ?? {}
+        const symbols = asRecord(node.symbols) ?? {}
+        const jni = asRecord(node.jni) ?? {}
+        const hardening = asRecord(node.hardening) ?? {}
+        const dependencies = Array.isArray(node.dependencies) ? node.dependencies : []
+        return <tr key={node.id} className="align-top hover:bg-slate-50"><td className="px-4 py-3"><p className="font-mono text-xs font-semibold text-slate-800">{textValue(node.name) ?? node.id}</p><p className="mt-1 text-[11px] text-slate-500">{textValue(node.abi) ?? "unknown"} · {shortHash(textValue(node.sha256) ?? "")}</p></td><td className="px-4 py-3 text-xs text-slate-600">{elf.valid === false ? <Badge tone="warning">非 ELF / 解析失败</Badge> : <><p>{textValue(elf.machine_description) ?? textValue(elf.machine) ?? "未知架构"}</p><p className="mt-1 text-slate-500">{textValue(elf.class) ?? `${String(elf.bits ?? "?")} bit`} · {textValue(elf.soname) ?? "无 SONAME"}</p></>}</td><td className="max-w-xs px-4 py-3 text-xs text-slate-600"><p className="line-clamp-3" title={dependencies.join(", ")}>{dependencies.slice(0, 6).join(", ") || "无动态依赖记录"}</p></td><td className="px-4 py-3 text-xs text-slate-600">导出 {String(symbols.exported_count ?? 0)}<br />导入 {String(symbols.imported_count ?? 0)}</td><td className="px-4 py-3 text-xs"><div className="flex flex-wrap gap-1"><Badge tone={numberValue(jni.export_count) ? "info" : "neutral"}>导出 {String(jni.export_count ?? 0)}</Badge>{jni.dynamic_registration === true && <Badge tone="warning">动态注册</Badge>}{jni.has_jni_onload === true && <Badge>JNI_OnLoad</Badge>}</div></td><td className="px-4 py-3 text-xs"><div className="flex flex-wrap gap-1"><Badge tone={hardening.gnu_relro === true ? "good" : "warning"}>RELRO</Badge><Badge tone={hardening.stack_canary === true ? "good" : "neutral"}>Canary</Badge><Badge tone={hardening.executable_stack === false ? "good" : hardening.executable_stack === true ? "danger" : "neutral"}>NX Stack</Badge>{hardening.stripped === true && <Badge>Stripped</Badge>}</div></td></tr>
+      })}</tbody></table>{!nativeNodes.length && <EmptyRow text="当前产品包没有 Native 库" />}</div>
+      {visibleLibraries < nativeNodes.length && <div className="mt-3 flex justify-center"><Button variant="secondary" size="sm" onClick={() => setVisibleLibraries((count) => count + 80)}>加载更多 SO · {nativeNodes.length - visibleLibraries}</Button></div>}
+    </section>
   </div>
 }
 

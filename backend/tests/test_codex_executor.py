@@ -367,7 +367,7 @@ def test_scan_container_command_has_scan_scope_and_no_provider_secret(
     monkeypatch.setattr(CodexDockerExecutor, "_docker", staticmethod(lambda: "docker"))
     configured = replace(settings, codex_docker_image="test-worker:fixed")
     scan_workspace = configured.data_dir / "workspaces" / SCAN_ID
-    for name in ("jadx", "apktool", "archive", "artifacts"):
+    for name in ("jadx", "apktool", "archive", "native", "artifacts"):
         (scan_workspace / name).mkdir(parents=True, exist_ok=True)
     (scan_workspace / "artifact_graph.json").write_text("{}", encoding="utf-8")
     sessions_root = configured.data_dir / "agent-sessions" / SCAN_ID
@@ -395,6 +395,7 @@ def test_scan_container_command_has_scan_scope_and_no_provider_secret(
     assert "target=/agent-workspaces" in rendered
     assert "target=/scan-input/target.apk,readonly" in rendered
     assert "target=/scan-input/jadx,readonly" in rendered
+    assert "target=/scan-input/native,readonly" in rendered
     assert "target=/scan-input/artifacts,readonly" in rendered
     assert "target=/scan-input/artifact_graph.json,readonly" in rendered
     assert "DEEPSEEK_API_KEY" not in rendered

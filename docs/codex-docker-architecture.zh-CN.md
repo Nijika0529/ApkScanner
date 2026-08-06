@@ -89,6 +89,9 @@ flowchart LR
 | `/scan-input/jadx` | 只读 | 当前 Scan 的 JADX 结果 |
 | `/scan-input/apktool` | 只读 | Apktool/Smali 结果 |
 | `/scan-input/archive` | 只读 | 安全解包后的归档视图 |
+| `/scan-input/native` | 只读 | SO 原件、标准化 ELF/JNI 摘要与 Java↔JNI↔SO 索引 |
+| `/scan-input/artifacts` | 只读 | 内嵌 APK 及其递归 JADX、资源和 Native 分析结果 |
+| `/scan-input/artifact_graph.json` | 只读 | 主包、插件、Java Native 桥、JNI 符号和 SO 的统一关系图 |
 | `/agent-workspaces/<key>/workspace` | 当前 UID 可写 | 脚本、笔记、PoC 工程和输出 |
 | `/agent-workspaces/<key>/home` | 当前 UID 可写 | 私有 HOME 与 Codex 状态 |
 

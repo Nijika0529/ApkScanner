@@ -1,6 +1,7 @@
 import type {
   AdbDevice,
   AgentAudit,
+  ArtifactGraph,
   BenchmarkEvaluation,
   CoverageItem,
   EntryPoint,
@@ -128,6 +129,8 @@ export const api = {
   scans: () => request<Scan[]>("/api/v1/scans"),
   scan: (id: string, signal?: AbortSignal) =>
     request<Scan>(`/api/v1/scans/${id}`, { signal }),
+  artifactGraph: (id: string, signal?: AbortSignal) =>
+    cachedOptionalRequest<ArtifactGraph>(`/api/v1/scans/${id}/artifact-graph`, signal, 300_000),
   entries: (id: string, signal?: AbortSignal) =>
     cachedRequest<EntryPoint[]>(`/api/v1/scans/${id}/entries`, signal),
   securitySnapshot: (id: string, signal?: AbortSignal) =>

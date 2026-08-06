@@ -15,7 +15,7 @@ from apkscanner.static_analysis import (
     InvalidApkError,
     StaticAnalysisResult,
 )
-from apkscanner.tools import CommandResult
+from apkscanner.tools import CommandResult, ToolRunner
 
 from .conftest import MANIFEST
 
@@ -148,11 +148,14 @@ def test_product_bundle_recursively_analyzes_embedded_apks_and_web_assets(
         "com.example.grandchild",
     }
     assert result.file_inventory["product_bundle"] == {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "artifact_count": 3,
         "embedded_apk_count": 2,
         "javascript_file_count": 3,
         "html_file_count": 3,
+        "native_library_count": 0,
+        "java_native_method_count": 0,
+        "linked_java_native_method_count": 0,
         "artifact_graph_path": "artifact_graph.json",
     }
     assert {
@@ -188,6 +191,118 @@ def test_product_bundle_recursively_analyzes_embedded_apks_and_web_assets(
     assert cached.file_inventory["product_bundle"] == result.file_inventory["product_bundle"]
     assert len(cached.artifact_graph["nodes"]) == 3
     assert any("/artifacts/" in f"/{root}" for root in cached.searchable_roots)
+
+
+def test_native_artifact_graph_links_java_jni_and_shared_library(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    compiler = ToolRunner(30)
+    if not compiler.available("gcc"):
+        pytest.skip("requires gcc to build the native functional fixture")
+    source = tmp_path / "account.c"
+    source.write_text(
+        """
+        __attribute__((visibility("default")))
+        long Java_com_example_NativeBridge_readToken(void *env, void *type) {
+            (void)env; (void)type; return 7;
+        }
+        __attribute__((visibility("default")))
+        int JNI_OnLoad(void *vm, void *reserved) {
+            (void)vm; (void)reserved; return 0x00010006;
+        }
+        """,
+        encoding="utf-8",
+    )
+    library = tmp_path / "libaccount.so"
+    compiled = compiler.run(
+        [
+            "gcc",
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libaccount.so",
+            "-o",
+            str(library),
+            str(source),
+        ],
+        timeout=30,
+    )
+    assert compiled.exit_code == 0, compiled.stderr
+    apk = tmp_path / "native-product.apk"
+    apk.write_bytes(
+        _nested_apk_bytes(
+            "com.example.nativeproduct",
+            {"lib/x86_64/libaccount.so": library.read_bytes()},
+        )
+    )
+    real_runner = ToolRunner(30)
+
+    class NativeFixtureRunner:
+        @staticmethod
+        def available(tool: str) -> bool:
+            return tool == "jadx" or (
+                tool in {"readelf", "llvm-readelf"} and real_runner.available(tool)
+            )
+
+        @staticmethod
+        def version(tool: str) -> str | None:
+            return "jadx native fixture" if tool == "jadx" else None
+
+        @staticmethod
+        def run(argv, **kwargs):  # noqa: ANN001
+            if argv[0] != "jadx":
+                return real_runner.run(argv, **kwargs)
+            output = Path(argv[argv.index("--output-dir") + 1])
+            java = output / "sources/com/example/NativeBridge.java"
+            java.parent.mkdir(parents=True, exist_ok=True)
+            java.write_text(
+                """
+                package com.example;
+                public final class NativeBridge {
+                    static { System.loadLibrary("account"); }
+                    public static native long readToken();
+                }
+                """,
+                encoding="utf-8",
+            )
+            return CommandResult(argv=argv, exit_code=0, stdout="", stderr="")
+
+    inspector = ApkInspector(settings, runner=NativeFixtureRunner())
+    result = inspector.inspect(
+        apk,
+        "native-artifact-graph",
+    )
+
+    summary = result.artifact_graph["summary"]
+    assert summary["native_library_count"] == 1
+    assert summary["java_native_bridge_count"] == 1
+    assert summary["java_native_method_count"] == 1
+    assert summary["linked_java_native_method_count"] == 1
+    assert summary["jni_symbol_count"] == 2
+    library_node = next(
+        node
+        for node in result.artifact_graph["nodes"]
+        if node["kind"] == "native_library"
+    )
+    assert library_node["name"] == "libaccount.so"
+    assert library_node["elf"]["valid"] is True
+    assert library_node["elf"]["soname"] == "libaccount.so"
+    assert library_node["symbols"]["exported_count"] >= 2
+    assert library_node["jni"]["has_jni_onload"] is True
+    relations = {edge["relation"] for edge in result.artifact_graph["edges"]}
+    assert {
+        "contains_native_library",
+        "declares_native_bridge",
+        "loads_native_library",
+        "binds_to_jni",
+    } <= relations
+    assert (result.workspace / "native/index.json").is_file()
+    assert (result.workspace / library_node["summary_path"]).is_file()
+
+    cached = inspector.inspect(apk, "native-artifact-graph-cache")
+    assert cached.file_inventory["static_cache_hit"] is True
+    assert cached.artifact_graph["summary"] == result.artifact_graph["summary"]
+    assert (cached.workspace / "native/index.json").is_file()
 
 
 def test_inspector_keeps_smali_and_uses_aapt2_manifest_when_oem_resources_fail(

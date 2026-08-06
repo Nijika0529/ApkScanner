@@ -258,7 +258,15 @@ class ToolRunner:
         return "available"
 
 
-TOOL_NAMES = ("aapt2", "apksigner", "apktool", "jadx", "adb")
+TOOL_NAMES = (
+    "aapt2",
+    "apksigner",
+    "apktool",
+    "jadx",
+    "readelf",
+    "llvm-readelf",
+    "adb",
+)
 
 
 def discover_tools(runner: ToolRunner) -> dict[str, str | None]:

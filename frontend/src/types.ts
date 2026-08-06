@@ -238,6 +238,26 @@ export interface ScanDeleteResult {
   cleanup_warnings: string[]
 }
 
+export interface ArtifactGraphNode extends Record<string, unknown> {
+  id: string
+  path: string
+  kind: string
+}
+
+export interface ArtifactGraphEdge extends Record<string, unknown> {
+  from: string
+  to: string
+  relation: string
+}
+
+export interface ArtifactGraph {
+  schema_version: string
+  root_id: string
+  summary: Record<string, unknown>
+  nodes: ArtifactGraphNode[]
+  edges: ArtifactGraphEdge[]
+}
+
 export interface TaskDeleteResult {
   id: string
   deleted: true

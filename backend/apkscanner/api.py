@@ -810,6 +810,26 @@ def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> Health
         Capability(name=name, available=version is not None, version=version)
         for name, version in tool_versions.items()
     ]
+    elf_tool = next(
+        (
+            name
+            for name in ("llvm-readelf", "readelf")
+            if orchestrator.runner.available(name)
+        ),
+        None,
+    )
+    capabilities.append(
+        Capability(
+            name="elf_inspector",
+            available=elf_tool is not None,
+            version=orchestrator.runner.version(elf_tool) if elf_tool else None,
+            detail=(
+                f"Native ELF summaries use {elf_tool}"
+                if elf_tool
+                else "Install binutils readelf or llvm-readelf for Native symbol summaries"
+            ),
+        )
+    )
     codex = orchestrator.codex.capability(deep=False)
     capabilities.append(
         Capability(

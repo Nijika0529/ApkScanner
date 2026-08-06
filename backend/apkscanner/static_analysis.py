@@ -14,10 +14,11 @@ from typing import Any
 from .android_chains import AndroidAttackChainAnalyzer
 from .config import Settings
 from .manifest import ManifestDocument, aapt2_xmltree_to_xml, parse_manifest
+from .native_analysis import NativeArtifactAnalyzer
 from .permissions import ensure_private_directory
 from .tools import CommandResult, TimeBudget, ToolRunner, discover_tools
 
-CODE_INDEX_CONTEXT_VERSION = "component-one-hop-android-chains-v4-product-bundle"
+CODE_INDEX_CONTEXT_VERSION = "component-one-hop-android-chains-v5-native-artifact-graph"
 
 
 class InvalidApkError(ValueError):
@@ -240,6 +241,27 @@ class ApkInspector:
             "cache_hit": False,
             "analysis_profile": analysis_profile,
         }
+        artifact_root_id = "target.apk" if _artifact_origin == "target.apk" else "artifact.apk"
+        native_index = NativeArtifactAnalyzer(self.runner).analyze(
+            apk_path=apk_path,
+            workspace=workspace,
+            artifact_id=artifact_root_id,
+            artifact_sha256=artifact_sha256,
+            package_name=manifest.package_name,
+            native_libraries=list(file_inventory.get("native_libraries") or []),
+            failed_java_classes={
+                str(value) for value in decompilation.get("failed_classes", [])
+            },
+            budget=budget,
+        )
+        tool_results["native_analysis"] = {
+            "argv": [],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "timed_out": False,
+            "summary": native_index["summary"],
+        }
         artifact_graph = self._analyze_embedded_apks(
             apk_path=apk_path,
             scan_id=scan_id,
@@ -249,6 +271,7 @@ class ApkInspector:
             manifest=manifest,
             file_inventory=file_inventory,
             decompilation=decompilation,
+            native_index=native_index,
             budget=budget,
             ancestry=(*_ancestry, artifact_sha256),
         )
@@ -258,12 +281,16 @@ class ApkInspector:
         )
         searchable_roots = self._workspace_searchable_roots(workspace)
         artifact_nodes = list(artifact_graph.get("nodes") or [])
+        artifact_summary = dict(artifact_graph.get("summary") or {})
         file_inventory = {
             **file_inventory,
             "product_bundle": {
                 "schema_version": artifact_graph.get("schema_version", "1.0"),
-                "artifact_count": len(artifact_nodes),
-                "embedded_apk_count": max(0, len(artifact_nodes) - 1),
+                "artifact_count": int(artifact_summary.get("apk_count") or 0),
+                "embedded_apk_count": max(
+                    0,
+                    int(artifact_summary.get("apk_count") or 0) - 1,
+                ),
                 "javascript_file_count": sum(
                     len((node.get("inventory") or {}).get("javascript_files") or [])
                     for node in artifact_nodes
@@ -271,6 +298,16 @@ class ApkInspector:
                 "html_file_count": sum(
                     len((node.get("inventory") or {}).get("html_files") or [])
                     for node in artifact_nodes
+                ),
+                "native_library_count": int(
+                    artifact_summary.get("native_library_count") or 0
+                ),
+                "java_native_method_count": int(
+                    artifact_summary.get("java_native_method_count") or 0
+                ),
+                "linked_java_native_method_count": int(
+                    artifact_summary.get("linked_java_native_method_count")
+                    or 0
                 ),
                 "artifact_graph_path": "artifact_graph.json",
             },
@@ -338,7 +375,7 @@ class ApkInspector:
             return None
         if any(
             (workspace / name).exists()
-            for name in ("jadx", "apktool", "archive", "artifacts")
+            for name in ("jadx", "apktool", "archive", "native", "artifacts")
         ):
             return None
         try:
@@ -363,7 +400,7 @@ class ApkInspector:
         cached_manifest = (cache_dir / manifest_relative).resolve()
         if not cached_manifest.is_relative_to(cache_dir.resolve()) or not cached_manifest.is_file():
             return None
-        for name in ("jadx", "apktool", "archive", "artifacts"):
+        for name in ("jadx", "apktool", "archive", "native", "artifacts"):
             source = cache_dir / name
             if source.is_dir():
                 shutil.copytree(source, workspace / name)
@@ -383,6 +420,7 @@ class ApkInspector:
         }
         searchable_roots = self._workspace_searchable_roots(workspace)
         artifact_nodes = list(artifact_graph.get("nodes") or [])
+        artifact_summary = dict(artifact_graph.get("summary") or {})
         return StaticAnalysisResult(
             manifest=manifest,
             workspace=workspace,
@@ -404,8 +442,11 @@ class ApkInspector:
                 "analysis_profile": analysis_profile,
                 "product_bundle": {
                     "schema_version": artifact_graph.get("schema_version", "1.0"),
-                    "artifact_count": len(artifact_nodes),
-                    "embedded_apk_count": max(0, len(artifact_nodes) - 1),
+                    "artifact_count": int(artifact_summary.get("apk_count") or 0),
+                    "embedded_apk_count": max(
+                        0,
+                        int(artifact_summary.get("apk_count") or 0) - 1,
+                    ),
                     "javascript_file_count": sum(
                         len((node.get("inventory") or {}).get("javascript_files") or [])
                         for node in artifact_nodes
@@ -413,6 +454,16 @@ class ApkInspector:
                     "html_file_count": sum(
                         len((node.get("inventory") or {}).get("html_files") or [])
                         for node in artifact_nodes
+                    ),
+                    "native_library_count": int(
+                        artifact_summary.get("native_library_count") or 0
+                    ),
+                    "java_native_method_count": int(
+                        artifact_summary.get("java_native_method_count") or 0
+                    ),
+                    "linked_java_native_method_count": int(
+                        artifact_summary.get("linked_java_native_method_count")
+                        or 0
                     ),
                     "artifact_graph_path": "artifact_graph.json",
                 },
@@ -454,7 +505,7 @@ class ApkInspector:
         cache_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         temporary = Path(tempfile.mkdtemp(prefix="static-cache-", dir=cache_dir.parent))
         try:
-            for name in ("jadx", "apktool", "archive", "artifacts"):
+            for name in ("jadx", "apktool", "archive", "native", "artifacts"):
                 source = workspace / name
                 if source.is_dir():
                     shutil.copytree(source, temporary / name)
@@ -523,6 +574,7 @@ class ApkInspector:
         manifest: ManifestDocument,
         file_inventory: dict[str, Any],
         decompilation: dict[str, Any],
+        native_index: dict[str, Any],
         budget: TimeBudget | None,
         ancestry: tuple[str, ...],
     ) -> dict[str, Any]:
@@ -540,6 +592,7 @@ class ApkInspector:
             "version_name": manifest.version_name,
             "version_code": manifest.version_code,
             "analysis_root": ".",
+            "native_index_path": "native/index.json",
             "decompilation": {
                 "status": decompilation.get("status"),
                 "generated_java_files": decompilation.get("generated_java_files", 0),
@@ -554,13 +607,14 @@ class ApkInspector:
             },
         }
         graph: dict[str, Any] = {
-            "schema_version": "1.0",
+            "schema_version": "1.1",
             "root_id": root_id,
-            "nodes": [root_node],
-            "edges": [],
+            "nodes": [root_node, *list((native_index.get("graph") or {}).get("nodes") or [])],
+            "edges": list((native_index.get("graph") or {}).get("edges") or []),
         }
         embedded_names = list(file_inventory.get("embedded_apk_files") or [])
         if not embedded_names:
+            graph["summary"] = self._artifact_graph_summary(graph)
             return graph
 
         artifacts_root = workspace / "artifacts"
@@ -611,6 +665,7 @@ class ApkInspector:
                 origins = child_root.setdefault("embedded_at", [])
                 if archive_path not in origins:
                     origins.append(archive_path)
+        graph["summary"] = self._artifact_graph_summary(graph)
         return graph
 
     @staticmethod
@@ -630,6 +685,9 @@ class ApkInspector:
             node["id"] = mapping[str(source["id"])]
             node["path"] = rebase(str(source.get("path") or source["id"]))
             node["analysis_root"] = rebase(str(source.get("analysis_root") or "."))
+            for key in ("native_index_path", "summary_path"):
+                if isinstance(source.get(key), str):
+                    node[key] = rebase(str(source[key]))
             nodes.append(node)
         edges = [
             {
@@ -640,10 +698,67 @@ class ApkInspector:
             for edge in graph.get("edges", [])
         ]
         return {
-            "schema_version": graph.get("schema_version", "1.0"),
+            "schema_version": graph.get("schema_version", "1.1"),
             "root_id": mapping[str(graph["root_id"])],
             "nodes": nodes,
             "edges": edges,
+            "summary": ApkInspector._artifact_graph_summary(
+                {"nodes": nodes, "edges": edges}
+            ),
+        }
+
+    @staticmethod
+    def _artifact_graph_summary(graph: dict[str, Any]) -> dict[str, Any]:
+        nodes = list(graph.get("nodes") or [])
+        edges = list(graph.get("edges") or [])
+        kinds: dict[str, int] = {}
+        abi_counts: dict[str, int] = {}
+        bridge_ownership: dict[str, int] = {}
+        for node in nodes:
+            kind = str(node.get("kind") or "unknown")
+            kinds[kind] = kinds.get(kind, 0) + 1
+            if kind == "native_library":
+                abi = str(node.get("abi") or "unknown")
+                abi_counts[abi] = abi_counts.get(abi, 0) + 1
+            elif kind == "java_native_bridge":
+                ownership = str(node.get("ownership") or "unknown")
+                bridge_ownership[ownership] = bridge_ownership.get(ownership, 0) + 1
+        relations: dict[str, int] = {}
+        for edge in edges:
+            relation = str(edge.get("relation") or "unknown")
+            relations[relation] = relations.get(relation, 0) + 1
+        linked_methods = {
+            (
+                str(edge.get("from")),
+                str(edge.get("method_name")),
+                str(edge.get("argument_descriptor")),
+            )
+            for edge in edges
+            if edge.get("relation") in {"binds_to_jni", "possible_dynamic_registration"}
+        }
+        java_native_method_count = sum(
+            int(node.get("native_method_count") or 0)
+            for node in nodes
+            if node.get("kind") == "java_native_bridge"
+        )
+        jni_symbol_count = sum(
+            int((node.get("jni") or {}).get("export_count") or 0)
+            for node in nodes
+            if node.get("kind") == "native_library"
+        )
+        return {
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "node_kinds": kinds,
+            "edge_relations": relations,
+            "apk_count": kinds.get("apk", 0),
+            "native_library_count": kinds.get("native_library", 0),
+            "java_native_bridge_count": kinds.get("java_native_bridge", 0),
+            "java_native_method_count": java_native_method_count,
+            "linked_java_native_method_count": len(linked_methods),
+            "jni_symbol_count": jni_symbol_count,
+            "native_libraries_by_abi": abi_counts,
+            "java_bridges_by_ownership": bridge_ownership,
         }
 
     def _run(self, argv: list[str], budget: TimeBudget | None, timeout_cap: int) -> CommandResult:

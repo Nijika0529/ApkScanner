@@ -3034,6 +3034,7 @@ class ScanOrchestrator:
                         "/scan-input/apktool",
                         "/scan-input/archive",
                         "/scan-input/artifacts",
+                        "/scan-input/native",
                     ],
                     "artifact_graph": "/scan-input/artifact_graph.json",
                     "target_apk": "/scan-input/target.apk",
@@ -7975,7 +7976,7 @@ class ScanOrchestrator:
         expose_shared_workspace = self.settings.agent_permission_profile == "personal_lab"
         shared_names = [
             name
-            for name in ("jadx", "apktool", "archive", "artifacts")
+            for name in ("jadx", "apktool", "archive", "native", "artifacts")
             if (scan_workspace / name).is_dir()
         ]
         workspace_policy = {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -101,6 +102,53 @@ def test_validation_fixture_registry_preserves_account_and_canary_context(settin
             headers=headers,
         )
         assert removed.status_code == 204
+
+
+def test_artifact_graph_api_returns_native_relationships(settings) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    workspace = settings.data_dir / "workspaces" / "native-graph-api"
+    workspace.mkdir(parents=True)
+    graph = {
+        "schema_version": "1.1",
+        "root_id": "target.apk",
+        "summary": {"native_library_count": 1},
+        "nodes": [
+            {"id": "target.apk", "path": "target.apk", "kind": "apk"},
+            {
+                "id": "native/lib/arm64-v8a/libdemo.so",
+                "path": "native/lib/arm64-v8a/libdemo.so",
+                "kind": "native_library",
+            },
+        ],
+        "edges": [
+            {
+                "from": "target.apk",
+                "to": "native/lib/arm64-v8a/libdemo.so",
+                "relation": "contains_native_library",
+            }
+        ],
+    }
+    (workspace / "artifact_graph.json").write_text(
+        json.dumps(graph),
+        encoding="utf-8",
+    )
+    with app.state.database.session_factory() as session:
+        scan = Scan(
+            status="static_complete",
+            filename="native.apk",
+            artifact_sha256="e" * 64,
+            artifact_path="native.apk",
+            stats={"workspace": str(workspace)},
+        )
+        session.add(scan)
+        session.commit()
+        scan_id = scan.id
+
+    with TestClient(app) as client:
+        response = client.get(f"/api/v1/scans/{scan_id}/artifact-graph")
+
+    assert response.status_code == 200
+    assert response.json() == graph
 
 
 def test_health_reports_a_leased_adb_pool_as_busy_not_unavailable(

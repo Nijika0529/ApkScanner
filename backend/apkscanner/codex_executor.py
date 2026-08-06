@@ -142,7 +142,7 @@ class CodexDockerExecutor:
                     f"type=bind,source={apk_path},target=/scan-input/target.apk,readonly",
                 ]
             )
-        for name in ("jadx", "apktool", "archive", "artifacts"):
+        for name in ("jadx", "apktool", "archive", "native", "artifacts"):
             source = scan_workspace / name
             if source.is_dir():
                 command.extend(
