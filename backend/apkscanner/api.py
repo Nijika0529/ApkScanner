@@ -83,6 +83,7 @@ from .schemas import (
     ScanAgentControl,
     ScanDeleteResult,
     ScanDetail,
+    ScanExecutionControl,
     ScanRerunResult,
     ScanSummary,
     SecurityHypothesisOut,
@@ -910,6 +911,7 @@ async def create_scan(
                 "enabled": resolved_investigator != "none",
                 "backend": resolved_investigator,
             },
+            "execution_control": {"state": "running"},
             "version_baseline": (
                 {
                     "scan_id": baseline.id,
@@ -981,6 +983,7 @@ async def create_fresh_scan_run(
                 "enabled": investigator != "none",
                 "backend": resolved_backend,
             },
+            "execution_control": {"state": "running"},
             "fresh_run": {
                 "source_scan_id": source.id,
                 "mode": "isolated",
@@ -1713,6 +1716,80 @@ def update_scan_agent_control(
     return scan
 
 
+@router.patch("/scans/{scan_id}/execution-control", response_model=ScanDetail)
+async def update_scan_execution_control(
+    scan_id: str,
+    control: ScanExecutionControl,
+    request: Request,
+    session: Session = Depends(get_session),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> Scan:
+    scan = session.get(Scan, scan_id)
+    if scan is None:
+        raise HTTPException(404, "Scan not found")
+    if scan.status in {ScanStatus.FINAL.value, ScanStatus.FAILED.value}:
+        raise HTTPException(409, "A finished scan cannot be paused, resumed, or stopped")
+
+    current = scan.stats.get("execution_control")
+    current_state = (
+        str(current.get("state") or "running")
+        if isinstance(current, dict)
+        else "running"
+    )
+    next_state = {
+        "pause": "paused",
+        "resume": "running",
+        "stop": "stopping",
+    }[control.action]
+    if current_state == "stopping" and control.action != "stop":
+        raise HTTPException(409, "Scan termination is already in progress")
+
+    changed_at = now()
+    scan.stats = {
+        **dict(scan.stats or {}),
+        "execution_control": {
+            "state": next_state,
+            "action": control.action,
+            "updated_at": changed_at.isoformat(),
+        },
+    }
+    event_type = {
+        "pause": "scan.execution.paused",
+        "resume": "scan.execution.resumed",
+        "stop": "scan.execution.stop_requested",
+    }[control.action]
+    message = {
+        "pause": "扫描任务调度已暂停；正在运行的任务会完成，等待任务不会继续领取",
+        "resume": "扫描任务调度已恢复",
+        "stop": "用户已请求结束扫描；未完成任务正在停止",
+    }[control.action]
+    add_event(
+        session,
+        scan.id,
+        event_type,
+        message,
+        {
+            "source": "platform",
+            "previous_state": current_state,
+            "state": next_state,
+        },
+    )
+    session.commit()
+
+    if control.action == "stop":
+        orchestrator.stop_scan_tasks(scan.id)
+    elif control.action == "resume":
+        background = asyncio.create_task(
+            orchestrator.ensure_scan_running(scan.id),
+            name=f"resume-execution-{scan.id}",
+        )
+        request.app.state.background_tasks.add(background)
+        background.add_done_callback(request.app.state.background_tasks.discard)
+
+    session.expire_all()
+    return require_scan(session, scan.id)
+
+
 @router.patch("/tasks/{task_id}/agent-control", response_model=InvestigationTaskOut)
 def update_task_agent_control(
     task_id: str,
@@ -1914,6 +1991,15 @@ def _resume_scan(session: Session, scan: Scan) -> None:
     scan.status = ScanStatus.INVESTIGATING.value
     scan.error = None
     scan.completed_at = None
+    scan.stats = {
+        **dict(scan.stats or {}),
+        "execution_control": {
+            "state": "running",
+            "action": "resume",
+            "updated_at": now().isoformat(),
+            "source": "manual_rerun",
+        },
+    }
 
 
 @router.post("/tasks/{task_id}/retry", response_model=InvestigationTaskOut, status_code=202)

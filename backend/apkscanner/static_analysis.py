@@ -18,7 +18,18 @@ from .native_analysis import NativeArtifactAnalyzer
 from .permissions import ensure_private_directory
 from .tools import CommandResult, TimeBudget, ToolRunner, discover_tools
 
-CODE_INDEX_CONTEXT_VERSION = "component-one-hop-android-chains-v5-native-artifact-graph"
+CODE_INDEX_CONTEXT_VERSION = "component-one-hop-android-chains-v7-cross-artifact-loaders"
+
+_LOADER_REFERENCE_SUFFIXES = {
+    ".java",
+    ".kt",
+    ".smali",
+    ".xml",
+    ".json",
+    ".js",
+    ".properties",
+    ".txt",
+}
 
 
 class InvalidApkError(ValueError):
@@ -589,6 +600,7 @@ class ApkInspector:
                 "archive_path": None if artifact_origin == "target.apk" else artifact_origin,
             },
             "package_name": manifest.package_name,
+            "application_class": manifest.application.get("name"),
             "version_name": manifest.version_name,
             "version_code": manifest.version_code,
             "analysis_root": ".",
@@ -607,7 +619,7 @@ class ApkInspector:
             },
         }
         graph: dict[str, Any] = {
-            "schema_version": "1.1",
+            "schema_version": "1.2",
             "root_id": root_id,
             "nodes": [root_node, *list((native_index.get("graph") or {}).get("nodes") or [])],
             "edges": list((native_index.get("graph") or {}).get("edges") or []),
@@ -619,7 +631,14 @@ class ApkInspector:
 
         artifacts_root = workspace / "artifacts"
         ensure_private_directory(artifacts_root)
-        analyzed: dict[str, tuple[dict[str, Any], str, str]] = {}
+        host_loader_references = self._embedded_loader_references(
+            workspace,
+            embedded_names,
+        )
+        analyzed: dict[
+            str,
+            tuple[dict[str, Any], str, str, list[str]],
+        ] = {}
         with zipfile.ZipFile(apk_path) as archive:
             for archive_path in embedded_names:
                 raw = archive.read(archive_path)
@@ -642,14 +661,45 @@ class ApkInspector:
                         child_result.artifact_graph,
                         child_prefix,
                     )
+                    child_root_id = str(child_graph["root_id"])
+                    child_root = next(
+                        node
+                        for node in child_graph["nodes"]
+                        if node["id"] == child_root_id
+                    )
+                    plugin_entry_nodes = self._embedded_plugin_entries(
+                        workspace=workspace,
+                        analysis_root=workspace / child_prefix,
+                        graph_analysis_root=str(child_root.get("analysis_root") or child_prefix),
+                        child_root_id=child_root_id,
+                        package_name=str(child_root.get("package_name") or ""),
+                        application_class=(
+                            str(child_root.get("application_class"))
+                            if child_root.get("application_class")
+                            else None
+                        ),
+                    )
+                    for entry_node in plugin_entry_nodes:
+                        child_graph["nodes"].append(entry_node)
+                        child_graph["edges"].append(
+                            {
+                                "from": child_root_id,
+                                "to": entry_node["id"],
+                                "relation": "declares_plugin_entry",
+                                "confidence": entry_node["confidence"],
+                            }
+                        )
                     analyzed[child_sha256] = (
                         child_graph,
                         child_prefix,
-                        str(child_graph["root_id"]),
+                        child_root_id,
+                        [str(node["id"]) for node in plugin_entry_nodes],
                     )
                     graph["nodes"].extend(child_graph["nodes"])
                     graph["edges"].extend(child_graph["edges"])
-                child_graph, _prefix, child_root_id = analyzed[child_sha256]
+                child_graph, _prefix, child_root_id, plugin_entry_ids = analyzed[
+                    child_sha256
+                ]
                 graph["edges"].append(
                     {
                         "from": root_id,
@@ -665,8 +715,288 @@ class ApkInspector:
                 origins = child_root.setdefault("embedded_at", [])
                 if archive_path not in origins:
                     origins.append(archive_path)
+                references = host_loader_references.get(archive_path, [])
+                if references:
+                    loader_id = (
+                        "plugin_loaders/"
+                        + hashlib.sha256(archive_path.encode()).hexdigest()[:16]
+                    )
+                    mechanisms = sorted(
+                        {
+                            mechanism
+                            for reference in references
+                            for mechanism in reference.get("mechanisms", [])
+                        }
+                    )
+                    graph["nodes"].append(
+                        {
+                            "id": loader_id,
+                            "path": references[0]["workspace_path"],
+                            "kind": "plugin_loader_reference",
+                            "name": PurePosixPath(archive_path).name,
+                            "embedded_apk_id": child_root_id,
+                            "archive_path": archive_path,
+                            "mechanisms": mechanisms,
+                            "references": references,
+                        }
+                    )
+                    graph["edges"].extend(
+                        [
+                            {
+                                "from": root_id,
+                                "to": loader_id,
+                                "relation": "declares_plugin_loader",
+                                "archive_path": archive_path,
+                            },
+                            {
+                                "from": loader_id,
+                                "to": child_root_id,
+                                "relation": "loads_embedded_apk",
+                                "archive_path": archive_path,
+                                "confidence": "high",
+                            },
+                        ]
+                    )
+                    graph["edges"].extend(
+                        {
+                            "from": loader_id,
+                            "to": entry_id,
+                            "relation": "may_invoke_plugin_entry",
+                            "archive_path": archive_path,
+                            "confidence": "medium",
+                        }
+                        for entry_id in plugin_entry_ids
+                    )
         graph["summary"] = self._artifact_graph_summary(graph)
         return graph
+
+    @staticmethod
+    def _embedded_loader_references(
+        workspace: Path,
+        archive_paths: list[str],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Index exact host references once, even when a bundle has many plugins."""
+
+        aliases: dict[str, set[str]] = {
+            archive_path: {
+                archive_path,
+                PurePosixPath(archive_path).name,
+            }
+            for archive_path in archive_paths
+        }
+        alias_to_archives: dict[str, set[str]] = {}
+        for archive_path, values in aliases.items():
+            for value in values:
+                alias_to_archives.setdefault(value, set()).add(archive_path)
+        if not alias_to_archives:
+            return {}
+        pattern = re.compile(
+            "|".join(
+                re.escape(value)
+                for value in sorted(alias_to_archives, key=len, reverse=True)
+            )
+        )
+        found: dict[str, list[dict[str, Any]]] = {
+            archive_path: [] for archive_path in archive_paths
+        }
+        seen: dict[str, set[tuple[str, int]]] = {
+            archive_path: set() for archive_path in archive_paths
+        }
+        for root_name in ("jadx", "apktool", "archive"):
+            root = workspace / root_name
+            if not root.is_dir():
+                continue
+            for candidate in sorted(root.rglob("*")):
+                if (
+                    not candidate.is_file()
+                    or candidate.suffix.lower() not in _LOADER_REFERENCE_SUFFIXES
+                ):
+                    continue
+                try:
+                    if candidate.stat().st_size > 4 * 1024 * 1024:
+                        continue
+                    text = candidate.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                matches = list(pattern.finditer(text))
+                if not matches:
+                    continue
+                lines = text.splitlines()
+                mechanisms = [
+                    token
+                    for token, marker in (
+                        ("dex_class_loader", "DexClassLoader"),
+                        ("path_class_loader", "PathClassLoader"),
+                        ("in_memory_dex_loader", "InMemoryDexClassLoader"),
+                        ("class_loader", "ClassLoader"),
+                        ("reflective_entry", "loadClass"),
+                        ("plugin_descriptor", "PluginInfo"),
+                        ("plugin_config", "plugin_config"),
+                    )
+                    if marker in text
+                ]
+                for match in matches:
+                    alias = match.group(0)
+                    line = text.count("\n", 0, match.start()) + 1
+                    for archive_path in alias_to_archives[alias]:
+                        key = (str(candidate), line)
+                        if key in seen[archive_path] or len(found[archive_path]) >= 12:
+                            continue
+                        seen[archive_path].add(key)
+                        found[archive_path].append(
+                            {
+                                "root": root_name,
+                                "path": str(candidate.relative_to(root)),
+                                "workspace_path": str(candidate.relative_to(workspace)),
+                                "line": line,
+                                "matched_value": alias,
+                                "mechanisms": mechanisms or ["asset_reference"],
+                                "excerpt": lines[line - 1].strip()[:500],
+                            }
+                        )
+        return {key: value for key, value in found.items() if value}
+
+    @staticmethod
+    def _embedded_plugin_entries(
+        *,
+        workspace: Path,
+        analysis_root: Path,
+        graph_analysis_root: str,
+        child_root_id: str,
+        package_name: str,
+        application_class: str | None,
+    ) -> list[dict[str, Any]]:
+        candidates: dict[str, dict[str, Any]] = {}
+        roots = [analysis_root / "jadx", analysis_root / "apktool"]
+        for root in roots:
+            if not root.is_dir():
+                continue
+            suffix = ".java" if root.name == "jadx" else ".smali"
+            for source in sorted(root.rglob(f"*{suffix}")):
+                try:
+                    text = source.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if suffix == ".java":
+                    package_match = re.search(
+                        r"\bpackage\s+([A-Za-z_$][\w.$]*)\s*;",
+                        text,
+                    )
+                    declared_package = package_match.group(1) if package_match else ""
+                    class_match = re.search(
+                        r"\b(?:class|interface|enum)\s+([A-Za-z_$][\w$]*)",
+                        text,
+                    )
+                    if class_match is None:
+                        continue
+                    class_name = (
+                        f"{declared_package}.{class_match.group(1)}"
+                        if declared_package
+                        else class_match.group(1)
+                    )
+                    line = text.count("\n", 0, class_match.start()) + 1
+                    abstract_declaration = bool(
+                        re.search(
+                            r"\b(?:abstract\s+class|interface)\s+"
+                            + re.escape(class_match.group(1))
+                            + r"\b",
+                            text,
+                        )
+                    )
+                else:
+                    class_match = re.search(
+                        r"(?m)^\.class[^\n]*\sL([^;]+);",
+                        text,
+                    )
+                    if class_match is None:
+                        continue
+                    class_name = class_match.group(1).replace("/", ".")
+                    line = text.count("\n", 0, class_match.start()) + 1
+                    abstract_declaration = bool(
+                        re.search(
+                            r"(?m)^\.class[^\n]*\b(?:abstract|interface)\b",
+                            text,
+                        )
+                    )
+                lowered = class_name.lower()
+                score = 0
+                reasons: list[str] = []
+                if package_name and class_name.startswith(f"{package_name}."):
+                    score += 10
+                    reasons.append("manifest_package_owned")
+                if application_class and class_name == application_class:
+                    score += 120
+                    reasons.append("manifest_application")
+                elif abstract_declaration:
+                    continue
+                if any(
+                    token in lowered
+                    for token in ("pluginentrance", "pluginentry", "plugin_entry")
+                ):
+                    score += 100
+                    reasons.append("entry_class_name")
+                elif "plugin" in lowered and any(
+                    token in lowered for token in ("entry", "entrance", "bootstrap")
+                ):
+                    score += 70
+                    reasons.append("plugin_entry_name")
+                if re.search(
+                    r"(?:implements|extends|\.implements|\.super)[^\n]{0,200}Plugin",
+                    text,
+                    re.IGNORECASE,
+                ):
+                    score += 45
+                    reasons.append("plugin_contract")
+                if any(
+                    marker in text
+                    for marker in ("IPluginInvoke", "IHostInvoke", "AbsInstantRecPlugin")
+                ):
+                    score += 30
+                    reasons.append("host_plugin_interface")
+                if score < 70:
+                    continue
+                if suffix == ".smali":
+                    score += 5
+                    reasons.append("dex_descriptor")
+                canonical_name = re.sub(
+                    r"\.p\d{3}(?=[a-z])",
+                    ".",
+                    class_name,
+                )
+                existing = candidates.get(canonical_name)
+                if existing is not None and int(existing["score"]) >= score:
+                    continue
+                candidates[canonical_name] = {
+                    "class_name": class_name,
+                    "source_path": str(source.relative_to(workspace)),
+                    "line": line,
+                    "score": score,
+                    "reasons": reasons,
+                }
+        result: list[dict[str, Any]] = []
+        for candidate in sorted(
+            candidates.values(),
+            key=lambda item: (-int(item["score"]), str(item["class_name"])),
+        )[:8]:
+            class_name = str(candidate["class_name"])
+            result.append(
+                {
+                    "id": (
+                        f"{child_root_id}/plugin_entries/"
+                        + hashlib.sha256(class_name.encode()).hexdigest()[:16]
+                    ),
+                    "path": candidate["source_path"],
+                    "analysis_root": graph_analysis_root,
+                    "kind": "embedded_plugin_entry",
+                    "name": class_name,
+                    "class_name": class_name,
+                    "source_path": candidate["source_path"],
+                    "line": candidate["line"],
+                    "confidence": "high" if int(candidate["score"]) >= 100 else "medium",
+                    "evidence": candidate["reasons"],
+                }
+            )
+        return result
 
     @staticmethod
     def _rebase_artifact_graph(graph: dict[str, Any], prefix: str) -> dict[str, Any]:
@@ -759,6 +1089,8 @@ class ApkInspector:
             "jni_symbol_count": jni_symbol_count,
             "native_libraries_by_abi": abi_counts,
             "java_bridges_by_ownership": bridge_ownership,
+            "plugin_loader_count": kinds.get("plugin_loader_reference", 0),
+            "embedded_plugin_entry_count": kinds.get("embedded_plugin_entry", 0),
         }
 
     def _run(self, argv: list[str], budget: TimeBudget | None, timeout_cap: int) -> CommandResult:

@@ -1518,6 +1518,94 @@ def test_scan_and_task_agent_controls_are_persisted(settings) -> None:  # noqa: 
             )
 
 
+def test_scan_execution_control_pauses_resumes_and_stops_all_tasks(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    resumed: list[str] = []
+
+    async def ensure_scan_running(scan_id: str) -> None:
+        resumed.append(scan_id)
+
+    monkeypatch.setattr(app.state.orchestrator, "ensure_scan_running", ensure_scan_running)
+    with TestClient(app) as client:
+        with app.state.database.session_factory() as session:
+            scan = Scan(
+                status="preliminary_ready",
+                filename="execution-control.apk",
+                artifact_sha256="8" * 64,
+                artifact_path=str(settings.data_dir / "missing.apk"),
+            )
+            session.add(scan)
+            session.flush()
+            session.add_all(
+                [
+                    InvestigationTask(
+                        scan_id=scan.id,
+                        task_type="component",
+                        status="queued",
+                    ),
+                    InvestigationTask(
+                        scan_id=scan.id,
+                        task_type="component",
+                        status="running",
+                    ),
+                ]
+            )
+            session.commit()
+            scan_id = scan.id
+
+        paused = client.patch(
+            f"/api/v1/scans/{scan_id}/execution-control",
+            headers={"X-APKScanner-Request": "console"},
+            json={"action": "pause"},
+        )
+        assert paused.status_code == 200
+        assert paused.json()["stats"]["execution_control"]["state"] == "paused"
+
+        resumed_response = client.patch(
+            f"/api/v1/scans/{scan_id}/execution-control",
+            headers={"X-APKScanner-Request": "console"},
+            json={"action": "resume"},
+        )
+        assert resumed_response.status_code == 200
+        assert resumed_response.json()["stats"]["execution_control"]["state"] == "running"
+
+        stopped = client.patch(
+            f"/api/v1/scans/{scan_id}/execution-control",
+            headers={"X-APKScanner-Request": "console"},
+            json={"action": "stop"},
+        )
+        assert stopped.status_code == 200
+        assert stopped.json()["stats"]["execution_control"]["state"] == "stopping"
+
+        with app.state.database.session_factory() as session:
+            statuses = list(
+                session.scalars(
+                    select(InvestigationTask.status).where(
+                        InvestigationTask.scan_id == scan_id
+                    )
+                )
+            )
+            event_types = set(
+                session.scalars(
+                    select(api_module.ScanEvent.event_type).where(
+                        api_module.ScanEvent.scan_id == scan_id
+                    )
+                )
+            )
+        assert statuses == ["canceled", "canceled"]
+        assert {
+            "scan.execution.paused",
+            "scan.execution.resumed",
+            "scan.execution.stop_requested",
+            "scan.execution.tasks_stopping",
+        } <= event_types
+
+    assert resumed == [scan_id]
+
+
 def test_batch_rerun_only_queues_incomplete_tasks(
     settings,
     monkeypatch,

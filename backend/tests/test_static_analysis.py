@@ -15,6 +15,7 @@ from apkscanner.static_analysis import (
     InvalidApkError,
     StaticAnalysisResult,
 )
+from apkscanner.target_profiles import target_review_surfaces
 from apkscanner.tools import CommandResult, ToolRunner
 
 from .conftest import MANIFEST
@@ -133,7 +134,19 @@ def test_product_bundle_recursively_analyzes_embedded_apks_and_web_assets(
             )
             source.parent.mkdir(parents=True, exist_ok=True)
             source.write_text(
-                f"package {package_name}; public final class PluginEntry {{}}",
+                (
+                    f"package {package_name}; public final class PluginEntry {{ "
+                    + (
+                        'String a = "assets/actor/child.apk"; '
+                        'String b = "assets/plugin/child-copy.apk"; '
+                        "ClassLoader loader;"
+                        if package_name == "com.example.host"
+                        else 'String nested = "assets/plugin/grandchild.apk"; ClassLoader loader;'
+                        if package_name == "com.example.child"
+                        else ""
+                    )
+                    + " }"
+                ),
                 encoding="utf-8",
             )
             return CommandResult(argv=argv, exit_code=0, stdout="", stderr="")
@@ -141,14 +154,18 @@ def test_product_bundle_recursively_analyzes_embedded_apks_and_web_assets(
     inspector = ApkInspector(settings, runner=ProductBundleRunner())
     result = inspector.inspect(root_apk, "product-bundle-source")
 
-    packages = {node.get("package_name") for node in result.artifact_graph["nodes"]}
+    packages = {
+        node.get("package_name")
+        for node in result.artifact_graph["nodes"]
+        if node.get("kind") == "apk"
+    }
     assert packages == {
         "com.example.host",
         "com.example.child",
         "com.example.grandchild",
     }
     assert result.file_inventory["product_bundle"] == {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "artifact_count": 3,
         "embedded_apk_count": 2,
         "javascript_file_count": 3,
@@ -159,7 +176,9 @@ def test_product_bundle_recursively_analyzes_embedded_apks_and_web_assets(
         "artifact_graph_path": "artifact_graph.json",
     }
     assert {
-        edge["archive_path"] for edge in result.artifact_graph["edges"]
+        edge["archive_path"]
+        for edge in result.artifact_graph["edges"]
+        if edge.get("relation") == "contains"
     } == {
         "assets/actor/child.apk",
         "assets/plugin/child-copy.apk",
@@ -170,6 +189,15 @@ def test_product_bundle_recursively_analyzes_embedded_apks_and_web_assets(
         for node in result.artifact_graph["nodes"]
         if node.get("package_name") == "com.example.child"
     ) == 1
+    summary = result.artifact_graph["summary"]
+    assert summary["plugin_loader_count"] == 3
+    assert summary["embedded_plugin_entry_count"] == 2
+    assert {
+        "declares_plugin_loader",
+        "loads_embedded_apk",
+        "declares_plugin_entry",
+        "may_invoke_plugin_entry",
+    } <= {edge["relation"] for edge in result.artifact_graph["edges"]}
     assert any(
         (root / "assets/main.js").is_file()
         or (root / "assets/child.js").is_file()
@@ -189,7 +217,8 @@ def test_product_bundle_recursively_analyzes_embedded_apks_and_web_assets(
     cached = inspector.inspect(root_apk, "product-bundle-cache-target")
     assert cached.file_inventory["static_cache_hit"] is True
     assert cached.file_inventory["product_bundle"] == result.file_inventory["product_bundle"]
-    assert len(cached.artifact_graph["nodes"]) == 3
+    assert cached.artifact_graph["summary"]["apk_count"] == 3
+    assert cached.artifact_graph["summary"]["plugin_loader_count"] == 3
     assert any("/artifacts/" in f"/{root}" for root in cached.searchable_roots)
 
 
@@ -303,6 +332,86 @@ def test_native_artifact_graph_links_java_jni_and_shared_library(
     assert cached.file_inventory["static_cache_hit"] is True
     assert cached.artifact_graph["summary"] == result.artifact_graph["summary"]
     assert (cached.workspace / "native/index.json").is_file()
+
+
+def test_copilot_profile_routes_runtime_plugin_and_native_subchains(
+    tmp_path,
+) -> None:
+    manifest = parse_manifest(
+        """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+        package="com.vivo.ai.copilot"><application /></manifest>"""
+    )
+    root = tmp_path / "jadx"
+    proxy = root / "sources/com/bytedance/openliveplugin/stub/activity/AuthProxy.java"
+    proxy.parent.mkdir(parents=True, exist_ok=True)
+    proxy.write_text(
+        'class AuthProxy { void open() { getPluginClassloader("com.byted.live.lite"); } }',
+        encoding="utf-8",
+    )
+    bridge = root / "sources/com/vivo/ai/copilot/security/WhiteBox.java"
+    bridge.parent.mkdir(parents=True, exist_ok=True)
+    bridge.write_text(
+        'class WhiteBox { static { System.loadLibrary("aes_wb"); } native String decrypt(); }',
+        encoding="utf-8",
+    )
+    native_id = "native/lib/arm64-v8a/libaes_wb.so"
+    bridge_id = "java/com.vivo.ai.copilot.security.WhiteBox"
+    result = StaticAnalysisResult(
+        manifest=manifest,
+        workspace=tmp_path,
+        tool_versions={},
+        tool_results={},
+        signing={},
+        file_inventory={},
+        searchable_roots=[root],
+        decompilation={"status": "complete"},
+        artifact_graph={
+            "nodes": [
+                {
+                    "id": native_id,
+                    "path": "native/lib/arm64-v8a/libaes_wb.so",
+                    "kind": "native_library",
+                    "name": "libaes_wb.so",
+                    "abi": "arm64-v8a",
+                    "sha256": "a" * 64,
+                    "summary_path": "native/summaries/a.json",
+                    "jni": {"dynamic_registration": True},
+                    "symbols": {"security_relevant": ["JNI_OnLoad"]},
+                },
+                {
+                    "id": bridge_id,
+                    "path": "jadx/sources/com/vivo/ai/copilot/security/WhiteBox.java",
+                    "kind": "java_native_bridge",
+                    "class_name": "com.vivo.ai.copilot.security.WhiteBox",
+                },
+            ],
+            "edges": [
+                {
+                    "from": bridge_id,
+                    "to": native_id,
+                    "relation": "loads_native_library",
+                }
+            ],
+        },
+    )
+
+    surfaces = target_review_surfaces(result)
+
+    assert {surface.family for surface in surfaces} == {
+        "copilot_zeus_runtime_plugin",
+        "copilot_native_credential_boundary",
+    }
+    assert all(surface.investigation_group for surface in surfaces)
+    native = next(
+        surface
+        for surface in surfaces
+        if surface.family == "copilot_native_credential_boundary"
+    )
+    assert native.artifact is not None
+    assert native.artifact["java_bridge_classes"] == [
+        "com.vivo.ai.copilot.security.WhiteBox"
+    ]
+    assert native.locations[0]["path"].endswith("WhiteBox.java")
 
 
 def test_inspector_keeps_smali_and_uses_aapt2_manifest_when_oem_resources_fail(

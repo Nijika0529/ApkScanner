@@ -84,6 +84,11 @@ from .schemas import (
 from .security_design import build_android_threat_model, finding_identity
 from .security_pipeline import HypothesisLedger
 from .static_analysis import CODE_INDEX_CONTEXT_VERSION, ApkInspector
+from .target_profiles import (
+    active_profile_id,
+    investigation_group,
+    target_review_surfaces,
+)
 from .tools import CommandResult, TimeBudget, ToolRunner
 from .versioning import SecurityEvolutionService
 
@@ -1314,6 +1319,13 @@ class ScanOrchestrator:
                 self._running.discard(scan_id)
                 self._resubmit_requested.discard(scan_id)
 
+    async def ensure_scan_running(self, scan_id: str) -> None:
+        """Resume a persisted scan without requesting a duplicate pass."""
+        async with self._running_lock:
+            if scan_id in self._running:
+                return
+        await self.submit(scan_id)
+
     def shutdown(self) -> None:
         """Cancel active orchestration and terminate owned subprocess groups."""
         self._shutting_down.set()
@@ -1515,8 +1527,14 @@ class ScanOrchestrator:
         self._ensure_scan_container_record(scan_id)
         try:
             self._run_static(scan_id)
-            self._run_tasks(scan_id)
-            self._run_adaptive_verifier(scan_id)
+            task_outcome = self._run_tasks(scan_id)
+            if task_outcome == "shutdown":
+                return
+            execution_state = self._wait_for_scan_execution(scan_id)
+            if execution_state == "shutdown":
+                return
+            if execution_state not in {"stopping", "stopped"}:
+                self._run_adaptive_verifier(scan_id)
             self._finish(scan_id)
         except Exception as exc:
             with self.database.session_factory() as session:
@@ -1605,6 +1623,16 @@ class ScanOrchestrator:
             static_review_surfaces.extend(
                 self.rules.embedded_artifact_review_surfaces(result)
             )
+            static_review_surfaces.extend(target_review_surfaces(result))
+            for surface in static_review_surfaces:
+                if surface.investigation_group is None:
+                    surface.investigation_group = investigation_group(
+                        package_name=result.manifest.package_name,
+                        name=surface.name,
+                        owner_component=surface.name,
+                        static_family=surface.family,
+                        artifact=surface.artifact,
+                    )
             for surface in static_review_surfaces:
                 self.inspector.add_static_surface_to_code_index(
                     result,
@@ -1664,6 +1692,9 @@ class ScanOrchestrator:
                     ),
                 },
                 "preliminary_deadline": preliminary_deadline.isoformat(),
+                "target_audit_profile": active_profile_id(
+                    result.manifest.package_name
+                ),
                 "decompilation": {
                     key: value
                     for key, value in result.decompilation.items()
@@ -1681,6 +1712,11 @@ class ScanOrchestrator:
                     for anchor in code_context.get("anchors", [])
                     if isinstance(anchor, dict)
                 ]
+                profile_group = investigation_group(
+                    package_name=result.manifest.package_name,
+                    name=parsed.name,
+                    owner_component=parsed.owner_component,
+                )
                 entry = EntryPoint(
                     scan_id=scan.id,
                     kind=parsed.kind,
@@ -1695,6 +1731,11 @@ class ScanOrchestrator:
                     code_anchors=public_anchors,
                     metadata_json={
                         **parsed.metadata,
+                        **(
+                            {"investigation_group": profile_group}
+                            if profile_group is not None
+                            else {}
+                        ),
                         "decompilation": {
                             "status": code_context.get("status", "source_not_found"),
                             "target_in_jadx_failure_list": bool(
@@ -1743,6 +1784,11 @@ class ScanOrchestrator:
                         "static_review_locations": surface.locations,
                         "static_review_attack_chains": surface.attack_chains,
                         "static_review_artifact": surface.artifact,
+                        **(
+                            {"investigation_group": surface.investigation_group}
+                            if surface.investigation_group is not None
+                            else {}
+                        ),
                         "decompilation": {
                             "status": code_context.get(
                                 "status",
@@ -1866,6 +1912,7 @@ class ScanOrchestrator:
             investigation_plan = planner.plan_with_decisions(scan.id, entries)
             tasks = investigation_plan.tasks
             static_closures = investigation_plan.static_closures
+            coalescing_decisions = investigation_plan.coalescing_decisions
             closures_by_entry = {closure.entry_point_id: closure for closure in static_closures}
             for entry_id, closure in closures_by_entry.items():
                 coverage_item = entry_coverage[entry_id]
@@ -1959,6 +2006,23 @@ class ScanOrchestrator:
                         "truncated": len(static_closures) > 200,
                     },
                 )
+            if coalescing_decisions:
+                avoided_task_count = sum(
+                    int(item.get("avoided_task_count") or 0)
+                    for item in coalescing_decisions
+                )
+                add_event(
+                    session,
+                    scan.id,
+                    "planning.tasks.coalesced",
+                    f"同一攻击链的入口变体已归并，避免 {avoided_task_count} 个重复调查任务",
+                    {
+                        "profile": active_profile_id(result.manifest.package_name),
+                        "group_count": len(coalescing_decisions),
+                        "avoided_task_count": avoided_task_count,
+                        "decisions": coalescing_decisions,
+                    },
+                )
             scan.status = ScanStatus.PRELIMINARY_READY.value
             scan.preliminary_at = now()
             dispatched_entry_ids = {
@@ -1968,6 +2032,16 @@ class ScanOrchestrator:
                 **scan.stats,
                 "entry_point_count": len(entries),
                 "task_count": len(tasks),
+                "planning_raw_task_count": len(tasks)
+                + sum(
+                    int(item.get("avoided_task_count") or 0)
+                    for item in coalescing_decisions
+                ),
+                "coalesced_task_count": sum(
+                    int(item.get("avoided_task_count") or 0)
+                    for item in coalescing_decisions
+                ),
+                "coalescing_group_count": len(coalescing_decisions),
                 "static_closed_entry_count": len(static_closures),
                 "agent_dispatched_entry_count": len(dispatched_entry_ids),
                 "security_snapshot_hash": security_snapshot.snapshot_hash,
@@ -2007,7 +2081,7 @@ class ScanOrchestrator:
             )
             session.commit()
 
-    def _run_tasks(self, scan_id: str) -> None:
+    def _run_tasks(self, scan_id: str) -> str:
         adb_concurrency = self.device_pool.capacity
         initial_concurrency = self._current_investigation_concurrency()
         with self.database.session_factory() as session:
@@ -2065,24 +2139,38 @@ class ScanOrchestrator:
             thread_name_prefix="investigation",
         ) as executor:
             while True:
-                desired_concurrency = self._current_investigation_concurrency()
-                while len(futures) < desired_concurrency:
-                    if not self._has_queued_tasks(scan_id):
-                        break
-                    claimed = self._claim_next_task(scan_id)
-                    if claimed is None:
-                        break
-                    task_id, timeout_seconds = claimed
-                    futures.add(
-                        executor.submit(
-                            self._run_claimed_task,
-                            scan_id,
-                            task_id,
-                            timeout_seconds,
+                if self._shutting_down.is_set():
+                    return "shutdown"
+                execution_state = self._scan_execution_state(scan_id)
+                if execution_state in {"stopping", "stopped"}:
+                    self.stop_scan_tasks(scan_id)
+                elif execution_state == "running":
+                    desired_concurrency = self._current_investigation_concurrency()
+                    while len(futures) < desired_concurrency:
+                        if not self._has_queued_tasks(scan_id):
+                            break
+                        claimed = self._claim_next_task(scan_id)
+                        if claimed is None:
+                            break
+                        task_id, timeout_seconds = claimed
+                        futures.add(
+                            executor.submit(
+                                self._run_claimed_task,
+                                scan_id,
+                                task_id,
+                                timeout_seconds,
+                            )
                         )
-                    )
                 if not futures:
-                    return
+                    if execution_state in {"stopping", "stopped"}:
+                        return execution_state
+                    if not self._has_queued_tasks(scan_id):
+                        return "completed"
+                    # A paused scan intentionally keeps its queued rows untouched.
+                    # Polling lets pause/resume survive service restarts without an
+                    # in-memory-only control object.
+                    self._shutting_down.wait(0.5)
+                    continue
                 completed, futures = wait(
                     futures,
                     timeout=0.5,
@@ -2090,6 +2178,28 @@ class ScanOrchestrator:
                 )
                 for future in completed:
                     future.result()
+
+    @staticmethod
+    def _execution_state_from_stats(stats: dict[str, Any] | None) -> str:
+        control = (stats or {}).get("execution_control")
+        state = str(control.get("state") or "running") if isinstance(control, dict) else "running"
+        return state if state in {"running", "paused", "stopping", "stopped"} else "running"
+
+    def _scan_execution_state(self, scan_id: str) -> str:
+        with self.database.session_factory() as session:
+            scan = session.get(Scan, scan_id)
+            if scan is None:
+                return "stopping"
+            return self._execution_state_from_stats(dict(scan.stats or {}))
+
+    def _wait_for_scan_execution(self, scan_id: str) -> str:
+        while True:
+            if self._shutting_down.is_set():
+                return "shutdown"
+            state = self._scan_execution_state(scan_id)
+            if state != "paused":
+                return state
+            self._shutting_down.wait(0.5)
 
     def _run_adaptive_verifier(self, scan_id: str) -> None:
         """Batch the strongest unresolved findings into one terminal Codex thread."""
@@ -2099,11 +2209,19 @@ class ScanOrchestrator:
         # exact semantic duplicates in the final report.
         with self.database.session_factory() as session:
             self._consolidate_findings(session, scan_id=scan_id)
+            scan = session.get(Scan, scan_id)
+            control = (scan.stats or {}).get("agent_control") if scan is not None else None
+            agent_enabled = (
+                bool(control.get("enabled", True))
+                if isinstance(control, dict)
+                else True
+            )
             session.commit()
         if (
             not self.settings.adaptive_verifier_enabled
             or not self.settings.codex_enabled
             or self.settings.codex_isolation != "docker"
+            or not agent_enabled
         ):
             return
         severity_rank = {
@@ -4016,6 +4134,8 @@ class ScanOrchestrator:
         with self.database.session_factory() as session:
             scan = session.get(Scan, scan_id)
             assert scan is not None
+            if self._execution_state_from_stats(dict(scan.stats or {})) != "running":
+                return None
             task = session.scalar(
                 select(InvestigationTask)
                 .where(
@@ -4128,6 +4248,89 @@ class ScanOrchestrator:
             event.set()
             self.device_pool.wake_waiters()
             return True
+
+    def stop_scan_tasks(self, scan_id: str) -> dict[str, int]:
+        """Stop every unfinished task while preserving completed evidence."""
+        requested_at = now()
+        requested: list[tuple[str, str]] = []
+        active_statuses = {
+            TaskStatus.QUEUED.value,
+            TaskStatus.AWAITING_DEVICE.value,
+            TaskStatus.RUNNING.value,
+        }
+        with self.database.session_factory() as session:
+            tasks = list(
+                session.scalars(
+                    select(InvestigationTask).where(
+                        InvestigationTask.scan_id == scan_id,
+                        InvestigationTask.status.in_(active_statuses),
+                    )
+                )
+            )
+            for task in tasks:
+                previous_status = task.status
+                result = {
+                    **dict(task.result or {}),
+                    "cancellation": {
+                        **dict((task.result or {}).get("cancellation") or {}),
+                        "requested": True,
+                        "acknowledged": False,
+                        "requested_at": requested_at.isoformat(),
+                        "scope": "scan",
+                    },
+                }
+                transition = session.execute(
+                    update(InvestigationTask)
+                    .where(
+                        InvestigationTask.id == task.id,
+                        InvestigationTask.status == previous_status,
+                    )
+                    .values(
+                        status=TaskStatus.CANCEL_REQUESTED.value,
+                        error=(
+                            "扫描已结束，正在退出云真机队列"
+                            if previous_status == TaskStatus.AWAITING_DEVICE.value
+                            else "扫描已结束，正在停止当前分析"
+                            if previous_status == TaskStatus.RUNNING.value
+                            else "扫描已结束，等待任务已取消"
+                        ),
+                        result=result,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                if transition.rowcount:
+                    requested.append((task.id, previous_status))
+            if requested:
+                add_event(
+                    session,
+                    scan_id,
+                    "scan.execution.tasks_stopping",
+                    f"正在停止 {len(requested)} 个未完成任务",
+                    {
+                        "source": "platform",
+                        "task_ids": [task_id for task_id, _status in requested],
+                        "status_counts": dict(Counter(status for _task_id, status in requested)),
+                    },
+                )
+            session.commit()
+
+        signalled = 0
+        acknowledged = 0
+        for task_id, _previous_status in requested:
+            if self.request_task_cancellation(task_id):
+                signalled += 1
+                continue
+            # The dispatcher may have claimed the row immediately before the stop
+            # request but not registered its runtime yet. Marking it cancelled now
+            # prevents that late worker from starting any work.
+            self._mark_task_canceled(scan_id, task_id)
+            acknowledged += 1
+        self.device_pool.wake_waiters()
+        return {
+            "requested": len(requested),
+            "signalled": signalled,
+            "acknowledged": acknowledged,
+        }
 
     def _device_queue_priority(self, scan_id: str, task_id: str) -> int | None:
         with self.database.session_factory() as session:
@@ -9348,6 +9551,14 @@ class ScanOrchestrator:
             signal_count = len(signals)
             # Re-analysis emits a fresh receipt; older seals remain as audit history.
             seal = self._create_scan_seal(session, scan, finding_records)
+            execution_control = dict((scan.stats or {}).get("execution_control") or {})
+            stopped_by_user = execution_control.get("state") == "stopping"
+            if stopped_by_user:
+                execution_control = {
+                    **execution_control,
+                    "state": "stopped",
+                    "completed_at": now().isoformat(),
+                }
             scan.status = ScanStatus.FINAL.value
             scan.completed_at = datetime.now(UTC)
             scan.stats = {
@@ -9355,6 +9566,11 @@ class ScanOrchestrator:
                 "task_status_counts": dict(counts),
                 "finding_count": finding_count,
                 "signal_count": signal_count,
+                **(
+                    {"execution_control": execution_control}
+                    if execution_control
+                    else {}
+                ),
                 "seal": {
                     "schema_version": "1.0",
                     "evidence_id": seal.id,
@@ -9372,6 +9588,7 @@ class ScanOrchestrator:
                     "signals": signal_count,
                     "seal_evidence_id": seal.id,
                     "seal_sha256": seal.sha256,
+                    "stopped_by_user": stopped_by_user,
                 },
             )
             session.commit()

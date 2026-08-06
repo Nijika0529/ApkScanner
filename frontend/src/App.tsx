@@ -17,9 +17,12 @@ import {
   LoaderCircle,
   Menu,
   Network,
+  Pause,
+  Play,
   Plus,
   Power,
   RefreshCw,
+  Route,
   ScanSearch,
   ScrollText,
   ServerCog,
@@ -54,6 +57,10 @@ const DETAIL_REFRESH_EVENTS = [
   "scan.deadline_exhausted",
   "scan.final",
   "scan.failed",
+  "scan.execution.paused",
+  "scan.execution.resumed",
+  "scan.execution.stop_requested",
+  "scan.execution.tasks_stopping",
   "investigation.pool.started",
   "task.worker_requeued",
   "task.device_requeued",
@@ -567,6 +574,8 @@ function ArtifactGraphView({ graph }: { graph: ArtifactGraph }) {
   const apkNodes = graph.nodes.filter((node) => node.kind === "apk")
   const nativeNodes = graph.nodes.filter((node) => node.kind === "native_library")
   const bridgeNodes = graph.nodes.filter((node) => node.kind === "java_native_bridge")
+  const pluginLoaderNodes = graph.nodes.filter((node) => node.kind === "plugin_loader_reference")
+  const pluginEntryNodes = graph.nodes.filter((node) => node.kind === "embedded_plugin_entry")
   const summary = graph.summary ?? {}
   const abiCounts = asRecord(summary.native_libraries_by_abi) ?? {}
   const bridgeOwnership = asRecord(summary.java_bridges_by_ownership) ?? {}
@@ -583,8 +592,10 @@ function ArtifactGraphView({ graph }: { graph: ArtifactGraph }) {
     <div className="rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-sm leading-6 text-cyan-950">
       这里展示的是可追踪的产品资产关系，不是简单文件数量：主 APK、内嵌 APK、Java Native 声明、JNI 导出符号和具体 ABI 的 SO 都使用稳定节点连接。Agent 可沿同一组节点 ID 和路径继续读取反编译代码或执行 readelf、nm、strings。
     </div>
-    <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+    <div className="grid grid-cols-2 gap-3 lg:grid-cols-7">
       <Metric label="APK / 插件" value={numberValue(summary.apk_count) ?? apkNodes.length} icon={FileArchive} tone="cyan" />
+      <Metric label="插件加载器" value={numberValue(summary.plugin_loader_count) ?? pluginLoaderNodes.length} icon={Route} tone="cyan" />
+      <Metric label="插件入口" value={numberValue(summary.embedded_plugin_entry_count) ?? pluginEntryNodes.length} icon={Network} tone="emerald" />
       <Metric label="Native SO" value={numberValue(summary.native_library_count) ?? nativeNodes.length} icon={Box} tone="violet" />
       <Metric label="Java Native 方法" value={numberValue(summary.java_native_method_count) ?? 0} icon={Code2} tone="cyan" />
       <Metric label="已链接方法" value={numberValue(summary.linked_java_native_method_count) ?? bindings.length} icon={Link2} tone="emerald" />
@@ -611,6 +622,17 @@ function ArtifactGraphView({ graph }: { graph: ArtifactGraph }) {
         <div className="mt-3 flex flex-wrap gap-2">{Object.entries(bridgeOwnership).map(([scope, count]) => <Badge key={scope} tone={scope === "application" ? "good" : scope === "vendor" ? "info" : "neutral"}>{scope} · {String(count)}</Badge>)}</div>
       </section>
     </div>
+    {pluginLoaderNodes.length > 0 && <section className="rounded-xl border border-cyan-200 bg-cyan-50/40 p-4">
+      <SectionTitle icon={Route} title="宿主 → 内嵌 APK → 插件入口" description="从包含关系提升为可追踪的实际加载链" />
+      <div className="mt-4 space-y-3">{pluginLoaderNodes.map((loader) => {
+        const loadedApkIds = graph.edges.filter((edge) => edge.from === loader.id && edge.relation === "loads_embedded_apk").map((edge) => edge.to)
+        const invokedEntryIds = graph.edges.filter((edge) => edge.from === loader.id && edge.relation === "may_invoke_plugin_entry").map((edge) => edge.to)
+        const loadedApks = loadedApkIds.map((id) => nodesById.get(id)).filter(Boolean)
+        const invokedEntries = invokedEntryIds.map((id) => nodesById.get(id)).filter(Boolean)
+        const mechanisms = Array.isArray(loader.mechanisms) ? loader.mechanisms : []
+        return <div key={loader.id} className="rounded-lg border border-cyan-200 bg-white p-3"><div className="grid gap-3 text-xs lg:grid-cols-[1fr_auto_1fr_auto_1fr] lg:items-center"><div className="min-w-0"><p className="font-semibold text-slate-800">宿主加载证据</p><p className="mt-1 truncate font-mono text-slate-600" title={loader.path}>{loader.path}</p><div className="mt-2 flex flex-wrap gap-1">{mechanisms.map((value) => <Badge key={String(value)}>{String(value)}</Badge>)}</div></div><ChevronRight className="hidden h-4 w-4 text-cyan-500 lg:block" /><div className="min-w-0"><p className="font-semibold text-slate-800">{loadedApks.map((node) => textValue(node?.package_name) ?? node?.id).join(", ") || "内嵌 APK"}</p><p className="mt-1 truncate font-mono text-slate-600">{textValue(loader.archive_path) ?? textValue(loader.name)}</p></div><ChevronRight className="hidden h-4 w-4 text-cyan-500 lg:block" /><div className="min-w-0"><p className="font-semibold text-slate-800">入口候选</p>{invokedEntries.length ? invokedEntries.map((node) => <p key={node?.id} className="mt-1 truncate font-mono text-slate-600" title={textValue(node?.class_name)}>{textValue(node?.class_name) ?? node?.id}</p>) : <p className="mt-1 text-slate-500">尚未解析入口类</p>}</div></div></div>
+      })}</div>
+    </section>}
     <section>
       <SectionTitle icon={Box} title="Native 库总览" description="标准化 ELF、动态符号、JNI 与基础加固摘要" />
       <div className="mt-4 overflow-x-auto rounded-xl border border-slate-200"><table className="w-full min-w-[980px] text-left text-sm"><thead className="bg-slate-50 text-xs text-slate-500"><tr><th className="px-4 py-3 font-medium">SO / ABI</th><th className="px-4 py-3 font-medium">ELF</th><th className="px-4 py-3 font-medium">依赖</th><th className="px-4 py-3 font-medium">符号</th><th className="px-4 py-3 font-medium">JNI</th><th className="px-4 py-3 font-medium">加固摘要</th></tr></thead><tbody className="divide-y divide-slate-200">{nativeNodes.slice(0, visibleLibraries).map((node) => {
@@ -1036,8 +1058,10 @@ function Tasks({ scan, tasks, entries, audits, subscribeEvents, health, onRefres
   const [controlSaving, setControlSaving] = useState<string | null>(null)
   const [rerunOpen, setRerunOpen] = useState(false)
   const [controlError, setControlError] = useState<string | null>(null)
+  const [executionError, setExecutionError] = useState<string | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<InvestigationTask | null>(null)
   const [cancelTarget, setCancelTarget] = useState<InvestigationTask | null>(null)
+  const [stopScanOpen, setStopScanOpen] = useState(false)
   const [visibleTaskCount, setVisibleTaskCount] = useState(40)
   useEffect(() => setVisibleTaskCount(40), [scan.id])
   async function retry(task: InvestigationTask, contextMode: "continue" | "independent") {
@@ -1056,6 +1080,11 @@ function Tasks({ scan, tasks, entries, audits, subscribeEvents, health, onRefres
   const configuredBackend = textValue(agentControl?.backend) ?? textValue(scan.stats.investigator) ?? "none"
   const backend: "codex" | "none" = configuredBackend === "codex" ? "codex" : "none"
   const masterEnabled = booleanValue(agentControl?.enabled) ?? backend !== "none"
+  const executionControl = recordValue(scan.stats.execution_control)
+  const executionState = textValue(executionControl?.state) ?? "running"
+  const executionPaused = executionState === "paused"
+  const executionStopping = executionState === "stopping"
+  const scanActive = !["final", "failed"].includes(scan.status)
   const deviceCapability = health?.capabilities.find((item) => item.name === "remote_android_device")
   const deviceBusy = Boolean(deviceCapability?.busy)
   const deviceReady = Boolean(deviceCapability?.available || deviceBusy)
@@ -1087,6 +1116,18 @@ function Tasks({ scan, tasks, entries, audits, subscribeEvents, health, onRefres
       setControlSaving(null)
     }
   }
+  async function updateExecution(action: "pause" | "resume") {
+    setControlSaving("execution")
+    setExecutionError(null)
+    try {
+      await api.updateScanExecutionControl(scan.id, action)
+      await onRefresh()
+    } catch (reason) {
+      setExecutionError(reason instanceof Error ? reason.message : "更新任务调度状态失败")
+    } finally {
+      setControlSaving(null)
+    }
+  }
   const stateCounts = tasks.reduce((counts, task) => {
     const state = taskVisualState(task).group
     counts[state] = (counts[state] ?? 0) + 1
@@ -1094,15 +1135,28 @@ function Tasks({ scan, tasks, entries, audits, subscribeEvents, health, onRefres
   }, {} as Record<string, number>)
   return (
     <div className="space-y-3">
+      <div className="rounded-xl border border-slate-300 bg-white p-4 shadow-sm">
+        <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+          <div>
+            <div className="flex flex-wrap items-center gap-2"><Activity className="h-4 w-4 text-slate-700" /><h3 className="text-sm font-bold text-slate-950">扫描任务控制</h3><Badge tone={executionStopping ? "warning" : executionPaused ? "warning" : scanActive ? "good" : "neutral"}>{executionStopping ? "正在结束" : executionPaused ? "调度已暂停" : scanActive ? "调度运行中" : executionState === "stopped" ? "已由用户结束" : "扫描已完成"}</Badge></div>
+            <p className="mt-1 text-xs leading-5 text-slate-600">暂停后不再领取 queued 任务，已运行的任务会完成并释放设备；结束扫描会停止运行中、设备排队中和等待中的全部任务，并保留已有 Finding 与 Evidence。</p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button variant="secondary" size="sm" onClick={() => void updateExecution(executionPaused ? "resume" : "pause")} disabled={!scanActive || executionStopping || controlSaving === "execution"}>{controlSaving === "execution" ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : executionPaused ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}{executionPaused ? "恢复任务调度" : "暂停新任务"}</Button>
+            <Button variant="danger" size="sm" onClick={() => setStopScanOpen(true)} disabled={!scanActive || executionStopping || controlSaving === "execution"}><X className="h-3.5 w-3.5" />{executionStopping ? "正在结束扫描" : "结束整次扫描"}</Button>
+          </div>
+        </div>
+        {executionError && <p role="alert" className="mt-3 text-xs text-rose-700">{executionError}</p>}
+      </div>
       <div className="rounded-xl border border-violet-200 bg-violet-50/70 p-4">
         <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
           <div>
-            <div className="flex items-center gap-2"><Power className="h-4 w-4 text-violet-700" /><h3 className="text-sm font-bold text-violet-950">AI 探索控制</h3><Badge tone={masterEnabled ? "good" : "neutral"}>{masterEnabled ? "总开关已开启" : "总开关已关闭"}</Badge></div>
-            <p className="mt-1 text-xs leading-5 text-violet-800">设置只影响尚未启动或之后重新分析的任务；运行中的模型调用保持启动时配置。</p>
+            <div className="flex items-center gap-2"><Power className="h-4 w-4 text-violet-700" /><h3 className="text-sm font-bold text-violet-950">AI 后端设置</h3><Badge tone={masterEnabled ? "good" : "neutral"}>{masterEnabled ? "AI 已启用" : "AI 已禁用"}</Badge></div>
+            <p className="mt-1 text-xs leading-5 text-violet-800">这里只决定尚未启动任务是否调用 AI，不会暂停任务调度；暂停或结束请使用上方“扫描任务控制”。</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <label><span className="sr-only">AI 后端</span><select className="field h-9 min-w-44 py-1.5 text-xs" value={backend} disabled={controlSaving === "scan"} onChange={(event) => { const selected = event.target.value as "codex" | "none"; void updateMaster(selected === "none" ? false : masterEnabled, selected) }}><option value="codex" disabled={!codexReady}>Codex + DeepSeek{codexReady ? "" : " · 未就绪"}</option><option value="none">不使用 AI</option></select></label>
-            <Button variant={masterEnabled ? "secondary" : "primary"} size="sm" onClick={() => void updateMaster(!masterEnabled)} disabled={controlSaving === "scan" || (!masterEnabled && !codexReady)}>{controlSaving === "scan" ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Power className="h-3.5 w-3.5" />}{masterEnabled ? "关闭全部 AI" : "开启全部 AI"}</Button>
+            <Button variant={masterEnabled ? "secondary" : "primary"} size="sm" onClick={() => void updateMaster(!masterEnabled)} disabled={controlSaving === "scan" || (!masterEnabled && !codexReady)}>{controlSaving === "scan" ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Power className="h-3.5 w-3.5" />}{masterEnabled ? "禁用后续 AI" : "启用 AI"}</Button>
             <Button variant="secondary" size="sm" onClick={() => setRerunOpen(true)} disabled={!["final", "failed"].includes(scan.status) || incompleteCount === 0}><RefreshCw className="h-3.5 w-3.5" />补扫信息不全项 · {incompleteCount}</Button>
           </div>
         </div>
@@ -1199,6 +1253,7 @@ function Tasks({ scan, tasks, entries, audits, subscribeEvents, health, onRefres
         onCancelled={async () => { setCancelTarget(null); await onRefresh() }}
       />
       <RerunIncompleteDialog scan={rerunOpen ? scan : null} count={incompleteCount} deviceReady={deviceReady} deviceBusy={deviceBusy} onOpenChange={setRerunOpen} onQueued={onRefresh} />
+      <StopScanDialog scan={stopScanOpen ? scan : null} tasks={tasks} onOpenChange={setStopScanOpen} onStopped={onRefresh} />
     </div>
   )
 }
@@ -1282,6 +1337,39 @@ function RerunIncompleteDialog({ scan, count, deviceReady, deviceBusy, onOpenCha
         <div className={cn("mt-5 rounded-xl border p-4 text-sm", deviceBusy ? "border-cyan-200 bg-cyan-50 text-cyan-950" : deviceReady ? "border-emerald-200 bg-emerald-50 text-emerald-900" : "border-amber-200 bg-amber-50 text-amber-950")}>{deviceBusy ? "ADB 设备当前都被扫描任务占用；补扫可以正常入队，设备释放后会自动执行。" : deviceReady ? "ADB 当前已就绪，可以开始补充动态证据。" : "ADB 当前仍不可用；继续补扫可能再次得到证据不足。"} AI 是否执行由总开关和各任务开关共同决定。</div>
         {error && <p role="alert" className="mt-4 text-sm text-rose-700">{error}</p>}
         <div className="mt-6 flex justify-end gap-2"><Button variant="ghost" onClick={() => onOpenChange(false)} disabled={submitting}>取消</Button><Button onClick={rerun} disabled={submitting}>{submitting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{submitting ? "正在排队" : `确认补扫 ${count} 项`}</Button></div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function StopScanDialog({ scan, tasks, onOpenChange, onStopped }: { scan: Scan | null; tasks: InvestigationTask[]; onOpenChange: (open: boolean) => void; onStopped: () => Promise<void> }) {
+  const [stopping, setStopping] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => setError(null), [scan?.id])
+  const activeCount = tasks.filter((task) => ["running", "awaiting_device", "cancel_requested"].includes(task.status)).length
+  const queuedCount = tasks.filter((task) => task.status === "queued").length
+  async function stop() {
+    if (!scan) return
+    setStopping(true)
+    setError(null)
+    try {
+      await api.updateScanExecutionControl(scan.id, "stop")
+      onOpenChange(false)
+      await onStopped()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "结束扫描失败")
+    } finally {
+      setStopping(false)
+    }
+  }
+  return (
+    <Dialog open={Boolean(scan)} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogTitle className="text-xl font-bold text-slate-950">结束整次扫描？</DialogTitle>
+        <DialogDescription className="mt-2 text-sm leading-6 text-slate-600">平台会停止 {activeCount} 个运行中或设备排队中的任务，并取消 {queuedCount} 个尚未启动的任务。已经生成的 Finding、Evidence、PoC 和审计事件会保留，停止完成后仍会生成一份终态报告。</DialogDescription>
+        <div className="mt-5 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">这个操作不能直接恢复未完成任务；之后仍可对具体任务重新分析或发起补扫。</div>
+        {error && <p role="alert" className="mt-4 text-sm text-rose-700">{error}</p>}
+        <div className="mt-6 flex justify-end gap-2"><Button variant="ghost" onClick={() => onOpenChange(false)} disabled={stopping}>继续扫描</Button><Button variant="danger" onClick={stop} disabled={stopping}>{stopping ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <X className="h-4 w-4" />}{stopping ? "正在停止" : "确认结束扫描"}</Button></div>
       </DialogContent>
     </Dialog>
   )

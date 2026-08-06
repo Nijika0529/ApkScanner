@@ -200,6 +200,10 @@ class ScanAgentControl(BaseModel):
     backend: Literal["codex", "none"] | None = None
 
 
+class ScanExecutionControl(BaseModel):
+    action: Literal["pause", "resume", "stop"]
+
+
 class TaskAgentControl(BaseModel):
     enabled: StrictBool
 

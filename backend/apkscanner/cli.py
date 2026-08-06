@@ -66,6 +66,7 @@ def _create_and_run_scan(
                 "upload_bytes": size,
                 "source": "cli",
                 "investigator": investigator,
+                "execution_control": {"state": "running"},
             },
         )
         session.add(scan)

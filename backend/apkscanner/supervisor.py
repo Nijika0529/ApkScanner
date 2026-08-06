@@ -272,6 +272,7 @@ class SupervisorService:
                     stats={
                         "upload_bytes": (source.stats or {}).get("upload_bytes"),
                         "investigator": self.orchestrator.resolve_investigator(),
+                        "execution_control": {"state": "running"},
                         "campaign": {
                             "id": campaign.id,
                             "name": campaign.name,

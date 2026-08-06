@@ -26,6 +26,14 @@ not receive permission to open the private provider, and a signature-protected
 immutable PendingIntent activity. The first control is intentionally close to a
 real capability-delegation bug so the scanner must not equate redirection with a
 demonstrated URI disclosure.
+
+`copilotfixture.apk` is a product-bundle fixture for the Copilot-focused asset
+pipeline. It targets API 36, embeds a separately signed `entityplugin.apk`, loads
+its concrete `EntityPluginEntrance` through `DexClassLoader`, calls an ARM64 JNI
+library, and includes an exported WebView/JSBridge route plus a duplicate activity
+alias. A successful device launch logs `PLUGIN_OK NATIVE_OK=42`; this proves that
+the same host → embedded APK → plugin entry and Java → JNI → SO paths represented
+by ArtifactGraph are executable on a real device.
 The adaptive fixture build normalizes ZIP timestamps and disables v1 signing so
 repeated builds from unchanged sources produce the same APK SHA-256.
 
@@ -48,6 +56,7 @@ testapk/build-vulntest.sh
 testapk/build-rescuetest.sh
 testapk/build-specialcases.sh
 testapk/build-adaptivecases.sh
+testapk/build-copilotfixture.sh
 ```
 
 The checked-in keystore is a public, test-only key used solely to make fixture

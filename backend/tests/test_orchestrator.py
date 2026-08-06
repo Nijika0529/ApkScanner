@@ -1154,6 +1154,72 @@ def test_two_configured_devices_run_two_investigations_concurrently(settings) ->
     assert statuses == ["completed"] * 4
 
 
+def test_paused_scan_does_not_claim_queued_tasks_until_resumed(settings) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            status="preliminary_ready",
+            filename="paused.apk",
+            artifact_sha256="5" * 64,
+            artifact_path=str(settings.data_dir / "paused.apk"),
+            stats={"execution_control": {"state": "paused"}},
+        )
+        session.add(scan)
+        session.flush()
+        session.add_all(
+            [
+                InvestigationTask(
+                    scan_id=scan.id,
+                    task_type="component",
+                    status="queued",
+                    priority=100 - index,
+                )
+                for index in range(2)
+            ]
+        )
+        session.commit()
+        scan_id = scan.id
+
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    started = threading.Event()
+
+    def fake_run_task(
+        _scan_id: str,
+        task_id: str,
+        _timeout_seconds: int | None = None,
+    ) -> None:
+        started.set()
+        with database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            assert task is not None
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            session.commit()
+
+    orchestrator._run_task = fake_run_task  # type: ignore[method-assign]
+    worker = threading.Thread(target=orchestrator._run_tasks, args=(scan_id,))
+    worker.start()
+    assert not started.wait(timeout=0.8)
+    with database.session_factory() as session:
+        scan = session.get(Scan, scan_id)
+        assert scan is not None
+        scan.stats = {"execution_control": {"state": "running"}}
+        session.commit()
+    assert started.wait(timeout=3)
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    with database.session_factory() as session:
+        statuses = list(
+            session.scalars(
+                select(InvestigationTask.status).where(
+                    InvestigationTask.scan_id == scan_id
+                )
+            )
+        )
+    assert statuses == ["completed", "completed"]
+
+
 def test_running_dispatch_expands_when_a_device_is_added(settings) -> None:  # noqa: ANN001
     configured = replace(
         settings,

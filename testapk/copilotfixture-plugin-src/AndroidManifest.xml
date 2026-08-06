@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.apkscanner.copilotfixture.entity"
+    android:versionCode="1"
+    android:versionName="1.0">
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="36" />
+    <application android:allowBackup="false" android:hasCode="true" />
+</manifest>

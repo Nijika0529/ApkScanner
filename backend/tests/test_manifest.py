@@ -77,6 +77,51 @@ def test_planner_statically_closes_signature_guarded_component() -> None:
     )
 
 
+def test_planner_coalesces_only_explicit_attack_chain_variants() -> None:
+    group = {
+        "key": "copilot:web_external_content",
+        "strategy": "vivo_copilot_7x_v1",
+        "reason": "same external content chain",
+    }
+    activity = EntryPoint(
+        id="00000000-0000-0000-0000-000000000101",
+        scan_id="scan",
+        kind="activity",
+        name="com.vivo.ai.copilot.transfer.EmptyLauncherActivity",
+        owner_component="com.vivo.ai.copilot.transfer.EmptyLauncherActivity",
+        exported=True,
+        metadata_json={"investigation_group": group},
+    )
+    surface = EntryPoint(
+        id="00000000-0000-0000-0000-000000000102",
+        scan_id="scan",
+        kind="static_surface",
+        name="static://web_content_boundary",
+        owner_component="static://web_content_boundary",
+        exported=False,
+        metadata_json={
+            "investigation_group": group,
+            "static_review_family": "web_content_boundary",
+            "static_review_hypotheses": ["Trace every bridge exposed to external content."],
+        },
+    )
+
+    plan = InvestigationPlanner(
+        android_version="16",
+        adb_configured=True,
+    ).plan_with_decisions("scan", [activity, surface])
+
+    assert len(plan.tasks) == 1
+    task = plan.tasks[0]
+    assert task.task_type == "component"
+    assert task.target_entry_ids == [activity.id, surface.id]
+    assert "build_agent_poc_apk" in task.allowed_side_effects
+    assert task.preconditions["coalescing"]["group_key"] == group["key"]
+    assert task.preconditions["coalescing"]["source_task_count"] == 2
+    assert len(plan.coalescing_decisions) == 1
+    assert plan.coalescing_decisions[0]["avoided_task_count"] == 1
+
+
 def test_planner_dispatches_internal_static_surface_without_device_side_effects() -> None:
     entry = EntryPoint(
         id="00000000-0000-0000-0000-000000000019",

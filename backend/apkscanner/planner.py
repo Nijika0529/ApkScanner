@@ -69,6 +69,7 @@ class StaticEntryClosure:
 class InvestigationPlan:
     tasks: list[InvestigationTask] = field(default_factory=list)
     static_closures: list[StaticEntryClosure] = field(default_factory=list)
+    coalescing_decisions: list[dict[str, object]] = field(default_factory=list)
 
 
 class InvestigationPlanner:
@@ -124,7 +125,146 @@ class InvestigationPlanner:
                 *self._deep_link_hypotheses(owner)[1:],
             ]
             owner_task.priority = max(owner_task.priority, 98)
+        plan.tasks, plan.coalescing_decisions = self._coalesce_explicit_groups(
+            plan.tasks,
+            entries,
+        )
         return plan
+
+    @staticmethod
+    def _coalesce_explicit_groups(
+        tasks: list[InvestigationTask],
+        entries: list[EntryPoint],
+    ) -> tuple[list[InvestigationTask], list[dict[str, object]]]:
+        """Merge only profile-declared equivalent attack-chain variants.
+
+        Every merged entry remains assigned to the resulting task, and the reason is
+        persisted in task preconditions so cost reduction never becomes silent coverage loss.
+        """
+
+        entries_by_id = {entry.id: entry for entry in entries}
+        task_groups: dict[int, str] = {}
+        group_metadata: dict[str, dict[str, object]] = {}
+        grouped_tasks: dict[str, list[InvestigationTask]] = defaultdict(list)
+        for task in tasks:
+            declarations = [
+                (entries_by_id[entry_id].metadata_json or {}).get(
+                    "investigation_group"
+                )
+                for entry_id in task.target_entry_ids
+                if entry_id in entries_by_id
+            ]
+            declarations = [item for item in declarations if isinstance(item, dict)]
+            keys = {
+                str(item.get("key"))
+                for item in declarations
+                if item.get("key")
+            }
+            if len(keys) != 1:
+                continue
+            key = next(iter(keys))
+            task_groups[id(task)] = key
+            grouped_tasks[key].append(task)
+            group_metadata.setdefault(key, dict(declarations[0]))
+
+        decisions: list[dict[str, object]] = []
+        replacements: dict[str, InvestigationTask] = {}
+        for key, candidates in grouped_tasks.items():
+            if len(candidates) < 2:
+                continue
+            base = max(
+                candidates,
+                key=lambda task: (
+                    task.task_type != TaskType.STATIC_REVIEW.value,
+                    task.task_type == TaskType.COMPONENT.value,
+                    task.priority,
+                ),
+            )
+            target_entry_ids = list(
+                dict.fromkeys(
+                    entry_id
+                    for task in candidates
+                    for entry_id in task.target_entry_ids
+                )
+            )
+            hypotheses = list(
+                dict.fromkeys(
+                    hypothesis
+                    for task in candidates
+                    for hypothesis in task.hypotheses
+                )
+            )
+            allowed_side_effects = list(
+                dict.fromkeys(
+                    side_effect
+                    for task in candidates
+                    for side_effect in task.allowed_side_effects
+                )
+            )
+            variants = [
+                {
+                    "entry_point_id": entry_id,
+                    "kind": entries_by_id[entry_id].kind,
+                    "name": entries_by_id[entry_id].name,
+                    "owner_component": entries_by_id[entry_id].owner_component,
+                }
+                for entry_id in target_entry_ids
+                if entry_id in entries_by_id
+            ]
+            static_families = list(
+                dict.fromkeys(
+                    str((entries_by_id[entry_id].metadata_json or {}).get("static_review_family"))
+                    for entry_id in target_entry_ids
+                    if entry_id in entries_by_id
+                    and (entries_by_id[entry_id].metadata_json or {}).get(
+                        "static_review_family"
+                    )
+                )
+            )
+            metadata = group_metadata[key]
+            base.target_entry_ids = target_entry_ids
+            base.hypotheses = hypotheses
+            base.priority = max(task.priority for task in candidates)
+            base.allowed_side_effects = allowed_side_effects
+            base.preconditions = {
+                **dict(base.preconditions or {}),
+                "coalescing": {
+                    "group_key": key,
+                    "strategy": metadata.get("strategy"),
+                    "reason": metadata.get("reason"),
+                    "source_task_count": len(candidates),
+                    "merged_entry_count": len(target_entry_ids),
+                    "variants": variants,
+                    "static_families": static_families,
+                },
+            }
+            replacements[key] = base
+            decisions.append(
+                {
+                    "group_key": key,
+                    "strategy": metadata.get("strategy"),
+                    "reason": metadata.get("reason"),
+                    "source_task_count": len(candidates),
+                    "result_task_count": 1,
+                    "avoided_task_count": len(candidates) - 1,
+                    "entry_point_ids": target_entry_ids,
+                    "entry_names": [item["name"] for item in variants],
+                }
+            )
+
+        emitted_groups: set[str] = set()
+        coalesced: list[InvestigationTask] = []
+        for task in tasks:
+            key = task_groups.get(id(task))
+            replacement = replacements.get(key or "")
+            if replacement is None:
+                coalesced.append(task)
+                continue
+            if key in emitted_groups:
+                continue
+            emitted_groups.add(str(key))
+            coalesced.append(replacement)
+        return coalesced, decisions
 
     @classmethod
     def _static_closure(cls, entry: EntryPoint) -> StaticEntryClosure | None:

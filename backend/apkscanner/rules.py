@@ -54,6 +54,7 @@ class StaticReviewSurfaceDraft:
     locations: list[dict[str, Any]]
     attack_chains: list[dict[str, Any]] = field(default_factory=list)
     artifact: dict[str, Any] | None = None
+    investigation_group: dict[str, Any] | None = None
 
 
 CODE_RULES = (
@@ -492,6 +493,11 @@ class BuiltinRuleEngine:
         result: StaticAnalysisResult,
     ) -> list[StaticReviewSurfaceDraft]:
         surfaces: list[StaticReviewSurfaceDraft] = []
+        graph_nodes = {
+            str(node.get("id")): node
+            for node in result.artifact_graph.get("nodes", [])
+        }
+        graph_edges = list(result.artifact_graph.get("edges", []))
         for node in result.artifact_graph.get("nodes", []):
             origin = node.get("origin") or {}
             if node.get("kind") != "apk" or origin.get("kind") != "embedded_apk":
@@ -513,9 +519,61 @@ class BuiltinRuleEngine:
                             "artifact_id": node.get("id"),
                         }
                     )
+            loader_nodes = [
+                graph_nodes.get(str(edge.get("from")))
+                for edge in graph_edges
+                if edge.get("relation") == "loads_embedded_apk"
+                and edge.get("to") == node.get("id")
+            ]
+            loader_nodes = [item for item in loader_nodes if item is not None]
+            for loader in loader_nodes:
+                for reference in loader.get("references") or []:
+                    if not isinstance(reference, dict):
+                        continue
+                    locations.append(
+                        {
+                            "root": reference.get("root"),
+                            "path": reference.get("path"),
+                            "line": reference.get("line"),
+                            "artifact_id": node.get("id"),
+                            "relationship": "host_loader_reference",
+                        }
+                    )
+            plugin_entry_nodes = [
+                graph_nodes.get(str(edge.get("to")))
+                for edge in graph_edges
+                if edge.get("relation") == "declares_plugin_entry"
+                and edge.get("from") == node.get("id")
+            ]
+            plugin_entry_nodes = [item for item in plugin_entry_nodes if item is not None]
+            for entry_node in plugin_entry_nodes:
+                source = result.workspace / str(entry_node.get("path") or "")
+                for searchable_root in result.searchable_roots:
+                    try:
+                        relative = source.resolve().relative_to(searchable_root.resolve())
+                    except ValueError:
+                        continue
+                    locations.append(
+                        {
+                            "root": BuiltinRuleEngine._search_root_label(
+                                searchable_root,
+                                result.workspace,
+                            ),
+                            "path": str(relative),
+                            "line": int(entry_node.get("line") or 1),
+                            "artifact_id": node.get("id"),
+                            "relationship": "plugin_entry_candidate",
+                        }
+                    )
+                    break
             package_name = str(node.get("package_name") or "unknown")
             sha256 = str(node.get("sha256") or "")
             archive_path = str(origin.get("archive_path") or node.get("path") or "")
+            entry_names = [
+                str(item.get("class_name") or item.get("name"))
+                for item in plugin_entry_nodes
+                if item.get("class_name") or item.get("name")
+            ]
             surfaces.append(
                 StaticReviewSurfaceDraft(
                     name=f"static://embedded_apk/{package_name}:{sha256[:12]}",
@@ -536,11 +594,29 @@ class BuiltinRuleEngine:
                         ),
                         (
                             "Trace the concrete host loader and plugin entry contract before deciding "
-                            "whether the embedded code is reachable from an untrusted Android entry."
+                            "whether the embedded code is reachable from an untrusted Android entry. "
+                            + (
+                                f"Current entry candidates: {', '.join(entry_names[:6])}."
+                                if entry_names
+                                else "No plugin entry class has been resolved yet."
+                            )
                         ),
                     ],
-                    locations=locations,
-                    artifact=dict(node),
+                    locations=list(
+                        {
+                            (
+                                str(item.get("root") or ""),
+                                str(item.get("path") or ""),
+                                int(item.get("line") or 0),
+                            ): item
+                            for item in locations
+                        }.values()
+                    )[:12],
+                    artifact={
+                        **dict(node),
+                        "host_loader_nodes": [dict(item) for item in loader_nodes],
+                        "plugin_entry_nodes": [dict(item) for item in plugin_entry_nodes],
+                    },
                 )
             )
         return surfaces

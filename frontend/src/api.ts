@@ -196,6 +196,12 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enabled, backend }),
     }),
+  updateScanExecutionControl: (scanId: string, action: "pause" | "resume" | "stop") =>
+    request<Scan>(`/api/v1/scans/${scanId}/execution-control`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action }),
+    }),
   updateTaskAgentControl: (taskId: string, enabled: boolean) =>
     request<InvestigationTask>(`/api/v1/tasks/${taskId}/agent-control`, {
       method: "PATCH",
