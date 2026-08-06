@@ -8,7 +8,10 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from apkscanner import native_analysis as native_analysis_module
+from apkscanner import rules as rules_module
 from apkscanner.manifest import parse_manifest
+from apkscanner.native_analysis import NativeArtifactAnalyzer
 from apkscanner.rules import BuiltinRuleEngine
 from apkscanner.static_analysis import (
     ApkInspector,
@@ -60,8 +63,22 @@ def test_exact_apk_reuses_content_addressed_static_analysis(settings, fixture_ap
 
     inspector = ApkInspector(settings, runner=NoToolsRunner())
 
-    first = inspector.inspect(fixture_apk, "scan-cache-source")
-    second = inspector.inspect(fixture_apk, "scan-cache-target")
+    first_progress: list[tuple[str, str, dict]] = []
+    cached_progress: list[tuple[str, str, dict]] = []
+    first = inspector.inspect(
+        fixture_apk,
+        "scan-cache-source",
+        _progress=lambda phase, status, details: first_progress.append(
+            (phase, status, details)
+        ),
+    )
+    second = inspector.inspect(
+        fixture_apk,
+        "scan-cache-target",
+        _progress=lambda phase, status, details: cached_progress.append(
+            (phase, status, details)
+        ),
+    )
 
     assert first.file_inventory.get("static_cache_hit") is not True
     assert second.file_inventory["static_cache_hit"] is True
@@ -70,9 +87,80 @@ def test_exact_apk_reuses_content_addressed_static_analysis(settings, fixture_ap
     assert second.code_index == first.code_index
     assert set(second.tool_results) == {"static_cache"}
     assert (second.workspace / "archive").is_dir()
+    if os.name == "posix":
+        assert (
+            (first.workspace / "archive/AndroidManifest.xml").stat().st_ino
+            == (second.workspace / "archive/AndroidManifest.xml").stat().st_ino
+        )
+    assert {phase for phase, status, _details in first_progress if status == "completed"} >= {
+        "decompilation",
+        "code_index",
+        "android_attack_chains",
+        "native_analysis",
+        "embedded_artifacts",
+    }
+    assert first.file_inventory["pipeline_timings_seconds"]["code_index"] >= 0
+    assert [(phase, status) for phase, status, _details in cached_progress] == [
+        ("static_cache", "completed")
+    ]
     assert ApkInspector._static_result_cacheable(
         {"jadx": {"timed_out": False}}, {"status": "partial_timeout"}
     ) is False
+    assert ApkInspector._static_result_cacheable(
+        {"jadx": {"timed_out": False}},
+        {"status": "partial_success", "output_usable": True},
+    ) is True
+
+
+def test_streaming_source_prefilters_preserve_native_and_rule_results(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    source_root = workspace / "jadx/sources"
+    bridge = source_root / "com/example/NativeBridge.java"
+    bridge.parent.mkdir(parents=True)
+    bridge.write_text(
+        """
+        package com.example;
+        final class NativeBridge {
+            static { Runtime.getRuntime().load("/data/local/tmp/libaccount.so"); }
+            static native String readAccount();
+        }
+        """,
+        encoding="utf-8",
+    )
+    risky = source_root / "com/example/RiskyWebView.java"
+    risky.write_text(
+        "webView.addJavascriptInterface(accountBridge, \"account\");\n",
+        encoding="utf-8",
+    )
+    for index in range(40):
+        noise = source_root / f"com/example/noise/Noise{index}.java"
+        noise.parent.mkdir(parents=True, exist_ok=True)
+        noise.write_text(f"final class Noise{index} {{}}\n", encoding="utf-8")
+
+    optimized_native = NativeArtifactAnalyzer._discover_java_bridges(
+        workspace,
+        failed_java_classes=set(),
+    )
+    optimized_rules = BuiltinRuleEngine()._code_rules([source_root], workspace)
+
+    monkeypatch.setattr(native_analysis_module, "files_containing_any", lambda *_a, **_k: None)
+    monkeypatch.setattr(rules_module, "files_containing_any", lambda *_a, **_k: None)
+    fallback_native = NativeArtifactAnalyzer._discover_java_bridges(
+        workspace,
+        failed_java_classes=set(),
+    )
+    fallback_rules = BuiltinRuleEngine()._code_rules([source_root], workspace)
+
+    assert optimized_native == fallback_native
+    assert [item.rule_id for item in optimized_rules] == [
+        item.rule_id for item in fallback_rules
+    ]
+    assert [item.locations for item in optimized_rules] == [
+        item.locations for item in fallback_rules
+    ]
 
 
 def test_product_bundle_recursively_analyzes_embedded_apks_and_web_assets(

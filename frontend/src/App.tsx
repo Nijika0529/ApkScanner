@@ -510,6 +510,10 @@ function ScanDetailView({ data, health, subscribeEvents, onRefresh, onDelete, on
   const links = entries.filter((item) => item.kind === "deep_link").length
   const covered = coverage.filter((item) => item.status === "covered").length
   const coveragePercent = coverage.length ? covered / coverage.length * 100 : 0
+  const staticProgress = recordValue(scan.stats.static_progress)
+  const staticProgressLabel = textValue(staticProgress?.label)
+  const staticProgressStatus = textValue(staticProgress?.status)
+  const staticProgressElapsed = numberValue(staticProgress?.elapsed_seconds)
   return (
     <div className="space-y-6">
       <section className="relative overflow-hidden rounded-2xl border border-slate-200 bg-gradient-to-br from-white via-white to-cyan-50 p-5 shadow-sm sm:p-7">
@@ -520,7 +524,19 @@ function ScanDetailView({ data, health, subscribeEvents, onRefresh, onDelete, on
             <h2 className="font-display truncate text-2xl font-bold tracking-tight text-slate-950 sm:text-3xl">{scan.package_name ?? scan.filename}</h2>
             <div className="mt-3 flex flex-wrap gap-x-5 gap-y-2 font-mono text-xs text-slate-500"><span>SHA256 {shortHash(scan.artifact_sha256)}</span><span>versionCode {scan.version_code ?? "—"}</span><span>minSdk {scan.min_sdk ?? "—"}</span></div>
           </div>
-          <div className="w-full max-w-lg space-y-3"><Progress value={scanProgress(scan.status)} label="扫描进度" /><div className="flex flex-wrap gap-2"><ReportLink scanId={scan.id} format="html" label="HTML" /><ReportLink scanId={scan.id} format="json" label="JSON" /><ReportLink scanId={scan.id} format="sarif" label="SARIF" /><Button variant="secondary" size="sm" onClick={onFreshRun} disabled={!["final", "failed"].includes(scan.status)} title={["final", "failed"].includes(scan.status) ? "只复用原始 APK，创建不继承历史结果的独立扫描" : "当前扫描结束后才能全新重扫"}><ScanSearch className="h-3.5 w-3.5" />全新重扫</Button><Button variant="danger" size="sm" onClick={onDelete} disabled={!["final", "failed"].includes(scan.status)} title={["final", "failed"].includes(scan.status) ? "永久删除扫描及其独占文件" : "运行中的扫描不能删除"}><Trash2 className="h-3.5 w-3.5" />删除扫描</Button></div></div>
+          <div className="w-full max-w-lg space-y-3">
+            <Progress value={scanProgress(scan.status)} label="扫描进度" />
+            {scan.status === "static_running" && staticProgressLabel && (
+              <div className="flex items-center justify-between gap-3 rounded-lg border border-cyan-200 bg-cyan-50 px-3 py-2 text-xs text-cyan-900" aria-live="polite">
+                <span className="truncate">当前阶段：{staticProgressLabel}</span>
+                <span className="shrink-0 font-mono text-cyan-700">
+                  {staticProgressStatus === "completed" ? "已完成" : "处理中"}
+                  {staticProgressElapsed !== undefined ? ` · ${staticProgressElapsed.toFixed(1)}s` : ""}
+                </span>
+              </div>
+            )}
+            <div className="flex flex-wrap gap-2"><ReportLink scanId={scan.id} format="html" label="HTML" /><ReportLink scanId={scan.id} format="json" label="JSON" /><ReportLink scanId={scan.id} format="sarif" label="SARIF" /><Button variant="secondary" size="sm" onClick={onFreshRun} disabled={!["final", "failed"].includes(scan.status)} title={["final", "failed"].includes(scan.status) ? "只复用原始 APK，创建不继承历史结果的独立扫描" : "当前扫描结束后才能全新重扫"}><ScanSearch className="h-3.5 w-3.5" />全新重扫</Button><Button variant="danger" size="sm" onClick={onDelete} disabled={!["final", "failed"].includes(scan.status)} title={["final", "failed"].includes(scan.status) ? "永久删除扫描及其独占文件" : "运行中的扫描不能删除"}><Trash2 className="h-3.5 w-3.5" />删除扫描</Button></div>
+          </div>
         </div>
       </section>
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">

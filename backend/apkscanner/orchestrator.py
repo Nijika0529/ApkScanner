@@ -8,6 +8,7 @@ import re
 import secrets
 import shutil
 import threading
+import time
 import uuid
 import zipfile
 from collections import Counter, defaultdict
@@ -1614,8 +1615,70 @@ class ScanOrchestrator:
                 1, int((preliminary_deadline - datetime.now(UTC)).total_seconds())
             )
             preliminary_budget = TimeBudget.from_seconds(preliminary_remaining)
-            result = self.inspector.inspect(Path(scan.artifact_path), scan.id, preliminary_budget)
+            phase_labels = {
+                "static_cache": "静态缓存恢复",
+                "static_cache_publish": "静态缓存发布",
+                "decompilation": "APK 解包与反编译",
+                "code_index": "组件代码索引",
+                "android_attack_chains": "Android 攻击链索引",
+                "native_analysis": "Native/JNI 资产分析",
+                "embedded_artifacts": "内嵌 APK 与插件链",
+                "rule_evaluation": "静态规则评估",
+                "target_profile": "目标审计 Profile 规划",
+            }
+            static_phase_started: dict[str, float] = {}
+
+            def record_static_phase(
+                phase: str,
+                status: str,
+                details: dict[str, Any] | None = None,
+            ) -> None:
+                label = phase_labels.get(phase, phase)
+                payload = dict(details or {})
+                if status == "started":
+                    static_phase_started[phase] = time.monotonic()
+                elif phase in static_phase_started and "elapsed_seconds" not in payload:
+                    payload["elapsed_seconds"] = round(
+                        time.monotonic() - static_phase_started[phase],
+                        3,
+                    )
+                payload.update({"phase": phase, "status": status})
+                scan.stats = {
+                    **dict(scan.stats or {}),
+                    "static_progress": {
+                        "phase": phase,
+                        "label": label,
+                        "status": status,
+                        **(
+                            {"elapsed_seconds": payload["elapsed_seconds"]}
+                            if payload.get("elapsed_seconds") is not None
+                            else {}
+                        ),
+                    },
+                }
+                add_event(
+                    session,
+                    scan.id,
+                    f"static.phase.{status}",
+                    f"{label}{'开始' if status == 'started' else '完成'}",
+                    payload,
+                )
+                session.commit()
+
+            result = self.inspector.inspect(
+                Path(scan.artifact_path),
+                scan.id,
+                preliminary_budget,
+                _progress=record_static_phase,
+            )
+            record_static_phase("rule_evaluation", "started")
             findings, coverage = self.rules.evaluate(result)
+            record_static_phase(
+                "rule_evaluation",
+                "completed",
+                {"finding_count": len(findings)},
+            )
+            record_static_phase("target_profile", "started")
             static_review_surfaces = self.rules.static_review_surfaces(
                 result.manifest,
                 findings,
@@ -1633,6 +1696,14 @@ class ScanOrchestrator:
                         static_family=surface.family,
                         artifact=surface.artifact,
                     )
+            record_static_phase(
+                "target_profile",
+                "completed",
+                {
+                    "profile": active_profile_id(result.manifest.package_name),
+                    "surface_count": len(static_review_surfaces),
+                },
+            )
             for surface in static_review_surfaces:
                 self.inspector.add_static_surface_to_code_index(
                     result,

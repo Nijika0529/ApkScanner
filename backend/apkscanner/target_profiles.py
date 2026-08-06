@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from .enums import Severity
+from .fast_text_search import files_containing_any
 from .rules import StaticReviewSurfaceDraft
 from .static_analysis import StaticAnalysisResult
 
@@ -314,7 +315,14 @@ def _find_locations(
     for root in result.searchable_roots:
         if not root.is_dir():
             continue
-        for source in sorted(root.rglob("*")):
+        optimized = files_containing_any(
+            root,
+            literals=lowered_needles,
+            suffixes=(".java", ".kt", ".smali", ".json", ".js"),
+            ignore_case=True,
+        )
+        sources = sorted(root.rglob("*")) if optimized is None else optimized
+        for source in sources:
             if not source.is_file() or source.suffix.lower() not in {
                 ".java",
                 ".kt",

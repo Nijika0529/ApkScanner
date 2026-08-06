@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .fast_text_search import files_containing_any
 from .permissions import ensure_private_directory
 from .tools import TimeBudget, ToolRunner
 
@@ -402,7 +403,19 @@ class NativeArtifactAnalyzer:
         jadx = workspace / "jadx"
         java_root = jadx / "sources" if (jadx / "sources").is_dir() else jadx
         if java_root.is_dir():
-            for path in sorted(java_root.rglob("*.java")):
+            java_paths = files_containing_any(
+                java_root,
+                literals=(
+                    "native",
+                    "System.load(",
+                    "loadLibrary",
+                    "getRuntime().load(",
+                ),
+                suffixes=(".java",),
+            )
+            if java_paths is None:
+                java_paths = sorted(java_root.rglob("*.java"))
+            for path in java_paths:
                 text = path.read_text(encoding="utf-8", errors="replace")
                 package = cls._first_match(r"\bpackage\s+([A-Za-z_$][\w.$]*)\s*;", text) or ""
                 class_name = cls._first_match(
@@ -435,7 +448,16 @@ class NativeArtifactAnalyzer:
                     if candidate.is_file()
                 }
             else:
-                smali_paths = set(parent.rglob("*.smali"))
+                optimized = files_containing_any(
+                    parent,
+                    literals=("native", "Ljava/lang/System;->load"),
+                    suffixes=(".smali",),
+                )
+                smali_paths = (
+                    set(parent.rglob("*.smali"))
+                    if optimized is None
+                    else set(optimized)
+                )
             for path in sorted(smali_paths):
                 text = path.read_text(encoding="utf-8", errors="replace")
                 class_match = re.search(r"^\.class[^\n]*\sL([^;]+);", text, re.MULTILINE)

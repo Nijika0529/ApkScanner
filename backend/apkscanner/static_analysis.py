@@ -6,13 +6,16 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .android_chains import AndroidAttackChainAnalyzer
 from .config import Settings
+from .fast_text_search import files_containing_any
 from .manifest import ManifestDocument, aapt2_xmltree_to_xml, parse_manifest
 from .native_analysis import NativeArtifactAnalyzer
 from .permissions import ensure_private_directory
@@ -65,7 +68,28 @@ class ApkInspector:
         _workspace: Path | None = None,
         _artifact_origin: str = "target.apk",
         _ancestry: tuple[str, ...] = (),
+        _progress: Callable[[str, str, dict[str, Any]], None] | None = None,
     ) -> StaticAnalysisResult:
+        phase_started: dict[str, float] = {}
+        phase_timings: dict[str, float] = {}
+
+        def progress(
+            phase: str,
+            status: str,
+            details: dict[str, Any] | None = None,
+        ) -> None:
+            timestamp = time.monotonic()
+            payload = dict(details or {})
+            payload["artifact_origin"] = _artifact_origin
+            if status == "started":
+                phase_started[phase] = timestamp
+            elif phase in phase_started:
+                elapsed = round(timestamp - phase_started[phase], 3)
+                phase_timings[phase] = elapsed
+                payload["elapsed_seconds"] = elapsed
+            if _progress is not None:
+                _progress(phase, status, payload)
+
         file_inventory = self._validate_zip(apk_path)
         workspace = _workspace or self.settings.data_dir / "workspaces" / scan_id
         ensure_private_directory(workspace)
@@ -92,7 +116,13 @@ class ApkInspector:
             file_inventory=file_inventory,
         )
         if cached is not None:
+            progress(
+                "static_cache",
+                "completed",
+                {"cache_hit": True, "artifact_sha256": artifact_sha256},
+            )
             return cached
+        progress("decompilation", "started", {"cache_hit": False})
         tool_results: dict[str, dict[str, Any]] = {}
         decoded_dir = workspace / "apktool"
         jadx_dir = workspace / "jadx"
@@ -219,6 +249,15 @@ class ApkInspector:
             tool_results["apksigner"] = self._serialize_result(result)
             signing = self._parse_signing(result)
 
+        progress(
+            "decompilation",
+            "completed",
+            {
+                "status": decompilation.get("status"),
+                "generated_java_files": decompilation.get("generated_java_files", 0),
+            },
+        )
+        progress("code_index", "started")
         code_index = self._build_code_index(
             result_entries=manifest.entries,
             package_name=manifest.package_name,
@@ -228,9 +267,20 @@ class ApkInspector:
             archive_dir=archive_dir,
             decompilation=decompilation,
         )
+        progress(
+            "code_index",
+            "completed",
+            {"component_count": len(code_index)},
+        )
+        progress("android_attack_chains", "started")
         attack_chains = AndroidAttackChainAnalyzer().analyze(
             manifest,
             searchable_roots,
+        )
+        progress(
+            "android_attack_chains",
+            "completed",
+            {"candidate_count": len(attack_chains)},
         )
         (workspace / "code_index.json").write_text(
             json.dumps(
@@ -253,6 +303,11 @@ class ApkInspector:
             "analysis_profile": analysis_profile,
         }
         artifact_root_id = "target.apk" if _artifact_origin == "target.apk" else "artifact.apk"
+        progress(
+            "native_analysis",
+            "started",
+            {"native_library_count": len(file_inventory.get("native_libraries") or [])},
+        )
         native_index = NativeArtifactAnalyzer(self.runner).analyze(
             apk_path=apk_path,
             workspace=workspace,
@@ -265,6 +320,11 @@ class ApkInspector:
             },
             budget=budget,
         )
+        progress(
+            "native_analysis",
+            "completed",
+            dict(native_index.get("summary") or {}),
+        )
         tool_results["native_analysis"] = {
             "argv": [],
             "exit_code": 0,
@@ -273,6 +333,11 @@ class ApkInspector:
             "timed_out": False,
             "summary": native_index["summary"],
         }
+        progress(
+            "embedded_artifacts",
+            "started",
+            {"embedded_apk_count": len(file_inventory.get("embedded_apk_files") or [])},
+        )
         artifact_graph = self._analyze_embedded_apks(
             apk_path=apk_path,
             scan_id=scan_id,
@@ -286,6 +351,11 @@ class ApkInspector:
             budget=budget,
             ancestry=(*_ancestry, artifact_sha256),
         )
+        progress(
+            "embedded_artifacts",
+            "completed",
+            dict(artifact_graph.get("summary") or {}),
+        )
         (workspace / "artifact_graph.json").write_text(
             json.dumps(artifact_graph, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -295,6 +365,7 @@ class ApkInspector:
         artifact_summary = dict(artifact_graph.get("summary") or {})
         file_inventory = {
             **file_inventory,
+            "pipeline_timings_seconds": phase_timings,
             "product_bundle": {
                 "schema_version": artifact_graph.get("schema_version", "1.0"),
                 "artifact_count": int(artifact_summary.get("apk_count") or 0),
@@ -323,7 +394,20 @@ class ApkInspector:
                 "artifact_graph_path": "artifact_graph.json",
             },
         }
+        tool_results["pipeline"] = {
+            "argv": [],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "timed_out": False,
+            "timings_seconds": phase_timings,
+        }
         if self._static_result_cacheable(tool_results, decompilation):
+            progress(
+                "static_cache_publish",
+                "started",
+                {"artifact_sha256": artifact_sha256},
+            )
             self._publish_static_cache(
                 cache_dir=cache_dir,
                 workspace=workspace,
@@ -333,6 +417,11 @@ class ApkInspector:
                 tool_versions=tool_versions,
                 signing=signing,
                 decompilation=decompilation,
+            )
+            progress(
+                "static_cache_publish",
+                "completed",
+                {"artifact_sha256": artifact_sha256},
             )
 
         return StaticAnalysisResult(
@@ -414,7 +503,7 @@ class ApkInspector:
         for name in ("jadx", "apktool", "archive", "native", "artifacts"):
             source = cache_dir / name
             if source.is_dir():
-                shutil.copytree(source, workspace / name)
+                self._copy_static_tree(source, workspace / name)
         top_manifest = cache_dir / "AndroidManifest.xml"
         if top_manifest.is_file():
             shutil.copy2(top_manifest, workspace / "AndroidManifest.xml")
@@ -497,7 +586,22 @@ class ApkInspector:
             "complete_success",
             "completed_without_java",
             "not_available",
+            "partial_success",
         }
+
+    @staticmethod
+    def _copy_static_file(source: str, destination: str) -> str:
+        """Clone immutable static output without reading file contents when possible."""
+
+        try:
+            os.link(source, destination)
+        except OSError:
+            shutil.copy2(source, destination)
+        return destination
+
+    @classmethod
+    def _copy_static_tree(cls, source: Path, destination: Path) -> None:
+        shutil.copytree(source, destination, copy_function=cls._copy_static_file)
 
     @staticmethod
     def _publish_static_cache(
@@ -519,7 +623,7 @@ class ApkInspector:
             for name in ("jadx", "apktool", "archive", "native", "artifacts"):
                 source = workspace / name
                 if source.is_dir():
-                    shutil.copytree(source, temporary / name)
+                    ApkInspector._copy_static_tree(source, temporary / name)
             top_manifest = workspace / "AndroidManifest.xml"
             if top_manifest.is_file():
                 shutil.copy2(top_manifest, temporary / "AndroidManifest.xml")
@@ -806,7 +910,13 @@ class ApkInspector:
             root = workspace / root_name
             if not root.is_dir():
                 continue
-            for candidate in sorted(root.rglob("*")):
+            optimized = files_containing_any(
+                root,
+                literals=tuple(alias_to_archives),
+                suffixes=tuple(_LOADER_REFERENCE_SUFFIXES),
+            )
+            candidates = sorted(root.rglob("*")) if optimized is None else optimized
+            for candidate in candidates:
                 if (
                     not candidate.is_file()
                     or candidate.suffix.lower() not in _LOADER_REFERENCE_SUFFIXES

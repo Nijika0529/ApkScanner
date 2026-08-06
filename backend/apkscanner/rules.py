@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .enums import Confidence, CoverageStatus, EntryPointKind, Severity
+from .fast_text_search import files_containing_any
 from .manifest import ManifestDocument, ParsedEntryPoint
 from .static_analysis import StaticAnalysisResult
 
@@ -209,6 +210,50 @@ CODE_RULES = (
         Severity.HIGH,
         "CWE-798",
     ),
+)
+
+CODE_RULE_PREFILTER_LITERALS = (
+    "addJavascriptInterface",
+    "setAllowFileAccess",
+    "setAllowUniversalAccessFromFileURLs",
+    "X509TrustManager",
+    "ALLOW_ALL_HOSTNAME_VERIFIER",
+    "setHostnameVerifier",
+    "Cipher.getInstance",
+    "MessageDigest.getInstance",
+    "DexClassLoader",
+    "PathClassLoader",
+    "InMemoryDexClassLoader",
+    "Runtime.getRuntime",
+    "ProcessBuilder",
+    "Ljava/lang/Runtime;->exec",
+    "ZipInputStream",
+    "ZipEntry",
+    "OpenableColumns.DISPLAY_NAME",
+    "_display_name",
+    "SharedPreferences",
+    "SQLiteDatabase",
+    "RoomDatabase",
+    "ClipboardManager",
+    "getPrimaryClip",
+    "getSSID",
+    "http://",
+    "https://",
+    "ws://",
+    "wss://",
+    "registerReceiver",
+    "appsecret",
+    "app_secret",
+    "app-secret",
+    "appkey",
+    "app_key",
+    "app-key",
+    "clientsecret",
+    "client_secret",
+    "client-secret",
+    "apikey",
+    "api_key",
+    "api-key",
 )
 
 
@@ -849,7 +894,28 @@ class BuiltinRuleEngine:
     def _code_rules(self, roots: list[Path], workspace: Path) -> list[FindingDraft]:
         matches: dict[str, list[dict[str, Any]]] = {rule[0]: [] for rule in CODE_RULES}
         for root in roots:
-            for path in self._iter_code_files(root):
+            optimized_paths = files_containing_any(
+                root,
+                literals=CODE_RULE_PREFILTER_LITERALS,
+                suffixes=(
+                    ".java",
+                    ".kt",
+                    ".smali",
+                    ".xml",
+                    ".js",
+                    ".mjs",
+                    ".cjs",
+                    ".html",
+                    ".htm",
+                ),
+                ignore_case=True,
+            )
+            paths = (
+                self._iter_code_files(root)
+                if optimized_paths is None
+                else self._bounded_code_files(optimized_paths)
+            )
+            for path in paths:
                 try:
                     text = path.read_text(encoding="utf-8", errors="replace")
                 except OSError:
@@ -1025,8 +1091,12 @@ class BuiltinRuleEngine:
 
     @staticmethod
     def _iter_code_files(root: Path):  # noqa: ANN205
+        return BuiltinRuleEngine._bounded_code_files(root.rglob("*"))
+
+    @staticmethod
+    def _bounded_code_files(paths):  # noqa: ANN001, ANN205
         total = 0
-        for path in root.rglob("*"):
+        for path in paths:
             if not path.is_file() or path.suffix.lower() not in {
                 ".java",
                 ".kt",
