@@ -359,7 +359,12 @@ class AdbDeviceAdapter:
 
     def capability(self, *, non_blocking: bool = False) -> dict[str, Any]:
         if not self.configured:
-            return {"available": False, "detail": "APKSCANNER_ADB_SERIAL is not configured"}
+            return {
+                "available": False,
+                "detail": "APKSCANNER_ADB_SERIAL is not configured",
+                **self.settings.verdict_metadata(None),
+                "verdict_scope": "unavailable",
+            }
         scheduler_state = self.scheduler.snapshot()
         active_task_id = scheduler_state["active_task_id"]
         if non_blocking and active_task_id:
@@ -404,6 +409,8 @@ class AdbDeviceAdapter:
             or {
                 "available": True,
                 "serial": self.serial,
+                **self.settings.verdict_metadata(None),
+                "verdict_scope": "unavailable",
             }
         )
         cached.update(
@@ -420,11 +427,16 @@ class AdbDeviceAdapter:
         """Probe device health while the caller owns the command lock."""
         state = self._adb(["get-state"], timeout=30)
         if state.exit_code != 0:
+            verdict_metadata = {
+                **self.settings.verdict_metadata(None),
+                "verdict_scope": "unavailable",
+            }
             result = {
                 "available": False,
                 "state": state.stdout.strip(),
                 "serial": self.serial,
                 "detail": state.stderr.strip() or "ADB device is unavailable",
+                **verdict_metadata,
             }
             self._last_capability = dict(result)
             self._last_capability_at = time.monotonic()

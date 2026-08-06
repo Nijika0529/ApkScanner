@@ -241,6 +241,20 @@ class ScanOrchestrator:
                         )[:4000]
                         record.state = "unavailable"
                         changed = True
+                verdict_metadata = self.settings.verdict_metadata(record.api_level)
+                verdict_metadata.update(
+                    {
+                        key: capability[key]
+                        for key in verdict_metadata
+                        if capability.get(key) is not None
+                    }
+                )
+                if capability and not capability.get("available"):
+                    verdict_metadata["android16_verdict_eligible"] = False
+                    verdict_metadata["dynamic_verdict_eligible"] = False
+                    verdict_metadata["release_gate_eligible"] = False
+                    verdict_metadata["compatibility_smoke_only"] = False
+                    verdict_metadata["verdict_scope"] = "unavailable"
                 output.append(
                     {
                         "id": record.id,
@@ -257,21 +271,7 @@ class ScanOrchestrator:
                         "api_level": record.api_level,
                         "android_version": record.android_version,
                         "available": bool(capability.get("available")),
-                        **(
-                            {
-                                key: capability.get(key)
-                                for key in (
-                                    "android16_verdict_eligible",
-                                    "dynamic_verdict_eligible",
-                                    "release_gate_eligible",
-                                    "compatibility_smoke_only",
-                                    "validation_profile",
-                                    "verdict_scope",
-                                )
-                            }
-                            if capability
-                            else self.settings.verdict_metadata(record.api_level)
-                        ),
+                        **verdict_metadata,
                         "busy": record.serial in active,
                         "active_task_id": active.get(record.serial),
                         "last_error": record.last_error,

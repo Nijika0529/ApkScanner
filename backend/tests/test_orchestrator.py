@@ -36,6 +36,7 @@ from apkscanner.planner import StaticEntryClosure
 from apkscanner.reports import ReportBuilder
 from apkscanner.schemas import (
     AdaptiveVerificationResult,
+    AdbDeviceOut,
     AgentInvestigationResult,
     AgentRuntimeObservation,
 )
@@ -70,6 +71,39 @@ def test_preserve_policy_allows_target_launch_and_poc_cleanup() -> None:
         ["uninstall", "io.apkscanner.poc.zipprobe"],
         package_name="com.example.target",
     )
+
+
+def test_device_listing_fills_verdict_contract_for_partial_capability(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    configured = replace(settings, adb_serial="offline-device:5555")
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    orchestrator = ScanOrchestrator(
+        configured,
+        database,
+        ArtifactStore(configured),
+    )
+    adapter = orchestrator.device_pool.adapters[0]
+    monkeypatch.setattr(
+        adapter,
+        "capability",
+        lambda **_kwargs: {
+            "available": False,
+            "detail": "device offline",
+        },
+    )
+
+    listed = orchestrator.list_adb_devices(probe=True)
+
+    assert len(listed) == 1
+    validated = AdbDeviceOut.model_validate(listed[0])
+    assert validated.available is False
+    assert validated.android16_verdict_eligible is False
+    assert validated.dynamic_verdict_eligible is False
+    assert validated.verdict_scope == "unavailable"
 
 
 def test_adaptive_verifier_batches_high_value_static_findings_once(

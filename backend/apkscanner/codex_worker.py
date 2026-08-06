@@ -432,6 +432,8 @@ class PersistentCodexWorker:
             "APKSCANNER_PROOF_TASK_ID",
             "APKSCANNER_PROOF_REPLAY_URL",
             "APKSCANNER_PROOF_TOKEN",
+            "APKSCANNER_OBSERVATION_URL",
+            "APKSCANNER_OBSERVATION_TOKEN",
         }
         unknown = set(values) - allowed
         if unknown:

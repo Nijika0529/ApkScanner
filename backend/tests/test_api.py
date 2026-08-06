@@ -132,6 +132,36 @@ def test_health_reports_a_leased_adb_pool_as_busy_not_unavailable(
     assert "active tasks" in device["detail"]
 
 
+def test_offline_device_list_preserves_the_verdict_response_contract(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    configured = replace(settings, adb_serial="offline-device:5555")
+    app = create_app(configured)
+    adapter = app.state.orchestrator.device_pool.adapters[0]
+    monkeypatch.setattr(
+        adapter,
+        "capability",
+        lambda **_kwargs: {
+            "available": False,
+            "detail": "device offline",
+        },
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/devices", params={"probe": True})
+
+    assert response.status_code == 200
+    device = response.json()[0]
+    assert device["available"] is False
+    assert device["android16_verdict_eligible"] is False
+    assert device["dynamic_verdict_eligible"] is False
+    assert device["release_gate_eligible"] is False
+    assert device["compatibility_smoke_only"] is False
+    assert device["validation_profile"] == configured.validation_profile
+    assert device["verdict_scope"] == "unavailable"
+
+
 def test_in_memory_sqlite_is_shared_with_app_worker_threads(settings) -> None:  # noqa: ANN001
     app = create_app(replace(settings, database_url="sqlite:///:memory:"))
 

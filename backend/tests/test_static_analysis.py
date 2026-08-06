@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import os
+import re
 import stat
 import zipfile
 from pathlib import Path
@@ -16,6 +18,21 @@ from apkscanner.static_analysis import (
 from apkscanner.tools import CommandResult
 
 from .conftest import MANIFEST
+
+
+def _nested_apk_bytes(package_name: str, entries: dict[str, bytes | str]) -> bytes:
+    manifest = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<manifest xmlns:android="http://schemas.android.com/apk/res/android" '
+        f'package="{package_name}"><application /></manifest>'
+    )
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("AndroidManifest.xml", manifest)
+        archive.writestr("classes.dex", b"dex\n035\x00" + b"\x00" * 80)
+        for name, content in entries.items():
+            archive.writestr(name, content)
+    return output.getvalue()
 
 
 def test_inspector_falls_back_to_plaintext_manifest(settings, fixture_apk) -> None:  # noqa: ANN001
@@ -55,6 +72,122 @@ def test_exact_apk_reuses_content_addressed_static_analysis(settings, fixture_ap
     assert ApkInspector._static_result_cacheable(
         {"jadx": {"timed_out": False}}, {"status": "partial_timeout"}
     ) is False
+
+
+def test_product_bundle_recursively_analyzes_embedded_apks_and_web_assets(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+
+    grandchild = _nested_apk_bytes(
+        "com.example.grandchild",
+        {
+            "assets/grandchild.js": "window.NativeBridge.readAccount();",
+            "assets/grandchild.html": "<script src='grandchild.js'></script>",
+        },
+    )
+    child = _nested_apk_bytes(
+        "com.example.child",
+        {
+            "assets/plugin/grandchild.apk": grandchild,
+            "assets/child.js": "window.Actor.execute();",
+            "assets/child.html": "<script src='child.js'></script>",
+        },
+    )
+    root_apk = tmp_path / "product-bundle.apk"
+    root_apk.write_bytes(
+        _nested_apk_bytes(
+            "com.example.host",
+            {
+                "assets/actor/child.apk": child,
+                "assets/plugin/child-copy.apk": child,
+                "assets/main.js": "webView.addJavascriptInterface(bridge, 'native');",
+                "assets/main.html": "<script src='main.js'></script>",
+            },
+        )
+    )
+
+    class ProductBundleRunner:
+        @staticmethod
+        def available(tool: str) -> bool:
+            return tool == "jadx"
+
+        @staticmethod
+        def version(tool: str) -> str | None:
+            return "jadx test" if tool == "jadx" else None
+
+        @staticmethod
+        def run(argv, **_kwargs):  # noqa: ANN001
+            assert argv[0] == "jadx"
+            output = Path(argv[argv.index("--output-dir") + 1])
+            input_apk = Path(argv[-1])
+            with zipfile.ZipFile(input_apk) as archive:
+                manifest = archive.read("AndroidManifest.xml").decode()
+            package_name = re.search(r'package="([^"]+)"', manifest).group(1)  # type: ignore[union-attr]
+            source = (
+                output
+                / "sources"
+                / Path(*package_name.split("."))
+                / "PluginEntry.java"
+            )
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(
+                f"package {package_name}; public final class PluginEntry {{}}",
+                encoding="utf-8",
+            )
+            return CommandResult(argv=argv, exit_code=0, stdout="", stderr="")
+
+    inspector = ApkInspector(settings, runner=ProductBundleRunner())
+    result = inspector.inspect(root_apk, "product-bundle-source")
+
+    packages = {node.get("package_name") for node in result.artifact_graph["nodes"]}
+    assert packages == {
+        "com.example.host",
+        "com.example.child",
+        "com.example.grandchild",
+    }
+    assert result.file_inventory["product_bundle"] == {
+        "schema_version": "1.0",
+        "artifact_count": 3,
+        "embedded_apk_count": 2,
+        "javascript_file_count": 3,
+        "html_file_count": 3,
+        "artifact_graph_path": "artifact_graph.json",
+    }
+    assert {
+        edge["archive_path"] for edge in result.artifact_graph["edges"]
+    } == {
+        "assets/actor/child.apk",
+        "assets/plugin/child-copy.apk",
+        "assets/plugin/grandchild.apk",
+    }
+    assert sum(
+        1
+        for node in result.artifact_graph["nodes"]
+        if node.get("package_name") == "com.example.child"
+    ) == 1
+    assert any(
+        (root / "assets/main.js").is_file()
+        or (root / "assets/child.js").is_file()
+        or (root / "assets/grandchild.js").is_file()
+        for root in result.searchable_roots
+    )
+
+    findings, _coverage = BuiltinRuleEngine().evaluate(result)
+    assert "CODE-WEBVIEW-JS-BRIDGE" in {finding.rule_id for finding in findings}
+    surfaces = BuiltinRuleEngine.embedded_artifact_review_surfaces(result)
+    assert {surface.artifact["package_name"] for surface in surfaces if surface.artifact} == {
+        "com.example.child",
+        "com.example.grandchild",
+    }
+    assert all(surface.locations for surface in surfaces)
+
+    cached = inspector.inspect(root_apk, "product-bundle-cache-target")
+    assert cached.file_inventory["static_cache_hit"] is True
+    assert cached.file_inventory["product_bundle"] == result.file_inventory["product_bundle"]
+    assert len(cached.artifact_graph["nodes"]) == 3
+    assert any("/artifacts/" in f"/{root}" for root in cached.searchable_roots)
 
 
 def test_inspector_keeps_smali_and_uses_aapt2_manifest_when_oem_resources_fail(

@@ -360,11 +360,16 @@ def test_worker_capacity_evicts_an_idle_resumable_session_instead_of_failing(set
     assert investigator._sessions == {}
 
 
-def test_scan_container_command_has_scan_scope_and_no_provider_secret(settings) -> None:  # noqa: ANN001
+def test_scan_container_command_has_scan_scope_and_no_provider_secret(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    monkeypatch.setattr(CodexDockerExecutor, "_docker", staticmethod(lambda: "docker"))
     configured = replace(settings, codex_docker_image="test-worker:fixed")
     scan_workspace = configured.data_dir / "workspaces" / SCAN_ID
-    for name in ("jadx", "apktool", "archive"):
+    for name in ("jadx", "apktool", "archive", "artifacts"):
         (scan_workspace / name).mkdir(parents=True, exist_ok=True)
+    (scan_workspace / "artifact_graph.json").write_text("{}", encoding="utf-8")
     sessions_root = configured.data_dir / "agent-sessions" / SCAN_ID
     sessions_root.mkdir(parents=True)
     apk_path = configured.data_dir / "target.apk"
@@ -390,11 +395,14 @@ def test_scan_container_command_has_scan_scope_and_no_provider_secret(settings) 
     assert "target=/agent-workspaces" in rendered
     assert "target=/scan-input/target.apk,readonly" in rendered
     assert "target=/scan-input/jadx,readonly" in rendered
+    assert "target=/scan-input/artifacts,readonly" in rendered
+    assert "target=/scan-input/artifact_graph.json,readonly" in rendered
     assert "DEEPSEEK_API_KEY" not in rendered
     assert "docker.sock" not in rendered
 
 
 def test_worker_exec_injects_only_key_name_for_one_uid(settings, monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(CodexDockerExecutor, "_docker", staticmethod(lambda: "docker"))
     monkeypatch.setenv("DEEPSEEK_API_KEY", "unit-test-secret-must-not-enter-argv")
     configured = replace(settings, codex_uid_min=21_200, codex_uid_max=21_210)
     source = configured.data_dir / "source"

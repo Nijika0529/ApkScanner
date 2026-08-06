@@ -353,6 +353,12 @@ def test_health_capability_does_not_enter_an_active_device_session(settings) -> 
     assert capability["available"] is True
     assert capability["busy"] is True
     assert capability["active_task_id"] == "active"
+    assert capability["android16_verdict_eligible"] is False
+    assert capability["dynamic_verdict_eligible"] is False
+    assert capability["release_gate_eligible"] is False
+    assert capability["compatibility_smoke_only"] is False
+    assert capability["validation_profile"] == settings.validation_profile
+    assert capability["verdict_scope"] == "unavailable"
     release.set()
     worker.join(timeout=5)
     assert not worker.is_alive()
@@ -428,6 +434,12 @@ def test_non_blocking_health_probe_does_not_wait_behind_an_adb_command(settings)
     assert capability["available"] is True
     assert capability["busy"] is True
     assert capability["active_task_id"] is None
+    assert capability["android16_verdict_eligible"] is False
+    assert capability["dynamic_verdict_eligible"] is False
+    assert capability["release_gate_eligible"] is False
+    assert capability["compatibility_smoke_only"] is False
+    assert capability["validation_profile"] == settings.validation_profile
+    assert capability["verdict_scope"] == "unavailable"
     release.set()
     worker.join(timeout=5)
     assert not worker.is_alive()
@@ -479,6 +491,12 @@ def test_non_blocking_device_health_reuses_recent_failure(settings) -> None:  # 
     second = adapter.capability(non_blocking=True)
 
     assert first["available"] is False
+    assert first["android16_verdict_eligible"] is False
+    assert first["dynamic_verdict_eligible"] is False
+    assert first["release_gate_eligible"] is False
+    assert first["compatibility_smoke_only"] is False
+    assert first["validation_profile"] == settings.validation_profile
+    assert first["verdict_scope"] == "unavailable"
     assert second["available"] is False
     assert second["cached"] is True
     assert len(calls) == 1

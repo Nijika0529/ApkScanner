@@ -49,6 +49,7 @@ def test_codex_overrides_use_responses_env_key_and_filter_secrets() -> None:
     assert "shell_environment_policy.ignore_default_excludes=true" in rendered
     assert '"APKSCANNER_ADB_*"' in rendered
     assert '"APKSCANNER_PROOF_*"' in rendered
+    assert '"APKSCANNER_OBSERVATION_*"' in rendered
     assert '"DEEPSEEK_API_KEY"' in rendered
     assert "^APKSCANNER" not in rendered
     assert not any("sk-" in item for item in overrides)

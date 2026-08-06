@@ -59,3 +59,21 @@ def test_gateway_environment_accepts_only_known_adb_policy(monkeypatch) -> None:
         PersistentCodexWorker._install_gateway_environment(
             {"APKSCANNER_ADB_POLICY": "unrestricted"}
         )
+
+
+def test_gateway_environment_accepts_runtime_observation_endpoint(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.delenv("APKSCANNER_OBSERVATION_URL", raising=False)
+    monkeypatch.delenv("APKSCANNER_OBSERVATION_TOKEN", raising=False)
+    token = "o" * 48
+
+    PersistentCodexWorker._install_gateway_environment(
+        {
+            "APKSCANNER_OBSERVATION_URL": (
+                "http://apkscanner-host:8000/api/v1/internal/tasks/task-1/observations"
+            ),
+            "APKSCANNER_OBSERVATION_TOKEN": token,
+        }
+    )
+
+    assert os.environ["APKSCANNER_OBSERVATION_URL"].endswith("/observations")
+    assert os.environ["APKSCANNER_OBSERVATION_TOKEN"] == token
