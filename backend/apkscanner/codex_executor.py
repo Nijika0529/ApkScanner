@@ -142,7 +142,7 @@ class CodexDockerExecutor:
                     f"type=bind,source={apk_path},target=/scan-input/target.apk,readonly",
                 ]
             )
-        for name in ("jadx", "apktool", "archive"):
+        for name in ("jadx", "apktool", "archive", "artifacts"):
             source = scan_workspace / name
             if source.is_dir():
                 command.extend(
@@ -151,6 +151,18 @@ class CodexDockerExecutor:
                         f"type=bind,source={source},target=/scan-input/{name},readonly",
                     ]
                 )
+        artifact_graph = scan_workspace / "artifact_graph.json"
+        if artifact_graph.is_file():
+            command.extend(
+                [
+                    "--mount",
+                    (
+                        "type=bind,"
+                        f"source={artifact_graph},"
+                        "target=/scan-input/artifact_graph.json,readonly"
+                    ),
+                ]
+            )
         command.extend(
             [
                 "--entrypoint",

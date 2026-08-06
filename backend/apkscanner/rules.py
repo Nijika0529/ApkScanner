@@ -53,6 +53,7 @@ class StaticReviewSurfaceDraft:
     hypotheses: list[str]
     locations: list[dict[str, Any]]
     attack_chains: list[dict[str, Any]] = field(default_factory=list)
+    artifact: dict[str, Any] | None = None
 
 
 CODE_RULES = (
@@ -393,7 +394,7 @@ class BuiltinRuleEngine:
     ) -> tuple[list[FindingDraft], list[CoverageDraft]]:
         findings = self._manifest_rules(result.manifest)
         findings.extend(self._file_rules(result))
-        findings.extend(self._code_rules(result.searchable_roots))
+        findings.extend(self._code_rules(result.searchable_roots, result.workspace))
         findings.extend(self._attack_chain_rules(result.attack_chains))
         coverage = self._coverage(result, findings)
         return findings, coverage
@@ -482,6 +483,64 @@ class BuiltinRuleEngine:
                             for index, item in enumerate(attack_chains)
                         }.values()
                     ),
+                )
+            )
+        return surfaces
+
+    @staticmethod
+    def embedded_artifact_review_surfaces(
+        result: StaticAnalysisResult,
+    ) -> list[StaticReviewSurfaceDraft]:
+        surfaces: list[StaticReviewSurfaceDraft] = []
+        for node in result.artifact_graph.get("nodes", []):
+            origin = node.get("origin") or {}
+            if node.get("kind") != "apk" or origin.get("kind") != "embedded_apk":
+                continue
+            analysis_root = result.workspace / str(node.get("analysis_root") or "")
+            jadx_root = analysis_root / "jadx"
+            source_root = jadx_root / "sources" if (jadx_root / "sources").is_dir() else jadx_root
+            locations: list[dict[str, Any]] = []
+            if source_root.is_dir():
+                for source in sorted(source_root.rglob("*.java"))[:3]:
+                    locations.append(
+                        {
+                            "root": BuiltinRuleEngine._search_root_label(
+                                jadx_root,
+                                result.workspace,
+                            ),
+                            "path": str(source.relative_to(jadx_root)),
+                            "line": 1,
+                            "artifact_id": node.get("id"),
+                        }
+                    )
+            package_name = str(node.get("package_name") or "unknown")
+            sha256 = str(node.get("sha256") or "")
+            archive_path = str(origin.get("archive_path") or node.get("path") or "")
+            surfaces.append(
+                StaticReviewSurfaceDraft(
+                    name=f"static://embedded_apk/{package_name}:{sha256[:12]}",
+                    family="embedded_apk",
+                    title=f"Embedded APK: {package_name}",
+                    severity=Severity.HIGH.value,
+                    priority=90,
+                    rule_ids=[],
+                    hypotheses=[
+                        (
+                            f"The host loads {archive_path} into its process, and plugin-specific "
+                            "code reaches an Android IPC, WebView, file, account, or cross-app "
+                            "operation that is security-sensitive."
+                        ),
+                        (
+                            "The plugin receives caller-controlled or remotely supplied data from "
+                            "the host without preserving the Android caller and authorization context."
+                        ),
+                        (
+                            "Trace the concrete host loader and plugin entry contract before deciding "
+                            "whether the embedded code is reachable from an untrusted Android entry."
+                        ),
+                    ],
+                    locations=locations,
+                    artifact=dict(node),
                 )
             )
         return surfaces
@@ -689,7 +748,7 @@ class BuiltinRuleEngine:
             )
         return findings
 
-    def _code_rules(self, roots: list[Path]) -> list[FindingDraft]:
+    def _code_rules(self, roots: list[Path], workspace: Path) -> list[FindingDraft]:
         matches: dict[str, list[dict[str, Any]]] = {rule[0]: [] for rule in CODE_RULES}
         for root in roots:
             for path in self._iter_code_files(root):
@@ -716,7 +775,7 @@ class BuiltinRuleEngine:
                             {
                                 "path": str(path.relative_to(root)),
                                 "line": line,
-                                "root": root.name,
+                                "root": self._search_root_label(root, workspace),
                             }
                         )
                         if len(matches[rule_id]) >= match_limit:
@@ -870,7 +929,17 @@ class BuiltinRuleEngine:
     def _iter_code_files(root: Path):  # noqa: ANN205
         total = 0
         for path in root.rglob("*"):
-            if not path.is_file() or path.suffix.lower() not in {".java", ".kt", ".smali", ".xml"}:
+            if not path.is_file() or path.suffix.lower() not in {
+                ".java",
+                ".kt",
+                ".smali",
+                ".xml",
+                ".js",
+                ".mjs",
+                ".cjs",
+                ".html",
+                ".htm",
+            }:
                 continue
             try:
                 size = path.stat().st_size
@@ -882,6 +951,13 @@ class BuiltinRuleEngine:
             if total > 250_000_000:
                 break
             yield path
+
+    @staticmethod
+    def _search_root_label(root: Path, workspace: Path) -> str:
+        try:
+            return str(root.resolve().relative_to(workspace.resolve()))
+        except ValueError:
+            return root.name
 
     @staticmethod
     def _coverage(

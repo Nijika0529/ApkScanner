@@ -1602,12 +1602,20 @@ class ScanOrchestrator:
                 result.manifest,
                 findings,
             )
+            static_review_surfaces.extend(
+                self.rules.embedded_artifact_review_surfaces(result)
+            )
             for surface in static_review_surfaces:
                 self.inspector.add_static_surface_to_code_index(
                     result,
                     surface_name=surface.name,
                     locations=surface.locations,
                     attack_chains=surface.attack_chains,
+                    package_name=(
+                        str(surface.artifact.get("package_name"))
+                        if surface.artifact and surface.artifact.get("package_name")
+                        else None
+                    ),
                 )
                 for finding in findings:
                     if (
@@ -1734,6 +1742,7 @@ class ScanOrchestrator:
                         "static_review_hypotheses": surface.hypotheses,
                         "static_review_locations": surface.locations,
                         "static_review_attack_chains": surface.attack_chains,
+                        "static_review_artifact": surface.artifact,
                         "decompilation": {
                             "status": code_context.get(
                                 "status",
@@ -3024,7 +3033,9 @@ class ScanOrchestrator:
                         "/scan-input/jadx",
                         "/scan-input/apktool",
                         "/scan-input/archive",
+                        "/scan-input/artifacts",
                     ],
+                    "artifact_graph": "/scan-input/artifact_graph.json",
                     "target_apk": "/scan-input/target.apk",
                 },
                 "proof_policy": {
@@ -7963,7 +7974,9 @@ class ScanOrchestrator:
         scan_workspace = (self.settings.data_dir / "workspaces" / scan_id).resolve()
         expose_shared_workspace = self.settings.agent_permission_profile == "personal_lab"
         shared_names = [
-            name for name in ("jadx", "apktool", "archive") if (scan_workspace / name).is_dir()
+            name
+            for name in ("jadx", "apktool", "archive", "artifacts")
+            if (scan_workspace / name).is_dir()
         ]
         workspace_policy = {
             "writable_root": ".",
@@ -7975,6 +7988,12 @@ class ScanOrchestrator:
                 }
                 if expose_shared_workspace
                 else {"container": []}
+            ),
+            "artifact_graph": (
+                "/scan-input/artifact_graph.json"
+                if expose_shared_workspace
+                and (scan_workspace / "artifact_graph.json").is_file()
+                else None
             ),
             "reason": (
                 "This bounded static semantic task receives the exact signal sources and "

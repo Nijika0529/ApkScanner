@@ -17,7 +17,7 @@ from .manifest import ManifestDocument, aapt2_xmltree_to_xml, parse_manifest
 from .permissions import ensure_private_directory
 from .tools import CommandResult, TimeBudget, ToolRunner, discover_tools
 
-CODE_INDEX_CONTEXT_VERSION = "component-one-hop-android-chains-v3"
+CODE_INDEX_CONTEXT_VERSION = "component-one-hop-android-chains-v4-product-bundle"
 
 
 class InvalidApkError(ValueError):
@@ -36,6 +36,7 @@ class StaticAnalysisResult:
     decompilation: dict[str, Any] = field(default_factory=dict)
     code_index: dict[str, dict[str, Any]] = field(default_factory=dict)
     attack_chains: list[dict[str, Any]] = field(default_factory=list)
+    artifact_graph: dict[str, Any] = field(default_factory=dict)
 
 
 class ApkInspector:
@@ -44,10 +45,17 @@ class ApkInspector:
         self.runner = runner or ToolRunner(settings.tool_timeout_seconds)
 
     def inspect(
-        self, apk_path: Path, scan_id: str, budget: TimeBudget | None = None
+        self,
+        apk_path: Path,
+        scan_id: str,
+        budget: TimeBudget | None = None,
+        *,
+        _workspace: Path | None = None,
+        _artifact_origin: str = "target.apk",
+        _ancestry: tuple[str, ...] = (),
     ) -> StaticAnalysisResult:
         file_inventory = self._validate_zip(apk_path)
-        workspace = self.settings.data_dir / "workspaces" / scan_id
+        workspace = _workspace or self.settings.data_dir / "workspaces" / scan_id
         ensure_private_directory(workspace)
         tool_versions = discover_tools(self.runner)
         artifact_sha256 = self._file_sha256(apk_path)
@@ -232,6 +240,41 @@ class ApkInspector:
             "cache_hit": False,
             "analysis_profile": analysis_profile,
         }
+        artifact_graph = self._analyze_embedded_apks(
+            apk_path=apk_path,
+            scan_id=scan_id,
+            workspace=workspace,
+            artifact_sha256=artifact_sha256,
+            artifact_origin=_artifact_origin,
+            manifest=manifest,
+            file_inventory=file_inventory,
+            decompilation=decompilation,
+            budget=budget,
+            ancestry=(*_ancestry, artifact_sha256),
+        )
+        (workspace / "artifact_graph.json").write_text(
+            json.dumps(artifact_graph, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        searchable_roots = self._workspace_searchable_roots(workspace)
+        artifact_nodes = list(artifact_graph.get("nodes") or [])
+        file_inventory = {
+            **file_inventory,
+            "product_bundle": {
+                "schema_version": artifact_graph.get("schema_version", "1.0"),
+                "artifact_count": len(artifact_nodes),
+                "embedded_apk_count": max(0, len(artifact_nodes) - 1),
+                "javascript_file_count": sum(
+                    len((node.get("inventory") or {}).get("javascript_files") or [])
+                    for node in artifact_nodes
+                ),
+                "html_file_count": sum(
+                    len((node.get("inventory") or {}).get("html_files") or [])
+                    for node in artifact_nodes
+                ),
+                "artifact_graph_path": "artifact_graph.json",
+            },
+        }
         if self._static_result_cacheable(tool_results, decompilation):
             self._publish_static_cache(
                 cache_dir=cache_dir,
@@ -255,6 +298,7 @@ class ApkInspector:
             decompilation=decompilation,
             code_index=code_index,
             attack_chains=attack_chains,
+            artifact_graph=artifact_graph,
         )
 
     @staticmethod
@@ -289,13 +333,18 @@ class ApkInspector:
     ) -> StaticAnalysisResult | None:
         metadata_path = cache_dir / "metadata.json"
         index_path = cache_dir / "code_index.json"
-        if not metadata_path.is_file() or not index_path.is_file():
+        graph_path = cache_dir / "artifact_graph.json"
+        if not metadata_path.is_file() or not index_path.is_file() or not graph_path.is_file():
             return None
-        if any((workspace / name).exists() for name in ("jadx", "apktool", "archive")):
+        if any(
+            (workspace / name).exists()
+            for name in ("jadx", "apktool", "archive", "artifacts")
+        ):
             return None
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             index_payload = json.loads(index_path.read_text(encoding="utf-8"))
+            artifact_graph = json.loads(graph_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
         if (
@@ -304,6 +353,8 @@ class ApkInspector:
             or index_payload.get("context_version") != CODE_INDEX_CONTEXT_VERSION
             or not isinstance(index_payload.get("components"), dict)
             or not isinstance(index_payload.get("attack_chains"), list)
+            or not isinstance(artifact_graph.get("nodes"), list)
+            or not isinstance(artifact_graph.get("edges"), list)
         ):
             return None
         manifest_relative = metadata.get("manifest_relative_path")
@@ -312,7 +363,7 @@ class ApkInspector:
         cached_manifest = (cache_dir / manifest_relative).resolve()
         if not cached_manifest.is_relative_to(cache_dir.resolve()) or not cached_manifest.is_file():
             return None
-        for name in ("jadx", "apktool", "archive"):
+        for name in ("jadx", "apktool", "archive", "artifacts"):
             source = cache_dir / name
             if source.is_dir():
                 shutil.copytree(source, workspace / name)
@@ -320,6 +371,7 @@ class ApkInspector:
         if top_manifest.is_file():
             shutil.copy2(top_manifest, workspace / "AndroidManifest.xml")
         shutil.copy2(index_path, workspace / "code_index.json")
+        shutil.copy2(graph_path, workspace / "artifact_graph.json")
         workspace_manifest = workspace / manifest_relative
         if not workspace_manifest.is_file():
             return None
@@ -329,11 +381,8 @@ class ApkInspector:
             "cache_hit": True,
             "analysis_profile": analysis_profile,
         }
-        searchable_roots = [
-            path
-            for path in (workspace / "jadx", workspace / "apktool", workspace / "archive")
-            if path.is_dir()
-        ]
+        searchable_roots = self._workspace_searchable_roots(workspace)
+        artifact_nodes = list(artifact_graph.get("nodes") or [])
         return StaticAnalysisResult(
             manifest=manifest,
             workspace=workspace,
@@ -353,11 +402,26 @@ class ApkInspector:
                 **file_inventory,
                 "static_cache_hit": True,
                 "analysis_profile": analysis_profile,
+                "product_bundle": {
+                    "schema_version": artifact_graph.get("schema_version", "1.0"),
+                    "artifact_count": len(artifact_nodes),
+                    "embedded_apk_count": max(0, len(artifact_nodes) - 1),
+                    "javascript_file_count": sum(
+                        len((node.get("inventory") or {}).get("javascript_files") or [])
+                        for node in artifact_nodes
+                    ),
+                    "html_file_count": sum(
+                        len((node.get("inventory") or {}).get("html_files") or [])
+                        for node in artifact_nodes
+                    ),
+                    "artifact_graph_path": "artifact_graph.json",
+                },
             },
             searchable_roots=searchable_roots,
             decompilation=decompilation,
             code_index=dict(index_payload["components"]),
             attack_chains=list(index_payload["attack_chains"]),
+            artifact_graph=artifact_graph,
         )
 
     @staticmethod
@@ -390,7 +454,7 @@ class ApkInspector:
         cache_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         temporary = Path(tempfile.mkdtemp(prefix="static-cache-", dir=cache_dir.parent))
         try:
-            for name in ("jadx", "apktool", "archive"):
+            for name in ("jadx", "apktool", "archive", "artifacts"):
                 source = workspace / name
                 if source.is_dir():
                     shutil.copytree(source, temporary / name)
@@ -398,6 +462,10 @@ class ApkInspector:
             if top_manifest.is_file():
                 shutil.copy2(top_manifest, temporary / "AndroidManifest.xml")
             shutil.copy2(workspace / "code_index.json", temporary / "code_index.json")
+            shutil.copy2(
+                workspace / "artifact_graph.json",
+                temporary / "artifact_graph.json",
+            )
             relative_manifest = str(manifest_path.relative_to(workspace))
             metadata = {
                 "schema_version": "1.0",
@@ -421,6 +489,163 @@ class ApkInspector:
             if temporary.exists():
                 shutil.rmtree(temporary)
 
+    @staticmethod
+    def _workspace_searchable_roots(workspace: Path) -> list[Path]:
+        roots: list[Path] = []
+        seen: set[Path] = set()
+        for name in ("jadx", "apktool", "archive"):
+            direct = workspace / name
+            if direct.is_dir():
+                resolved = direct.resolve()
+                seen.add(resolved)
+                roots.append(direct)
+            artifacts = workspace / "artifacts"
+            if not artifacts.is_dir():
+                continue
+            for candidate in sorted(artifacts.rglob(name)):
+                if not candidate.is_dir():
+                    continue
+                resolved = candidate.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                roots.append(candidate)
+        return roots
+
+    def _analyze_embedded_apks(
+        self,
+        *,
+        apk_path: Path,
+        scan_id: str,
+        workspace: Path,
+        artifact_sha256: str,
+        artifact_origin: str,
+        manifest: ManifestDocument,
+        file_inventory: dict[str, Any],
+        decompilation: dict[str, Any],
+        budget: TimeBudget | None,
+        ancestry: tuple[str, ...],
+    ) -> dict[str, Any]:
+        root_id = "target.apk" if artifact_origin == "target.apk" else "artifact.apk"
+        root_node = {
+            "id": root_id,
+            "path": root_id,
+            "kind": "apk",
+            "sha256": artifact_sha256,
+            "origin": {
+                "kind": "scan_input" if artifact_origin == "target.apk" else "embedded_apk",
+                "archive_path": None if artifact_origin == "target.apk" else artifact_origin,
+            },
+            "package_name": manifest.package_name,
+            "version_name": manifest.version_name,
+            "version_code": manifest.version_code,
+            "analysis_root": ".",
+            "decompilation": {
+                "status": decompilation.get("status"),
+                "generated_java_files": decompilation.get("generated_java_files", 0),
+                "cache_hit": bool(decompilation.get("cache_hit")),
+            },
+            "inventory": {
+                "dex_files": list(file_inventory.get("dex_files") or []),
+                "native_libraries": list(file_inventory.get("native_libraries") or []),
+                "embedded_apk_files": list(file_inventory.get("embedded_apk_files") or []),
+                "javascript_files": list(file_inventory.get("javascript_files") or []),
+                "html_files": list(file_inventory.get("html_files") or []),
+            },
+        }
+        graph: dict[str, Any] = {
+            "schema_version": "1.0",
+            "root_id": root_id,
+            "nodes": [root_node],
+            "edges": [],
+        }
+        embedded_names = list(file_inventory.get("embedded_apk_files") or [])
+        if not embedded_names:
+            return graph
+
+        artifacts_root = workspace / "artifacts"
+        ensure_private_directory(artifacts_root)
+        analyzed: dict[str, tuple[dict[str, Any], str, str]] = {}
+        with zipfile.ZipFile(apk_path) as archive:
+            for archive_path in embedded_names:
+                raw = archive.read(archive_path)
+                child_sha256 = hashlib.sha256(raw).hexdigest()
+                child_prefix = f"artifacts/{child_sha256}"
+                if child_sha256 not in analyzed:
+                    child_workspace = workspace / child_prefix
+                    ensure_private_directory(child_workspace)
+                    child_apk = child_workspace / "artifact.apk"
+                    child_apk.write_bytes(raw)
+                    child_result = self.inspect(
+                        child_apk,
+                        scan_id,
+                        budget,
+                        _workspace=child_workspace,
+                        _artifact_origin=archive_path,
+                        _ancestry=ancestry,
+                    )
+                    child_graph = self._rebase_artifact_graph(
+                        child_result.artifact_graph,
+                        child_prefix,
+                    )
+                    analyzed[child_sha256] = (
+                        child_graph,
+                        child_prefix,
+                        str(child_graph["root_id"]),
+                    )
+                    graph["nodes"].extend(child_graph["nodes"])
+                    graph["edges"].extend(child_graph["edges"])
+                child_graph, _prefix, child_root_id = analyzed[child_sha256]
+                graph["edges"].append(
+                    {
+                        "from": root_id,
+                        "to": child_root_id,
+                        "relation": "contains",
+                        "archive_path": archive_path,
+                        "sha256": child_sha256,
+                    }
+                )
+                child_root = next(
+                    node for node in child_graph["nodes"] if node["id"] == child_root_id
+                )
+                origins = child_root.setdefault("embedded_at", [])
+                if archive_path not in origins:
+                    origins.append(archive_path)
+        return graph
+
+    @staticmethod
+    def _rebase_artifact_graph(graph: dict[str, Any], prefix: str) -> dict[str, Any]:
+        def rebase(value: str) -> str:
+            if value in {"", "."}:
+                return prefix
+            return str(PurePosixPath(prefix) / PurePosixPath(value))
+
+        mapping = {
+            str(node["id"]): rebase(str(node["id"]))
+            for node in graph.get("nodes", [])
+        }
+        nodes: list[dict[str, Any]] = []
+        for source in graph.get("nodes", []):
+            node = dict(source)
+            node["id"] = mapping[str(source["id"])]
+            node["path"] = rebase(str(source.get("path") or source["id"]))
+            node["analysis_root"] = rebase(str(source.get("analysis_root") or "."))
+            nodes.append(node)
+        edges = [
+            {
+                **dict(edge),
+                "from": mapping[str(edge["from"])],
+                "to": mapping[str(edge["to"])],
+            }
+            for edge in graph.get("edges", [])
+        ]
+        return {
+            "schema_version": graph.get("schema_version", "1.0"),
+            "root_id": mapping[str(graph["root_id"])],
+            "nodes": nodes,
+            "edges": edges,
+        }
+
     def _run(self, argv: list[str], budget: TimeBudget | None, timeout_cap: int) -> CommandResult:
         timeout = timeout_cap if budget is None else budget.remaining(timeout_cap)
         if timeout <= 0:
@@ -439,6 +664,9 @@ class ApkInspector:
         total_uncompressed = 0
         native_libraries: list[str] = []
         dex_files: list[str] = []
+        embedded_apk_files: list[str] = []
+        javascript_files: list[str] = []
+        html_files: list[str] = []
         duplicate_names: list[str] = []
         names_seen: set[str] = set()
         archive_facts: list[dict[str, Any]] = []
@@ -470,6 +698,13 @@ class ApkInspector:
                     native_libraries.append(item.filename)
                 if re.fullmatch(r"classes\d*\.dex", PurePosixPath(item.filename).name):
                     dex_files.append(item.filename)
+                suffix = PurePosixPath(item.filename).suffix.lower()
+                if suffix == ".apk":
+                    embedded_apk_files.append(item.filename)
+                elif suffix in {".js", ".mjs", ".cjs"}:
+                    javascript_files.append(item.filename)
+                elif suffix in {".html", ".htm"}:
+                    html_files.append(item.filename)
                 archive_facts.append(
                     {
                         "path": item.filename,
@@ -514,6 +749,9 @@ class ApkInspector:
                 "uncompressed_bytes": total_uncompressed,
                 "dex_files": sorted(dex_files),
                 "native_libraries": sorted(native_libraries),
+                "embedded_apk_files": sorted(embedded_apk_files),
+                "javascript_files": sorted(javascript_files),
+                "html_files": sorted(html_files),
                 "duplicate_names": sorted(set(duplicate_names))[:200],
                 "has_assets": any(name.startswith("assets/") for name in names_seen),
                 "archive_fingerprint": archive_fingerprint,
@@ -536,10 +774,13 @@ class ApkInspector:
             return True
         return name.startswith("assets/") and suffix in {
             ".conf",
+            ".cjs",
             ".html",
+            ".htm",
             ".ini",
             ".js",
             ".json",
+            ".mjs",
             ".properties",
             ".txt",
             ".xml",
@@ -561,7 +802,19 @@ class ApkInspector:
     @staticmethod
     def _extract_searchable_files(apk_path: Path, destination: Path) -> None:
         destination.mkdir(parents=True, exist_ok=True)
-        allowed_suffixes = {".xml", ".smali", ".java", ".kt", ".json", ".properties"}
+        allowed_suffixes = {
+            ".xml",
+            ".smali",
+            ".java",
+            ".kt",
+            ".json",
+            ".properties",
+            ".js",
+            ".mjs",
+            ".cjs",
+            ".html",
+            ".htm",
+        }
         total = 0
         with zipfile.ZipFile(apk_path) as archive:
             for item in archive.infolist():
@@ -778,7 +1031,17 @@ class ApkInspector:
             excerpt = text[:max_chars]
         anchor: dict[str, Any] = {
             "path": str(path.relative_to(workspace)),
-            "language": "java" if path.suffix == ".java" else "smali",
+            "language": {
+                ".java": "java",
+                ".kt": "kotlin",
+                ".smali": "smali",
+                ".js": "javascript",
+                ".mjs": "javascript",
+                ".cjs": "javascript",
+                ".html": "html",
+                ".htm": "html",
+                ".xml": "xml",
+            }.get(path.suffix.lower(), "text"),
             "sha256": hashlib.sha256(raw).hexdigest(),
             "line_start": line_start,
             "line_end": line_start + excerpt.count("\n"),
@@ -806,12 +1069,15 @@ class ApkInspector:
         surface_name: str,
         locations: list[dict[str, Any]],
         attack_chains: list[dict[str, Any]] | None = None,
+        package_name: str | None = None,
     ) -> None:
         anchors: list[dict[str, Any]] = []
         seen: set[Path] = set()
         seed_sources: list[Path] = []
         allowed_roots = {
-            path.name: path.resolve() for path in result.searchable_roots if path.is_dir()
+            cls._search_root_label(path, result.workspace): path.resolve()
+            for path in result.searchable_roots
+            if path.is_dir()
         }
         for location in locations:
             root = allowed_roots.get(str(location.get("root") or ""))
@@ -833,7 +1099,7 @@ class ApkInspector:
             anchors.append(anchor)
             if len(anchors) >= 8:
                 break
-        package_path = result.manifest.package_name.replace(".", "/")
+        package_path = (package_name or result.manifest.package_name).replace(".", "/")
         for candidate, relationship in cls._one_hop_app_references(
             seed_sources,
             list(allowed_roots.values()),
@@ -861,6 +1127,13 @@ class ApkInspector:
             "anchors": anchors,
             "attack_chains": list(attack_chains or []),
         }
+
+    @staticmethod
+    def _search_root_label(root: Path, workspace: Path) -> str:
+        try:
+            return str(root.resolve().relative_to(workspace.resolve()))
+        except ValueError:
+            return root.name
 
     @staticmethod
     def _one_hop_app_references(

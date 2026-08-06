@@ -1022,6 +1022,25 @@ def get_scan(scan_id: str, session: Session = Depends(get_session)) -> Scan:
     return scan
 
 
+@router.get("/scans/{scan_id}/artifact-graph")
+def get_scan_artifact_graph(
+    scan_id: str,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    scan = require_scan(session, scan_id)
+    workspace = (scan.stats or {}).get("workspace")
+    if not isinstance(workspace, str):
+        raise HTTPException(409, "Product bundle analysis has not completed")
+    graph_path = Path(workspace) / "artifact_graph.json"
+    if not graph_path.is_file():
+        raise HTTPException(404, "Artifact graph is unavailable")
+    try:
+        payload = json.loads(graph_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(409, "Artifact graph could not be read") from exc
+    return payload
+
+
 @router.delete("/scans/{scan_id}", response_model=ScanDeleteResult)
 def delete_scan(
     scan_id: str,
