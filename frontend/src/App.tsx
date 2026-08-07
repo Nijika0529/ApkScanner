@@ -138,6 +138,29 @@ interface DetailData {
   evaluations: BenchmarkEvaluation[]
 }
 
+interface FindingProvenance {
+  taskIds: string[]
+  tasks: InvestigationTask[]
+  entryIds: string[]
+  entries: EntryPoint[]
+  hypothesisIds: string[]
+}
+
+type NativeBinding = {
+  edge: ArtifactGraph["edges"][number]
+  bridge: ArtifactGraph["nodes"][number] | undefined
+  library: ArtifactGraph["nodes"][number] | undefined
+}
+
+type NativeBindingGroup = {
+  id: string
+  library: ArtifactGraph["nodes"][number] | undefined
+  items: NativeBinding[]
+  classNames: string[]
+  staticCount: number
+  dynamicCount: number
+}
+
 type ScanEventSubscriber = (event: ScanEvent) => void
 
 function App() {
@@ -504,6 +527,10 @@ function ScanDetailView({ data, health, subscribeEvents, onRefresh, onDelete, on
   }, [scan.id])
   const verificationCandidates = signals.filter(isVerificationCandidate)
   const staticSignals = signals.filter((signal) => !isVerificationCandidate(signal))
+  const findingProvenance = useMemo(
+    () => buildFindingProvenance([...findings, ...signals], tasks, entries, hypotheses),
+    [entries, findings, hypotheses, signals, tasks],
+  )
   const high = findings.filter((item) => ["critical", "high"].includes(item.severity)).length
   const reproduced = findings.filter((item) => item.status === "reproduced_blackbox").length
   const exported = entries.filter((item) => item.exported && item.kind !== "deep_link").length
@@ -558,9 +585,9 @@ function ScanDetailView({ data, health, subscribeEvents, onRefresh, onDelete, on
           <TabsContent value="overview"><Overview scan={scan} health={health} coverage={coverage} /></TabsContent>
           <TabsContent value="assets">{artifactGraphLoading ? <LoadingState /> : artifactGraphError ? <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">{artifactGraphError}<Button className="ml-3" variant="secondary" size="sm" onClick={() => { setArtifactGraphLoaded(false); void loadArtifactGraph() }}>重试</Button></div> : artifactGraph ? <ArtifactGraphView graph={artifactGraph} /> : <EmptyRow text={artifactGraphLoaded ? "当前扫描没有资产图谱" : "正在准备资产图谱"} />}</TabsContent>
           <TabsContent value="entries"><EntryPoints entries={entries} /></TabsContent>
-          <TabsContent value="findings"><Findings findings={findings} verificationCandidates={verificationCandidates} scanStatus={scan.status} onRefresh={onRefresh} /></TabsContent>
-          <TabsContent value="proof-backlog"><ProofBacklog signals={verificationCandidates} tasks={tasks} onRefresh={onRefresh} /></TabsContent>
-          <TabsContent value="signals"><Signals signals={staticSignals} onRefresh={onRefresh} /></TabsContent>
+          <TabsContent value="findings"><Findings findings={findings} verificationCandidates={verificationCandidates} provenanceByFinding={findingProvenance} scanStatus={scan.status} onRefresh={onRefresh} /></TabsContent>
+          <TabsContent value="proof-backlog"><ProofBacklog signals={verificationCandidates} tasks={tasks} provenanceByFinding={findingProvenance} onRefresh={onRefresh} /></TabsContent>
+          <TabsContent value="signals"><Signals signals={staticSignals} provenanceByFinding={findingProvenance} onRefresh={onRefresh} /></TabsContent>
           <TabsContent value="versions">{versionLoading ? <LoadingState /> : versionLoadError ? <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">{versionLoadError}<Button className="ml-3" variant="secondary" size="sm" onClick={() => void loadVersionData()}>重试</Button></div> : versionData ? <VersionEvolution scan={scan} snapshot={versionData.snapshot} diff={versionData.diff} matches={versionData.matches} entries={entries} onCreated={onVersionCreated} /> : <EmptyRow text="正在准备版本演进数据" />}</TabsContent>
           <TabsContent value="coverage"><CoverageMatrix coverage={coverage} /></TabsContent>
           <TabsContent value="tasks"><Tasks scan={scan} tasks={tasks} entries={entries} audits={audits} subscribeEvents={subscribeEvents} health={health} onRefresh={onRefresh} /></TabsContent>
@@ -583,6 +610,7 @@ function Overview({ scan, health, coverage }: { scan: Scan; health: Health | nul
 
 function ArtifactGraphView({ graph }: { graph: ArtifactGraph }) {
   const [visibleLibraries, setVisibleLibraries] = useState(80)
+  const [visibleBindingGroups, setVisibleBindingGroups] = useState(8)
   const nodesById = useMemo(
     () => new Map(graph.nodes.map((node) => [node.id, node])),
     [graph.nodes],
@@ -595,13 +623,34 @@ function ArtifactGraphView({ graph }: { graph: ArtifactGraph }) {
   const summary = graph.summary ?? {}
   const abiCounts = asRecord(summary.native_libraries_by_abi) ?? {}
   const bridgeOwnership = asRecord(summary.java_bridges_by_ownership) ?? {}
-  const bindings = graph.edges
+  const bindings = useMemo<NativeBinding[]>(() => graph.edges
     .filter((edge) => ["binds_to_jni", "possible_dynamic_registration"].includes(edge.relation))
-    .map((edge) => {
-      const bridge = nodesById.get(edge.from)
-      const library = nodesById.get(edge.to)
-      return { edge, bridge, library }
+    .map((edge) => ({
+      edge,
+      bridge: nodesById.get(edge.from),
+      library: nodesById.get(edge.to),
+    })), [graph.edges, nodesById])
+  const bindingGroups = useMemo<NativeBindingGroup[]>(() => {
+    const groups = new Map<string, NativeBindingGroup>()
+    bindings.forEach((item) => {
+      const id = item.library?.id ?? item.edge.to
+      const group = groups.get(id) ?? {
+        id,
+        library: item.library,
+        items: [],
+        classNames: [],
+        staticCount: 0,
+        dynamicCount: 0,
+      }
+      group.items.push(item)
+      const className = textValue(item.bridge?.class_name) ?? textValue(item.edge.class_name) ?? item.edge.from
+      if (!group.classNames.includes(className)) group.classNames.push(className)
+      if (item.edge.relation === "binds_to_jni") group.staticCount += 1
+      else group.dynamicCount += 1
+      groups.set(id, group)
     })
+    return [...groups.values()].sort((left, right) => right.items.length - left.items.length)
+  }, [bindings])
   const loadEdges = graph.edges.filter((edge) => edge.relation === "loads_native_library")
   const embeddedEdges = graph.edges.filter((edge) => edge.relation === "contains")
   return <div className="space-y-6">
@@ -628,12 +677,17 @@ function ArtifactGraphView({ graph }: { graph: ArtifactGraph }) {
         <div className="mt-4 flex flex-wrap gap-2">{Object.entries(abiCounts).map(([abi, count]) => <Badge key={abi}>{abi} · {String(count)}</Badge>)}{!Object.keys(abiCounts).length && <span className="text-xs text-slate-500">没有 Native ABI</span>}</div>
       </section>
       <section className="rounded-xl border border-slate-200 p-4">
-        <SectionTitle icon={Link2} title="Java ↔ JNI ↔ SO" description="静态装载与符号绑定链" />
-        <div className="mt-4 space-y-2">
-          {bindings.slice(0, 80).map(({ edge, bridge, library }, index) => <div key={`${edge.from}:${edge.to}:${index}`} className="rounded-lg border border-slate-200 bg-slate-50 p-3"><div className="grid gap-2 text-xs sm:grid-cols-[1fr_auto_1fr_auto_1fr] sm:items-center"><div className="min-w-0"><p className="truncate font-mono font-semibold text-slate-800" title={textValue(bridge?.class_name)}>{textValue(bridge?.class_name) ?? "未知 Java 类"}</p><p className="truncate text-slate-500">{textValue(edge.method_name) ?? edge.from}</p></div><ChevronRight className="hidden h-4 w-4 text-slate-400 sm:block" /><div className="min-w-0"><p className="truncate font-mono text-slate-700" title={textValue(edge.jni_symbol)}>{textValue(edge.jni_symbol) ?? "RegisterNatives 候选"}</p><p className="text-slate-500">{edge.relation === "binds_to_jni" ? "静态 JNI 导出" : "动态注册推断"}</p></div><ChevronRight className="hidden h-4 w-4 text-slate-400 sm:block" /><div className="min-w-0"><p className="truncate font-mono font-semibold text-violet-800">{textValue(library?.name) ?? edge.to}</p><p className="text-slate-500">{textValue(library?.abi) ?? "ABI 未知"} · {textValue(edge.confidence) ?? "unknown"}</p></div></div></div>)}
+        <SectionTitle icon={Link2} title="Java ↔ JNI ↔ SO" description="按 SO 聚合；展开后查看类、方法与符号绑定" />
+        {bindings.length > 0 && <div className="mt-4 grid grid-cols-3 gap-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-center">
+          <div><p className="text-lg font-bold tabular-nums text-slate-900">{bindingGroups.length}</p><p className="text-[11px] text-slate-500">关联 SO</p></div>
+          <div><p className="text-lg font-bold tabular-nums text-slate-900">{bridgeNodes.length}</p><p className="text-[11px] text-slate-500">桥接类</p></div>
+          <div><p className="text-lg font-bold tabular-nums text-slate-900">{bindings.length}</p><p className="text-[11px] text-slate-500">方法绑定</p></div>
+        </div>}
+        <div className="mt-3 space-y-2">
+          {bindingGroups.slice(0, visibleBindingGroups).map((group) => <NativeBindingGroupCard key={group.id} group={group} />)}
           {!bindings.length && <EmptyRow text="尚未把 Java native 方法解析到静态 JNI 导出或动态注册候选" />}
         </div>
-        {bindings.length > 80 && <p className="mt-3 text-xs text-slate-500">当前仅展示前 80 条绑定，完整关系保存在 ArtifactGraph API 中。</p>}
+        {visibleBindingGroups < bindingGroups.length && <div className="mt-3 flex justify-center"><Button variant="secondary" size="sm" onClick={() => setVisibleBindingGroups((count) => count + 8)}>加载更多 SO · {bindingGroups.length - visibleBindingGroups}</Button></div>}
         {loadEdges.length > 0 && <p className="mt-3 text-xs text-slate-500">另有 {loadEdges.length} 条 System.loadLibrary / System.load 装载关系，覆盖 {bridgeNodes.length} 个 Java Native 桥类。</p>}
         <div className="mt-3 flex flex-wrap gap-2">{Object.entries(bridgeOwnership).map(([scope, count]) => <Badge key={scope} tone={scope === "application" ? "good" : scope === "vendor" ? "info" : "neutral"}>{scope} · {String(count)}</Badge>)}</div>
       </section>
@@ -662,6 +716,52 @@ function ArtifactGraphView({ graph }: { graph: ArtifactGraph }) {
       {visibleLibraries < nativeNodes.length && <div className="mt-3 flex justify-center"><Button variant="secondary" size="sm" onClick={() => setVisibleLibraries((count) => count + 80)}>加载更多 SO · {nativeNodes.length - visibleLibraries}</Button></div>}
     </section>
   </div>
+}
+
+function NativeBindingGroupCard({ group }: { group: NativeBindingGroup }) {
+  const [open, setOpen] = useState(false)
+  const classGroups = useMemo(() => {
+    if (!open) return []
+    const grouped = new Map<string, NativeBinding[]>()
+    group.items.forEach((item) => {
+      const className = textValue(item.bridge?.class_name) ?? textValue(item.edge.class_name) ?? item.edge.from
+      grouped.set(className, [...(grouped.get(className) ?? []), item])
+    })
+    return [...grouped.entries()].sort((left, right) => right[1].length - left[1].length)
+  }, [group.items, open])
+  const libraryName = textValue(group.library?.name) ?? group.id
+  const abi = textValue(group.library?.abi) ?? "ABI 未知"
+  return <article className="overflow-hidden rounded-lg border border-slate-200 bg-white">
+    <button type="button" onClick={() => setOpen((value) => !value)} aria-expanded={open} className="w-full px-3 py-3 text-left transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cyan-700">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="min-w-0 truncate font-mono text-xs font-semibold text-violet-800" title={libraryName}>{libraryName}</p>
+            <Badge>{abi}</Badge>
+            <Badge tone="info">{group.items.length} 个方法</Badge>
+            {group.dynamicCount > 0 && <Badge tone="warning">动态注册 {group.dynamicCount}</Badge>}
+          </div>
+          <div className="mt-2 flex min-w-0 flex-wrap gap-1.5">
+            {group.classNames.slice(0, 3).map((className) => <span key={className} title={className} className="max-w-full truncate rounded-md bg-slate-100 px-2 py-1 font-mono text-[10px] text-slate-600">{className}</span>)}
+            {group.classNames.length > 3 && <span className="rounded-md bg-slate-100 px-2 py-1 text-[10px] font-semibold text-slate-500">+{group.classNames.length - 3} 个类</span>}
+          </div>
+        </div>
+        <ChevronRight className={cn("mt-1 h-4 w-4 shrink-0 text-slate-500 transition-transform", open && "rotate-90")} />
+      </div>
+    </button>
+    {open && <div className="border-t border-slate-200 bg-slate-50/60 p-3">
+      <div className="mb-2 flex flex-wrap gap-2 text-[11px] text-slate-500"><span>静态导出 {group.staticCount}</span><span>动态注册推断 {group.dynamicCount}</span><span>Java 类 {group.classNames.length}</span></div>
+      <div className="max-h-80 space-y-2 overflow-y-auto pr-1">
+        {classGroups.map(([className, items]) => <div key={className} className="rounded-lg border border-slate-200 bg-white p-3">
+          <div className="flex items-center justify-between gap-3"><p className="min-w-0 truncate font-mono text-[11px] font-semibold text-slate-800" title={className}>{className}</p><Badge>{items.length}</Badge></div>
+          <div className="mt-2 divide-y divide-slate-100">{items.map(({ edge }, index) => <div key={`${edge.from}:${edge.to}:${textValue(edge.method_signature_key) ?? `${textValue(edge.method_name) ?? "dynamic"}:${index}`}`} className="grid gap-1 py-2 text-[11px] sm:grid-cols-[minmax(7rem,0.35fr)_minmax(0,0.65fr)] sm:gap-3">
+            <p className="truncate font-mono font-semibold text-slate-700" title={textValue(edge.method_name) ?? edge.from}>{textValue(edge.method_name) ?? "动态注册候选"}</p>
+            <div className="min-w-0"><p className="truncate font-mono text-slate-600" title={textValue(edge.jni_symbol)}>{textValue(edge.jni_symbol) ?? "RegisterNatives 符号待运行时确认"}</p><p className="mt-0.5 text-[10px] text-slate-400">{edge.relation === "binds_to_jni" ? "静态 JNI 导出" : "动态注册推断"} · {textValue(edge.confidence) ?? "unknown"}</p></div>
+          </div>)}</div>
+        </div>)}
+      </div>
+    </div>}
+  </article>
 }
 
 function DevicePoolPanel() {
@@ -772,7 +872,7 @@ function VersionEvolution({ scan, snapshot, diff, matches, entries, onCreated }:
   </div>
 }
 
-function Findings({ findings, verificationCandidates, scanStatus, onRefresh }: { findings: Finding[]; verificationCandidates: Finding[]; scanStatus: string; onRefresh: () => Promise<void> }) {
+function Findings({ findings, verificationCandidates, provenanceByFinding, scanStatus, onRefresh }: { findings: Finding[]; verificationCandidates: Finding[]; provenanceByFinding: Map<string, FindingProvenance>; scanStatus: string; onRefresh: () => Promise<void> }) {
   const sorted = [...findings].sort((a, b) => ["critical", "high", "medium", "low", "info"].indexOf(a.severity) - ["critical", "high", "medium", "low", "info"].indexOf(b.severity))
   const pending = [...verificationCandidates].sort((a, b) => ["critical", "high", "medium", "low", "info"].indexOf(a.severity) - ["critical", "high", "medium", "low", "info"].indexOf(b.severity))
   const isFinal = ["final", "failed"].includes(scanStatus)
@@ -780,24 +880,24 @@ function Findings({ findings, verificationCandidates, scanStatus, onRefresh }: {
     <section className="space-y-3">
       <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm leading-relaxed text-emerald-950">这里只展示平台 Oracle 已证明具体安全影响、且所有 Evidence ID 均可核验的漏洞。静态规则与 AI 静态判断不会计入 Finding。</div>
       {!isFinal && <div className="rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-sm leading-relaxed text-cyan-950">扫描尚未完成，后续动态证明可能继续增加 Finding。</div>}
-      {sorted.map((finding) => <FindingCard key={finding.id} finding={finding} onRefresh={onRefresh} />)}
+      {sorted.map((finding) => <FindingCard key={finding.id} finding={finding} provenance={provenanceByFinding.get(finding.id)} onRefresh={onRefresh} />)}
       {!findings.length && <EmptyRow text="尚无经过动态证据证明的 Finding" />}
     </section>
     {pending.length > 0 && <section className="space-y-3 border-t border-slate-200 pt-6">
       <div className="flex flex-col gap-3 rounded-xl border border-orange-200 bg-orange-50 px-4 py-4 sm:flex-row sm:items-center sm:justify-between">
         <div><div className="flex items-center gap-2"><Bot className="h-4 w-4 text-orange-700" /><h3 className="font-bold text-orange-950">待验证风险</h3><Badge tone="warning">{pending.length}</Badge></div><p className="mt-2 text-sm leading-6 text-orange-900">以下风险已有静态证据支持，但尚未获得平台危害 Oracle。它们不会计入上方已证实 Finding 数量；可在“待验证风险”Tab 中重新验证。</p></div>
       </div>
-      {pending.map((finding) => <FindingCard key={`pending-${finding.id}`} finding={finding} onRefresh={onRefresh} />)}
+      {pending.map((finding) => <FindingCard key={`pending-${finding.id}`} finding={finding} provenance={provenanceByFinding.get(finding.id)} onRefresh={onRefresh} />)}
     </section>}
   </div>
 }
 
-function Signals({ signals, onRefresh }: { signals: Finding[]; onRefresh: () => Promise<void> }) {
+function Signals({ signals, provenanceByFinding, onRefresh }: { signals: Finding[]; provenanceByFinding: Map<string, FindingProvenance>; onRefresh: () => Promise<void> }) {
   const sorted = [...signals].sort((a, b) => ["critical", "high", "medium", "low", "info"].indexOf(a.severity) - ["critical", "high", "medium", "low", "info"].indexOf(b.severity))
-  return <div className="space-y-3"><div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">这些是静态规则、AI 静态支持或尚未完成影响证明的调查线索，用于指导后续验证；它们不计入最终 Finding，也不代表漏洞已经成立。</div>{sorted.map((finding) => <FindingCard key={finding.id} finding={finding} onRefresh={onRefresh} />)}{!signals.length && <EmptyRow text="没有待验证线索" />}</div>
+  return <div className="space-y-3"><div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">这些是静态规则、AI 静态支持或尚未完成影响证明的调查线索，用于指导后续验证；它们不计入最终 Finding，也不代表漏洞已经成立。</div>{sorted.map((finding) => <FindingCard key={finding.id} finding={finding} provenance={provenanceByFinding.get(finding.id)} onRefresh={onRefresh} />)}{!signals.length && <EmptyRow text="没有待验证线索" />}</div>
 }
 
-function ProofBacklog({ signals, tasks, onRefresh }: { signals: Finding[]; tasks: InvestigationTask[]; onRefresh: () => Promise<void> }) {
+function ProofBacklog({ signals, tasks, provenanceByFinding, onRefresh }: { signals: Finding[]; tasks: InvestigationTask[]; provenanceByFinding: Map<string, FindingProvenance>; onRefresh: () => Promise<void> }) {
   const [retrying, setRetrying] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const tasksById = new Map(tasks.map((task) => [task.id, task]))
@@ -835,11 +935,70 @@ function ProofBacklog({ signals, tasks, onRefresh }: { signals: Finding[]; tasks
           <div><div className="flex flex-wrap items-center gap-2"><Badge tone="warning">待动态证明</Badge><Badge>{stateLabel}</Badge></div>{gaps.length > 0 && <p className="mt-2 text-xs leading-5 text-orange-900">{gaps.slice(0, 2).join("；")}</p>}</div>
           {task && isTerminalTask(task.status) && <Button variant="secondary" size="sm" onClick={() => retry(task)} disabled={retrying === task.id}>{retrying === task.id ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}重新验证</Button>}
         </div>
-        <FindingCard finding={signal} onRefresh={onRefresh} />
+        <FindingCard finding={signal} provenance={provenanceByFinding.get(signal.id)} onRefresh={onRefresh} />
       </div>
     })}
     {!sorted.length && <EmptyRow text="没有等待动态证明的风险候选" />}
   </div>
+}
+
+function buildFindingProvenance(findings: Finding[], tasks: InvestigationTask[], entries: EntryPoint[], hypotheses: SecurityHypothesis[]) {
+  const tasksById = new Map(tasks.map((task) => [task.id, task]))
+  const entriesById = new Map(entries.map((entry) => [entry.id, entry]))
+  const hypothesesById = new Map(hypotheses.map((hypothesis) => [hypothesis.id, hypothesis]))
+  const hypothesesByFinding = new Map<string, SecurityHypothesis[]>()
+  hypotheses.forEach((hypothesis) => {
+    if (!hypothesis.final_finding_id) return
+    hypothesesByFinding.set(hypothesis.final_finding_id, [...(hypothesesByFinding.get(hypothesis.final_finding_id) ?? []), hypothesis])
+  })
+
+  const result = new Map<string, FindingProvenance>()
+  findings.forEach((finding) => {
+    const backlog = asRecord(finding.metadata_json.proof_backlog)
+    const hypothesisIds = new Set<string>()
+    const hypothesisCandidates = [
+      textValue(finding.metadata_json.hypothesis_id),
+      ...stringValues(finding.metadata_json.hypothesis_ids),
+      textValue(backlog?.hypothesis_id),
+      ...stringValues(backlog?.hypothesis_ids),
+    ]
+    hypothesisCandidates.forEach((id) => { if (id) hypothesisIds.add(id) })
+    const linkedHypotheses = [...(hypothesesByFinding.get(finding.id) ?? [])]
+    linkedHypotheses.forEach((hypothesis) => hypothesisIds.add(hypothesis.id))
+    hypothesisIds.forEach((id) => {
+      const hypothesis = hypothesesById.get(id)
+      if (hypothesis && !linkedHypotheses.some((item) => item.id === id)) linkedHypotheses.push(hypothesis)
+    })
+
+    const taskIds = new Set<string>()
+    const taskCandidates = [
+      textValue(finding.metadata_json.task_id),
+      textValue(finding.metadata_json.source_task_id),
+      textValue(backlog?.task_id),
+      ...linkedHypotheses.map((hypothesis) => hypothesis.task_id),
+    ]
+    taskCandidates.forEach((id) => { if (id) taskIds.add(id) })
+
+    const entryIds = new Set<string>(finding.entry_point_ids)
+    const entryCandidates = [
+      textValue(finding.metadata_json.entry_point_id),
+      ...stringValues(finding.metadata_json.entry_point_ids),
+      textValue(backlog?.entry_point_id),
+      ...stringValues(backlog?.entry_point_ids),
+      ...linkedHypotheses.flatMap((hypothesis) => hypothesis.entry_point_ids),
+      ...[...taskIds].flatMap((id) => tasksById.get(id)?.target_entry_ids ?? []),
+    ]
+    entryCandidates.forEach((id) => { if (id) entryIds.add(id) })
+
+    result.set(finding.id, {
+      taskIds: [...taskIds],
+      tasks: [...taskIds].map((id) => tasksById.get(id)).filter((task): task is InvestigationTask => Boolean(task)),
+      entryIds: [...entryIds],
+      entries: [...entryIds].map((id) => entriesById.get(id)).filter((entry): entry is EntryPoint => Boolean(entry)),
+      hypothesisIds: [...hypothesisIds],
+    })
+  })
+  return result
 }
 
 function isVerificationCandidate(signal: Finding) {
@@ -848,7 +1007,7 @@ function isVerificationCandidate(signal: Finding) {
     || signal.status === "supported_static"
 }
 
-function FindingCard({ finding, onRefresh }: { finding: Finding; onRefresh: () => Promise<void> }) {
+function FindingCard({ finding, provenance, onRefresh }: { finding: Finding; provenance?: FindingProvenance; onRefresh: () => Promise<void> }) {
   const [open, setOpen] = useState(false)
   const [reviewOpen, setReviewOpen] = useState(false)
   return (
@@ -873,6 +1032,18 @@ function FindingCard({ finding, onRefresh }: { finding: Finding; onRefresh: () =
             <span>置信度 {finding.confidence}</span>
             <span>{finding.source}</span>
           </div>
+          {((provenance?.entryIds.length ?? 0) > 0 || (provenance?.taskIds.length ?? 0) > 0) && <div className="mt-3 flex flex-wrap items-center gap-1.5 text-[11px]">
+            {provenance?.entryIds.slice(0, 2).map((entryId) => {
+              const label = provenance.entries.find((entry) => entry.id === entryId)?.name ?? entryId
+              return <span key={entryId} title={label} className="inline-flex max-w-full items-center gap-1 rounded-md border border-cyan-200 bg-cyan-50 px-2 py-1 text-cyan-900"><Route className="h-3 w-3 shrink-0" /><span className="max-w-72 truncate">{label}</span></span>
+            })}
+            {(provenance?.entryIds.length ?? 0) > 2 && <span className="rounded-md bg-cyan-50 px-2 py-1 font-semibold text-cyan-800">+{(provenance?.entryIds.length ?? 2) - 2} 个入口</span>}
+            {provenance && provenance.taskIds.slice(0, 1).map((taskId) => {
+              const task = provenance.tasks.find((item) => item.id === taskId)
+              return <span key={taskId} title={taskId} className="inline-flex items-center gap-1 rounded-md border border-violet-200 bg-violet-50 px-2 py-1 text-violet-900"><Bot className="h-3 w-3" />{task ? taskTypeLabel(task.task_type) : "探索任务"} · {shortHash(taskId)}</span>
+            })}
+            {(provenance?.taskIds.length ?? 0) > 1 && <span className="rounded-md bg-violet-50 px-2 py-1 font-semibold text-violet-800">+{(provenance?.taskIds.length ?? 1) - 1} 个任务</span>}
+          </div>}
         </div>
         <ChevronRight className={cn("mt-1 h-4 w-4 shrink-0 text-slate-600 transition-transform", open && "rotate-90")} />
       </button>
@@ -888,6 +1059,7 @@ function FindingCard({ finding, onRefresh }: { finding: Finding; onRefresh: () =
               <MarkdownContent>{finding.remediation}</MarkdownContent>
             </div>
           </div>
+          <FindingProvenancePanel provenance={provenance} />
           {finding.evidence_ids.length > 0 && (
             <div className="mt-5">
               <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">可核验证据</p>
@@ -909,6 +1081,31 @@ function FindingCard({ finding, onRefresh }: { finding: Finding; onRefresh: () =
       <ReviewDialog finding={finding} open={reviewOpen} onOpenChange={setReviewOpen} onReviewed={onRefresh} />
     </article>
   )
+}
+
+function FindingProvenancePanel({ provenance }: { provenance?: FindingProvenance }) {
+  if (!provenance || (!provenance.entryIds.length && !provenance.taskIds.length && !provenance.hypothesisIds.length)) {
+    return <div className="mt-5 rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-500"><span className="font-semibold text-slate-700">来源追踪：</span>此历史记录没有保存明确的任务或入口关联。</div>
+  }
+  return <section className="mt-5 rounded-xl border border-cyan-200 bg-cyan-50/50 p-4">
+    <div className="flex flex-wrap items-center justify-between gap-2"><p className="text-xs font-semibold uppercase tracking-wider text-cyan-950">来源追踪</p>{provenance.hypothesisIds.length > 0 && <Badge tone="info">验证链 {provenance.hypothesisIds.length}</Badge>}</div>
+    <div className="mt-3 grid gap-4 lg:grid-cols-2">
+      <div className="min-w-0">
+        <p className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-slate-700"><Route className="h-3.5 w-3.5 text-cyan-700" />关联入口</p>
+        <div className="space-y-1.5">{provenance.entryIds.map((entryId) => {
+          const entry = provenance.entries.find((item) => item.id === entryId)
+          return <div key={entryId} className="rounded-lg border border-cyan-100 bg-white px-3 py-2"><div className="flex flex-wrap items-center justify-between gap-2"><p className="min-w-0 break-all font-mono text-[11px] font-semibold text-slate-800">{entry?.name ?? entryId}</p>{entry && <Badge>{entry.kind}</Badge>}</div>{entry && <p className="mt-1 break-all font-mono text-[10px] text-slate-400">{entry.id}</p>}</div>
+        })}{!provenance.entryIds.length && <p className="text-xs text-slate-500">未记录入口关联</p>}</div>
+      </div>
+      <div className="min-w-0">
+        <p className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-slate-700"><Bot className="h-3.5 w-3.5 text-violet-700" />产出任务</p>
+        <div className="space-y-1.5">{provenance.taskIds.map((taskId) => {
+          const task = provenance.tasks.find((item) => item.id === taskId)
+          return <div key={taskId} className="rounded-lg border border-violet-100 bg-white px-3 py-2"><div className="flex flex-wrap items-center justify-between gap-2"><p className="text-xs font-semibold text-slate-800">{task ? taskTypeLabel(task.task_type) : "历史探索任务"}</p>{task && <Badge tone={statusTone(task.status)}>{statusLabel(task.status)}</Badge>}</div><p className="mt-1 break-all font-mono text-[10px] text-slate-500">{taskId}{task ? ` · attempt ${task.attempts}` : ""}</p></div>
+        })}{!provenance.taskIds.length && <p className="text-xs text-slate-500">该结果来自静态规则或历史记录未保存任务关联</p>}</div>
+      </div>
+    </div>
+  </section>
 }
 
 function ReviewDialog({ finding, open, onOpenChange, onReviewed }: { finding: Finding; open: boolean; onOpenChange: (open: boolean) => void; onReviewed: () => Promise<void> }) {
