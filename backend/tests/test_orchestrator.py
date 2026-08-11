@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from apkscanner.adb_gateway import AdbGatewayRequest
 from apkscanner.agent_audit import build_agent_audits
 from apkscanner.agent_events import AgentCancelledError, AgentRuntimeEvent
 from apkscanner.artifacts import ArtifactStore
@@ -26,12 +27,13 @@ from apkscanner.models import (
     Finding,
     HypothesisArgument,
     InvestigationTask,
+    ProofAttempt,
     RuntimeObservation,
     Scan,
     ScanEvent,
     SecurityHypothesis,
 )
-from apkscanner.orchestrator import ScanOrchestrator
+from apkscanner.orchestrator import ScanOrchestrator, _LiveProofContext
 from apkscanner.planner import StaticEntryClosure
 from apkscanner.reports import ReportBuilder
 from apkscanner.schemas import (
@@ -40,7 +42,7 @@ from apkscanner.schemas import (
     AgentInvestigationResult,
     AgentRuntimeObservation,
 )
-from apkscanner.tools import CommandResult, ToolRunner
+from apkscanner.tools import CommandResult, TimeBudget, ToolRunner
 from sqlalchemy import select
 
 
@@ -71,6 +73,137 @@ def test_preserve_policy_allows_target_launch_and_poc_cleanup() -> None:
         ["uninstall", "io.apkscanner.poc.zipprobe"],
         package_name="com.example.target",
     )
+
+
+def test_adaptive_adb_maps_relative_host_files_into_the_verifier_workspace(
+    tmp_path,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "verifier"
+    workspace.mkdir()
+
+    assert ScanOrchestrator._translate_adaptive_adb_paths(
+        ["pull", "/data/app/example/base.apk", "probe.apk"],
+        container_workspace="/agent-workspaces/task-verifier/workspace",
+        host_workspace=workspace,
+    ) == ["pull", "/data/app/example/base.apk", str(workspace / "probe.apk")]
+    assert ScanOrchestrator._translate_adaptive_adb_paths(
+        ["pull", "/data/local/tmp/result.json"],
+        container_workspace="/agent-workspaces/task-verifier/workspace",
+        host_workspace=workspace,
+    ) == ["pull", "/data/local/tmp/result.json", str(workspace / "result.json")]
+    assert ScanOrchestrator._translate_adaptive_adb_paths(
+        ["install", "-r", "poc/test.apk"],
+        container_workspace="/agent-workspaces/task-verifier/workspace",
+        host_workspace=workspace,
+    ) == ["install", "-r", str(workspace / "poc/test.apk")]
+
+    with pytest.raises(ValueError, match="escapes the verifier workspace"):
+        ScanOrchestrator._translate_adaptive_adb_paths(
+            ["pull", "/data/app/example/base.apk", "../probe.apk"],
+            container_workspace="/agent-workspaces/task-verifier/workspace",
+            host_workspace=workspace,
+        )
+
+
+def test_adaptive_gateway_replaces_only_a_stale_apkscanner_poc(
+    settings,
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    workspace = tmp_path / "verifier"
+    workspace.mkdir()
+    (workspace / "poc.apk").write_bytes(b"apk")
+    recorded: list[tuple[str, CommandResult, dict]] = []
+
+    class RetryDevice:
+        serial = "device-1"
+        calls: list[list[str]] = []
+
+        @classmethod
+        def execute_gateway(cls, args, **_kwargs):  # noqa: ANN001, ANN206
+            cls.calls.append(args)
+            if len(cls.calls) == 1:
+                return CommandResult(
+                    ["adb", *args],
+                    1,
+                    "Performing Streamed Install",
+                    (
+                        "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package "
+                        "io.apkscanner.poc.compat signatures do not match newer version]"
+                    ),
+                )
+            return CommandResult(["adb", *args], 0, "Success\n", "")
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_record_commands",
+        lambda _scan_id, _task_id, commands, _summaries: recorded.extend(commands),
+    )
+    monkeypatch.setattr(orchestrator, "_materialize_live_evidence", lambda *_args: None)
+    monkeypatch.setattr(orchestrator, "_record_exploration_event", lambda *_args: None)
+    context = _LiveProofContext(
+        token="gateway-token",
+        scan_id="scan-1",
+        task_id="task-1",
+        package_name="com.example.target",
+        workspace=workspace,
+        entries=[],
+        default_entry_id="",
+        hypotheses=[],
+        budget=TimeBudget.from_seconds(30),
+        evidence_summaries=[],
+        cancel_event=threading.Event(),
+        round_index=0,
+        device=RetryDevice(),  # type: ignore[arg-type]
+        adb_policy="adaptive",
+        container_workspace="/agent-workspaces/task/workspace",
+    )
+    orchestrator._register_live_proof_context(context)
+
+    try:
+        response = orchestrator.execute_live_adb(
+            "task-1",
+            "gateway-token",
+            AdbGatewayRequest(
+                args=["install", "-r", "/agent-workspaces/task/workspace/poc.apk"],
+                policy="adaptive",
+            ),
+        )
+    finally:
+        orchestrator.shutdown()
+
+    assert response["exit_code"] == 0
+    assert RetryDevice.calls == [
+        ["install", "-r", str(workspace / "poc.apk")],
+        ["uninstall", "io.apkscanner.poc.compat"],
+        ["install", "-r", str(workspace / "poc.apk")],
+    ]
+    assert [kind for kind, _result, _metadata in recorded] == [
+        "agent.adb.gateway",
+        "agent.adb.gateway.poc_cleanup",
+        "agent.adb.gateway.poc_install_retry",
+    ]
+
+
+def test_adaptive_gateway_treats_textual_am_start_error_as_failure() -> None:
+    raw = CommandResult(
+        ["adb", "shell", "am", "start"],
+        0,
+        "Starting: Intent { cmp=io.apkscanner.poc.compat/.MainActivity }",
+        "Error type 3\nError: Activity class does not exist.\n",
+    )
+
+    normalized = ScanOrchestrator._normalize_adaptive_adb_result(
+        ["shell", "am", "start", "-n", "io.apkscanner.poc.compat/.MainActivity"],
+        raw,
+    )
+
+    assert normalized.exit_code == 1
+    assert "component_not_found" in normalized.stderr
 
 
 def test_device_listing_fills_verdict_contract_for_partial_capability(
@@ -418,11 +551,11 @@ def test_adaptive_verifier_splits_transport_safe_turns_and_merges_results(
 @pytest.mark.parametrize(
     ("android16_eligible", "expected_status", "expected_backlog"),
     [
-        (True, "reproduced_blackbox", "verified"),
+        (True, "supported_static", "proof_required"),
         (False, "supported_static", "proof_required"),
     ],
 )
-def test_adaptive_verifier_semantic_result_updates_original_finding(
+def test_adaptive_verifier_cannot_promote_without_platform_proof_attempt(
     settings,  # noqa: ANN001
     android16_eligible: bool,
     expected_status: str,
@@ -526,9 +659,11 @@ def test_adaptive_verifier_semantic_result_updates_original_finding(
         assert response_id in finding.evidence_ids
         assert finding.metadata_json["verification_mode"] == "adaptive_agent"
         assert finding.metadata_json["proof_backlog"]["status"] == expected_backlog
-        assert finding.metadata_json["harm_demonstrated"] is android16_eligible
+        assert finding.metadata_json["harm_demonstrated"] is False
         verification = finding.metadata_json["adaptive_verification"]
         assert verification["model_verdict"] == "reproduced_blackbox"
+        assert verification["verdict"] == "supported_static"
+        assert "ProofAttempt" in verification["verdict_override_reason"]
         assert verification["android16_verdict_eligible"] is android16_eligible
         assert task.status == "completed"
         assert task.thread_id == "thread-adaptive"
@@ -537,7 +672,129 @@ def test_adaptive_verifier_semantic_result_updates_original_finding(
         }
         assert scan.stats["adaptive_verification"][
             "compatibility_override_count"
-        ] == (0 if android16_eligible else 1)
+        ] == 1
+
+
+def test_adaptive_verifier_preserves_an_existing_platform_proof(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="proof-preserved.apk",
+            package_name="com.example.proofpreserved",
+            artifact_sha256="c" * 64,
+            artifact_path=str(settings.data_dir / "proof-preserved.apk"),
+        )
+        source_task = InvestigationTask(scan=scan, task_type="component", status="completed")
+        verifier_task = InvestigationTask(
+            scan=scan,
+            task_type="adaptive_verification",
+            status="running",
+        )
+        session.add_all([scan, source_task, verifier_task])
+        session.flush()
+        hypothesis = SecurityHypothesis(
+            scan_id=scan.id,
+            task_id=source_task.id,
+            fingerprint="7" * 64,
+            category="android.webview",
+            claim="An attacker page receives the target account token.",
+        )
+        proof_evidence = Evidence(
+            scan_id=scan.id,
+            task_id=source_task.id,
+            kind="blackbox.poc_ui_dump",
+            sha256="8" * 64,
+            path="proof.json",
+            summary="Platform Oracle observed token disclosure",
+        )
+        session.add_all([hypothesis, proof_evidence])
+        session.flush()
+        proof = ProofAttempt(
+            scan_id=scan.id,
+            task_id=source_task.id,
+            hypothesis_id=hypothesis.id,
+            test_case_id="proof-preserved",
+            status="proven",
+            evidence_ids=[proof_evidence.id],
+            harm_demonstrated=True,
+            oracle={"release_gate_eligible": True},
+        )
+        finding = Finding(
+            scan=scan,
+            dedupe_key="proof-preserved",
+            rule_id="AGENT-ENTRY-INVESTIGATION",
+            title="Account token disclosure",
+            description="Platform proof already exists.",
+            masvs="MASVS-PLATFORM",
+            severity="critical",
+            confidence="high",
+            status="reproduced_blackbox",
+            evidence_ids=[proof_evidence.id],
+        )
+        session.add_all([proof, finding])
+        session.flush()
+        finding.metadata_json = {
+            "hypothesis_id": hypothesis.id,
+            "proof_attempt_ids": [proof.id],
+            "harm_demonstrated": True,
+        }
+        response = orchestrator.evidence.json(
+            session,
+            scan_id=scan.id,
+            task_id=verifier_task.id,
+            kind="agent.adaptive_response",
+            value={"assessment": "model attempted downgrade"},
+            summary="Adaptive response",
+        )
+        session.commit()
+        scan_id = scan.id
+        task_id = verifier_task.id
+        finding_id = finding.id
+        proof_id = proof.id
+        proof_evidence_id = proof_evidence.id
+        response_id = response.id
+
+    result = AdaptiveVerificationResult.model_validate(
+        {
+            "summary": "模型未能重新观察到此前的平台证明。",
+            "assessments": [
+                {
+                    "finding_id": finding_id,
+                    "verdict": "supported_static",
+                    "confidence": "medium",
+                    "runtime_observed": False,
+                    "summary": "本轮未重新观察到影响。",
+                    "attack_chain": "Deep Link -> WebView -> bridge",
+                    "security_impact": "Existing platform receipt remains authoritative.",
+                }
+            ],
+        }
+    )
+    orchestrator._apply_adaptive_verifier_result(
+        scan_id=scan_id,
+        task_id=task_id,
+        candidate_ids=[finding_id],
+        result=result,
+        thread_id="thread-proof-preserved",
+        turn_id="turn-proof-preserved",
+        response_evidence_id=response_id,
+        android16_verdict_eligible=True,
+    )
+
+    with database.session_factory() as session:
+        finding = session.get(Finding, finding_id)
+        assert finding is not None
+        assert finding.status == "reproduced_blackbox"
+        assert finding.metadata_json["harm_demonstrated"] is True
+        assert finding.metadata_json["proof_attempt_ids"] == [proof_id]
+        assert proof_evidence_id in finding.evidence_ids
+        assert "cannot downgrade" in (
+            finding.metadata_json["adaptive_verification"]["verdict_override_reason"]
+        )
 
 
 def test_exact_finding_identity_is_consolidated_across_tasks(settings) -> None:  # noqa: ANN001
@@ -637,6 +894,33 @@ def test_exact_finding_identity_is_consolidated_across_tasks(settings) -> None: 
         )
         session.add_all([first_finding, second_finding])
         session.flush()
+        first_hypothesis = SecurityHypothesis(
+            scan_id=scan.id,
+            task_id=first_task.id,
+            fingerprint="4" * 64,
+            category="android.webview",
+            claim="Runtime ingress reaches AccountBridge token disclosure",
+            final_finding_id=first_finding.id,
+        )
+        session.add(first_hypothesis)
+        session.flush()
+        proof = ProofAttempt(
+            scan_id=scan.id,
+            task_id=first_task.id,
+            hypothesis_id=first_hypothesis.id,
+            test_case_id="bridge-proof",
+            status="proven",
+            evidence_ids=[first_evidence.id],
+            harm_demonstrated=True,
+            oracle={"release_gate_eligible": True},
+        )
+        session.add(proof)
+        session.flush()
+        first_finding.metadata_json = {
+            **first_finding.metadata_json,
+            "hypothesis_id": first_hypothesis.id,
+            "proof_attempt_ids": [proof.id],
+        }
         hypothesis = SecurityHypothesis(
             scan_id=scan.id,
             task_id=second_task.id,
@@ -764,17 +1048,17 @@ def test_adaptive_verifier_merges_semantic_duplicate_ingress_findings(settings) 
         scan = session.get(Scan, scan_id)
         task = session.get(InvestigationTask, task_id)
         assert canonical is not None and duplicate is not None and scan is not None and task is not None
-        assert canonical.status == "reproduced_blackbox"
-        assert canonical.metadata_json["harm_demonstrated"] is True
+        assert canonical.status == "supported_static"
+        assert canonical.metadata_json["harm_demonstrated"] is False
         assert duplicate.metadata_json["merged_into_finding_id"] == canonical_id
         assert task.result["merged_finding_map"] == {duplicate_id: canonical_id}
         assert scan.stats["adaptive_verification"]["verdict_counts"] == {
-            "reproduced_blackbox": 1
+            "supported_static": 1
         }
         records = list(session.scalars(select(Finding).where(Finding.scan_id == scan_id)))
         confirmed, signals = partition_findings(session, records)
-        assert [item.id for item in confirmed] == [canonical_id]
-        assert signals == []
+        assert confirmed == []
+        assert [item.id for item in signals] == [canonical_id]
 
 
 def test_live_runtime_observation_is_persisted_and_deduplicated(settings) -> None:  # noqa: ANN001
@@ -996,8 +1280,8 @@ def test_task_fails_closed_when_entry_belongs_to_another_scan(settings) -> None:
         assert events[0].data["loaded_entry_point_ids"] == []
 
 
-def test_task_dispatch_runs_one_investigation_at_a_time(settings) -> None:  # noqa: ANN001
-    configured = settings
+def test_task_dispatch_honors_configured_analysis_slots(settings) -> None:  # noqa: ANN001
+    configured = replace(settings, agent_analysis_slots=1)
     configured.ensure_directories()
     database = Database(configured)
     database.create_all()
@@ -1061,17 +1345,19 @@ def test_task_dispatch_runs_one_investigation_at_a_time(settings) -> None:  # no
         )
     assert persisted_scan is not None
     assert persisted_scan.stats["execution_policy"] == {
-        "concurrency_policy": "dynamic_adb_capacity",
+        "concurrency_policy": "resource_aware_phase_admission",
         "investigation_concurrency_at_start": 1,
         "adb_concurrency": 0,
-        "static_only_minimum_lane": 1,
-        "device_ownership": "complete_task",
+        "analysis_slots": 1,
+        "build_slots": configured.poc_build_slots,
+        "device_slots": 0,
+        "device_ownership": "dynamic_execution_phase",
         "agent_workspace_scope": "task_attempt",
     }
     assert statuses == ["completed"] * 6
 
 
-def test_two_configured_devices_run_two_investigations_concurrently(settings) -> None:  # noqa: ANN001
+def test_analysis_dispatch_is_not_bounded_by_device_count(settings) -> None:  # noqa: ANN001
     configured = replace(
         settings,
         adb_serial="device-a",
@@ -1134,7 +1420,7 @@ def test_two_configured_devices_run_two_investigations_concurrently(settings) ->
     orchestrator._run_task = fake_run_task  # type: ignore[method-assign]
     orchestrator._run_tasks(scan_id)
 
-    assert max_active == 2
+    assert max_active == configured.agent_analysis_slots
     with database.session_factory() as session:
         persisted_scan = session.get(Scan, scan_id)
         statuses = list(
@@ -1144,11 +1430,13 @@ def test_two_configured_devices_run_two_investigations_concurrently(settings) ->
         )
     assert persisted_scan is not None
     assert persisted_scan.stats["execution_policy"] == {
-        "concurrency_policy": "dynamic_adb_capacity",
-        "investigation_concurrency_at_start": 2,
+        "concurrency_policy": "resource_aware_phase_admission",
+        "investigation_concurrency_at_start": configured.agent_analysis_slots,
         "adb_concurrency": 2,
-        "static_only_minimum_lane": 1,
-        "device_ownership": "complete_task",
+        "analysis_slots": configured.agent_analysis_slots,
+        "build_slots": configured.poc_build_slots,
+        "device_slots": 2,
+        "device_ownership": "dynamic_execution_phase",
         "agent_workspace_scope": "task_attempt",
     }
     assert statuses == ["completed"] * 4
@@ -1444,7 +1732,7 @@ def test_parallel_workers_share_only_one_device_session(settings) -> None:  # no
         )
 
 
-def test_device_task_keeps_one_lease_through_agent_investigation(
+def test_device_task_leases_only_for_dynamic_execution(
     settings,
     monkeypatch,
 ) -> None:  # noqa: ANN001
@@ -1452,6 +1740,7 @@ def test_device_task_keeps_one_lease_through_agent_investigation(
         settings,
         adb_serial="exclusive-device:5555",
         codex_enabled=True,
+        rescue_audit_sample_rate=0.0,
     )
     configured.ensure_directories()
     database = Database(configured)
@@ -1531,6 +1820,8 @@ def test_device_task_keeps_one_lease_through_agent_investigation(
         "_validated_agent_payload",
         lambda payload, _evidence: (payload, "refuted_static"),
     )
+    monkeypatch.setattr(orchestrator, "_needs_adversarial_review", lambda _result: False)
+    monkeypatch.setattr(orchestrator, "_needs_rescue_review", lambda _result: False)
 
     class FakeInvestigator:
         @staticmethod
@@ -1539,15 +1830,11 @@ def test_device_task_keeps_one_lease_through_agent_investigation(
 
         @staticmethod
         def investigate(**_kwargs):  # noqa: ANN003, ANN205
-            assert orchestrator.device_pool.scheduler.snapshot()["active"] == {
-                "exclusive-device:5555": task_id
-            }
+            assert orchestrator.device_pool.scheduler.snapshot()["active"] == {}
             device_context = _kwargs["platform_context"]["device"]
             assert device_context["available"] is True
-            assert device_context["busy"] is False
-            assert device_context["lease_owned_by_current_task"] is True
-            assert device_context["active_task_id"] == task_id
-            timeline.append("agent")
+            assert device_context.get("lease_owned_by_current_task") is not True
+            timeline.append(f"agent:{device_context.get('lease_completed_by_current_task', False)}")
             return SimpleNamespace(
                 thread_id="thread-exclusive",
                 turn_id="turn-exclusive",
@@ -1569,7 +1856,8 @@ def test_device_task_keeps_one_lease_through_agent_investigation(
     orchestrator.investigators["codex"] = FakeInvestigator()
     orchestrator._run_task(scan_id, task_id, 30)
 
-    assert timeline == ["agent", "agent", "cleanup"]
+    assert timeline == ["agent:False"]
+    assert orchestrator.device_pool.scheduler.snapshot()["active"] == {}
     assert orchestrator.device_pool.scheduler.snapshot() == {
         "capacity": 1,
         "active": {},
@@ -1610,6 +1898,7 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
         settings,
         adb_serial="iterative-device:5555",
         codex_enabled=True,
+        rescue_audit_sample_rate=0.0,
     )
     configured.ensure_directories()
     database = Database(configured)
@@ -1776,7 +2065,7 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
     orchestrator.investigators["codex"] = FakeInvestigator()
     orchestrator._run_task(scan_id, task_id, 120)
 
-    assert phases == ["test_planning", "exploration_round", "rescue_review"]
+    assert phases == ["test_planning", "exploration_round"]
     with database.session_factory() as session:
         completed_task = session.get(InvestigationTask, task_id)
         assert completed_task is not None
@@ -1784,7 +2073,6 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
         assert [item["phase"] for item in history] == [
             "test_planning",
             "exploration_round",
-            "rescue_review",
         ]
         assert history[0]["test_validation"]["accepted"] == []
         if rejection_mode == "model_schema":
@@ -1976,6 +2264,7 @@ def test_blind_rescue_reopens_a_model_negative_before_closure(
             scan=scan,
             task_type="component",
             status="queued",
+            priority=100,
             target_entry_ids=[entry.id],
             hypotheses=[
                 "The exported entry may delegate attacker data to an internal sensitive sink."
@@ -2107,6 +2396,7 @@ def test_positive_debate_is_single_pass_and_arbitrates_only_real_objections(
         settings,
         adb_serial="single-pass-device:5555",
         codex_enabled=True,
+        rescue_audit_sample_rate=0.0,
     )
     configured.ensure_directories()
     database = Database(configured)
@@ -2386,7 +2676,6 @@ def test_positive_debate_is_single_pass_and_arbitrates_only_real_objections(
             "test_planning",
             "adversarial_review",
             "final_evaluation",
-            "rescue_review",
         ]
         if critic_objects
         else ["test_planning", "adversarial_review"]
@@ -2400,10 +2689,10 @@ def test_positive_debate_is_single_pass_and_arbitrates_only_real_objections(
         )
         policy = completed.result["debate_policy"]
         assert policy["phase_counts"]["adversarial_review"] == 1
-        assert policy["phase_counts"].get("rescue_review", 0) == int(critic_objects)
+        assert policy["phase_counts"].get("rescue_review", 0) == 0
         assert policy["phase_counts"].get("final_evaluation", 0) == int(critic_objects)
         assert policy["outcome"] == (
-            "independent_closure_confirmed"
+            "arbiter_completed"
             if critic_objects
             else "candidate_kept_without_arbiter"
         )
@@ -2527,6 +2816,31 @@ def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # no
         ]
         == materialized
     )
+    manifest_payload = json.loads(
+        (first / "context-manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest_payload["read_order"] == ["stable", "evidence", "latest_round"]
+    for document in manifest_payload["documents"].values():
+        content = (first / document["path"]).read_bytes()
+        assert hashlib.sha256(content).hexdigest() == document["sha256"]
+    stable_digest = manifest_payload["documents"]["stable"]["sha256"]
+    next_context = context()
+    next_context.update({"phase": "exploration_round", "round_index": 1})
+    orchestrator._materialize_agent_evidence(
+        scan_id,
+        first_task_id,
+        1,
+        [dict(evidence_summary)],
+        platform_context=next_context,
+    )
+    next_manifest = json.loads(
+        (first / "context-manifest.json").read_text(encoding="utf-8")
+    )
+    assert next_manifest["documents"]["stable"]["sha256"] == stable_digest
+    assert next_manifest["documents"]["latest_round"]["path"] == (
+        "rounds/001-exploration-round.json"
+    )
+    assert (first / "rounds/000-test-planning.json").is_file()
 
     static_context = context()
     static_context["entry_scope"] = {

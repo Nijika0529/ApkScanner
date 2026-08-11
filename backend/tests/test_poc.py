@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import threading
+import zipfile
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -381,6 +382,68 @@ public final class MainActivity extends android.app.Activity {
         oracle=oracle,
     )
     assert validated == project
+
+
+def test_platform_generated_poc_harness_owns_the_result_protocol(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = write_poc_project(workspace)
+    source_dir = next((project / "src").rglob("MainActivity.java")).parent
+    (source_dir / "Exploit.java").write_text(
+        """package io.apkscanner.poc.providerprobe;
+public final class Exploit {
+  public static Object runAttack(android.app.Activity activity,
+      android.content.Intent launch) {
+    android.os.Bundle result = new android.os.Bundle();
+    result.putBoolean("success", true);
+    result.putInt("row_count", 2);
+    return result;
+  }
+}""",
+        encoding="utf-8",
+    )
+    requested = AgentPocSpec(
+        project_path="poc/provider_probe",
+        package_name="io.apkscanner.poc.providerprobe",
+        launch_component=".ApkScannerHarnessActivity",
+        log_tag="APKSCANNER_POC",
+        harness_mode="platform_generated",
+        attack_class="io.apkscanner.poc.providerprobe.Exploit",
+    )
+    oracle = AgentOracleSpec(
+        kind="provider_rows",
+        minimum_rows=1,
+        impact="unauthorized_data_access",
+    )
+    builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
+
+    materialized = builder._materialize_platform_harness(workspace, requested)
+    validated, sources, manifest, effective = builder._validate_project(
+        workspace,
+        materialized,
+        oracle=oracle,
+    )
+
+    harness = source_dir / "ApkScannerHarnessActivity.java"
+    harness_text = harness.read_text(encoding="utf-8")
+    assert validated == project
+    assert harness in sources
+    assert 'getStringExtra("apkscanner_request_id")' in harness_text
+    assert 'record.put("row_count"' in harness_text
+    assert "security_impact_observed" not in harness_text
+    assert effective.launch_component.endswith(".ApkScannerHarnessActivity")
+    activities = ElementTree.parse(manifest).getroot().findall("application/activity")
+    generated = next(
+        item
+        for item in activities
+        if item.get("{http://schemas.android.com/apk/res/android}name")
+        == "io.apkscanner.poc.providerprobe.ApkScannerHarnessActivity"
+    )
+    assert generated.get("{http://schemas.android.com/apk/res/android}exported") == "true"
+    assert generated.find("intent-filter/action") is not None
 
 
 def test_poc_builder_allows_platform_owned_ui_oracle_without_poc_self_report(
@@ -842,6 +905,73 @@ def test_poc_sdk_roles_require_android_16_target_and_d8(
     assert builder._compile_api() == 36
     assert builder._target_api() == 36
     assert builder._effective_min_api() == 21
+
+
+def test_poc_builder_passes_manifest_min_sdk_to_d8(
+    settings,
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    write_poc_project(workspace)
+    android_jar = tmp_path / "android.jar"
+    android_jar.write_bytes(b"android")
+    aapt2 = tmp_path / "aapt2"
+    d8 = tmp_path / "d8"
+    aapt2.write_text("#!/bin/sh\n", encoding="utf-8")
+    d8.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    class MinApiRunner:
+        calls: list[list[str]] = []
+
+        @classmethod
+        def run(cls, argv, **_kwargs):  # noqa: ANN001, ANN206
+            cls.calls.append(argv)
+            if argv[0] == str(aapt2):
+                output = Path(argv[argv.index("-o") + 1])
+                with zipfile.ZipFile(output, "w"):
+                    pass
+                return CommandResult(argv, 0, "", "")
+            if argv[0] == "javac":
+                output = Path(argv[argv.index("-d") + 1]) / "MainActivity.class"
+                output.write_bytes(b"class")
+                return CommandResult(argv, 0, "", "")
+            if argv[0] == str(d8):
+                return CommandResult(argv, 1, "", "stop after recording D8 arguments")
+            raise AssertionError(f"unexpected command: {argv}")
+
+    configured = replace(
+        settings,
+        device_android_api=36,
+        poc_compile_api=36,
+        poc_min_api=21,
+        poc_target_api=36,
+    )
+    builder = PocBuilder(
+        configured,
+        MinApiRunner(),  # type: ignore[arg-type]
+        ArtifactStore(configured),
+    )
+    monkeypatch.setattr(
+        builder,
+        "capability",
+        lambda: {"available": True, "source_build_available": True},
+    )
+    monkeypatch.setattr(builder, "_android_jar", lambda: android_jar)
+    monkeypatch.setattr(builder, "_compile_api", lambda: 36)
+    monkeypatch.setattr(builder, "_target_api", lambda: 36)
+    monkeypatch.setattr(builder, "_dex_tool", lambda: ("d8", d8))
+    monkeypatch.setattr(builder, "_tool_candidates", lambda name: [aapt2])
+    monkeypatch.setattr(builder, "_aapt2_supports_flag", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(builder, "_required_tool", lambda name: name)
+
+    result = builder.build(workspace, poc_spec())
+
+    assert result.ok is False
+    d8_argv = next(argv for argv in MinApiRunner.calls if argv[0] == str(d8))
+    assert d8_argv[d8_argv.index("--min-api") + 1] == "21"
 
 
 def test_legacy_compile_platform_is_not_used_for_android_16_pocs(

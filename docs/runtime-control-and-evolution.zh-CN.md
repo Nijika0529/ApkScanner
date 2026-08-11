@@ -14,12 +14,22 @@
   APKAnalyzer。历史数据库中的 `ENGINE-MOBSF` coverage 行不再返回给控制台。
 - PoC 必须使用精确的 Android Platform 36+ `android.jar`、`d8`、`aapt2`、`zipalign` 和
   `apksigner`。不回退旧 Platform，不使用 `dx`，`targetSdkVersion` 不得低于 36。
+- `compileSdk/targetSdk` 与运行设备 API 不要求相等。平台始终以 36+ 编译和声明目标版本，但 D8
+  `--min-api` 必须与 Manifest `minSdkVersion` 使用同一个有效值；开发 Profile 可将该值降到本地
+  设备 API，正式结论仍只由 Android 16 Profile 签发。
 - Agent 提交预构建 APK 时，平台通过 `aapt2 dump badging` 检查包名、入口、minSdk 和 targetSdk；
   targetSdk 缺失或低于 36即拒绝。
 - 真机执行前再次读取 `ro.build.version.sdk`。PoC target 低于 36 或无法确认运行时兼容性时，产生
   `poc_incompatible`。默认拒绝 API 35 及以下；本地可显式开启 legacy smoke，但其全部 Evidence
   都带 `android16_verdict_eligible=false`，只能验证安装、启动、ADB 和证据链，不能证明或反驳
   Android 16 漏洞。
+- 安装和启动阶段分别记录 `install_failure_kind` 与 `launch_failure_kind`。若 `am start` 表面成功但
+  没有产生关联结果，平台额外采集 PoC 进程的 AndroidRuntime 日志，区分 DEX 校验、缺类、Activity
+  实例化和普通运行时崩溃，不再把这些情况统一归为“未复现”。
+- Adaptive Verifier 通过任务级 ADB 安装 `io.apkscanner.poc.*` 时，如果手机遗留同包名、不同签名的
+  临时 PoC，平台只卸载该临时包并重试一次；目标应用始终受 `DEVICE_RESET_POLICY` 保护。`am start`
+  返回码为 0 但输出 `Error type 3`、组件不存在或权限拒绝时，网关将其规范化为失败回执，阻止 Agent
+  在安装失败后继续误判运行结果。
 
 ## 2. 重新分析的两个语义
 

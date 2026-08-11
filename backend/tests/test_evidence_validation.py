@@ -57,6 +57,7 @@ def test_blackbox_reproduction_requires_correlated_concrete_harm() -> None:
                 "probe_success": True,
                 "test_case_id": "agent-r1-1",
                 "security_impact_observed": True,
+                "impact_contract_satisfied": True,
             },
         },
     ]
@@ -98,6 +99,7 @@ def test_agent_poc_can_supply_the_correlated_ordinary_app_execution_pair() -> No
             "metadata": {
                 "test_case_id": "agent-r1-1",
                 "security_impact_observed": True,
+                "impact_contract_satisfied": True,
             },
         },
     ]
@@ -203,7 +205,7 @@ def test_each_hypothesis_assessment_is_validated_at_its_own_evidence_strength() 
 
 def test_invalid_negative_assessment_degrades_without_failing_proven_task() -> None:
     hypothesis_id = "00000000-0000-0000-0000-000000000001"
-    payload = _payload("reproduced_blackbox", ["poc-launch", "poc-log"])
+    payload = _payload("reproduced_blackbox", ["poc-launch", "poc-log", "oracle"])
     payload["hypothesis_assessments"] = [
         {
             "hypothesis_id": hypothesis_id,
@@ -239,6 +241,15 @@ def test_invalid_negative_assessment_degrades_without_failing_proven_task() -> N
                 "poc_success": True,
                 "security_impact_observed": True,
                 "test_case_id": "agent-r1-1",
+            },
+        },
+        {
+            "id": "oracle",
+            "kind": "blackbox.poc_ui_dump",
+            "exit_code": 0,
+            "metadata": {
+                "test_case_id": "agent-r1-1",
+                "impact_contract_satisfied": True,
             },
         },
     ]
@@ -352,6 +363,7 @@ def test_blackbox_evidence_must_share_request_and_test_case_ids() -> None:
                 "probe_success": True,
                 "test_case_id": "agent-r1-2",
                 "security_impact_observed": True,
+                "impact_contract_satisfied": True,
             },
         },
     ]

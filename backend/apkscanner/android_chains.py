@@ -13,7 +13,7 @@ from .enums import EntryPointKind, Severity
 from .manifest import ManifestDocument
 
 ANALYSIS_SCHEMA_VERSION = "1.0"
-ANALYSIS_ENGINE_VERSION = "bounded-android-chain-v3-method-flow"
+ANALYSIS_ENGINE_VERSION = "bounded-android-chain-v4-ipc-identity"
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +74,10 @@ MARKERS = (
     ),
     MarkerPattern(
         "pending_intent_creator_identity",
-        _patterns(r"\bgetCreator(?:Package|Uid|UserHandle)\s*\(", r"->getCreator(?:Package|Uid|UserHandle)\("),
+        _patterns(
+            r"\bgetCreator(?:Package|Uid|UserHandle)\s*\(",
+            r"->getCreator(?:Package|Uid|UserHandle)\(",
+        ),
     ),
     MarkerPattern(
         "pending_base_implicit",
@@ -117,7 +120,9 @@ MARKERS = (
     ),
     MarkerPattern(
         "pending_intent_send",
-        _patterns(r"\bPendingIntent[^\n]{0,120}\.send\s*\(", r"Landroid/app/PendingIntent;->send\("),
+        _patterns(
+            r"\bPendingIntent[^\n]{0,120}\.send\s*\(", r"Landroid/app/PendingIntent;->send\("
+        ),
     ),
     MarkerPattern(
         "nested_intent_input",
@@ -143,9 +148,86 @@ MARKERS = (
     MarkerPattern(
         "intent_dispatch",
         _patterns(
-            r"\bstart(?:Activity|Activities|Service|ForegroundService)\s*\(",
+            r"\bstart(?:Activity|ActivityForResult|Activities|Service|ForegroundService)\s*\(",
             r"\bsend(?:Ordered|Sticky)?Broadcast\s*\(",
-            r"Landroid/content/Context[^;]*;->(?:startActivity|startActivities|startService|startForegroundService|sendBroadcast|sendOrderedBroadcast)\(",
+            r"Landroid/(?:app/Activity|content/Context[^;]*);->(?:startActivity|startActivityForResult|startActivities|startService|startForegroundService|sendBroadcast|sendOrderedBroadcast)\(",
+        ),
+    ),
+    MarkerPattern(
+        "sensitive_ipc_payload",
+        _patterns(
+            r"\.(?:putExtra|putString|putCharSequence|putParcelable|putSerializable)\s*\(\s*"
+            r"[\"'][^\"']*(?:token|session|auth|password|passwd|secret|credential|cookie|"
+            r"openid|account|email|phone|contact|location|latitude|longitude|imei|imsi|ssid|"
+            r"content[_-]?uri|file[_-]?path)[^\"']*[\"']",
+            r"(?s)const-string(?:/jumbo)?\s+[vp]\d+,\s*[\"'][^\"']*"
+            r"(?:token|session|auth|password|passwd|secret|credential|cookie|openid|account|"
+            r"email|phone|contact|location|latitude|longitude|imei|imsi|ssid|content[_-]?uri|"
+            r"file[_-]?path)[^\"']*[\"'].{0,800}?"
+            r"Landroid/content/Intent;->putExtra\(",
+            flags=re.IGNORECASE,
+        ),
+    ),
+    MarkerPattern(
+        "outbound_ipc_dispatch",
+        _patterns(
+            r"\bstart(?:Activity|ActivityForResult|Activities|Service|ForegroundService)\s*\(",
+            r"\bsend(?:Ordered|Sticky)?Broadcast\s*\(",
+            r"Landroid/(?:app/Activity|content/Context[^;]*);->(?:startActivity|startActivityForResult|startActivities|startService|startForegroundService|sendBroadcast|sendOrderedBroadcast)\(",
+            r"L[^;]+;->startActivityForResult\(",
+        ),
+    ),
+    MarkerPattern(
+        "ipc_dispatch_permission",
+        _patterns(
+            r"\bsend(?:Ordered)?Broadcast\s*\([^,;\n]{1,240},\s*"
+            r"[\"'][A-Za-z0-9_.]+[\"']",
+        ),
+    ),
+    MarkerPattern(
+        "activity_result_dispatch",
+        _patterns(
+            r"\bstartActivityForResult\s*\(",
+            r"\bregisterForActivityResult\s*\(",
+            r"Landroid/app/Activity;->startActivityForResult\(",
+        ),
+    ),
+    MarkerPattern(
+        "activity_result_input",
+        _patterns(
+            r"\bonActivityResult\s*\(",
+            r"\bActivityResultCallback\b",
+            r"\bActivityResult\s+[A-Za-z_$][\w$]*\b",
+            r"->onActivityResult\(",
+            r"\.method[^\n]*\bonActivityResult\(",
+        ),
+    ),
+    MarkerPattern(
+        "activity_result_return",
+        _patterns(
+            r"\bsetResult\s*\(",
+            r"Landroid/app/Activity;->setResult\(",
+        ),
+    ),
+    MarkerPattern(
+        "privileged_content_access",
+        _patterns(
+            r"\bgetContentResolver\s*\(\s*\)\s*\.\s*"
+            r"(?:query|openInputStream|openOutputStream|openAssetFileDescriptor|"
+            r"openFileDescriptor|insert|update|delete|call)\s*\(",
+            r"\bContentResolver[^\n]{0,160}\.(?:query|openInputStream|openOutputStream|"
+            r"openAssetFileDescriptor|openFileDescriptor|insert|update|delete|call)\s*\(",
+            r"Landroid/content/ContentResolver;->(?:query|openInputStream|openOutputStream|"
+            r"openAssetFileDescriptor|openFileDescriptor|insert|update|delete|call)\(",
+        ),
+    ),
+    MarkerPattern(
+        "content_authority_guard",
+        _patterns(
+            r"\b(?:getAuthority|getScheme|getHost)\s*\(\s*\)[^;\n]{0,240}"
+            r"(?:equals|matches|contains|startsWith)",
+            r"\b(?:allowedAuthorities|trustedAuthorities|authorityAllowlist|trustedProviders)\b",
+            flags=re.IGNORECASE,
         ),
     ),
     MarkerPattern(
@@ -252,6 +334,47 @@ MARKERS = (
         ),
     ),
     MarkerPattern(
+        "binder_entrypoint",
+        _patterns(
+            r"\b(?:onBind|onTransact)\s*\(",
+            r"\bextends\s+[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\.Stub\b",
+            r"->(?:onBind|onTransact)\(",
+            r"\.method[^\n]*\b(?:onBind|onTransact)\(",
+        ),
+    ),
+    MarkerPattern(
+        "caller_supplied_identity",
+        _patterns(
+            r"\b(?:packageName|package_name|callerPackage|callingPackage|clientPackage|"
+            r"fromPackage|callerPkg|callingPkg)\b",
+            flags=re.IGNORECASE,
+        ),
+    ),
+    MarkerPattern(
+        "caller_identity_authorization",
+        _patterns(
+            r"(?is)\b(?:packageName|package_name|callerPackage|callingPackage|clientPackage|"
+            r"fromPackage|callerPkg|callingPkg)\b.{0,360}?"
+            r"(?:checkPermission|getPackageInfo|verifySignature|allowedPackages|allowlist|"
+            r"whitelist|\.equals\s*\(|\.contains\s*\(|\.startsWith\s*\()",
+            r"(?is)(?:checkPermission|getPackageInfo|verifySignature|allowedPackages|allowlist|"
+            r"whitelist|\.equals\s*\(|\.contains\s*\(|\.startsWith\s*\()"
+            r".{0,360}?\b(?:packageName|package_name|callerPackage|callingPackage|clientPackage|"
+            r"fromPackage|callerPkg|callingPkg)\b",
+        ),
+    ),
+    MarkerPattern(
+        "binder_caller_identity_guard",
+        _patterns(
+            r"\b(?:Binder\s*\.\s*)?getCallingUid\s*\(",
+            r"\bgetPackagesForUid\s*\(",
+            r"\b(?:check|enforce)Calling(?:OrSelf)?Permission\s*\(",
+            r"\bcheckSignatures\s*\(",
+            r"Landroid/os/Binder;->getCallingUid\(",
+            r"Landroid/content/pm/PackageManager;->getPackagesForUid\(",
+        ),
+    ),
+    MarkerPattern(
         "local_server",
         _patterns(
             r"\b(?:new\s+)?ServerSocket\s*\(",
@@ -271,7 +394,9 @@ MARKERS = (
     ),
     MarkerPattern(
         "local_server_broad_bind",
-        _patterns(r"[\"']0\.0\.0\.0[\"']", r"\bInetAddress\s*\.\s*getByName\s*\(\s*[\"']0\.0\.0\.0"),
+        _patterns(
+            r"[\"']0\.0\.0\.0[\"']", r"\bInetAddress\s*\.\s*getByName\s*\(\s*[\"']0\.0\.0\.0"
+        ),
     ),
     MarkerPattern(
         "socket_peer_guard",
@@ -300,7 +425,9 @@ MARKERS = (
     ),
     MarkerPattern(
         "webview_bridge",
-        _patterns(r"\baddJavascriptInterface\s*\(", r"Landroid/webkit/WebView;->addJavascriptInterface\("),
+        _patterns(
+            r"\baddJavascriptInterface\s*\(", r"Landroid/webkit/WebView;->addJavascriptInterface\("
+        ),
     ),
     MarkerPattern(
         "webview_unsafe_setting",
@@ -339,6 +466,37 @@ MARKER_NEEDLES: dict[str, tuple[str, ...]] = {
     "nested_intent_input": ("EXTRA_INTENT", "Parcelable", "parseUri"),
     "intent_sanitizer": ("IntentSanitizer", "getComponent", "getPackage"),
     "intent_dispatch": ("startActivity", "startService", "sendBroadcast"),
+    "sensitive_ipc_payload": (
+        "putExtra",
+        "putString",
+        "putCharSequence",
+        "putParcelable",
+        "putSerializable",
+    ),
+    "outbound_ipc_dispatch": (
+        "startActivity",
+        "startService",
+        "sendBroadcast",
+    ),
+    "ipc_dispatch_permission": ("sendBroadcast", "sendOrderedBroadcast"),
+    "activity_result_dispatch": ("startActivityForResult", "registerForActivityResult"),
+    "activity_result_input": ("onActivityResult", "ActivityResultCallback", "ActivityResult"),
+    "activity_result_return": ("setResult",),
+    "privileged_content_access": (
+        "ContentResolver",
+        "getContentResolver",
+        "openInputStream",
+        "openOutputStream",
+        "openFileDescriptor",
+    ),
+    "content_authority_guard": (
+        "getAuthority",
+        "getScheme",
+        "getHost",
+        "allowedAuthorities",
+        "trustedAuthorities",
+        "trustedProviders",
+    ),
     "external_uri_input": ("getData", "getClipData", "EXTRA_STREAM", "Parcelable"),
     "uri_grant": ("grantUriPermission", "FLAG_GRANT_"),
     "uri_grant_persisted": ("takePersistableUriPermission",),
@@ -377,6 +535,34 @@ MARKER_NEEDLES: dict[str, tuple[str, ...]] = {
     "receiver_not_exported": ("RECEIVER_NOT_EXPORTED",),
     "receiver_callback": ("onReceive",),
     "receiver_permission_guard": ("Permission", "permission"),
+    "binder_entrypoint": ("onBind", "onTransact", ".Stub"),
+    "caller_supplied_identity": (
+        "packageName",
+        "package_name",
+        "callerPackage",
+        "callingPackage",
+        "clientPackage",
+        "fromPackage",
+        "callerPkg",
+        "callingPkg",
+    ),
+    "caller_identity_authorization": (
+        "packageName",
+        "package_name",
+        "callerPackage",
+        "callingPackage",
+        "clientPackage",
+        "fromPackage",
+        "callerPkg",
+        "callingPkg",
+    ),
+    "binder_caller_identity_guard": (
+        "getCallingUid",
+        "getPackagesForUid",
+        "checkCalling",
+        "enforceCalling",
+        "checkSignatures",
+    ),
     "local_server": (
         "ServerSocket",
         "LocalServerSocket",
@@ -474,6 +660,36 @@ CHAIN_SPECS = (
         guards=frozenset({"explicit_intent_target"}),
     ),
     ChainSpec(
+        family="capability_delegation_boundary",
+        chain_kind="implicit_ipc_sensitive_egress",
+        title="Sensitive data sent through an implicit IPC destination",
+        severity=Severity.HIGH.value,
+        priority=98,
+        sources=frozenset({"sensitive_ipc_payload"}),
+        sinks=frozenset({"outbound_ipc_dispatch"}),
+        risks=frozenset({"implicit_intent_candidate", "activity_result_dispatch", "uri_grant"}),
+        guards=frozenset({"explicit_intent_target", "ipc_dispatch_permission"}),
+    ),
+    ChainSpec(
+        family="capability_delegation_boundary",
+        chain_kind="activity_result_content_proxy",
+        title="Activity result crosses a privileged content boundary",
+        severity=Severity.HIGH.value,
+        priority=98,
+        sources=frozenset({"activity_result_input"}),
+        sinks=frozenset({"privileged_content_access", "activity_result_return", "uri_grant"}),
+        risks=frozenset(
+            {
+                "activity_result_dispatch",
+                "external_uri_input",
+                "content_stream_input",
+                "implicit_intent_candidate",
+                "uri_grant",
+            }
+        ),
+        guards=frozenset({"explicit_intent_target", "content_authority_guard"}),
+    ),
+    ChainSpec(
         family="external_file_ingress_boundary",
         chain_kind="external_content_to_private_file",
         title="External content stream to filesystem",
@@ -513,6 +729,17 @@ CHAIN_SPECS = (
     ),
     ChainSpec(
         family="runtime_ipc_boundary",
+        chain_kind="binder_claimed_identity_authorization",
+        title="Binder path accepts caller-supplied package identity",
+        severity=Severity.HIGH.value,
+        priority=98,
+        sources=frozenset({"binder_entrypoint"}),
+        sinks=frozenset({"caller_supplied_identity"}),
+        risks=frozenset({"caller_identity_authorization"}),
+        guards=frozenset({"binder_caller_identity_guard"}),
+    ),
+    ChainSpec(
+        family="runtime_ipc_boundary",
         chain_kind="local_tcp_or_unix_server",
         title="Local TCP or Unix-domain server",
         severity=Severity.HIGH.value,
@@ -530,7 +757,12 @@ CHAIN_SPECS = (
         severity=Severity.HIGH.value,
         priority=97,
         sources=frozenset(
-            {"web_external_input", "external_uri_input", "content_stream_input", "action_send_ingress"}
+            {
+                "web_external_input",
+                "external_uri_input",
+                "content_stream_input",
+                "action_send_ingress",
+            }
         ),
         sinks=frozenset({"webview_load", "webview_bridge"}),
         risks=frozenset({"webview_bridge", "webview_unsafe_setting"}),
@@ -650,9 +882,7 @@ class AndroidAttackChainAnalyzer:
         sources = root / "sources"
         if sources.is_dir():
             search_bases.insert(0, sources)
-        search_bases.extend(
-            path for path in sorted(root.glob("smali*")) if path.is_dir()
-        )
+        search_bases.extend(path for path in sorted(root.glob("smali*")) if path.is_dir())
         candidates: set[Path] = set()
         for base in search_bases:
             for prefix in owned_prefixes:
@@ -691,8 +921,7 @@ class AndroidAttackChainAnalyzer:
     ) -> bool:
         outer = logical.split("$", 1)[0]
         return outer in component_names or any(
-            logical == prefix or logical.startswith(f"{prefix}.")
-            for prefix in owned_prefixes
+            logical == prefix or logical.startswith(f"{prefix}.") for prefix in owned_prefixes
         )
 
     @staticmethod
@@ -749,7 +978,18 @@ class AndroidAttackChainAnalyzer:
             r"(?:[A-Za-z_$][\w$<>,.?\[\] ]*\s+)?([A-Za-z_$][\w$]*)\s*\([^;{}]*\)"
             r"\s*(?:throws\s+[^\{]+)?\{"
         )
-        matches = list(method_pattern.finditer(content, 0, position))
+        # Declaration markers such as ``onActivityResult`` and ``onTransact`` occur
+        # before the opening brace. Include a small look-ahead, then discard methods
+        # whose declaration starts after the marker.
+        matches = [
+            match
+            for match in method_pattern.finditer(
+                content,
+                0,
+                min(len(content), position + 1_000),
+            )
+            if match.start() <= position
+        ]
         return matches[-1].group(1) if matches else None
 
     @staticmethod
@@ -1032,12 +1272,8 @@ class AndroidAttackChainAnalyzer:
         adjacency: dict[str, set[str]],
         spec: ChainSpec,
     ) -> list[dict[str, Any]]:
-        source_nodes = [
-            name for name, node in nodes.items() if set(node.markers) & spec.sources
-        ]
-        sink_nodes = {
-            name for name, node in nodes.items() if set(node.markers) & spec.sinks
-        }
+        source_nodes = [name for name, node in nodes.items() if set(node.markers) & spec.sources]
+        sink_nodes = {name for name, node in nodes.items() if set(node.markers) & spec.sinks}
         candidates: list[dict[str, Any]] = []
         for source_name in sorted(
             source_nodes,
@@ -1082,16 +1318,8 @@ class AndroidAttackChainAnalyzer:
         sources: frozenset[str],
         sinks: frozenset[str],
     ) -> bool:
-        source_evidence = [
-            item
-            for marker in sources
-            for item in node.markers.get(marker, [])
-        ]
-        sink_evidence = [
-            item
-            for marker in sinks
-            for item in node.markers.get(marker, [])
-        ]
+        source_evidence = [item for marker in sources for item in node.markers.get(marker, [])]
+        sink_evidence = [item for marker in sinks for item in node.markers.get(marker, [])]
         if any(item.get("analysis_scope") == "manifest" for item in source_evidence):
             return True
         source_methods = {str(item["method"]) for item in source_evidence if item.get("method")}
@@ -1212,6 +1440,17 @@ class AndroidAttackChainAnalyzer:
         elif spec.chain_kind == "external_input_to_webview":
             if "web_origin_guard" not in guard_markers:
                 inferred_risks.append("strict_origin_validation_not_observed_in_bounded_path")
+        elif spec.chain_kind == "implicit_ipc_sensitive_egress":
+            if not ({"explicit_intent_target", "ipc_dispatch_permission"} & guard_markers):
+                inferred_risks.append(
+                    "explicit_destination_or_receiver_permission_not_observed_in_bounded_path"
+                )
+        elif spec.chain_kind == "activity_result_content_proxy":
+            if "content_authority_guard" not in guard_markers:
+                inferred_risks.append("content_authority_validation_not_observed_in_bounded_path")
+        elif spec.chain_kind == "binder_claimed_identity_authorization":
+            if "binder_caller_identity_guard" not in guard_markers:
+                inferred_risks.append("calling_uid_binding_not_observed_in_bounded_path")
         elif spec.chain_kind in {
             "external_content_to_private_file",
             "external_archive_extraction",
@@ -1223,8 +1462,7 @@ class AndroidAttackChainAnalyzer:
         disposition = "review_required"
         if (
             spec.chain_kind == "pending_intent_delegation"
-            and {"pending_base_explicit", "pending_intent_immutable"}
-            <= guard_markers
+            and {"pending_base_explicit", "pending_intent_immutable"} <= guard_markers
             and not risk_markers
         ):
             # FLAG_ONE_SHOT is a useful hardening option, but its absence alone does
@@ -1238,6 +1476,12 @@ class AndroidAttackChainAnalyzer:
         ):
             review_required = False
             disposition = "non_exported_receiver_inventory"
+        elif (
+            spec.chain_kind == "implicit_ipc_sensitive_egress"
+            and {"explicit_intent_target", "ipc_dispatch_permission"} & guard_markers
+        ):
+            review_required = False
+            disposition = "scoped_ipc_destination_inventory"
 
         stable = {
             "engine": ANALYSIS_ENGINE_VERSION,
@@ -1364,24 +1608,17 @@ class AndroidAttackChainAnalyzer:
                         region,
                     )
                     aliases = {
-                        name: sorted(
-                            set(re.findall(r"\b[A-Za-z_$][\w$]*\b", expression))
-                        )[:12]
+                        name: sorted(set(re.findall(r"\b[A-Za-z_$][\w$]*\b", expression)))[:12]
                         for name, expression in assignments[:40]
                     }
                     source_line_text = lines[source_line - 1] if source_line <= len(lines) else ""
                     sink_line_text = lines[sink_line - 1] if sink_line <= len(lines) else ""
-                    source_variables = set(
-                        re.findall(r"\b[A-Za-z_$][\w$]*\b", source_line_text)
-                    )
-                    sink_variables = set(
-                        re.findall(r"\b[A-Za-z_$][\w$]*\b", sink_line_text)
-                    )
+                    source_variables = set(re.findall(r"\b[A-Za-z_$][\w$]*\b", source_line_text))
+                    sink_variables = set(re.findall(r"\b[A-Za-z_$][\w$]*\b", sink_line_text))
                     connected = bool(source_variables & sink_variables)
                     if not connected:
                         connected = any(
-                            name in sink_variables
-                            and bool(source_variables & set(inputs))
+                            name in sink_variables and bool(source_variables & set(inputs))
                             for name, inputs in aliases.items()
                         )
                     edges.append(
@@ -1444,11 +1681,7 @@ class AndroidAttackChainAnalyzer:
                 if candidate.is_dir()
             ]
             xml_paths = sorted(
-                {
-                    path
-                    for resource_root in resource_roots
-                    for path in resource_root.glob("*.xml")
-                }
+                {path for resource_root in resource_roots for path in resource_root.glob("*.xml")}
             )
             for path in xml_paths:
                 try:

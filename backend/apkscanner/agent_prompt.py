@@ -91,8 +91,9 @@ def developer_instructions(
     exploration_discipline = (
         "The assigned coverage seed is a hard workflow scope. Do not use a broad glob, directory "
         "listing, grep pattern, or manifest catalogue to enumerate application classes or exported "
-        "components for later reading. Start with context.json and the materialized target_source. "
-        "Use the workspace paths from context.json exactly as written; never reconstruct a task UUID "
+        "components for later reading. Start with context-manifest.json, then open the stable, "
+        "evidence, and current-round documents it names; context.json remains a compatibility copy. "
+        "Use the workspace paths from those files exactly as written; never reconstruct a task UUID "
         "or search from filesystem root to recover a guessed path. Evidence is already materialized "
         "under the task workspace's evidence/ directory. "
         "Open another application class only after the current source or runtime output names its "
@@ -333,6 +334,21 @@ def investigation_prompt(
     phase = str(platform_context.get("phase") or "")
     prompt_evidence = evidence
     prompt_platform_context = platform_context
+    prompt_entries = [
+        {
+            "id": entry.id,
+            "kind": entry.kind,
+            "name": entry.name,
+            "owner_component": entry.owner_component,
+            "exported": entry.exported,
+            "permission": entry.permission,
+            "permission_protection": entry.permission_protection,
+            "deep_links": entry.deep_links,
+            "code_anchors": entry.code_anchors,
+            "metadata": entry.metadata_json,
+        }
+        for entry in entries
+    ]
     if direct_tool_access:
         prompt_evidence = [
             {
@@ -340,7 +356,29 @@ def investigation_prompt(
                 for key in ("id", "kind", "exit_code", "summary", "artifact")
                 if item.get(key) is not None
             }
-            for item in evidence
+            for item in evidence[:64]
+        ]
+        prompt_entries = [
+            {
+                "id": entry.id,
+                "kind": entry.kind,
+                "name": entry.name,
+                "owner_component": entry.owner_component,
+                "exported": entry.exported,
+                "permission": entry.permission,
+                "permission_protection": entry.permission_protection,
+                "deep_link_count": len(entry.deep_links or []),
+                "code_anchors": [
+                    {
+                        key: anchor.get(key)
+                        for key in ("path", "file", "line", "symbol", "method", "class")
+                        if anchor.get(key) is not None
+                    }
+                    for anchor in (entry.code_anchors or [])[:16]
+                    if isinstance(anchor, dict)
+                ],
+            }
+            for entry in entries
         ]
         prompt_platform_context = _compact_tool_context(platform_context)
     payload = {
@@ -360,22 +398,9 @@ def investigation_prompt(
             "allowed_side_effects": task.allowed_side_effects,
             "device_profile": task.device_profile,
         },
-        "entry_points": [
-            {
-                "id": entry.id,
-                "kind": entry.kind,
-                "name": entry.name,
-                "owner_component": entry.owner_component,
-                "exported": entry.exported,
-                "permission": entry.permission,
-                "permission_protection": entry.permission_protection,
-                "deep_links": entry.deep_links,
-                "code_anchors": entry.code_anchors,
-                "metadata": entry.metadata_json,
-            }
-            for entry in entries
-        ],
+        "entry_points": prompt_entries,
         "existing_evidence": prompt_evidence,
+        "existing_evidence_total": len(evidence),
         "platform_context": prompt_platform_context,
     }
     if phase in {"adversarial_review", "rescue_review"}:
@@ -395,7 +420,8 @@ def investigation_prompt(
         access_instruction = (
             "Inspect the task workspace and run shell commands as needed. Temporary "
             "scripts and analysis artifacts may be created only in the workspace or /tmp. Use raw "
-            "ADB only under the system ADB policy. Inspect context.json first; it lists the read-only JADX, "
+            "ADB only under the system ADB policy. Inspect context-manifest.json first; its stable "
+            "document lists the read-only JADX, "
             "apktool, and archive roots exposed by the platform. The original APK is available "
             "read-only at /scan-input/target.apk, so you may run the container's JADX into your "
             "writable workspace when the platform Java output is absent or partial. Before creating "
@@ -434,16 +460,17 @@ def investigation_prompt(
             "do not use Java lambdas; use anonymous callback or Runnable classes so dx-based and "
             "older-device validation remains deterministic. Use prebuilt_apk_path only when "
             "source_build_available is false. "
-            "The PoC package must start with "
-            "io.apkscanner.poc.; its manifest package, Activity class name, Java package "
-            "declaration, and src/ directory must describe the same fully qualified class. Verify "
-            "the manifest and Java source with test -f before invoking proof. Its "
-            "declared launch Activity must read the apkscanner_request_id Intent extra and log a "
-            "single JSON result using the requested log_tag. Include that request ID plus "
-            "success and security_impact_observed booleans. When the requested oracle kind is "
-            "provider_rows, also include an integer row_count derived from the returned Cursor "
-            "(not a guessed or hard-coded value); the platform requires it to prove unauthorized "
-            "data access. For source-only projects the platform "
+            "The PoC package must start with io.apkscanner.poc. Prefer poc.harness_mode="
+            "platform_generated: provide attack_class with a public static runAttack(Activity, "
+            "Intent) method and set launch_component to .ApkScannerHarnessActivity. The method may "
+            "return Boolean, String, or a Bundle containing success, result_summary, and an optional "
+            "measured row_count. The platform generates the launcher Activity, reads the injected "
+            "request ID, serializes the result, and reports exceptions. Do not handwrite that "
+            "protocol or return security_impact_observed. Use harness_mode=custom only for an "
+            "asynchronous or multi-Activity PoC that cannot use the generated synchronous wrapper. "
+            "Verify the manifest and attack source with test -f before invoking proof. For "
+            "provider_rows, row_count must come from the returned Cursor, not a guessed or "
+            "hard-coded value. For source-only projects the platform "
             "builds and signs the APK; for prebuilt_apk_path you build and sign it. In both cases "
             "the platform validates, hashes, installs, launches, records, and uninstalls it. "
             "A PoC's self-reported "
@@ -760,10 +787,11 @@ def investigation_prompt(
         "Binder fields for the platform Probe; extras/reset are optional. Copy both IDs exactly from the supplied task "
         'context. Use this shape: {"hypothesis_id":"<exact-id>","entry_point_id":'
         '"<exact-seed-id>","poc":{"project_path":"poc/name","package_name":'
-        '"io.apkscanner.poc.name","launch_component":".MainActivity","log_tag":'
-        '"APKSCANNER_POC"},"oracle":{"kind":"target_uid_log_contains",'
-        '"expected_text":"APKSCANNER_TARGET_COMMAND_MARKER",'
-        '"impact":"privileged_action"},"rationale":'
+        '"io.apkscanner.poc.name","launch_component":".ApkScannerHarnessActivity",'
+        '"log_tag":"APKSCANNER_POC","harness_mode":"platform_generated",'
+        '"attack_class":"io.apkscanner.poc.name.Exploit"},"oracle":'
+        '{"kind":"provider_rows","minimum_rows":1,'
+        '"impact":"unauthorized_data_access"},"rationale":'
         '"final ordinary-app replay"}. '
         "Before submitting a PoC, verify with shell tools that its exact project_path exists relative to the "
         "task workspace and contains the matching manifest and Java source. Never emit a poc object "
@@ -797,9 +825,10 @@ def investigation_prompt(
         "for onServiceConnected. Perform the Binder transaction inside onServiceConnected (or hand "
         "it to a worker from that callback), then emit the final PoC result. A successful bind, "
         "transact return, or target acknowledgement proves reachability only. For shell-command "
-        "execution, make the target command invoke `/system/bin/log` with a unique fixed marker and "
-        "use target_uid_log_contains; the platform accepts it only when logcat attributes the marker "
-        "to the installed target package UID. Do not use /data/local/tmp as an app-writable Oracle. "
+        "execution, a target command may invoke `/system/bin/log` with a unique fixed marker and "
+        "target_uid_log_contains can then establish target-owned execution. That fact is reachability "
+        "only and cannot prove privileged_action without a separate semantic impact receipt. Do not "
+        "use /data/local/tmp as an app-writable Oracle. "
         "The uri field is Android Intent data, not an arbitrary WebView input: never submit a "
         "javascript: URI unless that exact origin is accepted by the entry's declared deep link. "
         "For archive or file-import traversal hypotheses, launching the target with no archive is "
@@ -819,8 +848,8 @@ def investigation_prompt(
         "diagnostics. binder_reply may use unauthorized_data_access only; it becomes platform harm "
         "evidence only when the Probe successfully binds, transact returns true, and the typed reply "
         "exactly matches expected_text. "
-        "target_uid_log_contains may use "
-        "privileged_action only and requires a marker emitted under the target package UID. "
+        "target_uid_log_contains supports impact=none only; target UID attribution is an observed "
+        "fact, not a security-impact decision. "
         "target_file_sha256 uses an app-data-relative target_path and may prove "
         "unauthorized_state_change only when the platform obtains comparable before/after hashes; "
         "run-as unavailability is an Oracle gap, not negative evidence. "
@@ -828,8 +857,9 @@ def investigation_prompt(
         "evidence only for a new target-package-owned UI transition; process_crash may use "
         "denial_of_service only and must identify the target process. No Oracle independently "
         "proves an invisible target-private state change when hashing is unavailable; in that case "
-        "seek a target-owned UI/log/readback effect. privileged_action requires a target-UID-attributed "
-        "observation such as target_uid_log_contains. Deep-link and provider URI mutations "
+        "seek a target-owned UI/readback or semantic observation. A privileged_action requires a "
+        "separate impact contract bound to the concrete sink; an arbitrary log marker is insufficient. "
+        "Deep-link and provider URI mutations "
         "must preserve the declared scheme and authority. Use requested_tests only when existing "
         "evidence cannot answer a concrete hypothesis, and adapt later requests to the executed "
         "tests and evidence returned by the platform. Read "
@@ -848,21 +878,48 @@ def investigation_prompt(
 
 
 def _compact_tool_context(platform_context: dict[str, Any]) -> dict[str, Any]:
-    """Keep routing metadata in the prompt and leave full content in context.json."""
+    """Keep only dispatch facts inline; complete context lives in versioned files."""
 
-    value = copy.deepcopy(platform_context)
-    target = value.get("target_code_context")
-    if isinstance(target, dict):
-        for component in target.get("components", []):
-            if not isinstance(component, dict):
-                continue
-            for anchor in component.get("anchors", []):
-                if not isinstance(anchor, dict):
-                    continue
-                for key in tuple(anchor):
-                    item = anchor.get(key)
-                    if key in {"content", "snippet", "source", "text", "body", "lines"} and (
-                        isinstance(item, (str, list, dict))
-                    ):
-                        anchor.pop(key, None)
-    return value
+    device = platform_context.get("device")
+    device_summary = (
+        {
+            key: device.get(key)
+            for key in (
+                "available",
+                "busy",
+                "serial",
+                "lease_owned_by_current_task",
+                "verdict_scope",
+            )
+            if key in device
+        }
+        if isinstance(device, dict)
+        else None
+    )
+    hypotheses = platform_context.get("security_hypotheses")
+    hypothesis_index = [
+        {
+            key: item.get(key)
+            for key in ("id", "category", "status")
+            if item.get(key) is not None
+        }
+        for item in hypotheses or []
+        if isinstance(item, dict)
+    ]
+    return {
+        "phase": platform_context.get("phase"),
+        "round_index": platform_context.get("round_index"),
+        "output_language": platform_context.get("output_language"),
+        "context_manifest": copy.deepcopy(platform_context.get("context_manifest")),
+        "device": device_summary,
+        "security_hypotheses": hypothesis_index,
+        "platform_proven_hypotheses": copy.deepcopy(
+            platform_context.get("platform_proven_hypotheses")
+        ),
+        "further_test_rounds_available": platform_context.get(
+            "further_test_rounds_available"
+        ),
+        "proof_replay": copy.deepcopy(platform_context.get("proof_replay")),
+        "adb_gateway": copy.deepcopy(platform_context.get("adb_gateway")),
+        "context_policy": copy.deepcopy(platform_context.get("context_policy")),
+    }

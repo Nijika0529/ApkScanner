@@ -20,6 +20,7 @@ from pydantic import (
 
 from .agent_events import normalize_codex_notification
 from .codex_runner import CodexInvestigator, codex_config_overrides
+from .runtime_contracts import GATEWAY_ENVIRONMENT_NAMES
 from .schemas import AGENT_RESULT_JSON_SCHEMA
 
 PROTOCOL_VERSION = "3.0"
@@ -424,18 +425,7 @@ class PersistentCodexWorker:
 
     @staticmethod
     def _install_gateway_environment(values: dict[str, str]) -> None:
-        allowed = {
-            "APKSCANNER_ADB_TASK_ID",
-            "APKSCANNER_ADB_GATEWAY_URL",
-            "APKSCANNER_ADB_TOKEN",
-            "APKSCANNER_ADB_POLICY",
-            "APKSCANNER_PROOF_TASK_ID",
-            "APKSCANNER_PROOF_REPLAY_URL",
-            "APKSCANNER_PROOF_TOKEN",
-            "APKSCANNER_OBSERVATION_URL",
-            "APKSCANNER_OBSERVATION_TOKEN",
-        }
-        unknown = set(values) - allowed
+        unknown = set(values) - GATEWAY_ENVIRONMENT_NAMES
         if unknown:
             raise ValueError("gateway environment contains unsupported names")
         url_adapter = TypeAdapter(AnyHttpUrl)

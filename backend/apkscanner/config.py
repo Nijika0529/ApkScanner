@@ -50,6 +50,14 @@ class Settings:
     codex_max_containers: int = 2
     codex_max_sessions: int = 8
     codex_max_sessions_per_scan: int = 6
+    agent_analysis_slots: int = 4
+    poc_build_slots: int = 2
+    agent_initial_phase_seconds: int = 15 * 60
+    agent_critic_phase_seconds: int = 5 * 60
+    agent_rescue_phase_seconds: int = 8 * 60
+    agent_final_phase_seconds: int = 3 * 60
+    agent_no_progress_limit: int = 3
+    rescue_audit_sample_rate: float = 0.15
     codex_uid_min: int = 21_000
     codex_uid_max: int = 21_999
     codex_cpu_limit: float = 6.0
@@ -187,6 +195,34 @@ class Settings:
             ),
             codex_max_sessions_per_scan=max(
                 1, int(os.getenv("APKSCANNER_CODEX_MAX_SESSIONS_PER_SCAN", 6))
+            ),
+            agent_analysis_slots=max(
+                1, int(os.getenv("APKSCANNER_AGENT_ANALYSIS_SLOTS", 4))
+            ),
+            poc_build_slots=max(
+                1, int(os.getenv("APKSCANNER_POC_BUILD_SLOTS", 2))
+            ),
+            agent_initial_phase_seconds=max(
+                60, int(os.getenv("APKSCANNER_AGENT_INITIAL_PHASE_SECONDS", 900))
+            ),
+            agent_critic_phase_seconds=max(
+                60, int(os.getenv("APKSCANNER_AGENT_CRITIC_PHASE_SECONDS", 300))
+            ),
+            agent_rescue_phase_seconds=max(
+                60, int(os.getenv("APKSCANNER_AGENT_RESCUE_PHASE_SECONDS", 480))
+            ),
+            agent_final_phase_seconds=max(
+                60, int(os.getenv("APKSCANNER_AGENT_FINAL_PHASE_SECONDS", 180))
+            ),
+            agent_no_progress_limit=max(
+                1, int(os.getenv("APKSCANNER_AGENT_NO_PROGRESS_LIMIT", 3))
+            ),
+            rescue_audit_sample_rate=max(
+                0.0,
+                min(
+                    1.0,
+                    float(os.getenv("APKSCANNER_RESCUE_AUDIT_SAMPLE_RATE", 0.15)),
+                ),
             ),
             codex_uid_min=int(os.getenv("APKSCANNER_CODEX_UID_MIN", 21_000)),
             codex_uid_max=int(os.getenv("APKSCANNER_CODEX_UID_MAX", 21_999)),

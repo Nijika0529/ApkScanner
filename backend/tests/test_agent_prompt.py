@@ -281,7 +281,7 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     assert "live Proof Gateway rejects every impact=none replay" in planning
     assert "operation=binder_transact" in planning
     assert "binder_reply may use unauthorized_data_access only" in planning
-    assert "target_uid_log_contains may use" in planning
+    assert "target_uid_log_contains supports impact=none only" in planning
     critic = _phase_prompt("adversarial_review")
     rescue_review = _phase_prompt("rescue_review")
     rescue_exploration = _phase_prompt("rescue_exploration")
@@ -295,7 +295,8 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     assert "catalog contains only the assigned seed" in planning
     assert "may still be examined freely" in planning
     assert "platform_context.agent_workspace.poc_root" in planning
-    assert "manifest package, Activity class name, Java package" in planning
+    assert "harness_mode=platform_generated" in planning
+    assert "attack_class" in planning
     assert "do not search for aapt, aapt2, d8, dx, sdkmanager" in planning
     assert "platform_context.poc_builder.source_build_available" in planning
     assert "open the actual target source or Smali" in planning
@@ -559,6 +560,72 @@ def test_poc_log_oracle_recovers_an_omitted_expected_text() -> None:
     assert result.rejected_requested_tests == []
     assert len(result.requested_tests) == 1
     assert result.requested_tests[0].oracle.expected_text == "security_impact_observed"
+
+
+def test_agent_result_repairs_fields_from_the_wrong_execution_mode() -> None:
+    payload = {
+        "summary": "静态证据支持风险，申请普通应用身份的设备验证。",
+        "result": "supported_static",
+        "hypotheses_tested": [],
+        "test_cases": [],
+        "evidence_ids": [],
+        "severity_proposal": "high",
+        "confidence": "high",
+        "coverage_gaps": [],
+        "followups": [],
+        "requested_tests": [
+            {
+                "hypothesis_id": "00000000-0000-0000-0000-000000000001",
+                "entry_point_id": "00000000-0000-0000-0000-000000000002",
+                "state": "guest",
+                "uri": None,
+                "extras": {},
+                "operation": "auto",
+                "oracle": {
+                    "kind": "ui_text",
+                    "expected_text": "完成",
+                    "match_mode": "contains",
+                    "reply_index": 2,
+                    "impact": "unauthorized_state_change",
+                },
+                "poc": {
+                    "project_path": "poc/custom_harness",
+                    "package_name": "io.apkscanner.poc.custom_harness",
+                    "launch_component": "io.apkscanner.poc.custom_harness.MainActivity",
+                    "harness_mode": "custom",
+                    "attack_class": "io.apkscanner.poc.custom_harness.Attack",
+                },
+                "rationale": "自定义 Activity 执行攻击并观察目标 UI。",
+            }
+        ],
+    }
+
+    result = AgentInvestigationResult.model_validate(payload)
+
+    assert result.rejected_requested_tests == []
+    assert len(result.requested_tests) == 1
+    request = result.requested_tests[0]
+    assert request.oracle.match_mode == "exact"
+    assert request.oracle.reply_index == 0
+    assert request.poc is not None
+    assert request.poc.attack_class is None
+    assert result.normalization_repairs == [
+        {
+            "location": "requested_tests.0.oracle.match_mode",
+            "repair": "removed_binder_only_field",
+            "original_value": "contains",
+        },
+        {
+            "location": "requested_tests.0.oracle.reply_index",
+            "repair": "removed_binder_only_field",
+            "original_value": 2,
+        },
+        {
+            "location": "requested_tests.0.poc.attack_class",
+            "repair": "removed_platform_harness_only_field",
+            "original_value": "io.apkscanner.poc.custom_harness.Attack",
+        },
+    ]
 
 
 def test_content_provider_method_implies_call_operation() -> None:

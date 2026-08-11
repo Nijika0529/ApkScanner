@@ -4,6 +4,10 @@ import os
 
 import pytest
 from apkscanner.codex_worker import PersistentCodexWorker, TurnCommand
+from apkscanner.runtime_contracts import (
+    GATEWAY_ENVIRONMENT_NAMES,
+    task_gateway_environment,
+)
 from apkscanner.schemas import AGENT_RESULT_JSON_SCHEMA
 from pydantic import ValidationError
 
@@ -77,3 +81,18 @@ def test_gateway_environment_accepts_runtime_observation_endpoint(monkeypatch) -
 
     assert os.environ["APKSCANNER_OBSERVATION_URL"].endswith("/observations")
     assert os.environ["APKSCANNER_OBSERVATION_TOKEN"] == token
+
+
+def test_gateway_environment_is_built_from_the_worker_allowlist() -> None:
+    values = task_gateway_environment(
+        task_id="11111111-2222-4333-8444-555555555555",
+        base_url="http://apkscanner-host:8000/",
+        token="t" * 48,
+        adb_policy="scoped",
+        proof_replay=True,
+    )
+
+    assert set(values) <= GATEWAY_ENVIRONMENT_NAMES
+    assert values["APKSCANNER_OBSERVATION_URL"].endswith("/observations")
+    assert values["APKSCANNER_PROOF_REPLAY_URL"].endswith("/proof-replay")
+    assert values["APKSCANNER_ADB_POLICY"] == "scoped"

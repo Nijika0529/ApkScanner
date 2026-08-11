@@ -191,9 +191,9 @@ def test_runtime_receiver_and_local_socket_are_discovered_with_guards(tmp_path) 
     receiver = by_kind["dynamic_broadcast_receiver"]
     assert receiver["hop_count"] == 1
     assert "receiver_not_exported" in receiver["guard_markers"]
-    assert "receiver_sender_restriction_not_observed_in_bounded_path" not in receiver[
-        "inferred_risks"
-    ]
+    assert (
+        "receiver_sender_restriction_not_observed_in_bounded_path" not in receiver["inferred_risks"]
+    )
     assert receiver["review_required"] is False
     assert receiver["disposition"] == "non_exported_receiver_inventory"
     socket = by_kind["local_tcp_or_unix_server"]
@@ -246,9 +246,7 @@ def test_webview_chain_requires_a_bounded_reference_path(tmp_path) -> None:
         "com.example.target.WebPane",
     ]
     assert "webview_bridge" in web[0]["risk_markers"]
-    assert "strict_origin_validation_not_observed_in_bounded_path" in web[0][
-        "inferred_risks"
-    ]
+    assert "strict_origin_validation_not_observed_in_bounded_path" in web[0]["inferred_risks"]
 
 
 def test_chain_findings_create_surfaces_and_preserve_candidate_metadata(tmp_path) -> None:
@@ -323,9 +321,7 @@ def test_smali_flag_recovery_distinguishes_guards_and_capability_bits(tmp_path) 
     assert "pending_intent_immutable" in pending["guard_markers"]
     assert "pending_base_explicit" in pending["guard_markers"]
     assert "immutable_flag_not_observed_in_bounded_path" not in pending["inferred_risks"]
-    assert "explicit_base_intent_not_observed_in_bounded_path" not in pending[
-        "inferred_risks"
-    ]
+    assert "explicit_base_intent_not_observed_in_bounded_path" not in pending["inferred_risks"]
     assert pending["review_required"] is False
     assert pending["disposition"] == "guarded_capability_inventory"
     assert "uri_grant" in by_kind["uri_permission_redelegation"]["sink_markers"]
@@ -365,11 +361,7 @@ def test_guarded_inventory_does_not_create_a_review_finding(tmp_path) -> None:
     findings, _coverage = BuiltinRuleEngine().evaluate(result)
 
     assert attack_chains[0]["review_required"] is False
-    assert not [
-        item
-        for item in findings
-        if item.rule_id == "CHAIN-ANDROID-CAPABILITY-DELEGATION"
-    ]
+    assert not [item for item in findings if item.rule_id == "CHAIN-ANDROID-CAPABILITY-DELEGATION"]
 
 
 def test_unrelated_methods_in_the_same_class_do_not_form_a_chain(tmp_path) -> None:
@@ -393,3 +385,157 @@ def test_unrelated_methods_in_the_same_class_do_not_form_a_chain(tmp_path) -> No
     chains = AndroidAttackChainAnalyzer().analyze(_manifest(), [root])
 
     assert not [item for item in chains if item["chain_kind"] == "external_input_to_webview"]
+
+
+def test_sensitive_implicit_ipc_egress_is_a_capability_candidate(tmp_path) -> None:
+    root = tmp_path / "jadx"
+    _write(
+        root,
+        "sources/com/example/target/AccountRelay.java",
+        """
+        package com.example.target;
+        class AccountRelay {
+          void share(Context context, String token) {
+            Intent intent = new Intent("com.example.account.EXPORT");
+            intent.putExtra("access_token", token);
+            context.startActivity(intent);
+          }
+        }
+        """,
+    )
+
+    chains = AndroidAttackChainAnalyzer().analyze(_manifest(), [root])
+    chain = next(item for item in chains if item["chain_kind"] == "implicit_ipc_sensitive_egress")
+
+    assert chain["family"] == "capability_delegation_boundary"
+    assert "sensitive_ipc_payload" in chain["source_markers"]
+    assert "implicit_intent_candidate" in chain["risk_markers"]
+    assert (
+        "explicit_destination_or_receiver_permission_not_observed_in_bounded_path"
+        in chain["inferred_risks"]
+    )
+
+
+def test_sensitive_ipc_with_an_explicit_destination_stays_inventory_only(tmp_path) -> None:
+    root = tmp_path / "jadx"
+    _write(
+        root,
+        "sources/com/example/target/ScopedRelay.java",
+        """
+        package com.example.target;
+        class ScopedRelay {
+          void share(Context context, String token) {
+            Intent intent = new Intent("com.example.account.EXPORT");
+            intent.setPackage("com.example.trusted");
+            intent.putExtra("access_token", token);
+            context.startActivity(intent);
+          }
+        }
+        """,
+    )
+
+    chains = AndroidAttackChainAnalyzer().analyze(_manifest(), [root])
+    chain = next(item for item in chains if item["chain_kind"] == "implicit_ipc_sensitive_egress")
+
+    assert "explicit_intent_target" in chain["guard_markers"]
+    assert chain["review_required"] is False
+    assert chain["disposition"] == "scoped_ipc_destination_inventory"
+
+
+def test_sensitive_implicit_ipc_egress_is_recovered_from_smali(tmp_path) -> None:
+    root = tmp_path / "apktool"
+    _write(
+        root,
+        "smali/com/example/target/TokenRelay.smali",
+        """
+        .class public Lcom/example/target/TokenRelay;
+        .method public send(Landroid/content/Context;Ljava/lang/String;)V
+            new-instance v0, Landroid/content/Intent;
+            const-string v1, "com.example.account.EXPORT"
+            invoke-direct {v0, v1}, Landroid/content/Intent;-><init>(Ljava/lang/String;)V
+            const-string v2, "access_token"
+            invoke-virtual {v0, v2, p2}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;
+            invoke-virtual {p1, v0}, Landroid/content/Context;->startActivity(Landroid/content/Intent;)V
+            return-void
+        .end method
+        """,
+    )
+
+    chains = AndroidAttackChainAnalyzer().analyze(_manifest(), [root])
+
+    assert any(item["chain_kind"] == "implicit_ipc_sensitive_egress" for item in chains)
+
+
+def test_activity_result_to_content_resolver_and_set_result_is_linked(tmp_path) -> None:
+    root = tmp_path / "jadx"
+    _write(
+        root,
+        "sources/com/example/target/PickerProxyActivity.java",
+        """
+        package com.example.target;
+        class PickerProxyActivity extends Activity {
+          protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+            Uri uri = data.getData();
+            Cursor cursor = getContentResolver().query(uri, null, null, null, null);
+            Intent reply = new Intent().setData(uri);
+            reply.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            setResult(RESULT_OK, reply);
+          }
+        }
+        """,
+    )
+
+    chains = AndroidAttackChainAnalyzer().analyze(_manifest(), [root])
+    chain = next(item for item in chains if item["chain_kind"] == "activity_result_content_proxy")
+
+    assert {"privileged_content_access", "activity_result_return"} <= set(chain["sink_markers"])
+    assert "external_uri_input" in chain["risk_markers"]
+    assert "content_authority_validation_not_observed_in_bounded_path" in chain["inferred_risks"]
+    assert chain["method_dataflow"]["edges"]
+
+
+def test_binder_claimed_package_authorization_requires_calling_uid_binding(tmp_path) -> None:
+    root = tmp_path / "jadx"
+    _write(
+        root,
+        "sources/com/example/target/ExportBinder.java",
+        """
+        package com.example.target;
+        class ExportBinder extends IExportService.Stub {
+          boolean authorize(String callerPackage) {
+            return allowedPackages.contains(callerPackage);
+          }
+        }
+        """,
+    )
+
+    manifest = _manifest()
+    attack_chains = AndroidAttackChainAnalyzer().analyze(manifest, [root])
+    chain = next(
+        item
+        for item in attack_chains
+        if item["chain_kind"] == "binder_claimed_identity_authorization"
+    )
+
+    assert chain["family"] == "runtime_ipc_boundary"
+    assert "caller_supplied_identity" in chain["sink_markers"]
+    assert "caller_identity_authorization" in chain["risk_markers"]
+    assert "calling_uid_binding_not_observed_in_bounded_path" in chain["inferred_risks"]
+
+    result = StaticAnalysisResult(
+        manifest=manifest,
+        workspace=tmp_path,
+        tool_versions={},
+        tool_results={},
+        signing={},
+        file_inventory={},
+        searchable_roots=[root],
+        decompilation={"status": "complete_success", "output_usable": True},
+        attack_chains=attack_chains,
+    )
+    engine = BuiltinRuleEngine()
+    findings, _coverage = engine.evaluate(result)
+    surfaces = engine.static_review_surfaces(manifest, findings)
+
+    assert any(item.rule_id == "CHAIN-ANDROID-RUNTIME-IPC" for item in findings)
+    assert [item.family for item in surfaces].count("runtime_ipc_boundary") == 1

@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .enums import FindingStatus
-from .models import Evidence, Finding
+from .models import Evidence, Finding, ProofAttempt
 
 EVIDENCE_BACKED_FINDING_STATUSES = {
     FindingStatus.REPRODUCED_BLACKBOX.value,
@@ -38,6 +38,24 @@ def partition_findings(
         if referenced_ids
         else set()
     )
+    declared_proof_ids = {
+        proof_id
+        for finding in items
+        for proof_id in (finding.metadata_json or {}).get("proof_attempt_ids", [])
+        if isinstance(proof_id, str) and proof_id
+    }
+    valid_proof_ids = (
+        set(
+            session.scalars(
+                select(ProofAttempt.id).where(
+                    ProofAttempt.id.in_(declared_proof_ids),
+                    ProofAttempt.harm_demonstrated.is_(True),
+                )
+            )
+        )
+        if declared_proof_ids
+        else set()
+    )
 
     confirmed: list[Finding] = []
     signals: list[Finding] = []
@@ -54,9 +72,19 @@ def partition_findings(
             for value in finding.evidence_ids
             if isinstance(value, str) and value
         }
+        proof_attempt_ids = {
+            value
+            for value in (finding.metadata_json or {}).get("proof_attempt_ids", [])
+            if isinstance(value, str) and value
+        }
+        proof_backed = bool(proof_attempt_ids & valid_proof_ids)
         is_confirmed = (
             finding.status in EVIDENCE_BACKED_FINDING_STATUSES
             and (finding.metadata_json or {}).get("harm_demonstrated") is True
+            and (
+                finding.status != FindingStatus.REPRODUCED_BLACKBOX.value
+                or proof_backed
+            )
             and bool(evidence_ids)
             and all(
                 (evidence_id, finding.scan_id) in valid_evidence

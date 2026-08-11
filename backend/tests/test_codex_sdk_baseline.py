@@ -13,7 +13,7 @@ from apkscanner.codex_sdk_baseline import (
 from openai_codex import Codex, CodexConfig
 
 
-def test_checked_sdk_baseline_matches_runtime_and_reviewed_source() -> None:
+def test_checked_sdk_baseline_matches_runtime_and_reviewed_protocol() -> None:
     checked = load_checked_baseline(Path("config/codex-sdk-baseline.json"))
     runtime = collect_sdk_baseline()
 
@@ -22,7 +22,9 @@ def test_checked_sdk_baseline_matches_runtime_and_reviewed_source() -> None:
     assert checked.source_commit == VERIFIED_SOURCE_COMMIT
     assert runtime.sdk_version == PINNED_SDK_VERSION
     assert runtime.runtime_version == PINNED_SDK_VERSION
-    assert runtime.source_commit == VERIFIED_SOURCE_COMMIT
+    # /work/codex is intentionally updated when reviewing upstream changes. The
+    # installed distributions and generated protocol must remain pinned, while the
+    # checked baseline retains the exact source commit that was reviewed.
     assert runtime.generated_protocol_sha256 == checked.generated_protocol_sha256
     assert runtime_capability()["available"] is True
 

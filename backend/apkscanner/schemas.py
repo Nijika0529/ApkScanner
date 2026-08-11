@@ -384,11 +384,34 @@ class AgentPocSpec(BaseModel):
         pattern=r"^[A-Z][A-Z0-9_]{2,31}$",
     )
     timeout_seconds: int = Field(default=60, ge=5, le=120)
+    harness_mode: Literal["platform_generated", "custom"] = "custom"
+    attack_class: str | None = Field(
+        default=None,
+        pattern=(
+            r"^[A-Za-z][A-Za-z0-9_$]*(?:\.[A-Za-z][A-Za-z0-9_$]*)+$"
+        ),
+        max_length=300,
+    )
+    attack_method: str = Field(
+        default="runAttack",
+        pattern=r"^[A-Za-z][A-Za-z0-9_]{0,63}$",
+    )
     prebuilt_apk_path: str | None = Field(
         default=None,
         pattern=r"^poc/[A-Za-z0-9][A-Za-z0-9._/-]{0,220}\.apk$",
         max_length=256,
     )
+
+    @model_validator(mode="after")
+    def validate_harness(self) -> Self:
+        if self.harness_mode == "platform_generated":
+            if self.prebuilt_apk_path is not None:
+                raise ValueError("platform_generated harness requires a source project")
+            if self.attack_class is None:
+                raise ValueError("platform_generated harness requires attack_class")
+        elif self.attack_class is not None:
+            raise ValueError("attack_class is valid only for platform_generated harness")
+        return self
 
 
 class AgentBinderScriptStep(BaseModel):
@@ -484,6 +507,11 @@ class AgentOracleSpec(BaseModel):
         "privileged_action",
         "denial_of_service",
     ] = "none"
+    impact_contract_id: str | None = Field(
+        default=None,
+        pattern=r"^(?:builtin|semantic):[a-z0-9_.:-]{3,160}$",
+        max_length=192,
+    )
     refute_on_miss: bool = False
 
     @model_validator(mode="after")
@@ -550,7 +578,10 @@ class AgentOracleSpec(BaseModel):
                 "unauthorized_state_change",
                 "privileged_action",
             },
-            "target_uid_log_contains": {"none", "privileged_action"},
+            # A target-owned log line proves provenance and reachability, not the
+            # security meaning of the message. Privileged effects must be attested
+            # by a separate semantic proof receipt bound to concrete observations.
+            "target_uid_log_contains": {"none"},
             "target_file_sha256": {"unauthorized_state_change"},
             "process_crash": {"none", "denial_of_service"},
             "binder_reply": {"none", "unauthorized_data_access"},
@@ -558,6 +589,11 @@ class AgentOracleSpec(BaseModel):
         if self.impact not in allowed_impacts[self.kind]:
             supported = ", ".join(sorted(allowed_impacts[self.kind]))
             raise ValueError(f"{self.kind} Oracle supports only these impacts: {supported}")
+        if self.impact == "none":
+            if self.impact_contract_id is not None:
+                raise ValueError("impact_contract_id requires a non-none impact")
+        elif self.impact_contract_id is None:
+            self.impact_contract_id = f"builtin:{self.kind}:{self.impact}"
         return self
 
 
@@ -948,6 +984,50 @@ class AgentInvestigationResult(BaseModel):
                 _normalize_wire_extras(request) if isinstance(request, dict) else request
             )
             if isinstance(normalized_request, dict):
+                oracle = normalized_request.get("oracle")
+                if isinstance(oracle, dict) and oracle.get("kind") != "binder_reply":
+                    repaired_oracle = dict(oracle)
+                    if repaired_oracle.get("match_mode", "exact") != "exact":
+                        repairs.append(
+                            {
+                                "location": f"requested_tests.{index}.oracle.match_mode",
+                                "repair": "removed_binder_only_field",
+                                "original_value": repaired_oracle.get("match_mode"),
+                            }
+                        )
+                        repaired_oracle["match_mode"] = "exact"
+                    if repaired_oracle.get("reply_index", 0) != 0:
+                        repairs.append(
+                            {
+                                "location": f"requested_tests.{index}.oracle.reply_index",
+                                "repair": "removed_binder_only_field",
+                                "original_value": repaired_oracle.get("reply_index"),
+                            }
+                        )
+                        repaired_oracle["reply_index"] = 0
+                    normalized_request = {
+                        **normalized_request,
+                        "oracle": repaired_oracle,
+                    }
+                poc = normalized_request.get("poc")
+                if (
+                    isinstance(poc, dict)
+                    and poc.get("harness_mode", "custom") == "custom"
+                    and poc.get("attack_class") is not None
+                ):
+                    repaired_poc = dict(poc)
+                    attack_class = repaired_poc.pop("attack_class")
+                    repairs.append(
+                        {
+                            "location": f"requested_tests.{index}.poc.attack_class",
+                            "repair": "removed_platform_harness_only_field",
+                            "original_value": attack_class,
+                        }
+                    )
+                    normalized_request = {
+                        **normalized_request,
+                        "poc": repaired_poc,
+                    }
                 uri = normalized_request.get("uri")
                 if (
                     isinstance(uri, str)

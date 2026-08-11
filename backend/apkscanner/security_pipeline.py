@@ -367,14 +367,32 @@ class HypothesisLedger:
         platform_observed_poc_effect = any(
             item.get("kind") == "blackbox.poc_ui_dump"
             and item.get("metadata", {}).get("request_id") in poc_request_ids
-            and item.get("metadata", {}).get("security_impact_observed") is True
+            and item.get("metadata", {}).get("impact_contract_satisfied") is True
             for item in evidence
         )
         execution_demonstrated = (
             probe_succeeded or poc_succeeded or platform_observed_poc_effect
         )
+        observed_facts: list[dict[str, Any]] = []
+        for item in evidence:
+            metadata = item.get("metadata", {})
+            oracle_metadata = metadata.get("oracle")
+            if not isinstance(oracle_metadata, dict):
+                continue
+            fact = oracle_metadata.get("observed_fact")
+            if not isinstance(fact, dict):
+                continue
+            observed_facts.append(
+                {
+                    **fact,
+                    "evidence_ids": (
+                        [str(item["id"])] if isinstance(item.get("id"), str) else []
+                    ),
+                }
+            )
         impact_observed = any(
-            item.get("metadata", {}).get("security_impact_observed") is True for item in evidence
+            item.get("metadata", {}).get("impact_contract_satisfied") is True
+            for item in evidence
         )
         oracle_refuted = any(
             item.get("metadata", {}).get("oracle_refuted") is True for item in evidence
@@ -447,6 +465,18 @@ class HypothesisLedger:
                 "platform_observed_poc_effect": platform_observed_poc_effect,
                 "execution_demonstrated": execution_demonstrated,
                 "security_impact_observed": impact_observed,
+                "impact_contract_ids": list(
+                    dict.fromkeys(
+                        str(contract_id)
+                        for item in evidence
+                        if (
+                            contract_id := item.get("metadata", {}).get(
+                                "impact_contract_id"
+                            )
+                        )
+                    )
+                ),
+                "observed_facts": observed_facts,
                 "oracle_refuted": oracle_refuted,
                 "android16_verdict_eligible": android16_verdict_eligible,
                 "dynamic_verdict_eligible": dynamic_verdict_eligible,
@@ -457,7 +487,7 @@ class HypothesisLedger:
                 "policy": (
                     "A model claim and successful reachability test are not proof of harm. "
                     "Harm requires both demonstrated execution and a platform Prover's "
-                    "security_impact_observed signal on a device eligible for the selected "
+                    "satisfied ImpactContract on a device eligible for the selected "
                     "validation profile. Development legacy verdicts become Findings but "
                     "remain ineligible for the Android 16 release gate."
                 ),

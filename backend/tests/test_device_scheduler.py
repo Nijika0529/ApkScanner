@@ -287,6 +287,66 @@ def test_device_pool_assigns_two_tasks_to_distinct_devices() -> None:
     }
 
 
+def test_device_pool_preserves_sticky_serial_without_blocking_other_work() -> None:
+    scheduler = DevicePoolScheduler(("device-a", "device-b"))
+    release_a = threading.Event()
+    a_acquired = threading.Event()
+    sticky_queued = threading.Event()
+    sticky_acquired = threading.Event()
+    flexible_acquired = threading.Event()
+    assignments: dict[str, str] = {}
+
+    def hold_a() -> None:
+        with scheduler.lease(
+            "holder",
+            priority=100,
+            cancel_event=threading.Event(),
+            preferred_serial="device-a",
+        ) as lease:
+            assignments["holder"] = lease["serial"]
+            a_acquired.set()
+            assert release_a.wait(timeout=5)
+
+    def sticky() -> None:
+        with scheduler.lease(
+            "sticky",
+            priority=95,
+            cancel_event=threading.Event(),
+            preferred_serial="device-a",
+            on_queued=lambda _position: sticky_queued.set(),
+        ) as lease:
+            assignments["sticky"] = lease["serial"]
+            sticky_acquired.set()
+
+    def flexible() -> None:
+        with scheduler.lease(
+            "flexible",
+            priority=90,
+            cancel_event=threading.Event(),
+        ) as lease:
+            assignments["flexible"] = lease["serial"]
+            flexible_acquired.set()
+
+    holder = threading.Thread(target=hold_a)
+    holder.start()
+    assert a_acquired.wait(timeout=5)
+    sticky_worker = threading.Thread(target=sticky)
+    flexible_worker = threading.Thread(target=flexible)
+    sticky_worker.start()
+    assert sticky_queued.wait(timeout=5)
+    flexible_worker.start()
+
+    assert flexible_acquired.wait(timeout=5)
+    assert assignments["flexible"] == "device-b"
+    assert not sticky_acquired.is_set()
+    release_a.set()
+    assert sticky_acquired.wait(timeout=5)
+    assert assignments["sticky"] == "device-a"
+    for worker in (holder, sticky_worker, flexible_worker):
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+
+
 def test_device_pool_can_expand_and_drain_without_interrupting_an_active_lease() -> None:
     scheduler = DevicePoolScheduler(("device-a",))
     release = threading.Event()
@@ -846,11 +906,11 @@ def test_poc_log_claim_without_expected_observation_is_not_proof() -> None:
     assert metadata["oracle"]["matched"] is False
 
 
-def test_target_uid_log_oracle_proves_command_execution_under_target_uid() -> None:
+def test_target_uid_log_oracle_records_target_owned_reachability_only() -> None:
     oracle = AgentOracleSpec(
         kind="target_uid_log_contains",
         expected_text="APKSCANNER_TARGET_COMMAND_MARKER",
-        impact="privileged_action",
+        impact="none",
     )
     output = (
         "07-30 22:11:02.460 10413 2423 2968 I APKSCANNER_TARGET: "
@@ -873,7 +933,9 @@ def test_target_uid_log_oracle_proves_command_execution_under_target_uid() -> No
     )
 
     assert matched["oracle"]["matched"] is True
-    assert matched["security_impact_observed"] is True
+    assert matched["oracle"]["observed_fact"]["fact_type"] == "target_uid_marker_observed"
+    assert matched["security_impact_observed"] is False
+    assert matched["impact_contract_satisfied"] is False
     assert wrong_uid["oracle"]["matched"] is False
     assert wrong_uid["security_impact_observed"] is False
 
@@ -1187,6 +1249,44 @@ def test_poc_log_collection_accepts_debug_priority(settings) -> None:  # noqa: A
 
     assert len(matching) == 1
     assert attempts == 1
+
+
+def test_poc_runtime_diagnostics_classify_install_launch_and_dex_failures() -> None:
+    install = AdbDeviceAdapter._poc_install_diagnostics(
+        CommandResult(
+            ["adb", "install"],
+            0,
+            "Failure [INSTALL_FAILED_OLDER_SDK: Requires newer sdk version]",
+            "",
+        )
+    )
+    launch = AdbDeviceAdapter._poc_launch_diagnostics(
+        CommandResult(
+            ["adb", "shell", "am", "start"],
+            0,
+            "Error type 3\nActivity class does not exist.",
+            "",
+        )
+    )
+    runtime = AdbDeviceAdapter._poc_runtime_diagnostics(
+        (
+            "FATAL EXCEPTION: main\n"
+            "Process: io.apkscanner.poc.compat, PID: 123\n"
+            "java.lang.VerifyError: rejected class"
+        ),
+        "io.apkscanner.poc.compat",
+    )
+
+    assert install == {
+        "install_accepted": False,
+        "install_failure_kind": "min_sdk_too_high",
+    }
+    assert launch == {
+        "launch_accepted": False,
+        "launch_failure_kind": "component_not_found",
+    }
+    assert runtime["runtime_failure_kind"] == "dex_verification_failed"
+    assert runtime["runtime_crash_observed"] is True
 
 
 def test_poc_log_evidence_waits_for_delayed_correlated_result(

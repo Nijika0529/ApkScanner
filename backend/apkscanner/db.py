@@ -75,6 +75,7 @@ class Database:
         Base.metadata.create_all(self.engine)
         if not self._sqlite_read_only:
             self._reconcile_legacy_direct_reachability_findings()
+            self._reconcile_unproven_dynamic_findings()
             self._reconcile_duplicate_findings()
             self._ensure_runtime_schema_guards()
             self._recover_interrupted_runtime_records()
@@ -279,6 +280,73 @@ class Database:
                         "cross-component chains"
                     ),
                 }
+                finding.metadata_json = metadata
+                changed = True
+            if changed:
+                session.commit()
+
+    def _reconcile_unproven_dynamic_findings(self) -> None:
+        """Ensure historical reproduced findings retain a platform harm receipt."""
+
+        from .enums import FindingStatus
+        from .models import Finding, ProofAttempt
+
+        with self.session_factory() as session:
+            findings = list(
+                session.scalars(
+                    select(Finding).where(
+                        Finding.status == FindingStatus.REPRODUCED_BLACKBOX.value
+                    )
+                )
+            )
+            changed = False
+            for finding in findings:
+                metadata = dict(finding.metadata_json or {})
+                declared_ids = [
+                    value
+                    for value in metadata.get("proof_attempt_ids", [])
+                    if isinstance(value, str)
+                ]
+                statement = select(ProofAttempt).where(
+                    ProofAttempt.scan_id == finding.scan_id,
+                    ProofAttempt.harm_demonstrated.is_(True),
+                )
+                if declared_ids:
+                    statement = statement.where(ProofAttempt.id.in_(declared_ids))
+                elif isinstance(metadata.get("hypothesis_id"), str):
+                    statement = statement.where(
+                        ProofAttempt.hypothesis_id == metadata["hypothesis_id"]
+                    )
+                else:
+                    statement = None
+                attempts = (
+                    list(session.scalars(statement.order_by(ProofAttempt.created_at)))
+                    if statement is not None
+                    else []
+                )
+                if attempts:
+                    proof_ids = [attempt.id for attempt in attempts]
+                    if metadata.get("proof_attempt_ids") != proof_ids:
+                        metadata["proof_attempt_ids"] = proof_ids
+                        metadata["harm_demonstrated"] = True
+                        finding.metadata_json = metadata
+                        changed = True
+                    continue
+                finding.status = FindingStatus.SUPPORTED_STATIC.value
+                metadata.update(
+                    {
+                        "harm_demonstrated": False,
+                        "release_gate_eligible": False,
+                        "proof_attempt_ids": [],
+                        "verdict_reconciliation": {
+                            "schema_version": "1.0",
+                            "reason": (
+                                "Legacy reproduced verdict had no attributable platform "
+                                "ProofAttempt with harm_demonstrated=true."
+                            ),
+                        },
+                    }
+                )
                 finding.metadata_json = metadata
                 changed = True
             if changed:

@@ -7,7 +7,10 @@
 1. PendingIntent、嵌套 Intent 与 URI permission grant；
 2. FileProvider、ACTION_SEND、SAF、压缩包与文件导入；
 3. context-registered Receiver、localhost TCP 与 Unix-domain socket；
-4. Android 外部输入到 WebView 内容、导航和 JavaScript bridge 的路径。
+4. Android 外部输入到 WebView 内容、导航和 JavaScript bridge 的路径；
+5. 携带敏感 extra 的隐式 Activity、Service 和 Broadcast 出站链；
+6. `Activity.onActivityResult()` 到 `ContentResolver`、`setResult()` 和 URI grant 的代理链；
+7. Binder/AIDL 中调用方自报包名与真实 calling UID 的身份绑定链。
 
 输出是供后续 Codex 调查的 `candidate`，不是漏洞结论。静态链仍需证明普通第三方应用可达、缺少有效防护并产生具体的机密性、完整性或权限影响。
 
@@ -109,6 +112,43 @@ Java/JavaScript 信息交换都会破坏只看 Java API 的分析。动态验证
 
 参考：[Iframes/Popups Are Dangerous in Mobile WebView](https://www.usenix.org/conference/usenixsecurity19/presentation/yang-guangliang)、[Identity Confusion in WebView-based Mobile App-in-app Ecosystems](https://www.usenix.org/conference/usenixsecurity22/presentation/zhang-lei)、[$\omega$Test: WebView-Oriented Testing for Android Applications](https://arxiv.org/abs/2306.03845)、[WebViewTracer / Cross-Boundary Mobile Tracking](https://www.ndss-symposium.org/ndss-paper/cross-boundary-mobile-tracking-exploring-java-to-javascript-information-diffusion-in-webviews/)。
 
+### 3.6 出站 IPC 也是攻击入口
+
+入口枚举不能只看“外部如何进入 APK”。高权限应用通过隐式 Intent 或 Broadcast 向外发送 token、
+账号、位置、文件路径或 content URI 时，普通应用可能注册高优先级组件拦截数据，或伪造返回结果。
+本实现只在同一有界方法/类链中同时观察到以下信号时生成候选：
+
+```text
+敏感名称的 Intent/Bundle extra
+  → startActivity/startActivityForResult/startService/sendBroadcast
+  → 未观察到 setPackage/setComponent/显式 class/接收权限
+```
+
+敏感名称匹配是候选生成启发式，不表示值已被证明敏感；显式目标和广播权限会把该链保留为
+inventory，但不创建审查任务。
+
+### 3.7 Activity Result 要按双向能力流分析
+
+`startActivityForResult()` 不只是一次组件启动。被调起方能够控制返回 Intent、data URI、ClipData
+和 grant flag；调用方又可能以更高权限读取该 URI、复制文件或把结果继续返回给上游。当前链把
+`onActivityResult`/Activity Result callback 与下列落点连接：
+
+- `ContentResolver.query/open*/insert/update/delete/call`；
+- `Activity.setResult()`；
+- `grantUriPermission()` 和 Intent URI grant flag。
+
+候选会同时记录显式目标与 authority/scheme/host allowlist 信号。`requestCode` 或 `resultCode`
+检查只能区分业务分支，不能证明结果提供者可信，因此不作为身份防护。
+
+### 3.8 Binder 授权必须绑定真实调用 UID
+
+平台现在识别 `onBind`、`onTransact` 和 AIDL `Stub` 附近的调用方包名字段。对 `packageName`、
+`callerPackage` 等调用者可提供字段，会记录它是否参与 allowlist、签名或权限判断，并检查同一
+有界路径是否出现 `Binder.getCallingUid()`、`getPackagesForUid()`、calling permission 或签名绑定。
+
+这条规则专门生成“调用方自报身份”候选，不把所有 Binder 方法都变成任务。即使观察到 UID
+检查也不自动关闭候选，因为检查顺序、共享 UID、多包 UID 和先信任后校验仍需要 Agent 复核。
+
 ## 4. 已实现的数据流
 
 实现入口位于 `backend/apkscanner/android_chains.py`：
@@ -118,7 +158,7 @@ Java/JavaScript 信息交换都会破坏只看 Java API 的分析。动态验证
 3. 构建应用自有类的有向引用图；
 4. 对各 chain spec 执行最多三跳的 BFS；
 5. 把所有候选链写入 `code_index.json.attack_chains` 作为可复用 inventory；
-6. 只为需要审查的链生成四类 `STATIC_SURFACE`，向 Codex 暴露链、位置和防护信号；显式且 immutable 的 PendingIntent、明确 `RECEIVER_NOT_EXPORTED` 的动态 Receiver 仍保留在 inventory，但不制造漏洞任务；
+6. 只为需要审查的链生成四类 `STATIC_SURFACE`，向 Codex 暴露链、位置和防护信号；新增链复用 `capability_delegation_boundary` 和 `runtime_ipc_boundary`，不会为每种模式另建任务。显式且 immutable 的 PendingIntent、目标已限定的敏感 IPC、明确 `RECEIVER_NOT_EXPORTED` 的动态 Receiver 仍保留在 inventory，但不制造漏洞任务；
 7. 把 chain fingerprint 纳入安全快照。
 
 静态缓存 context version 已更新。旧缓存不会被误用，新 APK 的链分析结果可随反编译产物一起复用。
@@ -154,6 +194,10 @@ Java/JavaScript 信息交换都会破坏只看 Java API 的分析。动态验证
 - WebView 暂不执行 JavaScript，也不恢复服务端动态内容；
 - 普通 APK 的 Unix socket 结果暂未联合设备 SELinux policy；
 - ZIP/TAR 路径检查暂未做逐语句 def-use 和 TOCTOU/symlink 证明。
+- 敏感 IPC extra 依赖字段名启发式，业务自定义名称可能漏报，普通名称也需要 Agent 语义复核；
+- Binder 当前只专门建模“调用方自报 package identity”，尚未覆盖所有无鉴权 AIDL 方法、
+  framework `ServiceManager` 注册服务和 system_server 全局调用图；
+- Activity Result 链只做应用代码内有界关联，不能静态证明运行时解析到的实际处理组件。
 
 这些边界会作为 Coverage Gap 进入报告。平台不会因为有界图未观察到路径，就把反射、异步边、
 动态 Web 内容或 SELinux 相关风险判定为安全。

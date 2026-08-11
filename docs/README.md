@@ -17,6 +17,7 @@
 | 文档 | 内容 | 状态 |
 | --- | --- | --- |
 | [Android 攻击链分析](android-attack-chain-analysis.zh-CN.md) | PendingIntent、文件导入、动态 Receiver、Socket、WebView/JSBridge 等 | 当前实现与扩展方法 |
+| [Samsung 漏洞案例集覆盖分析](samsung-vulnerability-coverage-review.zh-CN.md) | 140 份详细案例的模式映射、本轮补齐与后续边界 | 研究报告与实现映射 |
 | [AdaptiveCases 真机评测](adaptivecases-real-device-evaluation.zh-CN.md) | 合成 APK 的测试口径、已知限制与动态证明要求 | 评测记录 |
 | [私有已知漏洞集盲测计划](private-benchmark-plan.zh-CN.md) | Ground truth 隔离、验收分层和公开披露规则 | 验收计划 |
 | [运行时控制与版本演进](runtime-control-and-evolution.zh-CN.md) | 设备池、重新分析、验证 Profile、事件性能 | 当前实现 |

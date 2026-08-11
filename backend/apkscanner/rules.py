@@ -100,7 +100,9 @@ CODE_RULES = (
     ),
     (
         "CODE-WEAK-CRYPTO",
-        re.compile(r"Cipher\.getInstance\s*\([^\n]*(ECB|DES)|MessageDigest\.getInstance\s*\([^\n]*(MD5|SHA-?1)"),
+        re.compile(
+            r"Cipher\.getInstance\s*\([^\n]*(ECB|DES)|MessageDigest\.getInstance\s*\([^\n]*(MD5|SHA-?1)"
+        ),
         "Potential weak cryptographic primitive",
         "Use modern authenticated encryption and collision-resistant hashes appropriate to the use case.",
         "MASVS-CRYPTO",
@@ -186,9 +188,7 @@ CODE_RULES = (
     ),
     (
         "CODE-NONPRODUCTION-ENDPOINT",
-        re.compile(
-            r"(?i)(?:https?|wss?)://[^\s\"']*(?:pre|test|staging|dev)[^\s\"']*"
-        ),
+        re.compile(r"(?i)(?:https?|wss?)://[^\s\"']*(?:pre|test|staging|dev)[^\s\"']*"),
         "Release code references a non-production service endpoint",
         "Use environment-bound release configuration and reject pre, test, staging, or development endpoints in production artifacts.",
         "MASVS-NETWORK",
@@ -198,9 +198,9 @@ CODE_RULES = (
     (
         "CODE-HARDCODED-SECRET",
         re.compile(
-            r'\.field[^\n]*(?:app[_-]?secret|app[_-]?key|client[_-]?secret|'
+            r"\.field[^\n]*(?:app[_-]?secret|app[_-]?key|client[_-]?secret|"
             r'api[_-]?key)[^\n]*=\s*"[A-Za-z0-9+/=_-]{12,}"|'
-            r'(?:app[_-]?secret|app[_-]?key|client[_-]?secret|api[_-]?key)'
+            r"(?:app[_-]?secret|app[_-]?key|client[_-]?secret|api[_-]?key)"
             r'\s*[=:]\s*["\'][A-Za-z0-9+/=_-]{12,}["\']',
             re.IGNORECASE,
         ),
@@ -338,7 +338,7 @@ STATIC_REVIEW_FAMILIES: dict[str, dict[str, Any]] = {
     },
     "capability_delegation_boundary": {
         "rule_ids": {"CHAIN-ANDROID-CAPABILITY-DELEGATION"},
-        "title": "PendingIntent, nested Intent, and URI grant capability boundary",
+        "title": "Intent, Activity result, and URI capability boundary",
         "severity": Severity.HIGH.value,
         "priority": 98,
         "path_hints": (
@@ -354,6 +354,8 @@ STATIC_REVIEW_FAMILIES: dict[str, dict[str, Any]] = {
             "A PendingIntent delegates more mutable, replayable, or redirectable authority than its intended recipient requires.",
             "A nested or serialized Intent reaches an internal component launch without complete destination and flag sanitization.",
             "An attacker-controlled content URI or ClipData item gains or propagates read, write, prefix, or persisted access across an unintended trust boundary.",
+            "Sensitive extras leave through an implicit Activity, Service, or broadcast destination that another app can intercept.",
+            "An untrusted Activity result is consumed with the caller's ContentResolver authority or returned with URI grants without validating its provider.",
         ],
     },
     "runtime_ipc_boundary": {
@@ -361,7 +363,7 @@ STATIC_REVIEW_FAMILIES: dict[str, dict[str, Any]] = {
             "CHAIN-ANDROID-RUNTIME-IPC",
             "CODE-DYNAMIC-RECEIVER",
         },
-        "title": "Runtime receiver and local socket ingress boundary",
+        "title": "Runtime receiver, local socket, and Binder identity boundary",
         "severity": Severity.HIGH.value,
         "priority": 95,
         "path_hints": (
@@ -371,12 +373,15 @@ STATIC_REVIEW_FAMILIES: dict[str, dict[str, Any]] = {
             "server",
             "http",
             "ipc",
+            "binder",
+            "aidl",
         ),
         "preferred_only": False,
         "hypotheses": [
             "A context-registered receiver accepts broadcasts from an ordinary third-party app without a non-exported flag or strong sender permission.",
             "Receiver-controlled extras can cross into a persistent, privileged, filesystem, component-launch, or WebView sink.",
             "A TCP loopback or Unix-domain listener is reachable without binding its peer to an authenticated application identity and exposes sensitive commands or data.",
+            "A Binder/AIDL authorization decision trusts a package name or identity supplied by the caller instead of binding it to Binder.getCallingUid().",
         ],
     },
     "persistent_security_policy_boundary": {
@@ -468,8 +473,7 @@ class BuiltinRuleEngine:
                     if self._location_belongs_to_package(location, package_prefix)
                     or (
                         is_chain_finding
-                        and location.get("analysis_scope")
-                        in {"manifest", "resource_config"}
+                        and location.get("analysis_scope") in {"manifest", "resource_config"}
                     )
                 ]
                 if not accepted:
@@ -497,18 +501,13 @@ class BuiltinRuleEngine:
             preferred = [
                 item
                 for item in unique_locations
-                if any(
-                    hint in str(item.get("path") or "").lower()
-                    for hint in hints
-                )
+                if any(hint in str(item.get("path") or "").lower() for hint in hints)
             ]
             if config.get("preferred_only") and preferred:
                 unique_locations = preferred
             unique_locations.sort(
                 key=lambda item: (
-                    0
-                    if any(hint in str(item.get("path") or "").lower() for hint in hints)
-                    else 1,
+                    0 if any(hint in str(item.get("path") or "").lower() for hint in hints) else 1,
                     str(item.get("path") or ""),
                     int(item.get("line") or 0),
                 )
@@ -538,10 +537,7 @@ class BuiltinRuleEngine:
         result: StaticAnalysisResult,
     ) -> list[StaticReviewSurfaceDraft]:
         surfaces: list[StaticReviewSurfaceDraft] = []
-        graph_nodes = {
-            str(node.get("id")): node
-            for node in result.artifact_graph.get("nodes", [])
-        }
+        graph_nodes = {str(node.get("id")): node for node in result.artifact_graph.get("nodes", [])}
         graph_edges = list(result.artifact_graph.get("edges", []))
         for node in result.artifact_graph.get("nodes", []):
             origin = node.get("origin") or {}
@@ -567,8 +563,7 @@ class BuiltinRuleEngine:
             loader_nodes = [
                 graph_nodes.get(str(edge.get("from")))
                 for edge in graph_edges
-                if edge.get("relation") == "loads_embedded_apk"
-                and edge.get("to") == node.get("id")
+                if edge.get("relation") == "loads_embedded_apk" and edge.get("to") == node.get("id")
             ]
             loader_nodes = [item for item in loader_nodes if item is not None]
             for loader in loader_nodes:
@@ -730,7 +725,9 @@ class BuiltinRuleEngine:
                     severity=Severity.MEDIUM.value,
                     confidence=Confidence.MEDIUM.value,
                     cwe="CWE-319",
-                    locations=[{"path": "AndroidManifest.xml", "attribute": "android:usesCleartextTraffic"}],
+                    locations=[
+                        {"path": "AndroidManifest.xml", "attribute": "android:usesCleartextTraffic"}
+                    ],
                 )
             )
         for entry in manifest.entries:
@@ -824,8 +821,10 @@ class BuiltinRuleEngine:
                 )
             )
         schemes = result.signing.get("schemes", {}) if result.signing else {}
-        if result.signing.get("verified") and schemes.get("v1") and not any(
-            schemes.get(version) for version in ("v2", "v3", "v3.1", "v4")
+        if (
+            result.signing.get("verified")
+            and schemes.get("v1")
+            and not any(schemes.get(version) for version in ("v2", "v3", "v3.1", "v4"))
         ):
             findings.append(
                 FindingDraft(
@@ -976,12 +975,14 @@ class BuiltinRuleEngine:
                 "title": "Android capability delegation chain requires review",
                 "description": (
                     "A bounded app-class reference path connects PendingIntent, nested Intent, "
-                    "or content-URI capability handling to delegation or dispatch behavior. This "
-                    "is an explainable investigation seed, not an exploitation verdict."
+                    "Activity result, sensitive implicit IPC, or content-URI capability handling "
+                    "to delegation, privileged content access, or dispatch behavior. This is an "
+                    "explainable investigation seed, not an exploitation verdict."
                 ),
                 "remediation": (
                     "Use explicit immutable PendingIntents, sanitize nested Intents, narrowly "
-                    "scope URI grants, and bind authorization to the real caller and operation."
+                    "scope URI grants, validate result-provider authority, and make sensitive IPC "
+                    "destinations explicit or permission protected."
                 ),
                 "cwe": "CWE-926",
             },
@@ -1001,15 +1002,17 @@ class BuiltinRuleEngine:
             },
             "runtime_ipc_boundary": {
                 "rule_id": "CHAIN-ANDROID-RUNTIME-IPC",
-                "title": "Runtime receiver or local server creates an IPC ingress surface",
+                "title": "Runtime IPC surface requires caller and peer validation",
                 "description": (
                     "The APK contains a context-registered receiver or local TCP/Unix-domain "
-                    "server. Export flags, sender permissions, peer authentication, and reachable "
-                    "privileged handlers require validation."
+                    "server, or a Binder authorization path involving caller-provided package "
+                    "identity. Export flags, sender permissions, peer authentication, calling UID "
+                    "binding, and reachable privileged handlers require validation."
                 ),
                 "remediation": (
                     "Keep receivers non-exported unless required, enforce signature permissions, "
-                    "and authenticate local socket peers before parsing commands or returning data."
+                    "authenticate local socket peers, and derive Binder caller identity from "
+                    "Binder.getCallingUid() before parsing commands or returning data."
                 ),
                 "cwe": "CWE-306",
             },
@@ -1041,9 +1044,7 @@ class BuiltinRuleEngine:
             locations: list[dict[str, Any]] = []
             for candidate in candidates:
                 locations.extend(
-                    item
-                    for item in candidate.get("locations", [])
-                    if isinstance(item, dict)
+                    item for item in candidate.get("locations", []) if isinstance(item, dict)
                 )
             unique_locations = list(
                 {
@@ -1080,8 +1081,7 @@ class BuiltinRuleEngine:
                     metadata={
                         "candidate_only": True,
                         "analysis_engine": str(
-                            candidates[0].get("engine_version")
-                            or "bounded-android-chain-v1"
+                            candidates[0].get("engine_version") or "bounded-android-chain-v1"
                         ),
                         "attack_chains": candidates,
                     },
@@ -1141,9 +1141,7 @@ class BuiltinRuleEngine:
             "MASVS-RESILIENCE": "Reverse engineering and tamper resilience",
             "MASVS-PRIVACY": "Privacy-related permissions and SDKs",
         }
-        component_statuses = [
-            str(item.get("status")) for item in result.code_index.values()
-        ]
+        component_statuses = [str(item.get("status")) for item in result.code_index.values()]
         component_code_available = any(
             status
             in {
@@ -1159,32 +1157,29 @@ class BuiltinRuleEngine:
             or result.decompilation.get("generated_java_files", 0)
             or global_decompilation_status in {"complete", "partial_success"}
         )
-        code_available = component_code_available or global_code_available or any(
-            item.rule_id.startswith("CODE-") for item in findings
+        code_available = (
+            component_code_available
+            or global_code_available
+            or any(item.rule_id.startswith("CODE-") for item in findings)
         )
         full_code_coverage = (
             global_decompilation_status == "complete"
             and global_code_available
             and all(status == "source_available" for status in component_statuses)
         )
-        incomplete_components = sum(
-            status != "source_available" for status in component_statuses
-        )
+        incomplete_components = sum(status != "source_available" for status in component_statuses)
         coverage: list[CoverageDraft] = []
         for domain, title in domains.items():
-            partial = (
-                domain in {"MASVS-AUTH", "MASVS-PRIVACY"}
-                or not full_code_coverage
-            )
+            partial = domain in {"MASVS-AUTH", "MASVS-PRIVACY"} or not full_code_coverage
             gap = None
             if domain == "MASVS-AUTH":
-                gap = "APK-only analysis and one test account cannot prove server-side authorization."
+                gap = (
+                    "APK-only analysis and one test account cannot prove server-side authorization."
+                )
             elif domain == "MASVS-PRIVACY":
                 gap = "Runtime data collection and declared privacy policy are not available from the APK alone."
             elif not code_available:
-                gap = (
-                    "No searchable application code was available; manifest and archive checks only."
-                )
+                gap = "No searchable application code was available; manifest and archive checks only."
             elif global_decompilation_status == "partial_success":
                 gap = (
                     "Decompiler output was only partially successful; code coverage cannot "

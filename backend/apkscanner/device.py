@@ -38,6 +38,7 @@ class _DeviceWaiter:
     task_id: str = field(compare=False)
     enqueued_at: float = field(compare=False)
     cancel_event: threading.Event = field(compare=False)
+    preferred_serial: str | None = field(default=None, compare=False)
 
 
 class SingleDeviceScheduler:
@@ -56,6 +57,7 @@ class SingleDeviceScheduler:
         *,
         priority: int,
         cancel_event: threading.Event,
+        preferred_serial: str | None = None,
         on_queued=None,  # noqa: ANN001
         on_acquired=None,  # noqa: ANN001
     ):  # noqa: ANN201
@@ -66,6 +68,7 @@ class SingleDeviceScheduler:
                 task_id=task_id,
                 enqueued_at=time.monotonic(),
                 cancel_event=cancel_event,
+                preferred_serial=preferred_serial,
             )
             heapq.heappush(self._queue, waiter)
             position = self._position(waiter)
@@ -132,7 +135,7 @@ class SingleDeviceScheduler:
 
 
 class DevicePoolScheduler:
-    """Priority queue that assigns one complete task to one free device."""
+    """Priority queue that assigns one dynamic execution batch to one device."""
 
     def __init__(self, serials: tuple[str, ...]) -> None:
         self._serials = list(dict.fromkeys(serials))
@@ -149,6 +152,7 @@ class DevicePoolScheduler:
         *,
         priority: int,
         cancel_event: threading.Event,
+        preferred_serial: str | None = None,
         on_queued=None,  # noqa: ANN001
         on_acquired=None,  # noqa: ANN001
     ):  # noqa: ANN201
@@ -159,6 +163,7 @@ class DevicePoolScheduler:
                 task_id=task_id,
                 enqueued_at=time.monotonic(),
                 cancel_event=cancel_event,
+                preferred_serial=preferred_serial,
             )
             heapq.heappush(self._queue, waiter)
             position = self._position(waiter)
@@ -173,19 +178,30 @@ class DevicePoolScheduler:
                         self._remove(waiter)
                         self._condition.notify_all()
                         raise DeviceLeaseCancelledError("device lease was cancelled while queued")
-                    available_serial = next(
-                        (
-                            serial
-                            for serial in self._serials
-                            if serial not in self._active_by_serial
-                            and serial not in self._draining
-                        ),
-                        None,
-                    )
-                    if available_serial is not None and self._queue and self._queue[0] is waiter:
-                        heapq.heappop(self._queue)
-                        self._active_by_serial[available_serial] = task_id
-                        acquired_serial = available_serial
+                    available_serials = [
+                        serial
+                        for serial in self._serials
+                        if serial not in self._active_by_serial
+                        and serial not in self._draining
+                    ]
+                    selected_waiter: _DeviceWaiter | None = None
+                    selected_serial: str | None = None
+                    for candidate in sorted(self._queue):
+                        preferred = candidate.preferred_serial
+                        if preferred in available_serials:
+                            selected_waiter = candidate
+                            selected_serial = preferred
+                            break
+                        if (
+                            preferred is None or preferred not in self._serials
+                        ) and available_serials:
+                            selected_waiter = candidate
+                            selected_serial = available_serials[0]
+                            break
+                    if selected_waiter is waiter and selected_serial is not None:
+                        self._remove(waiter)
+                        self._active_by_serial[selected_serial] = task_id
+                        acquired_serial = selected_serial
                         break
                     self._condition.wait(timeout=0.25)
             waited_seconds = max(0.0, time.monotonic() - waiter.enqueued_at)
@@ -195,6 +211,10 @@ class DevicePoolScheduler:
                 "task_id": task_id,
                 "serial": acquired_serial,
                 "wait_seconds": waited_seconds,
+                "preferred_serial": preferred_serial,
+                "preferred_serial_matched": (
+                    preferred_serial is None or acquired_serial == preferred_serial
+                ),
             }
         finally:
             with self._condition:
@@ -323,6 +343,7 @@ class AdbDeviceAdapter:
         *,
         priority: int,
         cancel_event: threading.Event,
+        preferred_serial: str | None = None,
         on_queued=None,  # noqa: ANN001
         on_acquired=None,  # noqa: ANN001
         on_released=None,  # noqa: ANN001
@@ -332,6 +353,7 @@ class AdbDeviceAdapter:
             task_id,
             priority=priority,
             cancel_event=cancel_event,
+            preferred_serial=preferred_serial,
             on_queued=on_queued,
         ) as metadata:
             acquired_at = time.monotonic()
@@ -341,7 +363,7 @@ class AdbDeviceAdapter:
                     raise DeviceLeaseCancelledError(
                         "device lease was cancelled before the command session"
                     )
-                # The scheduler owns the device for the complete task. Do not hold
+                # The scheduler owns the device for this dynamic batch. Do not hold
                 # the command RLock here: live proof replay enters through the API
                 # thread while the Agent thread waits for its response. Individual
                 # device operations take `_lease`, so commands remain serialized
@@ -959,6 +981,79 @@ class AdbDeviceAdapter:
                 return last, matching, attempts, time.monotonic() - started
             time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
 
+    @staticmethod
+    def _poc_install_diagnostics(result: CommandResult) -> dict[str, Any]:
+        output = "\n".join(value for value in (result.stdout, result.stderr) if value).strip()
+        upper = output.upper()
+        failure_kind: str | None = None
+        for marker, kind in (
+            ("INSTALL_FAILED_OLDER_SDK", "min_sdk_too_high"),
+            ("INSTALL_FAILED_DEPRECATED_SDK_VERSION", "target_sdk_too_low"),
+            ("INSTALL_FAILED_NO_MATCHING_ABIS", "abi_incompatible"),
+            ("INSTALL_FAILED_UPDATE_INCOMPATIBLE", "signing_key_mismatch"),
+            ("INSTALL_PARSE_FAILED", "invalid_apk"),
+            ("INSTALL_FAILED_INVALID_APK", "invalid_apk"),
+            ("INSTALL_FAILED_INSUFFICIENT_STORAGE", "insufficient_storage"),
+            ("INSTALL_FAILED_USER_RESTRICTED", "device_policy_restricted"),
+        ):
+            if marker in upper:
+                failure_kind = kind
+                break
+        accepted = result.exit_code == 0 and "FAILURE [" not in upper
+        if not accepted and failure_kind is None:
+            failure_kind = "adb_install_failed"
+        return {
+            "install_accepted": accepted,
+            "install_failure_kind": failure_kind,
+        }
+
+    @staticmethod
+    def _poc_launch_diagnostics(result: CommandResult) -> dict[str, Any]:
+        output = "\n".join(value for value in (result.stdout, result.stderr) if value).strip()
+        lowered = output.lower()
+        failure_kind: str | None = None
+        for marker, kind in (
+            ("error type 3", "component_not_found"),
+            ("does not exist", "component_not_found"),
+            ("unable to resolve intent", "component_not_found"),
+            ("permission denial", "launch_permission_denied"),
+            ("securityexception", "launch_permission_denied"),
+            ("background activity start", "background_launch_restricted"),
+        ):
+            if marker in lowered:
+                failure_kind = kind
+                break
+        accepted = result.exit_code == 0 and failure_kind is None
+        if not accepted and failure_kind is None:
+            failure_kind = "adb_launch_failed"
+        return {
+            "launch_accepted": accepted,
+            "launch_failure_kind": failure_kind,
+        }
+
+    @staticmethod
+    def _poc_runtime_diagnostics(output: str, package_name: str) -> dict[str, Any]:
+        lowered = output.lower()
+        package_lower = package_name.lower()
+        package_observed = package_lower in lowered
+        failure_kind: str | None = None
+        for marker, kind in (
+            ("verifyerror", "dex_verification_failed"),
+            ("unsupportedclassversionerror", "java_bytecode_incompatible"),
+            ("noclassdeffounderror", "runtime_class_missing"),
+            ("classnotfoundexception", "runtime_class_missing"),
+            ("unable to instantiate activity", "activity_instantiation_failed"),
+            ("fatal exception", "process_crashed"),
+        ):
+            if marker in lowered and package_observed:
+                failure_kind = kind
+                break
+        return {
+            "runtime_package_observed": package_observed,
+            "runtime_failure_kind": failure_kind,
+            "runtime_crash_observed": failure_kind is not None,
+        }
+
     def execute_poc(
         self,
         apk_path: Path,
@@ -1096,8 +1191,21 @@ class AdbDeviceAdapter:
                 budget,
                 300,
             )
-            commands.append(("blackbox.poc_install", install, dict(common)))
-            if install.exit_code == 0:
+            install_diagnostics = self._poc_install_diagnostics(install)
+            commands.append(
+                (
+                    "blackbox.poc_install",
+                    install,
+                    {**common, **install_diagnostics},
+                )
+            )
+            launch_diagnostics: dict[str, Any] = {
+                "launch_accepted": False,
+                "launch_failure_kind": "not_attempted",
+            }
+            poc_result_observed = False
+            runtime_diagnostics: dict[str, Any] = {}
+            if install_diagnostics["install_accepted"] is True:
                 clear = self._adb_budget(
                     ["shell", "pm", "clear", spec.package_name],
                     budget,
@@ -1229,7 +1337,14 @@ class AdbDeviceAdapter:
                     budget,
                     spec.timeout_seconds,
                 )
-                commands.append(("blackbox.poc_launch", launch, dict(common)))
+                launch_diagnostics = self._poc_launch_diagnostics(launch)
+                commands.append(
+                    (
+                        "blackbox.poc_launch",
+                        launch,
+                        {**common, **launch_diagnostics},
+                    )
+                )
                 process = self._adb_budget(
                     ["shell", "pidof", spec.package_name],
                     budget,
@@ -1266,6 +1381,7 @@ class AdbDeviceAdapter:
                 )
                 normalized = [line.lower().replace(" ", "") for line in matching]
                 poc_payload = self._last_json_payload(matching)
+                poc_result_observed = bool(matching)
                 poc_oracle = self._evaluate_poc_oracle(
                     oracle,
                     poc_payload=poc_payload,
@@ -1302,6 +1418,45 @@ class AdbDeviceAdapter:
                         },
                     )
                 )
+                if not poc_result_observed or launch_diagnostics["launch_accepted"] is not True:
+                    runtime_log = self._adb_budget(
+                        [
+                            "logcat",
+                            "-d",
+                            "-t",
+                            "800",
+                            "-s",
+                            "AndroidRuntime:E",
+                            "ActivityTaskManager:E",
+                            "ActivityManager:E",
+                        ],
+                        budget,
+                        60,
+                    )
+                    runtime_diagnostics = self._poc_runtime_diagnostics(
+                        "\n".join(
+                            value
+                            for value in (runtime_log.stdout, runtime_log.stderr)
+                            if value
+                        ),
+                        spec.package_name,
+                    )
+                    commands.append(
+                        (
+                            "blackbox.poc_runtime_logcat",
+                            runtime_log,
+                            {
+                                **common,
+                                **launch_diagnostics,
+                                **runtime_diagnostics,
+                                "diagnostic_trigger": (
+                                    "launch_rejected"
+                                    if launch_diagnostics["launch_accepted"] is not True
+                                    else "structured_result_missing"
+                                ),
+                            },
+                        )
+                    )
                 if oracle is not None and oracle.kind == "target_file_sha256":
                     (
                         target_file_result,
@@ -1427,6 +1582,10 @@ class AdbDeviceAdapter:
                 "request_id": request_id,
                 "session_state": state,
                 "command_count": len(commands),
+                **install_diagnostics,
+                **launch_diagnostics,
+                "poc_result_observed": poc_result_observed,
+                **runtime_diagnostics,
             },
         )
 
@@ -1834,14 +1993,34 @@ class AdbDeviceAdapter:
         refutation_observed: bool = False,
     ) -> dict[str, Any]:
         impact = bool(oracle.impact != "none" and matched and impact_observed)
+        fact_type = {
+            "reachability": "entry_reachable",
+            "provider_rows": "provider_rows_returned",
+            "ui_text": "target_ui_transition",
+            "log_contains": "log_marker_observed",
+            "target_uid_log_contains": "target_uid_marker_observed",
+            "target_file_sha256": "target_file_state_changed",
+            "process_crash": "target_process_crashed",
+            "binder_reply": "binder_reply_matched",
+        }[oracle.kind]
         return {
             "oracle": {
                 "kind": oracle.kind,
                 "impact": oracle.impact,
+                "impact_contract_id": oracle.impact_contract_id,
                 "matched": matched,
                 "observation": observation,
                 "impact_predicate_satisfied": impact,
+                "observed_fact": {
+                    "schema_version": "1.0",
+                    "fact_type": fact_type,
+                    "matched": matched,
+                    "source": "platform_oracle",
+                    "details": observation,
+                },
             },
+            "impact_contract_id": oracle.impact_contract_id,
+            "impact_contract_satisfied": impact,
             "security_impact_observed": impact,
             "oracle_refuted": bool(oracle.refute_on_miss and not matched and refutation_observed),
         }
@@ -2161,7 +2340,10 @@ class AdbDeviceAdapter:
                 "target_uid": target_uid,
                 "matching_target_uid_lines": len(matching_lines),
             }
-            impact_observed = bool(matched and oracle.impact == "privileged_action")
+            # UID attribution only establishes that the target emitted the
+            # marker. It cannot turn arbitrary model-selected text into a
+            # privileged-action proof.
+            impact_observed = False
         elif oracle.kind == "process_crash":
             matched = cls._target_process_crashed(output, package_name)
             observation = {
@@ -2264,7 +2446,7 @@ class AdbDeviceAdapter:
 
 
 class AdbDevicePool:
-    """Assign each investigation one exclusive adapter for its complete task."""
+    """Assign each dynamic task batch one exclusive adapter."""
 
     def __init__(self, adapters: list[AdbDeviceAdapter]) -> None:
         self._lock = threading.RLock()
@@ -2402,6 +2584,7 @@ class AdbDevicePool:
         *,
         priority: int,
         cancel_event: threading.Event,
+        preferred_serial: str | None = None,
         on_queued=None,  # noqa: ANN001
         on_acquired=None,  # noqa: ANN001
         on_released=None,  # noqa: ANN001
@@ -2410,6 +2593,7 @@ class AdbDevicePool:
             task_id,
             priority=priority,
             cancel_event=cancel_event,
+            preferred_serial=preferred_serial,
             on_queued=on_queued,
         ) as metadata:
             serial = str(metadata["serial"])

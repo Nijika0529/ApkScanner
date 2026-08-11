@@ -11,7 +11,15 @@ import apkscanner.api as api_module
 import pytest
 from apkscanner.enums import TaskStatus
 from apkscanner.main import create_app
-from apkscanner.models import EntryPoint, Evidence, Finding, InvestigationTask, Scan
+from apkscanner.models import (
+    EntryPoint,
+    Evidence,
+    Finding,
+    InvestigationTask,
+    ProofAttempt,
+    Scan,
+    SecurityHypothesis,
+)
 from apkscanner.schemas import AgentInvestigationResult
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -441,6 +449,22 @@ def test_findings_require_platform_harm_and_valid_evidence(settings) -> None:  #
             )
             session.add(scan)
             session.flush()
+            proof_task = InvestigationTask(
+                scan=scan,
+                task_type="component",
+                status="completed",
+            )
+            session.add(proof_task)
+            session.flush()
+            hypothesis = SecurityHypothesis(
+                scan_id=scan.id,
+                task_id=proof_task.id,
+                fingerprint="e" * 64,
+                category="android.exported_component",
+                claim="An ordinary app triggers the proven impact.",
+            )
+            session.add(hypothesis)
+            session.flush()
             evidence = Evidence(
                 scan_id=scan.id,
                 kind="dynamic.oracle",
@@ -449,6 +473,17 @@ def test_findings_require_platform_harm_and_valid_evidence(settings) -> None:  #
                 summary="Platform Oracle observed unauthorized impact",
             )
             session.add(evidence)
+            session.flush()
+            proof = ProofAttempt(
+                scan_id=scan.id,
+                task_id=proof_task.id,
+                hypothesis_id=hypothesis.id,
+                test_case_id="api-proof-policy",
+                status="proven",
+                evidence_ids=[evidence.id],
+                harm_demonstrated=True,
+            )
+            session.add(proof)
             session.flush()
             records = [
                 Finding(
@@ -486,7 +521,11 @@ def test_findings_require_platform_harm_and_valid_evidence(settings) -> None:  #
                     severity="high",
                     status="reproduced_blackbox",
                     evidence_ids=[evidence.id],
-                    metadata_json={"harm_demonstrated": True},
+                    metadata_json={
+                        "harm_demonstrated": True,
+                        "hypothesis_id": hypothesis.id,
+                        "proof_attempt_ids": [proof.id],
+                    },
                 ),
                 Finding(
                     scan_id=scan.id,
@@ -1921,6 +1960,27 @@ def test_hypothesis_and_private_evaluation_endpoints(settings) -> None:  # noqa:
             )
             session.add_all([probe_evidence, log_evidence])
             session.flush()
+            hypothesis = SecurityHypothesis(
+                scan_id=scan.id,
+                task_id=task.id,
+                fingerprint="9" * 64,
+                category="android.deep_link",
+                claim="Guest route may trigger protected behavior.",
+                entry_point_ids=[entry.id],
+            )
+            session.add(hypothesis)
+            session.flush()
+            proof = ProofAttempt(
+                scan_id=scan.id,
+                task_id=task.id,
+                hypothesis_id=hypothesis.id,
+                test_case_id="evaluation-proof",
+                status="proven",
+                evidence_ids=[probe_evidence.id, log_evidence.id],
+                harm_demonstrated=True,
+            )
+            session.add(proof)
+            session.flush()
             session.add(
                 Finding(
                     scan=scan,
@@ -1934,7 +1994,11 @@ def test_hypothesis_and_private_evaluation_endpoints(settings) -> None:  # noqa:
                     status="reproduced_blackbox",
                     entry_point_ids=[entry.id],
                     evidence_ids=[probe_evidence.id, log_evidence.id],
-                    metadata_json={"harm_demonstrated": True},
+                    metadata_json={
+                        "harm_demonstrated": True,
+                        "hypothesis_id": hypothesis.id,
+                        "proof_attempt_ids": [proof.id],
+                    },
                 )
             )
             session.commit()

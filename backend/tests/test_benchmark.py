@@ -3,10 +3,53 @@ from __future__ import annotations
 import pytest
 from apkscanner.benchmark import BenchmarkEvaluator
 from apkscanner.db import Database
-from apkscanner.models import BenchmarkEvaluation, EntryPoint, Evidence, Finding, Scan
+from apkscanner.models import (
+    BenchmarkEvaluation,
+    EntryPoint,
+    Evidence,
+    Finding,
+    InvestigationTask,
+    ProofAttempt,
+    Scan,
+    SecurityHypothesis,
+)
 from apkscanner.schemas import BenchmarkSpec
 from pydantic import ValidationError
 from sqlalchemy import select
+
+
+def _platform_proof(
+    session,
+    *,
+    scan: Scan,
+    evidence_ids: list[str],
+    fingerprint: str,
+    claim: str,
+) -> tuple[SecurityHypothesis, ProofAttempt]:  # noqa: ANN001
+    task = InvestigationTask(scan=scan, task_type="component", status="completed")
+    session.add(task)
+    session.flush()
+    hypothesis = SecurityHypothesis(
+        scan_id=scan.id,
+        task_id=task.id,
+        fingerprint=fingerprint,
+        category="android.exported_component",
+        claim=claim,
+    )
+    session.add(hypothesis)
+    session.flush()
+    proof = ProofAttempt(
+        scan_id=scan.id,
+        task_id=task.id,
+        hypothesis_id=hypothesis.id,
+        test_case_id=f"benchmark-{fingerprint[:8]}",
+        status="proven",
+        evidence_ids=evidence_ids,
+        harm_demonstrated=True,
+    )
+    session.add(proof)
+    session.flush()
+    return hypothesis, proof
 
 
 def test_private_benchmark_rewards_proven_harm_and_penalizes_confirmed_noise(
@@ -51,6 +94,13 @@ def test_private_benchmark_rewards_proven_harm_and_penalizes_confirmed_noise(
         )
         session.add_all([proof_one, proof_two])
         session.flush()
+        hypothesis, proof = _platform_proof(
+            session,
+            scan=scan,
+            evidence_ids=[proof_one.id, proof_two.id],
+            fingerprint="5" * 64,
+            claim="The deep link triggers a protected action.",
+        )
         session.add_all(
             [
                 Finding(
@@ -64,10 +114,12 @@ def test_private_benchmark_rewards_proven_harm_and_penalizes_confirmed_noise(
                     severity="high",
                     status="reproduced_blackbox",
                     entry_point_ids=[vulnerable_entry.id],
-                        evidence_ids=[proof_one.id, proof_two.id],
+                    evidence_ids=[proof_one.id, proof_two.id],
                     metadata_json={
                         "harm_demonstrated": True,
                         "model": "deepseek-v4-pro",
+                        "hypothesis_id": hypothesis.id,
+                        "proof_attempt_ids": [proof.id],
                     },
                 ),
                 Finding(
@@ -206,6 +258,20 @@ def test_benchmark_uses_maximum_matching_instead_of_truth_file_order(settings) -
         )
         session.add_all([specific_evidence, generic_evidence])
         session.flush()
+        specific_hypothesis, specific_proof = _platform_proof(
+            session,
+            scan=scan,
+            evidence_ids=[specific_evidence.id],
+            fingerprint="6" * 64,
+            claim="A specific authorization bypass is reproducible.",
+        )
+        generic_hypothesis, generic_proof = _platform_proof(
+            session,
+            scan=scan,
+            evidence_ids=[generic_evidence.id],
+            fingerprint="7" * 64,
+            claim="A generic impact is reproducible.",
+        )
         specific = Finding(
             scan=scan,
             dedupe_key="specific",
@@ -217,7 +283,11 @@ def test_benchmark_uses_maximum_matching_instead_of_truth_file_order(settings) -
             severity="high",
             status="reproduced_blackbox",
             evidence_ids=[specific_evidence.id],
-            metadata_json={"harm_demonstrated": True},
+            metadata_json={
+                "harm_demonstrated": True,
+                "hypothesis_id": specific_hypothesis.id,
+                "proof_attempt_ids": [specific_proof.id],
+            },
         )
         generic = Finding(
             scan=scan,
@@ -230,7 +300,11 @@ def test_benchmark_uses_maximum_matching_instead_of_truth_file_order(settings) -
             severity="medium",
             status="reproduced_blackbox",
             evidence_ids=[generic_evidence.id],
-            metadata_json={"harm_demonstrated": True},
+            metadata_json={
+                "harm_demonstrated": True,
+                "hypothesis_id": generic_hypothesis.id,
+                "proof_attempt_ids": [generic_proof.id],
+            },
         )
         session.add_all([specific, generic])
         session.commit()

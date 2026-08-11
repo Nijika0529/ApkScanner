@@ -71,6 +71,7 @@ from .planner import InvestigationPlanner
 from .poc import PocBuilder, PocBuildResult
 from .repository import add_event, now
 from .rules import BuiltinRuleEngine
+from .runtime_contracts import task_gateway_environment
 from .schemas import (
     ADAPTIVE_VERIFIER_RESULT_JSON_SCHEMA,
     AGENT_RESULT_JSON_SCHEMA,
@@ -203,6 +204,8 @@ class ScanOrchestrator:
         self._live_proof_base_url: str | None = None
         self._task_cancellations_lock = threading.Lock()
         self._shutting_down = threading.Event()
+        self._analysis_slots = threading.BoundedSemaphore(settings.agent_analysis_slots)
+        self._build_slots = threading.BoundedSemaphore(settings.poc_build_slots)
 
     @staticmethod
     def _validate_adb_serial(serial: str) -> str:
@@ -591,24 +594,80 @@ class ScanOrchestrator:
                 timeout=timeout,
                 policy=context.adb_policy,
             )
+            command_records: list[tuple[str, CommandResult, dict[str, Any]]] = [
+                (
+                    "agent.adb.gateway",
+                    result,
+                    {
+                        "source": "codex_gateway",
+                        "round_index": context.round_index,
+                        "gateway_policy": (
+                            "adaptive_task_scoped_v1"
+                            if context.adb_policy == "adaptive"
+                            else "task_scoped_v1"
+                        ),
+                    },
+                )
+            ]
+            result_record_index = 0
+            conflicting_poc = self._adaptive_poc_signature_conflict(
+                forwarded_args,
+                result,
+                target_package=context.package_name,
+            )
+            if conflicting_poc is not None:
+                cleanup = context.device.execute_gateway(
+                    ["uninstall", conflicting_poc],
+                    timeout=min(90, max(1, context.budget.remaining(90))),
+                    policy="adaptive",
+                )
+                command_records.append(
+                    (
+                        "agent.adb.gateway.poc_cleanup",
+                        cleanup,
+                        {
+                            "source": "platform",
+                            "round_index": context.round_index,
+                            "poc_package": conflicting_poc,
+                            "reason": "stale_poc_signing_key_mismatch",
+                        },
+                    )
+                )
+                if cleanup.exit_code == 0 and not context.budget.expired:
+                    result = context.device.execute_gateway(
+                        forwarded_args,
+                        timeout=min(
+                            request.timeout_seconds,
+                            max(1, context.budget.remaining(120)),
+                        ),
+                        policy="adaptive",
+                    )
+                    command_records.append(
+                        (
+                            "agent.adb.gateway.poc_install_retry",
+                            result,
+                            {
+                                "source": "platform",
+                                "round_index": context.round_index,
+                                "poc_package": conflicting_poc,
+                                "reason": "retry_after_stale_poc_cleanup",
+                            },
+                        )
+                    )
+                    result_record_index = len(command_records) - 1
+            normalized_result = self._normalize_adaptive_adb_result(forwarded_args, result)
+            if normalized_result is not result:
+                kind, _raw_result, metadata = command_records[result_record_index]
+                command_records[result_record_index] = (
+                    kind,
+                    normalized_result,
+                    {**metadata, "semantic_exit_normalized": True},
+                )
+                result = normalized_result
             self._record_commands(
                 context.scan_id,
                 context.task_id,
-                [
-                    (
-                        "agent.adb.gateway",
-                        result,
-                        {
-                            "source": "codex_gateway",
-                            "round_index": context.round_index,
-                            "gateway_policy": (
-                                "adaptive_task_scoped_v1"
-                                if context.adb_policy == "adaptive"
-                                else "task_scoped_v1"
-                            ),
-                        },
-                    )
-                ],
+                command_records,
                 context.evidence_summaries,
             )
             self._materialize_live_evidence(context, context.evidence_summaries)
@@ -626,6 +685,60 @@ class ScanOrchestrator:
                 },
             )
             return AdbGatewayResponse.from_command(result).model_dump(mode="json")
+
+    @staticmethod
+    def _adaptive_poc_signature_conflict(
+        args: list[str],
+        result: CommandResult,
+        *,
+        target_package: str,
+    ) -> str | None:
+        """Return a stale temporary PoC package that may be safely replaced."""
+
+        if not args or args[0] != "install" or result.exit_code == 0:
+            return None
+        output = "\n".join(value for value in (result.stdout, result.stderr) if value)
+        if "INSTALL_FAILED_UPDATE_INCOMPATIBLE" not in output.upper():
+            return None
+        match = re.search(
+            r"Existing package\s+([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)\s+"
+            r"signatures do not match",
+            output,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            return None
+        package_name = match.group(1)
+        if (
+            package_name == target_package
+            or not package_name.startswith("io.apkscanner.poc.")
+        ):
+            return None
+        return package_name
+
+    @staticmethod
+    def _normalize_adaptive_adb_result(
+        args: list[str],
+        result: CommandResult,
+    ) -> CommandResult:
+        """Turn Android's textual `am start` errors into a real command failure."""
+
+        if len(args) < 3 or args[:3] != ["shell", "am", "start"]:
+            return result
+        diagnostics = AdbDeviceAdapter._poc_launch_diagnostics(result)
+        if diagnostics["launch_accepted"] is not False or result.exit_code != 0:
+            return result
+        failure_kind = diagnostics["launch_failure_kind"] or "adb_launch_failed"
+        suffix = f"APKScanner: semantic am start failure ({failure_kind})"
+        stderr = f"{result.stderr.rstrip()}\n{suffix}\n" if result.stderr else f"{suffix}\n"
+        return CommandResult(
+            argv=result.argv,
+            exit_code=1,
+            stdout=result.stdout,
+            stderr=stderr,
+            timed_out=result.timed_out,
+            canceled=result.canceled,
+        )
 
     @staticmethod
     def _adb_command_destroys_target_data(
@@ -663,16 +776,55 @@ class ScanOrchestrator:
 
         prefix = container_workspace.rstrip("/")
         host_root = host_workspace.resolve()
+
+        def local_path(value: str) -> str:
+            if value == prefix or value.startswith(prefix + "/"):
+                relative = value[len(prefix) :].lstrip("/")
+            elif Path(value).is_absolute():
+                absolute = Path(value).resolve()
+                if not absolute.is_relative_to(host_root):
+                    raise ValueError("ADB local path escapes the verifier workspace")
+                return str(absolute)
+            else:
+                relative = value
+            target = (host_root / relative).resolve()
+            if not target.is_relative_to(host_root):
+                raise ValueError("ADB local path escapes the verifier workspace")
+            return str(target)
+
         translated: list[str] = []
         for value in args:
             if value == prefix or value.startswith(prefix + "/"):
-                relative = value[len(prefix) :].lstrip("/")
-                target = (host_root / relative).resolve()
-                if not target.is_relative_to(host_root):
-                    raise ValueError("ADB local path escapes the verifier workspace")
-                translated.append(str(target))
+                translated.append(local_path(value))
             else:
                 translated.append(value)
+
+        command = translated[0] if translated else ""
+        positional = [
+            index
+            for index in range(1, len(translated))
+            if not translated[index].startswith("-")
+        ]
+        if command == "pull":
+            if len(positional) >= 2:
+                translated[positional[1]] = local_path(translated[positional[1]])
+            elif positional:
+                remote_name = Path(translated[positional[0]].rstrip("/")).name or "adb-pull"
+                translated.append(local_path(remote_name))
+        elif command == "push" and positional:
+            translated[positional[0]] = local_path(translated[positional[0]])
+        elif command in {
+            "install",
+            "install-multiple",
+            "install-multi-package",
+            "install-streaming",
+        }:
+            for index in positional:
+                value = translated[index]
+                if value.lower().endswith((".apk", ".apex")):
+                    translated[index] = local_path(value)
+        elif command == "bugreport" and positional:
+            translated[positional[0]] = local_path(translated[positional[0]])
         return translated
 
     def execute_live_proof_replay(
@@ -2161,11 +2313,13 @@ class ScanOrchestrator:
             scan.stats = {
                 **dict(scan.stats or {}),
                 "execution_policy": {
-                    "concurrency_policy": "dynamic_adb_capacity",
+                    "concurrency_policy": "resource_aware_phase_admission",
                     "investigation_concurrency_at_start": initial_concurrency,
                     "adb_concurrency": adb_concurrency,
-                    "static_only_minimum_lane": 1,
-                    "device_ownership": "complete_task",
+                    "analysis_slots": self.settings.agent_analysis_slots,
+                    "build_slots": self.settings.poc_build_slots,
+                    "device_slots": adb_concurrency,
+                    "device_ownership": "dynamic_execution_phase",
                     "agent_workspace_scope": "task_attempt",
                 },
             }
@@ -2174,18 +2328,18 @@ class ScanOrchestrator:
                 scan_id,
                 "investigation.pool.started",
                 (
-                    "多设备探索池已启动：每个任务完整独占一台 ADB 设备"
-                    if adb_concurrency > 1
-                    else "当前无 ADB 设备：保留一个静态分析 lane，接入设备后自动扩容"
-                    if adb_concurrency == 0
-                    else "单任务探索已启动：每次只有一个任务完整占有 ADB"
+                    "资源感知探索池已启动：分析、构建和设备执行分别调度"
+                    if adb_concurrency
+                    else "资源感知探索池已启动：先运行无设备分析，设备接入后执行证明"
                 ),
                 {
-                    "concurrency_policy": "dynamic_adb_capacity",
+                    "concurrency_policy": "resource_aware_phase_admission",
                     "investigation_concurrency": initial_concurrency,
                     "adb_concurrency": adb_concurrency,
+                    "analysis_slots": self.settings.agent_analysis_slots,
+                    "build_slots": self.settings.poc_build_slots,
                     "device_serials": list(self.device_pool.serials),
-                    "device_ownership": "complete_task",
+                    "device_ownership": "dynamic_execution_phase",
                 },
             )
             session.commit()
@@ -2203,9 +2357,9 @@ class ScanOrchestrator:
             )
         futures: set[Future[None]] = set()
         with ThreadPoolExecutor(
-            # The executor is only a thread container. Submission is governed
-            # by the live ADB pool capacity below, so a newly attached device
-            # can expand the running scan without restarting the service.
+            # The executor is only a thread container. Analysis admission is
+            # independent from the device pool; build and device stages acquire
+            # their own process-wide resource tokens.
             max_workers=max(1, task_count),
             thread_name_prefix="investigation",
         ) as executor:
@@ -3373,18 +3527,13 @@ class ScanOrchestrator:
                     )
                 )
                 docker_base = f"http://apkscanner-host:{port}"
-                gateway_environment = {
-                    "APKSCANNER_ADB_TASK_ID": task_id,
-                    "APKSCANNER_ADB_GATEWAY_URL": (
-                        f"{docker_base}/api/v1/internal/tasks/{task_id}/adb"
-                    ),
-                    "APKSCANNER_ADB_TOKEN": gateway_token,
-                    "APKSCANNER_ADB_POLICY": "adaptive",
-                    "APKSCANNER_OBSERVATION_URL": (
-                        f"{docker_base}/api/v1/internal/tasks/{task_id}/observations"
-                    ),
-                    "APKSCANNER_OBSERVATION_TOKEN": gateway_token,
-                }
+                gateway_environment = task_gateway_environment(
+                    task_id=task_id,
+                    base_url=docker_base,
+                    token=gateway_token,
+                    adb_policy="adaptive",
+                    proof_replay=False,
+                )
             successful_results: list[Any] = []
             batch_receipts: list[dict[str, Any]] = list(checkpoint_receipts)
             response_evidence_ids_by_finding: dict[str, str] = dict(
@@ -3855,6 +4004,30 @@ class ScanOrchestrator:
             if device_session is not None:
                 device_session.__exit__(None, None, None)
 
+    @staticmethod
+    def _proven_attempts_for_finding(session, finding: Finding) -> list[ProofAttempt]:  # noqa: ANN001
+        """Resolve only platform-owned harm receipts attributable to one finding."""
+
+        metadata = dict(finding.metadata_json or {})
+        declared_ids = [
+            value
+            for value in metadata.get("proof_attempt_ids", [])
+            if isinstance(value, str)
+        ]
+        statement = select(ProofAttempt).where(
+            ProofAttempt.scan_id == finding.scan_id,
+            ProofAttempt.harm_demonstrated.is_(True),
+        )
+        if declared_ids:
+            statement = statement.where(ProofAttempt.id.in_(declared_ids))
+        elif isinstance(metadata.get("hypothesis_id"), str):
+            statement = statement.where(
+                ProofAttempt.hypothesis_id == metadata["hypothesis_id"]
+            )
+        else:
+            return []
+        return list(session.scalars(statement.order_by(ProofAttempt.created_at)))
+
     def _apply_adaptive_verifier_result(
         self,
         *,
@@ -3917,6 +4090,11 @@ class ScanOrchestrator:
                 assessment = assessments.get(finding_id)
                 if finding is None or assessment is None:
                     continue
+                proven_attempts = self._proven_attempts_for_finding(session, finding)
+                proven_attempt_ids = [attempt.id for attempt in proven_attempts]
+                proven_evidence_ids = self._ordered_union(
+                    *(list(attempt.evidence_ids or []) for attempt in proven_attempts)
+                )
                 model_verdict = assessment.verdict
                 model_verdict_counts[model_verdict] += 1
                 candidate_execution = batch_execution_by_finding.get(finding_id, {})
@@ -3943,14 +4121,11 @@ class ScanOrchestrator:
                 )
                 verdict = model_verdict
                 verdict_override_reason: str | None = None
-                if (
-                    model_verdict == FindingStatus.REPRODUCED_BLACKBOX.value
-                    and not candidate_dynamic_eligible
-                ):
+                if model_verdict == FindingStatus.REPRODUCED_BLACKBOX.value and not proven_attempts:
                     verdict = FindingStatus.SUPPORTED_STATIC.value
                     verdict_override_reason = (
-                        "Adaptive runtime evidence came from a device outside the selected "
-                        "dynamic-verdict profile and cannot issue a reproduced verdict."
+                        "Adaptive semantic assessment did not reference a platform ProofAttempt "
+                        "with harm_demonstrated=true and cannot issue a reproduced verdict."
                     )
                     verdict_overrides.append(
                         {
@@ -3960,12 +4135,28 @@ class ScanOrchestrator:
                             "reason": verdict_override_reason,
                         }
                     )
+                elif proven_attempts:
+                    verdict = FindingStatus.REPRODUCED_BLACKBOX.value
+                    if model_verdict != verdict:
+                        verdict_override_reason = (
+                            "An existing platform ProofAttempt demonstrated harm; the adaptive "
+                            "model verdict cannot downgrade that immutable receipt."
+                        )
+                        verdict_overrides.append(
+                            {
+                                "finding_id": finding_id,
+                                "model_verdict": model_verdict,
+                                "applied_verdict": verdict,
+                                "reason": verdict_override_reason,
+                            }
+                        )
                 verdict_counts[verdict] += 1
                 accepted_evidence_ids = [
                     evidence_id
                     for evidence_id in assessment.evidence_ids
                     if evidence_id in known_evidence_ids
                 ]
+                accepted_evidence_ids.extend(proven_evidence_ids)
                 candidate_response_evidence_id = response_evidence_ids_by_finding.get(
                     finding_id,
                     response_evidence_id,
@@ -4003,6 +4194,7 @@ class ScanOrchestrator:
                             experiment.model_dump(mode="json")
                             for experiment in assessment.experiments
                         ],
+                        "proof_attempt_ids": proven_attempt_ids,
                         "response_evidence_id": candidate_response_evidence_id,
                     }
                 )
@@ -4018,13 +4210,16 @@ class ScanOrchestrator:
                 )
                 finding.metadata_json = {
                     **dict(finding.metadata_json or {}),
-                    "harm_demonstrated": verdict
-                    == FindingStatus.REPRODUCED_BLACKBOX.value,
+                    "harm_demonstrated": bool(proven_attempts),
+                    "proof_attempt_ids": proven_attempt_ids,
                     "android16_verdict_eligible": candidate_android16_eligible,
                     "dynamic_verdict_eligible": candidate_dynamic_eligible,
                     "release_gate_eligible": bool(
-                        verdict == FindingStatus.REPRODUCED_BLACKBOX.value
-                        and candidate_release_eligible
+                        proven_attempts
+                        and any(
+                            bool((attempt.oracle or {}).get("release_gate_eligible"))
+                            for attempt in proven_attempts
+                        )
                     ),
                     "verdict_scope": candidate_verdict_scope,
                     "verification_mode": "adaptive_agent",
@@ -4171,8 +4366,223 @@ class ScanOrchestrator:
             session.commit()
 
     def _current_investigation_concurrency(self) -> int:
-        """Follow live assignable ADB capacity, retaining one static-only lane."""
-        return max(1, self.device_pool.capacity)
+        """Admit analysis independently while device execution stays device-bounded."""
+        return max(
+            1,
+            min(
+                self.settings.agent_analysis_slots,
+                self.settings.codex_max_sessions_per_scan,
+            ),
+        )
+
+    @staticmethod
+    def _default_execution_dag() -> dict[str, Any]:
+        return {
+            "schema_version": "1.0",
+            "nodes": {
+                "seed_analysis": {
+                    "status": "pending",
+                    "depends_on": [],
+                    "resources": ["analysis"],
+                },
+                "adversarial_review": {
+                    "status": "optional",
+                    "depends_on": ["seed_analysis"],
+                    "resources": ["analysis"],
+                },
+                "rescue_review": {
+                    "status": "optional",
+                    "depends_on": ["seed_analysis"],
+                    "resources": ["analysis"],
+                },
+                "poc_build": {
+                    "status": "pending",
+                    "depends_on": ["seed_analysis"],
+                    "resources": ["build"],
+                },
+                "device_execution": {
+                    "status": "pending",
+                    "depends_on": ["poc_build"],
+                    "resources": ["device"],
+                },
+                "adaptive_analysis": {
+                    "status": "optional",
+                    "depends_on": ["device_execution"],
+                    "resources": ["analysis"],
+                },
+                "impact_evaluation": {
+                    "status": "pending",
+                    "depends_on": ["device_execution", "adaptive_analysis"],
+                    "resources": ["platform"],
+                },
+                "final_synthesis": {
+                    "status": "pending",
+                    "depends_on": ["impact_evaluation"],
+                    "resources": ["analysis"],
+                },
+            },
+        }
+
+    @classmethod
+    def _ensure_task_execution_dag(cls, task: InvestigationTask) -> dict[str, Any]:
+        result = dict(task.result or {})
+        dag = result.get("execution_dag")
+        if not isinstance(dag, dict) or not isinstance(dag.get("nodes"), dict):
+            dag = cls._default_execution_dag()
+            result["execution_dag"] = dag
+            task.result = result
+        return dag
+
+    def _set_task_stage(
+        self,
+        scan_id: str,
+        task_id: str,
+        stage: str,
+        status: str,
+        **metadata: Any,
+    ) -> None:
+        with self.database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            if task is None or task.scan_id != scan_id:
+                return
+            dag = deepcopy(self._ensure_task_execution_dag(task))
+            nodes = dag["nodes"]
+            node = dict(nodes.get(stage) or {})
+            node["status"] = status
+            if status == "running" and not node.get("started_at"):
+                node["started_at"] = now().isoformat()
+            if status in {"completed", "failed", "skipped", "inconclusive"}:
+                node["completed_at"] = now().isoformat()
+            if metadata:
+                node["metadata"] = {**dict(node.get("metadata") or {}), **metadata}
+            nodes[stage] = node
+            dag["current_stage"] = stage
+            dag["updated_at"] = now().isoformat()
+            task.result = {**dict(task.result or {}), "execution_dag": dag}
+            add_event(
+                session,
+                scan_id,
+                "task.stage.updated",
+                f"任务阶段 {stage} 更新为 {status}",
+                {
+                    "task_id": task_id,
+                    "stage": stage,
+                    "status": status,
+                    "resources": node.get("resources", []),
+                    **metadata,
+                },
+            )
+            session.commit()
+
+    @staticmethod
+    def _scheduler_score(task: InvestigationTask) -> tuple[int, dict[str, int]]:
+        text = " ".join(str(value).lower() for value in task.hypotheses or [])
+        risk_terms = {
+            "token",
+            "credential",
+            "account",
+            "payment",
+            "privilege",
+            "binder",
+            "webview",
+            "javascript",
+            "file",
+        }
+        risk = min(18, 3 * sum(term in text for term in risk_terms))
+        proof_ready = 20 if (task.preconditions or {}).get("version_replays") else 0
+        coalesced = int(
+            bool((task.preconditions or {}).get("coalescing"))
+        ) * 4
+        created_at = task.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        age_seconds = max(0.0, (now() - created_at).total_seconds())
+        aging = min(20, int(age_seconds // 300))
+        entry_cost = min(12, max(0, len(task.target_entry_ids or []) - 1))
+        breakdown = {
+            "base_priority": int(task.priority),
+            "risk": risk,
+            "proof_readiness": proof_ready,
+            "coalescing_value": coalesced,
+            "aging": aging,
+            "entry_cost": -entry_cost,
+        }
+        return sum(breakdown.values()), breakdown
+
+    @staticmethod
+    def _agent_progress_signature(
+        result: AgentInvestigationResult,
+        *,
+        evidence_summaries: list[dict[str, Any]],
+        proven_hypotheses: dict[str, list[str]],
+    ) -> str:
+        """Hash platform-visible progress, excluding free-form model wording."""
+
+        requested_tests = [
+            {
+                "hypothesis_id": request.hypothesis_id,
+                "entry_point_id": request.entry_point_id,
+                "state": request.state,
+                "operation": request.operation,
+                "extras": request.extras,
+                "binder_transaction_code": request.binder_transaction_code,
+                "binder_interface_descriptor": request.binder_interface_descriptor,
+                "binder_reply_type": request.binder_reply_type,
+                "binder_script": (
+                    [item.model_dump(mode="json") for item in request.binder_script]
+                    if request.binder_script
+                    else None
+                ),
+                "poc": request.poc.model_dump(mode="json") if request.poc else None,
+                "oracle": request.oracle.model_dump(mode="json"),
+            }
+            for request in result.requested_tests
+        ]
+        assessments = [
+            {
+                "hypothesis_id": assessment.hypothesis_id,
+                "verdict": assessment.verdict,
+                "evidence_ids": sorted(assessment.evidence_ids),
+                "source": assessment.source,
+                "control": assessment.control,
+                "sink": assessment.sink,
+                "reachable_path": assessment.reachable_path,
+                "boundary": assessment.boundary,
+                "has_counterevidence": bool(assessment.counterevidence),
+                "has_proof_gaps": bool(assessment.proof_gaps),
+            }
+            for assessment in result.hypothesis_assessments
+        ]
+        payload = {
+            "result": result.result,
+            "evidence_ids": sorted(
+                {
+                    *result.evidence_ids,
+                    *(
+                        str(item["id"])
+                        for item in evidence_summaries
+                        if item.get("id")
+                    ),
+                }
+            ),
+            "proven_hypotheses": {
+                hypothesis_id: sorted(evidence_ids)
+                for hypothesis_id, evidence_ids in sorted(proven_hypotheses.items())
+            },
+            "requested_tests": requested_tests,
+            "assessments": sorted(
+                assessments,
+                key=lambda item: (item["hypothesis_id"], item["verdict"]),
+            ),
+        }
+        return hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
 
     def _has_queued_tasks(self, scan_id: str) -> bool:
         with self.database.session_factory() as session:
@@ -4207,7 +4617,7 @@ class ScanOrchestrator:
             assert scan is not None
             if self._execution_state_from_stats(dict(scan.stats or {})) != "running":
                 return None
-            task = session.scalar(
+            queued_tasks = list(session.scalars(
                 select(InvestigationTask)
                 .where(
                     InvestigationTask.scan_id == scan_id,
@@ -4215,14 +4625,34 @@ class ScanOrchestrator:
                     InvestigationTask.task_type
                     != TaskType.ADAPTIVE_VERIFICATION.value,
                 )
-                .order_by(
-                    InvestigationTask.priority.desc(),
-                    InvestigationTask.created_at,
-                )
-                .limit(1)
+                .order_by(InvestigationTask.created_at)
+            ))
+            scored_tasks = [
+                (self._scheduler_score(candidate), candidate)
+                for candidate in queued_tasks
+            ]
+            task = (
+                max(
+                    scored_tasks,
+                    key=lambda item: (item[0][0], -item[1].created_at.timestamp()),
+                )[1]
+                if scored_tasks
+                else None
             )
             if task is None:
                 return None
+            score, score_breakdown = self._scheduler_score(task)
+            self._ensure_task_execution_dag(task)
+            task.result = {
+                **dict(task.result or {}),
+                "scheduler": {
+                    "schema_version": "1.0",
+                    "score": score,
+                    "score_breakdown": score_breakdown,
+                    "admitted_at": now().isoformat(),
+                    "policy": "risk_proof_readiness_cost_aging",
+                },
+            }
             created_at = scan.created_at
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=UTC)
@@ -4438,7 +4868,7 @@ class ScanOrchestrator:
             if previous_queue.get("requested_at"):
                 history.append(previous_queue)
             task.status = TaskStatus.AWAITING_DEVICE.value
-            task.result = {
+            task_result = {
                 **dict(task.result or {}),
                 "device_queue": {
                     "history": history,
@@ -4448,6 +4878,19 @@ class ScanOrchestrator:
                     "requested_at": requested_at.isoformat(),
                 },
             }
+            task.result = task_result
+            dag = deepcopy(self._ensure_task_execution_dag(task))
+            device_node = dict(dag["nodes"]["device_execution"])
+            device_node.update(
+                {
+                    "status": "waiting_resource",
+                    "waiting_since": requested_at.isoformat(),
+                    "metadata": {"queue_position": position},
+                }
+            )
+            dag["nodes"]["device_execution"] = device_node
+            dag["current_stage"] = "device_execution"
+            task.result = {**dict(task.result or {}), "execution_dag": dag}
             add_event(
                 session,
                 scan_id,
@@ -4502,6 +4945,21 @@ class ScanOrchestrator:
                 },
             }
             task.status = TaskStatus.RUNNING.value
+            dag = deepcopy(self._ensure_task_execution_dag(task))
+            device_node = dict(dag["nodes"]["device_execution"])
+            device_node.update(
+                {
+                    "status": "running",
+                    "started_at": acquired_at.isoformat(),
+                    "metadata": {
+                        "serial": device_serial,
+                        "wait_seconds": round(waited_seconds, 3),
+                    },
+                }
+            )
+            dag["nodes"]["device_execution"] = device_node
+            dag["current_stage"] = "device_execution"
+            task.result = {**dict(task.result or {}), "execution_dag": dag}
             add_event(
                 session,
                 scan_id,
@@ -4548,6 +5006,21 @@ class ScanOrchestrator:
                     "held_seconds": round(held_seconds, 3),
                 },
             }
+            dag = deepcopy(self._ensure_task_execution_dag(task))
+            device_node = dict(dag["nodes"]["device_execution"])
+            device_node.update(
+                {
+                    "status": "completed",
+                    "completed_at": released_at.isoformat(),
+                    "metadata": {
+                        **dict(device_node.get("metadata") or {}),
+                        "serial": device_serial,
+                        "held_seconds": round(held_seconds, 3),
+                    },
+                }
+            )
+            dag["nodes"]["device_execution"] = device_node
+            task.result = {**dict(task.result or {}), "execution_dag": dag}
             add_event(
                 session,
                 scan_id,
@@ -4581,12 +5054,14 @@ class ScanOrchestrator:
         *,
         priority: int,
         cancel_event: threading.Event,
+        preferred_serial: str | None = None,
     ):  # noqa: ANN201
         try:
             with self.device_pool.task_lease(
                 task_id,
                 priority=priority,
                 cancel_event=cancel_event,
+                preferred_serial=preferred_serial,
                 on_queued=lambda position: self._mark_task_awaiting_device(
                     scan_id, task_id, position
                 ),
@@ -4716,6 +5191,17 @@ class ScanOrchestrator:
             )
             agent_backend = self.resolve_task_investigator(scan, task)
             task.status = TaskStatus.RUNNING.value
+            dag = deepcopy(self._ensure_task_execution_dag(task))
+            seed_node = dict(dag["nodes"]["seed_analysis"])
+            seed_node.update(
+                {
+                    "status": "running",
+                    "started_at": seed_node.get("started_at") or now().isoformat(),
+                }
+            )
+            dag["nodes"]["seed_analysis"] = seed_node
+            dag["current_stage"] = "seed_analysis"
+            task.result = {**dict(task.result or {}), "execution_dag": dag}
             task.attempts += 1
             task.started_at = task.started_at or now()
             scan.status = ScanStatus.INVESTIGATING.value
@@ -4750,7 +5236,7 @@ class ScanOrchestrator:
                     ),
                     "origin_task_id": independent_context.get("origin_task_id"),
                     "investigation_concurrency": self._current_investigation_concurrency(),
-                    "concurrency_policy": "dynamic_adb_capacity",
+                    "concurrency_policy": "resource_aware_phase_admission",
                 },
             )
             session.commit()
@@ -4859,11 +5345,64 @@ class ScanOrchestrator:
         task_device: AdbDeviceAdapter | None = None
         device_lease_owned = False
         device_lease_acquired = False
+        device_session = None
+        target_installed = False
+        sticky_device_serial: str | None = None
+        prepared_device_serials: set[str] = set()
         task_gateway_token = secrets.token_urlsafe(48)
+
+        def acquire_dynamic_device() -> dict[str, Any]:
+            nonlocal device_session, task_device, device_lease_owned
+            nonlocal device_lease_acquired, sticky_device_serial, budget
+            if device_session is not None:
+                return {
+                    "device": task_device,
+                    "wait_seconds": 0.0,
+                    "serial": task_device.serial if task_device else None,
+                }
+            device_session = self._task_device_session(
+                scan_id,
+                task_id,
+                priority=int(task.priority),
+                cancel_event=cancel_event,
+                preferred_serial=sticky_device_serial,
+            )
+            lease_metadata = device_session.__enter__()
+            task_device = lease_metadata["device"]
+            device_lease_owned = True
+            device_lease_acquired = True
+            acquired_serial = str(task_device.serial or "")
+            if sticky_device_serial is None:
+                sticky_device_serial = acquired_serial
+            elif acquired_serial != sticky_device_serial:
+                coverage_gaps.append(
+                    "The preferred Android device became unavailable; a later dynamic batch "
+                    f"moved from {sticky_device_serial} to {acquired_serial} and re-preparation "
+                    "was required."
+                )
+                sticky_device_serial = acquired_serial
+            budget = budget.extend(
+                float(lease_metadata["wait_seconds"]),
+                maximum_deadline=scan_deadline,
+            )
+            return lease_metadata
+
+        def release_dynamic_device(*, cleanup_target: bool = False) -> None:
+            nonlocal device_session, device_lease_owned, target_installed
+            if device_session is None:
+                return
+            if cleanup_target and target_installed and task_device is not None and package_name:
+                cleanup = task_device.cleanup(package_name)
+                self._record_commands(scan_id, task_id, cleanup, None)
+                target_installed = False
+            final_device_session = device_session
+            device_session = None
+            final_device_session.__exit__(None, None, None)
+            device_lease_owned = False
 
         def current_device_capability() -> dict[str, Any]:
             capability = dict(device_capability)
-            if task_device is not None:
+            if task_device is not None and device_lease_owned:
                 capability.update(task_device.capability(non_blocking=False))
             if device_lease_owned:
                 capability.update(
@@ -4887,10 +5426,42 @@ class ScanOrchestrator:
                         "lease_owned_by_current_task": False,
                         "lease_completed_by_current_task": True,
                         "active_task_id": None,
+                        "serial": sticky_device_serial,
                         "detail": "当前任务的独占设备会话已完成并释放。",
                     }
                 )
             return capability
+
+        def prepare_dynamic_target() -> bool:
+            nonlocal target_installed
+            if task_device is None or not device_lease_owned or not package_name:
+                return False
+            serial = str(task_device.serial or "")
+            if serial in prepared_device_serials:
+                return True
+            stages["device_attempted"] = True
+            prepare_commands = task_device.prepare(
+                Path(scan.artifact_path), package_name, budget
+            )
+            self._record_commands(scan_id, task_id, prepare_commands, evidence_summaries)
+            target_installed = target_installed or any(
+                kind == "device.install" and result.exit_code == 0
+                for kind, result, _metadata in prepare_commands
+            )
+            critical = {
+                kind: result
+                for kind, result, _metadata in prepare_commands
+                if kind in {"device.health", "device.install", "device.clear"}
+                and result.exit_code != 0
+            }
+            if critical:
+                failures = ", ".join(
+                    f"{kind}=exit {result.exit_code}" for kind, result in critical.items()
+                )
+                coverage_gaps.append(f"Device preparation failed: {failures}")
+                return False
+            prepared_device_serials.add(serial)
+            return True
 
         agent_result = None
         agent_error = None
@@ -4901,7 +5472,10 @@ class ScanOrchestrator:
         rescue_context: dict[str, Any] = {}
         rescue_gate: dict[str, Any] = {}
         phase_counts: dict[str, int] = {}
+        phase_usage_seconds: dict[str, float] = defaultdict(float)
         agent_runtime_workspaces: dict[str, Path] = {}
+        last_progress_signature: str | None = None
+        agent_no_progress_rounds = 0
         single_pass_phases = {
             "adversarial_review",
             "rescue_review",
@@ -4920,6 +5494,15 @@ class ScanOrchestrator:
         investigator = self.investigators.get(agent_backend)
         agent_enabled = self.settings.investigator_enabled(agent_backend)
 
+        def phase_budget(phase: str) -> tuple[str, int]:
+            if phase in {"static_only", "test_planning", "exploration_round"}:
+                return "primary_analysis", self.settings.agent_initial_phase_seconds
+            if phase == "adversarial_review":
+                return "critic", self.settings.agent_critic_phase_seconds
+            if phase in {"rescue_review", "rescue_exploration"}:
+                return "rescue", self.settings.agent_rescue_phase_seconds
+            return "final_synthesis", self.settings.agent_final_phase_seconds
+
         def invoke_agent(
             *,
             phase: str,
@@ -4929,8 +5512,20 @@ class ScanOrchestrator:
             round_index: int = 0,
             blind_rescue: bool = False,
         ):  # noqa: ANN202
+            nonlocal last_progress_signature, agent_no_progress_rounds
             audit_id: str | None = None
             runtime_events: list[dict[str, Any]] = []
+            phase_bucket, phase_limit_seconds = phase_budget(phase)
+            stage = {
+                "static_only": "seed_analysis",
+                "test_planning": "seed_analysis",
+                "adversarial_review": "adversarial_review",
+                "rescue_review": "rescue_review",
+                "rescue_exploration": "rescue_review",
+                "exploration_round": "adaptive_analysis",
+                "final_evaluation": "final_synthesis",
+                "recovery_evaluation": "final_synthesis",
+            }.get(phase, "seed_analysis")
             self._raise_if_cancelled(cancel_event)
             if phase in single_pass_phases and phase_counts.get(phase, 0) >= 1:
                 self._record_exploration_event(
@@ -4948,26 +5543,82 @@ class ScanOrchestrator:
                 return None, f"{phase} is limited to one run per task"
             phase_counts[phase] = phase_counts.get(phase, 0) + 1
             if investigator is None:
+                self._set_task_stage(
+                    scan_id,
+                    task_id,
+                    stage,
+                    "inconclusive",
+                    phase=phase,
+                    reason="investigator_unavailable",
+                )
                 return None, "AI investigation is disabled for this scan"
             if not agent_enabled:
+                self._set_task_stage(
+                    scan_id,
+                    task_id,
+                    stage,
+                    "inconclusive",
+                    phase=phase,
+                    reason="investigator_disabled",
+                )
                 return None, f"{agent_backend} investigation is disabled"
 
             def dispatch_remaining() -> int:
                 remaining_seconds = budget.remaining()
+                phase_remaining = max(
+                    0,
+                    int(
+                        phase_limit_seconds
+                        - phase_usage_seconds.get(phase_bucket, 0.0)
+                    ),
+                )
+                remaining_seconds = min(remaining_seconds, phase_remaining)
                 if timeout_cap is not None:
                     remaining_seconds = min(remaining_seconds, timeout_cap)
                 return remaining_seconds
 
             remaining = dispatch_remaining()
             if remaining <= 0:
+                self._set_task_stage(
+                    scan_id,
+                    task_id,
+                    stage,
+                    "inconclusive",
+                    phase=phase,
+                    reason="phase_budget_exhausted",
+                )
                 return None, "task time budget exhausted before AI dispatch"
             capability = investigator.capability(deep=True)
             self._raise_if_cancelled(cancel_event)
             if not capability.get("available"):
+                self._set_task_stage(
+                    scan_id,
+                    task_id,
+                    stage,
+                    "inconclusive",
+                    phase=phase,
+                    reason="capability_unavailable",
+                )
                 return None, capability.get("detail", f"{agent_backend} capability probe failed")
             remaining = dispatch_remaining()
             if remaining <= 0:
+                self._set_task_stage(
+                    scan_id,
+                    task_id,
+                    stage,
+                    "inconclusive",
+                    phase=phase,
+                    reason="phase_budget_exhausted",
+                )
                 return None, "task time budget exhausted during AI capability probe"
+            self._set_task_stage(
+                scan_id,
+                task_id,
+                stage,
+                "running",
+                phase=phase,
+                round_index=round_index,
+            )
             try:
                 task_threat_model = deepcopy((scan.stats or {}).get("threat_model"))
                 if isinstance(task_threat_model, dict):
@@ -5229,22 +5880,12 @@ class ScanOrchestrator:
                         )
                     )
                     docker_base = f"http://apkscanner-host:{port}"
-                    gateway_environment = {
-                        "APKSCANNER_ADB_TASK_ID": task_id,
-                        "APKSCANNER_ADB_GATEWAY_URL": (
-                            f"{docker_base}/api/v1/internal/tasks/{task_id}/adb"
-                        ),
-                        "APKSCANNER_ADB_TOKEN": proof_token,
-                        "APKSCANNER_PROOF_TASK_ID": task_id,
-                        "APKSCANNER_PROOF_REPLAY_URL": (
-                            f"{docker_base}/api/v1/internal/tasks/{task_id}/proof-replay"
-                        ),
-                        "APKSCANNER_PROOF_TOKEN": proof_token,
-                        "APKSCANNER_OBSERVATION_URL": (
-                            f"{docker_base}/api/v1/internal/tasks/{task_id}/observations"
-                        ),
-                        "APKSCANNER_OBSERVATION_TOKEN": proof_token,
-                    }
+                    gateway_environment = task_gateway_environment(
+                        task_id=task_id,
+                        base_url=docker_base,
+                        token=proof_token,
+                        proof_replay=True,
+                    )
 
                 def on_runtime_event(event: AgentRuntimeEvent) -> None:
                     if not self._record_agent_runtime_event(
@@ -5300,9 +5941,31 @@ class ScanOrchestrator:
                     "cancel_event": cancel_event,
                     "gateway_environment": gateway_environment,
                 }
+                acquired_analysis_slot = False
+                agent_call_started_at: float | None = None
                 try:
+                    while not acquired_analysis_slot:
+                        self._raise_if_cancelled(cancel_event)
+                        if dispatch_remaining() <= 0:
+                            raise TimeoutError(
+                                "phase budget exhausted while waiting for an analysis slot"
+                            )
+                        acquired_analysis_slot = self._analysis_slots.acquire(timeout=0.5)
+                    call_timeout = dispatch_remaining()
+                    if call_timeout <= 0:
+                        raise TimeoutError(
+                            "phase budget exhausted before the AI call started"
+                        )
+                    investigation_kwargs["timeout_seconds"] = call_timeout
+                    agent_call_started_at = time.monotonic()
                     result = investigator.investigate(**investigation_kwargs)
                 finally:
+                    if agent_call_started_at is not None:
+                        phase_usage_seconds[phase_bucket] += max(
+                            0.0, time.monotonic() - agent_call_started_at
+                        )
+                    if acquired_analysis_slot:
+                        self._analysis_slots.release()
                     if proof_token is not None:
                         self._unregister_live_proof_context(task_id, proof_token)
                 self._raise_if_cancelled(cancel_event)
@@ -5364,6 +6027,11 @@ class ScanOrchestrator:
                         "requested_test_count": len(result.result.requested_tests),
                         "rejected_requested_test_count": len(rejected_requested_tests),
                         "normalization_repair_count": len(normalization_repairs),
+                        "phase_budget_bucket": phase_bucket,
+                        "phase_budget_consumed_seconds": round(
+                            phase_usage_seconds.get(phase_bucket, 0.0), 3
+                        ),
+                        "phase_budget_remaining_seconds": dispatch_remaining(),
                     },
                 )
                 for hypothesis in result.result.hypotheses_tested[:12]:
@@ -5412,6 +6080,31 @@ class ScanOrchestrator:
                         "test_validation": None,
                     }
                 )
+                progress_signature = self._agent_progress_signature(
+                    result.result,
+                    evidence_summaries=evidence_summaries,
+                    proven_hypotheses=(
+                        self.hypothesis_ledger.task_proven_hypotheses(task_id)
+                    ),
+                )
+                if progress_signature == last_progress_signature:
+                    agent_no_progress_rounds += 1
+                else:
+                    agent_no_progress_rounds = 0
+                    last_progress_signature = progress_signature
+                agent_round_history[-1]["progress"] = {
+                    "signature": progress_signature,
+                    "consecutive_no_progress_rounds": agent_no_progress_rounds,
+                }
+                self._set_task_stage(
+                    scan_id,
+                    task_id,
+                    stage,
+                    "completed",
+                    phase=phase,
+                    round_index=round_index,
+                    no_progress_rounds=agent_no_progress_rounds,
+                )
                 return result, None
             except AgentCancelledError as exc:
                 if audit_id is not None and runtime_events:
@@ -5448,6 +6141,15 @@ class ScanOrchestrator:
                 )
                 raise
             except Exception as exc:
+                self._set_task_stage(
+                    scan_id,
+                    task_id,
+                    stage,
+                    "failed",
+                    phase=phase,
+                    round_index=round_index,
+                    error=str(exc)[:1000],
+                )
                 agent_failures.append(
                     {
                         "phase": phase,
@@ -5491,7 +6193,7 @@ class ScanOrchestrator:
                 return None, str(exc)
 
         def run_negative_rescue(current_result, *, round_index: int):  # noqa: ANN202
-            """Require an independent blind review before accepting a model negative."""
+            """Review only material negatives plus a deterministic quality sample."""
 
             nonlocal rescue_context
             if (
@@ -5499,6 +6201,39 @@ class ScanOrchestrator:
                 or not self._needs_rescue_review(current_result.result)
                 or self.hypothesis_ledger.task_all_hypotheses_proven(task_id)
             ):
+                return current_result
+            rescue_decision = self._rescue_decision(
+                task,
+                current_result.result,
+                target_code_context=target_code_context,
+            )
+            if not rescue_decision["triggered"]:
+                rescue_gate.update(
+                    {
+                        "triggered": False,
+                        "passed": True,
+                        "outcome": "risk_gate_skipped",
+                        "policy": rescue_decision,
+                    }
+                )
+                self._set_task_stage(
+                    scan_id,
+                    task_id,
+                    "rescue_review",
+                    "skipped",
+                    reasons=rescue_decision["reasons"],
+                )
+                self._record_exploration_event(
+                    scan_id,
+                    task_id,
+                    "rescue.skipped",
+                    "负面结论未命中高风险救援条件，本次不执行盲审",
+                    {
+                        "source": "platform",
+                        "round_index": round_index,
+                        **rescue_decision,
+                    },
+                )
                 return current_result
 
             rescue_gate.update(
@@ -5508,6 +6243,7 @@ class ScanOrchestrator:
                     "candidate_turn_id": current_result.turn_id,
                     "candidate_result": current_result.result.result,
                     "mode": "blind_independent_review",
+                    "policy": rescue_decision,
                 }
             )
             debate_policy["outcome"] = "rescue_started"
@@ -5677,51 +6413,109 @@ class ScanOrchestrator:
             and self.device_pool.package_safe(package_name)
             and (device_capability.get("available") or device_capability.get("busy"))
         )
+        prebuilt_plans: dict[str, dict[str, Any]] = {}
+        if device_ready:
+            # Static reasoning and the first PoC build happen before a scarce
+            # device is leased. Later adaptive rounds may still rebuild after a
+            # concrete runtime failure, but the normal path enters the queue
+            # with an executable ProofSpec.
+            agent_result, agent_error = invoke_agent(
+                phase="test_planning",
+                executed_tests=executed_agent_tests,
+                round_index=0,
+            )
+            if agent_result is not None:
+                model_rejections = self._rejected_requested_tests(agent_result.result)
+                submitted_tests = [
+                    item.model_dump(mode="json")
+                    for item in agent_result.result.requested_tests
+                ]
+                submitted_tests.extend(
+                    rejection["request"]
+                    for rejection in model_rejections
+                    if isinstance(rejection.get("request"), dict)
+                )
+                requested, platform_request_gaps = self._validate_requested_tests(
+                    agent_result.result.requested_tests,
+                    testable_entries,
+                    hypothesis_ids=hypothesis_ids,
+                    permission_profile=self.settings.agent_permission_profile,
+                )
+                request_gaps = [
+                    *self._rejected_requested_test_gaps(model_rejections),
+                    *platform_request_gaps,
+                ]
+                poc_artifacts: dict[str, PocBuildResult] = {}
+                if requested:
+                    materialized_workspace = (
+                        self.settings.data_dir
+                        / "workspaces"
+                        / scan_id
+                        / "agent_context"
+                        / task_id
+                        / f"attempt-{task.attempts}"
+                    )
+                    poc_workspace = agent_runtime_workspaces.get(
+                        "primary", materialized_workspace
+                    )
+                    requested, poc_artifacts, poc_build_gaps = self._build_requested_pocs(
+                        scan_id=scan_id,
+                        task_id=task_id,
+                        workspace=poc_workspace,
+                        requests=requested,
+                        evidence_summaries=evidence_summaries,
+                        cancel_event=cancel_event,
+                    )
+                    request_gaps.extend(poc_build_gaps)
+                prebuilt_plans[agent_result.turn_id] = {
+                    "model_rejections": model_rejections,
+                    "submitted_tests": submitted_tests,
+                    "requested": requested,
+                    "request_gaps": request_gaps,
+                    "poc_artifacts": poc_artifacts,
+                }
+                if not any(item.poc is not None for item in requested):
+                    self._set_task_stage(
+                        scan_id,
+                        task_id,
+                        "poc_build",
+                        "skipped",
+                        reason="no_source_poc_required",
+                    )
+            else:
+                self._set_task_stage(
+                    scan_id,
+                    task_id,
+                    "poc_build",
+                    "inconclusive",
+                    reason="test_planning_unavailable",
+                )
         if not device_ready:
+            self._set_task_stage(
+                scan_id,
+                task_id,
+                "poc_build",
+                "skipped",
+                reason="static_or_device_unavailable_path",
+            )
+            self._set_task_stage(
+                scan_id,
+                task_id,
+                "device_execution",
+                "skipped",
+                reason="static_or_device_unavailable_path",
+            )
             agent_result, agent_error = invoke_agent(
                 phase="static_only",
             )
             agent_result = run_negative_rescue(agent_result, round_index=0)
         else:
-            device_session = self._task_device_session(
-                scan_id,
-                task_id,
-                priority=int(task.priority),
-                cancel_event=cancel_event,
-            )
-            lease_metadata = device_session.__enter__()
-            task_device = lease_metadata["device"]
-            device_lease_owned = True
-            device_lease_acquired = True
-            budget = budget.extend(
-                lease_metadata["wait_seconds"],
-                maximum_deadline=scan_deadline,
-            )
+            acquire_dynamic_device()
             if device_session is not None:
                 prepared = False
                 target_installed = False
                 try:
-                    stages["device_attempted"] = True
-                    prepare_commands = task_device.prepare(
-                        Path(scan.artifact_path), package_name, budget
-                    )
-                    self._record_commands(scan_id, task_id, prepare_commands, evidence_summaries)
-                    target_installed = any(
-                        kind == "device.install" and result.exit_code == 0
-                        for kind, result, _metadata in prepare_commands
-                    )
-                    critical = {
-                        kind: result
-                        for kind, result, _metadata in prepare_commands
-                        if kind in {"device.health", "device.install", "device.clear"}
-                        and result.exit_code != 0
-                    }
-                    if critical:
-                        failures = ", ".join(
-                            f"{kind}=exit {result.exit_code}" for kind, result in critical.items()
-                        )
-                        coverage_gaps.append(f"Device preparation failed: {failures}")
-                    else:
+                    if prepare_dynamic_target():
                         prepared = True
                         for entry in entries:
                             if budget.expired:
@@ -5759,11 +6553,13 @@ class ScanOrchestrator:
                         self.hypothesis_ledger.task_all_hypotheses_proven(task_id)
                     )
                     initial_executed_test_count = len(executed_agent_tests)
-                    agent_result, agent_error = invoke_agent(
-                        phase=("final_evaluation" if replay_proof_terminal else "test_planning"),
-                        executed_tests=executed_agent_tests,
-                        round_index=0,
-                    )
+                    if replay_proof_terminal and agent_result is None:
+                        release_dynamic_device()
+                        agent_result, agent_error = invoke_agent(
+                            phase="final_evaluation",
+                            executed_tests=executed_agent_tests,
+                            round_index=0,
+                        )
                     if (
                         agent_result is not None
                         and self._needs_adversarial_review(agent_result.result)
@@ -5771,6 +6567,7 @@ class ScanOrchestrator:
                         and not self.hypothesis_ledger.task_all_hypotheses_proven(task_id)
                         and not budget.expired
                     ):
+                        release_dynamic_device()
                         candidate_payload = agent_result.result.model_dump(mode="json")
                         critic_result, critic_error = invoke_agent(
                             phase="adversarial_review",
@@ -5883,55 +6680,65 @@ class ScanOrchestrator:
                         and not self.hypothesis_ledger.task_all_hypotheses_proven(task_id)
                         and prepared
                         and not budget.expired
+                        and agent_no_progress_rounds
+                        < self.settings.agent_no_progress_limit
                     ):
                         planning_result = agent_result
                         planning_turn_id = planning_result.turn_id
-                        model_rejections = self._rejected_requested_tests(planning_result.result)
-                        submitted_tests = [
-                            item.model_dump(mode="json")
-                            for item in planning_result.result.requested_tests
-                        ]
-                        submitted_tests.extend(
-                            rejection["request"]
-                            for rejection in model_rejections
-                            if isinstance(rejection.get("request"), dict)
-                        )
-                        requested, platform_request_gaps = self._validate_requested_tests(
-                            planning_result.result.requested_tests,
-                            testable_entries,
-                            hypothesis_ids=hypothesis_ids,
-                            permission_profile=self.settings.agent_permission_profile,
-                        )
-                        request_gaps = [
-                            *self._rejected_requested_test_gaps(model_rejections),
-                            *platform_request_gaps,
-                        ]
-                        poc_artifacts: dict[str, PocBuildResult] = {}
-                        if requested:
-                            materialized_workspace = (
-                                self.settings.data_dir
-                                / "workspaces"
-                                / scan_id
-                                / "agent_context"
-                                / task_id
-                                / f"attempt-{task.attempts}"
+                        prebuilt = prebuilt_plans.pop(planning_turn_id, None)
+                        if prebuilt is not None:
+                            model_rejections = prebuilt["model_rejections"]
+                            submitted_tests = prebuilt["submitted_tests"]
+                            requested = prebuilt["requested"]
+                            request_gaps = prebuilt["request_gaps"]
+                            poc_artifacts = prebuilt["poc_artifacts"]
+                        else:
+                            model_rejections = self._rejected_requested_tests(
+                                planning_result.result
                             )
-                            poc_workspace = agent_runtime_workspaces.get(
-                                "primary", materialized_workspace
+                            submitted_tests = [
+                                item.model_dump(mode="json")
+                                for item in planning_result.result.requested_tests
+                            ]
+                            submitted_tests.extend(
+                                rejection["request"]
+                                for rejection in model_rejections
+                                if isinstance(rejection.get("request"), dict)
                             )
-                            (
-                                requested,
-                                poc_artifacts,
-                                poc_build_gaps,
-                            ) = self._build_requested_pocs(
-                                scan_id=scan_id,
-                                task_id=task_id,
-                                workspace=poc_workspace,
-                                requests=requested,
-                                evidence_summaries=evidence_summaries,
-                                cancel_event=cancel_event,
+                            requested, platform_request_gaps = self._validate_requested_tests(
+                                planning_result.result.requested_tests,
+                                testable_entries,
+                                hypothesis_ids=hypothesis_ids,
+                                permission_profile=self.settings.agent_permission_profile,
                             )
-                            request_gaps.extend(poc_build_gaps)
+                            request_gaps = [
+                                *self._rejected_requested_test_gaps(model_rejections),
+                                *platform_request_gaps,
+                            ]
+                            poc_artifacts: dict[str, PocBuildResult] = {}
+                            if requested:
+                                materialized_workspace = (
+                                    self.settings.data_dir
+                                    / "workspaces"
+                                    / scan_id
+                                    / "agent_context"
+                                    / task_id
+                                    / f"attempt-{task.attempts}"
+                                )
+                                poc_workspace = agent_runtime_workspaces.get(
+                                    "primary", materialized_workspace
+                                )
+                                requested, poc_artifacts, poc_build_gaps = (
+                                    self._build_requested_pocs(
+                                        scan_id=scan_id,
+                                        task_id=task_id,
+                                        workspace=poc_workspace,
+                                        requests=requested,
+                                        evidence_summaries=evidence_summaries,
+                                        cancel_event=cancel_event,
+                                    )
+                                )
+                                request_gaps.extend(poc_build_gaps)
                         coverage_gaps.extend(request_gaps)
                         for accepted in requested:
                             self._record_exploration_event(
@@ -5968,23 +6775,33 @@ class ScanOrchestrator:
                         execution_gaps: list[str] = []
                         executed_this_round: list[dict[str, Any]] = []
                         if requested and not budget.expired:
-                            (
-                                executed_this_round,
-                                execution_gaps,
-                            ) = self._execute_requested_tests(
-                                scan_id=scan_id,
-                                task_id=task_id,
-                                package_name=package_name,
-                                entries=testable_entries,
-                                requests=requested,
-                                budget=budget,
-                                evidence_summaries=evidence_summaries,
-                                round_index=completed_rounds + 1,
-                                poc_artifacts=poc_artifacts,
-                                device=task_device,
-                            )
-                            executed_agent_tests.extend(executed_this_round)
-                            coverage_gaps.extend(execution_gaps)
+                            if not device_lease_owned:
+                                acquire_dynamic_device()
+                                prepared = prepare_dynamic_target()
+                            if prepared and task_device is not None:
+                                (
+                                    executed_this_round,
+                                    execution_gaps,
+                                ) = self._execute_requested_tests(
+                                    scan_id=scan_id,
+                                    task_id=task_id,
+                                    package_name=package_name,
+                                    entries=testable_entries,
+                                    requests=requested,
+                                    budget=budget,
+                                    evidence_summaries=evidence_summaries,
+                                    round_index=completed_rounds + 1,
+                                    poc_artifacts=poc_artifacts,
+                                    device=task_device,
+                                )
+                                executed_agent_tests.extend(executed_this_round)
+                                coverage_gaps.extend(execution_gaps)
+                            else:
+                                execution_gaps.append(
+                                    "The dynamic batch could not prepare its assigned device."
+                                )
+                                coverage_gaps.extend(execution_gaps)
+                            release_dynamic_device()
                         elif requested:
                             execution_gaps.append(
                                 "Task budget expired before accepted AI-requested tests ran."
@@ -6033,6 +6850,10 @@ class ScanOrchestrator:
                             break
                         if budget.expired:
                             break
+                        # Model analysis and any next-round PoC build run without
+                        # occupying a scarce device. The next accepted dynamic
+                        # batch reacquires the same serial when it is available.
+                        release_dynamic_device()
                         next_result, next_error = invoke_agent(
                             phase="exploration_round",
                             executed_tests=executed_agent_tests,
@@ -6047,11 +6868,29 @@ class ScanOrchestrator:
                         agent_result = next_result
                         agent_error = None
 
+                    if agent_no_progress_rounds >= self.settings.agent_no_progress_limit:
+                        coverage_gaps.append(
+                            "Dynamic exploration stopped after repeated rounds produced no new "
+                            "Evidence, proof state, materially changed test, or hypothesis update."
+                        )
+                        self._record_exploration_event(
+                            scan_id,
+                            task_id,
+                            "exploration.no_progress_stopped",
+                            "连续多轮未产生新的证据或假设进展，动态探索阶段已收尾",
+                            {
+                                "source": "platform",
+                                "consecutive_rounds": agent_no_progress_rounds,
+                                "limit": self.settings.agent_no_progress_limit,
+                            },
+                        )
+
                     if (
                         (len(executed_agent_tests) > initial_executed_test_count or debate_context)
                         and not replay_proof_terminal
                         and not budget.expired
                     ):
+                        release_dynamic_device()
                         final_result, final_error = invoke_agent(
                             phase="final_evaluation",
                             executed_tests=executed_agent_tests,
@@ -6081,6 +6920,7 @@ class ScanOrchestrator:
                             "Final AI evaluation could not start because the parent task "
                             "lifecycle had already ended; retained the latest validated result."
                         )
+                    release_dynamic_device()
                     agent_result = run_negative_rescue(
                         agent_result,
                         round_index=completed_rounds + 1,
@@ -6094,16 +6934,18 @@ class ScanOrchestrator:
                             phase="recovery_evaluation",
                         )
                 finally:
-                    if device_session is not None and target_installed:
-                        cleanup = task_device.cleanup(package_name)
-                        self._record_commands(scan_id, task_id, cleanup, None)
-                    if device_session is not None:
-                        final_device_session = device_session
-                        device_session = None
-                        final_device_session.__exit__(None, None, None)
-                        device_lease_owned = False
+                    release_dynamic_device()
 
         self._raise_if_cancelled(cancel_event)
+        self._set_task_stage(
+            scan_id,
+            task_id,
+            "impact_evaluation",
+            "running",
+            proven_hypothesis_count=len(
+                self.hypothesis_ledger.task_proven_hypotheses(task_id)
+            ),
+        )
         if (
             agent_result is not None
             and self._needs_rescue_review(agent_result.result)
@@ -6172,6 +7014,24 @@ class ScanOrchestrator:
                 raw_payload=raw_payload,
                 validated_payload=validated_payload,
             )
+
+        self._set_task_stage(
+            scan_id,
+            task_id,
+            "impact_evaluation",
+            "completed" if agent_result is not None else "inconclusive",
+            result=validated_result_value,
+            proven_hypothesis_count=len(
+                self.hypothesis_ledger.task_proven_hypotheses(task_id)
+            ),
+        )
+        self._set_task_stage(
+            scan_id,
+            task_id,
+            "final_synthesis",
+            "completed" if agent_result is not None else "inconclusive",
+            result=validated_result_value,
+        )
 
         with self.database.session_factory() as session:
             task = session.get(InvestigationTask, task_id)
@@ -6643,11 +7503,70 @@ class ScanOrchestrator:
 
     @staticmethod
     def _needs_rescue_review(result: Any) -> bool:
-        """Independently review every model-derived negative on a dispatched seed."""
+        """Return whether a result is a negative eligible for the rescue policy."""
 
         return str(getattr(result, "result", FindingStatus.REFUTED_STATIC.value)) in {
             FindingStatus.REFUTED_STATIC.value,
             FindingStatus.NOT_REPRODUCED.value,
+        }
+
+    def _rescue_decision(
+        self,
+        task: InvestigationTask,
+        result: Any,
+        *,
+        target_code_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Gate expensive blind rescue by risk, uncertainty, and sampled quality audit."""
+
+        reasons: list[str] = []
+        if int(task.priority) >= 95:
+            reasons.append("high_priority_entry")
+        text = " ".join(
+            [
+                *(str(value).lower() for value in task.hypotheses or []),
+                str(getattr(result, "summary", "")).lower(),
+            ]
+        )
+        complex_terms = {
+            "binder",
+            "webview",
+            "javascript",
+            "pendingintent",
+            "nested intent",
+            "uri grant",
+            "native",
+            "plugin",
+            "classloader",
+            "socket",
+            "token",
+            "credential",
+            "payment",
+            "account",
+        }
+        matched_terms = sorted(term for term in complex_terms if term in text)
+        if matched_terms:
+            reasons.append("complex_boundary:" + ",".join(matched_terms[:5]))
+        if list(getattr(result, "coverage_gaps", []) or []):
+            reasons.append("coverage_gap")
+        components = target_code_context.get("components", [])
+        if any(
+            isinstance(component, dict)
+            and str(component.get("status") or "") not in {"complete", "available"}
+            for component in components
+        ):
+            reasons.append("partial_static_context")
+        digest = hashlib.sha256(task.id.encode()).digest()
+        sample_value = int.from_bytes(digest[:8], "big") / float(2**64)
+        sampled = sample_value < self.settings.rescue_audit_sample_rate
+        if sampled:
+            reasons.append("quality_audit_sample")
+        return {
+            "schema_version": "1.0",
+            "triggered": bool(reasons),
+            "reasons": reasons,
+            "sampled": sampled,
+            "sample_rate": self.settings.rescue_audit_sample_rate,
         }
 
     @staticmethod
@@ -7049,6 +7968,14 @@ class ScanOrchestrator:
                     select(EntryPoint).where(EntryPoint.id.in_(requested_entry_ids))
                 )
             }
+        if any(request.poc is not None for request in requests):
+            self._set_task_stage(
+                scan_id,
+                task_id,
+                "poc_build",
+                "running",
+                requested_count=sum(request.poc is not None for request in requests),
+            )
         for request in requests:
             if request.poc is None:
                 accepted.append(request)
@@ -7071,27 +7998,35 @@ class ScanOrchestrator:
                         "project_path": request.poc.project_path,
                     },
                 )
-                outcome = self.poc_builder.build(
-                    workspace,
-                    request.poc,
-                    oracle=request.oracle,
-                    cancel_event=cancel_event,
-                    visible_packages=(
-                        (target_package,) if provider_request and target_package else ()
-                    ),
-                    visible_provider_authorities=tuple(
-                        authority.strip()
-                        for authority in str(
-                            (
-                                request_entry.metadata_json
-                                if provider_request and request_entry
-                                else {}
-                            ).get("authorities")
-                            or ""
-                        ).split(";")
-                        if authority.strip()
-                    ),
-                )
+                acquired_build_slot = False
+                try:
+                    while not acquired_build_slot:
+                        self._raise_if_cancelled(cancel_event)
+                        acquired_build_slot = self._build_slots.acquire(timeout=0.5)
+                    outcome = self.poc_builder.build(
+                        workspace,
+                        request.poc,
+                        oracle=request.oracle,
+                        cancel_event=cancel_event,
+                        visible_packages=(
+                            (target_package,) if provider_request and target_package else ()
+                        ),
+                        visible_provider_authorities=tuple(
+                            authority.strip()
+                            for authority in str(
+                                (
+                                    request_entry.metadata_json
+                                    if provider_request and request_entry
+                                    else {}
+                                ).get("authorities")
+                                or ""
+                            ).split(";")
+                            if authority.strip()
+                        ),
+                    )
+                finally:
+                    if acquired_build_slot:
+                        self._build_slots.release()
                 artifacts[key] = outcome
                 if outcome.commands:
                     self._record_commands(
@@ -7160,6 +8095,15 @@ class ScanOrchestrator:
                     "Rejected Agent PoC test for "
                     f"{request.entry_point_id}: {outcome.error or 'build failed'}."
                 )
+        if any(request.poc is not None for request in requests):
+            self._set_task_stage(
+                scan_id,
+                task_id,
+                "poc_build",
+                "completed" if not gaps else "inconclusive",
+                accepted_count=sum(request.poc is not None for request in accepted),
+                gap_count=len(gaps),
+            )
         return accepted, artifacts, gaps
 
     @staticmethod
@@ -8293,13 +9237,97 @@ class ScanOrchestrator:
                 "templates": attacker_template_catalog(),
             }
         self._copy_evidence_artifacts(task_root, summaries)
+        effective_context = platform_context or {}
+        stable_keys = (
+            "validation_fixtures",
+            "poc_builder",
+            "proof_capabilities",
+            "target_code_context",
+            "entry_scope",
+            "threat_model",
+            "workspace",
+            "attacker_templates",
+            "context_policy",
+        )
+        stable_context = {
+            "schema_version": "1.0",
+            "scan_id": scan_id,
+            "task_id": task_id,
+            "attempt": attempt,
+            "platform_context": {
+                key: effective_context.get(key)
+                for key in stable_keys
+                if effective_context.get(key) is not None
+            },
+            "workspace_policy": workspace_policy,
+        }
+        dynamic_context = {
+            "schema_version": "1.0",
+            "phase": str(effective_context.get("phase") or "unknown"),
+            "round_index": int(effective_context.get("round_index") or 0),
+            "platform_context": {
+                key: value
+                for key, value in effective_context.items()
+                if key not in stable_keys and key != "context_manifest"
+            },
+        }
+        evidence_index = {
+            "schema_version": "1.0",
+            "count": len(summaries),
+            "evidence": summaries,
+        }
+        phase_slug = re.sub(
+            r"[^a-z0-9-]+",
+            "-",
+            dynamic_context["phase"].lower().replace("_", "-"),
+        ).strip("-") or "unknown"
+        round_path = Path("rounds") / (
+            f"{dynamic_context['round_index']:03d}-{phase_slug}.json"
+        )
+        materialized_documents = {
+            "stable": (Path("stable-context.json"), stable_context),
+            "evidence": (Path("evidence-index.json"), evidence_index),
+            "latest_round": (round_path, dynamic_context),
+        }
+        manifest_documents: dict[str, dict[str, Any]] = {}
+        for name, (relative_path, value) in materialized_documents.items():
+            encoded = json.dumps(
+                value,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ).encode("utf-8")
+            target = task_root / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.is_file() or target.read_bytes() != encoded:
+                target.write_bytes(encoded)
+            manifest_documents[name] = {
+                "path": relative_path.as_posix(),
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+                "bytes": len(encoded),
+            }
+        context_manifest = {
+            "schema_version": "1.0",
+            "read_order": ["stable", "evidence", "latest_round"],
+            "documents": manifest_documents,
+            "legacy_context_path": "context.json",
+            "policy": "read_manifest_then_open_only_the_evidence_needed_for_the_current_hypothesis",
+        }
+        effective_context["context_manifest"] = context_manifest
+        manifest_bytes = json.dumps(
+            context_manifest,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8")
+        (task_root / "context-manifest.json").write_bytes(manifest_bytes)
         context = {
             "schema_version": "1.0",
             "scan_id": scan_id,
             "task_id": task_id,
             "attempt": attempt,
             "evidence": summaries,
-            "platform_context": platform_context or {},
+            "platform_context": effective_context,
             "workspace_policy": workspace_policy,
         }
         (task_root / "context.json").write_text(
@@ -8404,7 +9432,38 @@ class ScanOrchestrator:
                 encoding="utf-8",
             )
             temporary.replace(context_path)
-        except OSError:
+            evidence_index = {
+                "schema_version": "1.0",
+                "count": len(context.evidence_summaries),
+                "evidence": context.evidence_summaries,
+            }
+            evidence_bytes = json.dumps(
+                evidence_index,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ).encode("utf-8")
+            evidence_path = context.workspace / "evidence-index.json"
+            evidence_path.write_bytes(evidence_bytes)
+            manifest_path = context.workspace / "context-manifest.json"
+            if manifest_path.is_file():
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                documents = manifest.setdefault("documents", {})
+                documents["evidence"] = {
+                    "path": "evidence-index.json",
+                    "sha256": hashlib.sha256(evidence_bytes).hexdigest(),
+                    "bytes": len(evidence_bytes),
+                }
+                manifest_path.write_text(
+                    json.dumps(
+                        manifest,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+        except (OSError, json.JSONDecodeError):
             with suppress(OSError):
                 temporary.unlink()
 
@@ -8993,7 +10052,7 @@ class ScanOrchestrator:
         impact_test_ids = {
             item.get("metadata", {}).get("test_case_id")
             for item in cited
-            if item.get("metadata", {}).get("security_impact_observed") is True
+            if item.get("metadata", {}).get("impact_contract_satisfied") is True
         } - {None}
         refuted_test_ids = {
             item.get("metadata", {}).get("test_case_id")

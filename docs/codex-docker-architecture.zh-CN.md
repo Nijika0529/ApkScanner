@@ -124,6 +124,11 @@ environment policy 会从 Agent 自己执行的 Bash 子进程中排除 Provider
 当前路径直接连接 DeepSeek，不依赖本地 Provider Gateway。覆盖 base URL 时只接受明确配置的
 HTTPS 目标；开发代理不得静默改变模型、结构化输出或认证语义。
 
+`config/codex-sdk-baseline.json` 记录已审查的源码提交、Python SDK/CLI 版本和生成协议哈希。
+`/work/codex` 可以更新到上游最新提交用于差异检查；兼容性门禁比较已安装版本和生成协议哈希，
+不会因为检查仓库 HEAD 前进、但运行时与协议未升级而误报失败。真正升级 SDK 或协议时，仍需重新
+审查并更新 baseline。
+
 启动前可以执行：
 
 ```bash
@@ -275,6 +280,14 @@ Campaign 并发控制扫描级任务，不绕过单个 Scan 内的设备租约�
 | `APKSCANNER_CODEX_MAX_CONTAINERS` | `2` | 全局扫描容器上限 |
 | `APKSCANNER_CODEX_MAX_SESSIONS` | `6` | 全局活动 UID Session 上限 |
 | `APKSCANNER_CODEX_MAX_SESSIONS_PER_SCAN` | `6` | 单 Scan 活动 Session 上限 |
+| `APKSCANNER_AGENT_ANALYSIS_SLOTS` | `4` | 无设备 Agent 分析并发 |
+| `APKSCANNER_POC_BUILD_SLOTS` | `2` | PoC 编译并发 |
+| `APKSCANNER_AGENT_INITIAL_PHASE_SECONDS` | `900` | 首轮分析阶段时限 |
+| `APKSCANNER_AGENT_CRITIC_PHASE_SECONDS` | `300` | Critic 阶段时限 |
+| `APKSCANNER_AGENT_RESCUE_PHASE_SECONDS` | `480` | Rescue 阶段时限 |
+| `APKSCANNER_AGENT_FINAL_PHASE_SECONDS` | `180` | 终局裁决阶段时限 |
+| `APKSCANNER_AGENT_NO_PROGRESS_LIMIT` | `3` | 连续无证据进展轮次上限 |
+| `APKSCANNER_RESCUE_AUDIT_SAMPLE_RATE` | `0.15` | 低风险负面结论的 Rescue 抽样率 |
 | `APKSCANNER_CODEX_CPU_LIMIT` | `6` | 单容器 CPU 上限 |
 | `APKSCANNER_CODEX_MEMORY_LIMIT` | `12g` | 单容器内存上限 |
 | `APKSCANNER_CODEX_TURN_TIMEOUT` | `3600` | 单 Turn 生命周期 |
