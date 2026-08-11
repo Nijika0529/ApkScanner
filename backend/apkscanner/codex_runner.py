@@ -39,6 +39,7 @@ from .codex_protocol import (
 from .codex_sdk_baseline import PINNED_SDK_VERSION, WORKER_REVISION, runtime_capability
 from .config import Settings
 from .models import EntryPoint, InvestigationTask, Scan
+from .operator_schemas import OPERATOR_RECEIPT_JSON_SCHEMA, OperatorReceipt
 from .schemas import (
     ADAPTIVE_VERIFIER_RESULT_JSON_SCHEMA,
     AGENT_RESULT_JSON_SCHEMA,
@@ -60,6 +61,14 @@ class CodexAdaptiveRunResult:
     thread_id: str
     turn_id: str
     result: AdaptiveVerificationResult
+    usage: dict[str, Any]
+
+
+@dataclass(slots=True)
+class CodexOperatorRunResult:
+    thread_id: str
+    turn_id: str
+    result: OperatorReceipt
     usage: dict[str, Any]
 
 
@@ -525,6 +534,80 @@ class CodexInvestigator:
             usage=result.get("usage") or {},
         )
 
+    def operate(
+        self,
+        *,
+        scan: Scan,
+        task: InvestigationTask,
+        workspace: Path,
+        prompt: str,
+        timeout_seconds: int,
+        event_callback: AgentEventCallback | None = None,
+        cancel_event: threading.Event | None = None,
+        gateway_environment: dict[str, str] | None = None,
+    ) -> CodexOperatorRunResult:
+        """Run or continue a privileged platform Operator conversation."""
+
+        if self.settings.codex_isolation != "docker":
+            raise RuntimeError("the Platform Operator requires Docker isolation")
+        capability = self._docker_capability(
+            {
+                "available": True,
+                "version": importlib.metadata.version("openai-codex"),
+                "isolation": "docker",
+            }
+        )
+        if not capability.get("available"):
+            raise RuntimeError(str(capability.get("detail")))
+        scan_workspace = (self.settings.data_dir / "workspaces" / scan.id).resolve()
+        if not scan_workspace.is_dir() or "," in str(scan_workspace):
+            raise ValueError("scan decompiler workspace is unavailable or unsafe")
+        role = "operator"
+        active = self._prepare_active_session(
+            scan=scan,
+            task=task,
+            source_workspace=workspace,
+            phase="platform_operator",
+            role=role,
+            scan_workspace=scan_workspace,
+            gateway_environment=gateway_environment,
+            cancel_event=cancel_event,
+            developer_instructions_text=(
+                "你是 APKScanner 平台级 Operator Agent。你可以读取当前扫描、Finding、Evidence、"
+                "历史 Agent 工作区和 Artifact 索引，在自己的可写工作区使用 Bash、Web Search、"
+                "Android SDK、ADB 与 SSH 完成用户明确要求的分析或复现。优先复用已有 PoC 和证据，"
+                "设备命令必须通过任务级 adb 网关；不要清除或卸载待测应用的数据。把新产物放到 "
+                "output/ 或 poc/。只报告实际完成的动作和观察，并严格按输出 schema 返回简洁中文回执。"
+            ),
+        )
+        session_key = (scan.id, task.id, task.attempts, role)
+        effective_timeout = min(timeout_seconds, self.settings.codex_turn_timeout_seconds)
+        try:
+            result = active.client.turn(
+                prompt=prompt,
+                output_schema=OPERATOR_RECEIPT_JSON_SCHEMA,
+                result_contract="json_object.v1",
+                timeout_seconds=effective_timeout,
+                no_event_timeout_seconds=self.settings.codex_no_event_timeout_seconds,
+                event_callback=event_callback,
+                cancel_event=cancel_event,
+            )
+        except PersistentWorkerCancelled as exc:
+            raise AgentCancelledError("Platform Operator was cancelled by the user") from exc
+        except PersistentWorkerTimeout as exc:
+            raise TimeoutError(f"Platform Operator exceeded its timeout: {exc}") from exc
+        except PersistentWorkerError as exc:
+            self._discard_session(scan.id, task.id, task.attempts, role)
+            raise RuntimeError(f"Platform Operator worker failed: {exc}") from exc
+        finally:
+            self._release_active_session(session_key)
+        return CodexOperatorRunResult(
+            thread_id=str(result["thread_id"]),
+            turn_id=str(result["turn_id"]),
+            result=OperatorReceipt.model_validate(result["result"]),
+            usage=result.get("usage") or {},
+        )
+
     def prepare_session_workspace(
         self,
         *,
@@ -749,6 +832,8 @@ class CodexInvestigator:
             if phase == "rescue_exploration"
             else "verifier"
             if phase == "adaptive_verification"
+            else "operator"
+            if phase == "platform_operator"
             else "primary"
         )
 

@@ -32,6 +32,7 @@ class ArtifactStore:
         "poc_artifacts",
         "poc_sources",
         "reports",
+        "operator_artifacts",
     }
 
     def __init__(self, settings: Settings):
@@ -121,6 +122,55 @@ class ArtifactStore:
     def put_json(self, category: str, value: Any) -> tuple[str, Path]:
         content = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2).encode()
         return self.put_bytes(category, content, suffix=".json")
+
+    def put_file(
+        self,
+        category: str,
+        source: str | Path,
+        *,
+        suffix: str | None = None,
+    ) -> tuple[str, Path, int]:
+        """Stream a local file into the content-addressed store without loading it in memory."""
+
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", category):
+            raise ValueError("artifact category is invalid")
+        source_path = Path(source)
+        if source_path.is_symlink() or not source_path.is_file():
+            raise ValueError("artifact source is not a regular file")
+        actual_suffix = suffix or source_path.suffix.lower() or ".bin"
+        if not re.fullmatch(r"\.[A-Za-z0-9]{1,10}", actual_suffix):
+            actual_suffix = ".bin"
+        root = self._category_root(category)
+        temporary = tempfile.NamedTemporaryFile(  # noqa: SIM115
+            mode="wb", prefix="import-", suffix=".part", dir=root, delete=False
+        )
+        temp_path = Path(temporary.name)
+        ensure_private_file(temp_path)
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            with source_path.open("rb") as input_stream, temporary as output_stream:
+                while chunk := input_stream.read(1024 * 1024):
+                    digest.update(chunk)
+                    total += len(chunk)
+                    output_stream.write(chunk)
+                output_stream.flush()
+            sha256 = digest.hexdigest()
+            directory = root / sha256[:2]
+            ensure_private_directory(directory)
+            self._verify_directory(directory, root)
+            path = directory / f"{sha256}{actual_suffix}"
+            if path.exists() or path.is_symlink():
+                self._verify_existing(path, sha256)
+                temp_path.unlink(missing_ok=True)
+            else:
+                temp_path.replace(path)
+            ensure_private_file(path)
+            return sha256, path, total
+        except Exception:
+            temporary.close()
+            temp_path.unlink(missing_ok=True)
+            raise
 
     @staticmethod
     def stream_file(path: Path, chunk_size: int = 1024 * 1024) -> BinaryIO:

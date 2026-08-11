@@ -48,6 +48,12 @@ from .enums import (
 )
 from .evidence import EvidenceRecorder
 from .finding_policy import partition_findings
+from .finding_reports import (
+    FindingReport,
+    build_finding_report,
+    render_finding_description,
+    render_finding_remediation,
+)
 from .manifest import parse_manifest
 from .models import (
     AdaptiveVerificationCheckpoint,
@@ -4208,7 +4214,7 @@ class ScanOrchestrator:
                 finding.evidence_ids = list(
                     dict.fromkeys([*finding.evidence_ids, *accepted_evidence_ids])
                 )
-                finding.metadata_json = {
+                finding_metadata = {
                     **dict(finding.metadata_json or {}),
                     "harm_demonstrated": bool(proven_attempts),
                     "proof_attempt_ids": proven_attempt_ids,
@@ -4242,6 +4248,65 @@ class ScanOrchestrator:
                         "verifier_task_id": task_id,
                     },
                 }
+                report_payload = finding_metadata.get("report")
+                if isinstance(report_payload, dict):
+                    report = FindingReport.model_validate(report_payload)
+                    report.conclusion = (
+                        assessment.security_impact or assessment.summary
+                    )[:600]
+                    if assessment.attack_chain:
+                        chain = [
+                            item.strip()
+                            for item in re.split(r"\s*(?:→|->|\n)\s*", assessment.attack_chain)
+                            if item.strip()
+                        ]
+                        report.attack_chain = chain[:5]
+                    report.verification.status = (
+                        "confirmed"
+                        if verdict == FindingStatus.REPRODUCED_BLACKBOX.value
+                        else "refuted"
+                        if verdict == FindingStatus.REFUTED_STATIC.value
+                        else "inconclusive"
+                        if verdict in {
+                            FindingStatus.NOT_REPRODUCED.value,
+                            FindingStatus.INCONCLUSIVE.value,
+                        }
+                        else "pending"
+                    )
+                    report.verification.established_facts = list(
+                        dict.fromkeys(
+                            value
+                            for value in [assessment.summary, assessment.security_impact]
+                            if value
+                        )
+                    )[:3]
+                    report.verification.missing_proof = (
+                        assessment.remaining_gaps[0]
+                        if assessment.remaining_gaps
+                        else None
+                    )
+                    report.verification.next_step = (
+                        "根据剩余缺口继续补充动态实验。"
+                        if assessment.remaining_gaps
+                        else None
+                    )
+                    report.verification.evidence_ids = list(
+                        dict.fromkeys(accepted_evidence_ids)
+                    )[:64]
+                    report.verification.proof_attempt_ids = proven_attempt_ids[:64]
+                    report.kind = (
+                        "finding"
+                        if verdict == FindingStatus.REPRODUCED_BLACKBOX.value
+                        else "pending_risk"
+                    )
+                    if verdict == FindingStatus.REPRODUCED_BLACKBOX.value:
+                        report.title = re.sub(r"^(?:待验证|已复现)：", "已复现：", report.title)
+                    elif report.title.startswith("已复现："):
+                        report.title = f"待验证：{report.title.removeprefix('已复现：')}"
+                    finding_metadata["report"] = report.model_dump(mode="json")
+                    finding.title = report.title
+                    finding.description = render_finding_description(report)
+                finding.metadata_json = finding_metadata
             ignored_duplicate_relations: list[dict[str, str]] = []
             explicit_duplicates: dict[str, str] = {}
             for finding_id, assessment in assessments.items():
@@ -10187,6 +10252,11 @@ class ScanOrchestrator:
                 .order_by(SecurityHypothesis.created_at)
             )
         )
+        assessment_by_hypothesis = {
+            str(item.get("hypothesis_id")): item
+            for item in payload.get("hypothesis_assessments", [])
+            if isinstance(item, dict) and isinstance(item.get("hypothesis_id"), str)
+        }
         entry_name_by_id = {
             entry.id: entry.name
             for entry in session.scalars(select(EntryPoint).where(EntryPoint.scan_id == scan.id))
@@ -10240,10 +10310,6 @@ class ScanOrchestrator:
                         and str(attempt.plan["rationale"]).strip()
                     )
                 )
-                proof_description = "\n\n".join(proof_rationales) or payload.get(
-                    "summary",
-                    hypothesis.impact or "Platform harm Oracle succeeded.",
-                )
                 release_gate_eligible = any(
                     bool((attempt.oracle or {}).get("release_gate_eligible"))
                     for attempt in attempts
@@ -10295,18 +10361,24 @@ class ScanOrchestrator:
                         claim=hypothesis.claim,
                     ),
                 }
+                report = build_finding_report(
+                    task_id=task.id,
+                    hypothesis=hypothesis,
+                    assessment=assessment_by_hypothesis.get(hypothesis.id),
+                    evidence_ids=proof_evidence_ids,
+                    attempts=attempts,
+                    coverage_gaps=payload.get("coverage_gaps", []),
+                )
+                metadata["report"] = report.model_dump(mode="json")
                 if finding is None:
                     finding = Finding(
                         scan_id=scan.id,
                         dedupe_key=dedupe,
                         rule_id="AGENT-ENTRY-INVESTIGATION",
                         source=agent_backend,
-                        title=f"Validated hypothesis: {hypothesis.claim}",
-                        description=proof_description,
-                        remediation=(
-                            "Review the affected handler and enforce input validation, "
-                            "caller authorization, and explicit trust-boundary checks."
-                        ),
+                        title=report.title,
+                        description=render_finding_description(report),
+                        remediation=render_finding_remediation(report),
                         masvs="MASVS-PLATFORM",
                         severity=payload.get("platform_severity")
                         or payload.get("severity_proposal", "medium"),
@@ -10327,8 +10399,9 @@ class ScanOrchestrator:
                     ):
                         previous_metadata.pop(merge_key, None)
                     finding.source = agent_backend
-                    finding.title = f"Validated hypothesis: {hypothesis.claim}"
-                    finding.description = proof_description
+                    finding.title = report.title
+                    finding.description = render_finding_description(report)
+                    finding.remediation = render_finding_remediation(report)
                     finding.severity = payload.get("platform_severity") or payload.get(
                         "severity_proposal", "medium"
                     )
@@ -10387,62 +10460,6 @@ class ScanOrchestrator:
             # Hypothesis-level reproduced findings above fully represent the
             # positive result. Avoid a duplicate task-level weaker record.
             return
-        supported_hypothesis_ids = {
-            str(assessment["hypothesis_id"])
-            for assessment in supported_assessments
-            if isinstance(assessment.get("hypothesis_id"), str)
-        }
-        signal_hypotheses = [
-            hypothesis
-            for hypothesis in hypotheses
-            if not supported_hypothesis_ids or hypothesis.id in supported_hypothesis_ids
-        ]
-        signal_entry_ids = list(
-            dict.fromkeys(
-                entry_id
-                for hypothesis in signal_hypotheses
-                for entry_id in hypothesis.entry_point_ids
-            )
-        ) or list(task.target_entry_ids)
-        signal_evidence_ids = (
-            list(
-                dict.fromkeys(
-                    evidence_id
-                    for assessment in supported_assessments
-                    for evidence_id in assessment.get("evidence_ids", [])
-                    if isinstance(evidence_id, str) and evidence_id
-                )
-            )
-            or evidence_ids
-        )
-        signal_result_value = (
-            FindingStatus.SUPPORTED_STATIC.value if supported_assessments else result_value
-        )
-        dedupe = f"agent:{task.id}:{signal_result_value}"
-        signal_identity = finding_identity(
-            scan=scan,
-            rule_id="AGENT-ENTRY-INVESTIGATION",
-            category=f"android.{task.task_type}",
-            entry_names=[entry_name_by_id.get(entry_id, entry_id) for entry_id in signal_entry_ids],
-            claim=" | ".join(hypothesis.claim for hypothesis in signal_hypotheses),
-        )
-        proof_gaps = list(
-            dict.fromkeys(
-                [
-                    *[
-                        str(gap)
-                        for assessment in supported_assessments
-                        for gap in assessment.get("proof_gaps", [])
-                        if isinstance(gap, str) and gap
-                    ],
-                    *[
-                        str(gap)
-                        for gap in payload.get("coverage_gaps", [])
-                        if isinstance(gap, str) and gap
-                    ],
-                ]
-            )
-        )
         platform_context = (
             payload.get("platform_context")
             if isinstance(payload.get("platform_context"), dict)
@@ -10459,71 +10476,82 @@ class ScanOrchestrator:
         else:
             automation_state = "manual_or_poc_required"
             proof_reason = "agent_did_not_produce_an_automatable_proof"
-        proof_backlog = {
-            "schema_version": "1.0",
-            "status": "proof_required",
-            "automation_state": automation_state,
-            "reason": proof_reason,
-            "task_id": task.id,
-            "hypothesis_ids": [
-                str(assessment["hypothesis_id"])
-                for assessment in supported_assessments
-                if isinstance(assessment.get("hypothesis_id"), str)
-            ],
-            "proof_gaps": proof_gaps,
-            "requested_test_count": (
-                len(requested_tests) if isinstance(requested_tests, list) else 0
-            ),
-            "executed_test_count": (len(executed_tests) if isinstance(executed_tests, list) else 0),
-        }
-        finding = session.scalar(
-            select(Finding).where(
-                Finding.scan_id == scan.id,
-                Finding.dedupe_key == dedupe,
+        hypothesis_by_id = {hypothesis.id: hypothesis for hypothesis in hypotheses}
+        if not supported_assessments and result_value == FindingStatus.SUPPORTED_STATIC.value:
+            supported_assessments = [
+                {
+                    "hypothesis_id": hypothesis.id,
+                    "verdict": FindingStatus.SUPPORTED_STATIC.value,
+                    "evidence_ids": evidence_ids,
+                    "proof_gaps": payload.get("coverage_gaps", []),
+                }
+                for hypothesis in hypotheses[:1]
+                if hypothesis.id not in proven_hypothesis_ids
+            ]
+
+        for assessment in supported_assessments:
+            hypothesis = hypothesis_by_id.get(str(assessment.get("hypothesis_id")))
+            if hypothesis is None:
+                continue
+            signal_entry_ids = list(hypothesis.entry_point_ids) or list(task.target_entry_ids)
+            signal_evidence_ids = list(
+                dict.fromkeys(
+                    evidence_id
+                    for evidence_id in assessment.get("evidence_ids", []) or evidence_ids
+                    if isinstance(evidence_id, str) and evidence_id
+                )
             )
-        )
-        if finding is None:
-            finding = Finding(
-                scan_id=scan.id,
-                dedupe_key=dedupe,
-                rule_id="AGENT-ENTRY-INVESTIGATION",
-                source=agent_backend,
-                title=f"待验证风险：{entries[0].name if entries else task.id}",
-                description=payload.get("summary", "Agent investigation result"),
-                remediation="Review the affected handler and enforce validation and caller authorization.",
-                masvs="MASVS-PLATFORM",
-                severity=payload.get("platform_severity")
-                or payload.get("severity_proposal", "medium"),
-                confidence=payload.get("confidence", "medium"),
-                status=signal_result_value,
-                entry_point_ids=signal_entry_ids,
-                evidence_ids=signal_evidence_ids,
-                metadata_json={
-                    "task_id": task.id,
-                    "agent_backend": agent_backend,
-                    "model": model,
-                    "coverage_gaps": payload.get("coverage_gaps", []),
-                    "harm_demonstrated": False,
-                    "excluded_proven_hypothesis_ids": sorted(proven_hypothesis_ids),
-                    "proof_backlog": proof_backlog,
-                    "identity": signal_identity,
-                },
+            proof_gaps = list(
+                dict.fromkeys(
+                    [
+                        *[
+                            str(gap)
+                            for gap in assessment.get("proof_gaps", [])
+                            if isinstance(gap, str) and gap
+                        ],
+                        *[
+                            str(gap)
+                            for gap in payload.get("coverage_gaps", [])
+                            if isinstance(gap, str) and gap
+                        ],
+                    ]
+                )
             )
-            session.add(finding)
-        else:
-            finding.source = agent_backend
-            finding.title = f"待验证风险：{entries[0].name if entries else task.id}"
-            finding.description = payload.get("summary", "Agent investigation result")
-            finding.severity = payload.get("platform_severity") or payload.get(
-                "severity_proposal", "medium"
-            )
-            finding.confidence = payload.get("confidence", "medium")
-            finding.status = signal_result_value
-            finding.review_note = None
-            finding.entry_point_ids = signal_entry_ids
-            finding.evidence_ids = signal_evidence_ids
-            finding.metadata_json = {
+            proof_backlog = {
+                "schema_version": "1.0",
+                "status": "proof_required",
+                "automation_state": automation_state,
+                "reason": proof_reason,
                 "task_id": task.id,
+                "hypothesis_ids": [hypothesis.id],
+                "proof_gaps": proof_gaps,
+                "requested_test_count": (
+                    len(requested_tests) if isinstance(requested_tests, list) else 0
+                ),
+                "executed_test_count": (
+                    len(executed_tests) if isinstance(executed_tests, list) else 0
+                ),
+            }
+            report = build_finding_report(
+                task_id=task.id,
+                hypothesis=hypothesis,
+                assessment=assessment,
+                evidence_ids=signal_evidence_ids,
+                coverage_gaps=payload.get("coverage_gaps", []),
+            )
+            dedupe = f"agent:{task.id}:hypothesis:{hypothesis.id}"
+            signal_identity = finding_identity(
+                scan=scan,
+                rule_id="AGENT-ENTRY-INVESTIGATION",
+                category=hypothesis.category,
+                entry_names=[
+                    entry_name_by_id.get(entry_id, entry_id) for entry_id in signal_entry_ids
+                ],
+                claim=hypothesis.claim,
+            )
+            metadata = {
+                "task_id": task.id,
+                "hypothesis_id": hypothesis.id,
                 "agent_backend": agent_backend,
                 "model": model,
                 "coverage_gaps": payload.get("coverage_gaps", []),
@@ -10531,7 +10559,52 @@ class ScanOrchestrator:
                 "excluded_proven_hypothesis_ids": sorted(proven_hypothesis_ids),
                 "proof_backlog": proof_backlog,
                 "identity": signal_identity,
+                "report": report.model_dump(mode="json"),
             }
+            finding = session.scalar(
+                select(Finding).where(
+                    Finding.scan_id == scan.id,
+                    Finding.dedupe_key == dedupe,
+                )
+            )
+            if finding is None:
+                finding = Finding(
+                    scan_id=scan.id,
+                    dedupe_key=dedupe,
+                    rule_id="AGENT-ENTRY-INVESTIGATION",
+                    source=agent_backend,
+                    title=report.title,
+                    description=render_finding_description(report),
+                    remediation=render_finding_remediation(report),
+                    masvs="MASVS-PLATFORM",
+                    severity=payload.get("platform_severity")
+                    or payload.get("severity_proposal", "medium"),
+                    confidence=assessment.get("confidence")
+                    or payload.get("confidence", "medium"),
+                    status=FindingStatus.SUPPORTED_STATIC.value,
+                    entry_point_ids=signal_entry_ids,
+                    evidence_ids=signal_evidence_ids,
+                    metadata_json=metadata,
+                )
+                session.add(finding)
+            else:
+                finding.source = agent_backend
+                finding.title = report.title
+                finding.description = render_finding_description(report)
+                finding.remediation = render_finding_remediation(report)
+                finding.severity = payload.get("platform_severity") or payload.get(
+                    "severity_proposal", "medium"
+                )
+                finding.confidence = assessment.get("confidence") or payload.get(
+                    "confidence", "medium"
+                )
+                finding.status = FindingStatus.SUPPORTED_STATIC.value
+                finding.review_note = None
+                finding.entry_point_ids = signal_entry_ids
+                finding.evidence_ids = signal_evidence_ids
+                finding.metadata_json = {**(finding.metadata_json or {}), **metadata}
+            session.flush()
+            hypothesis.final_finding_id = finding.id
 
     @staticmethod
     def _update_entry_coverage(

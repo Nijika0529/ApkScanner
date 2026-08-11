@@ -16,6 +16,7 @@ from .config import Settings
 from .db import Database
 from .enums import ScanStatus
 from .models import Scan
+from .operator_service import PlatformOperatorService
 from .orchestrator import ScanOrchestrator
 from .supervisor import SupervisorService
 
@@ -29,6 +30,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     orchestrator = ScanOrchestrator(app_settings, database, store)
     capability_registry = CapabilityRegistry(orchestrator)
     supervisor = SupervisorService(orchestrator, capability_registry)
+    platform_operator = PlatformOperatorService(database, store, orchestrator)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -105,6 +107,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.orchestrator = orchestrator
     app.state.capability_registry = capability_registry
     app.state.supervisor = supervisor
+    app.state.platform_operator = platform_operator
     app.state.background_tasks = set()
     app.add_middleware(
         TrustedHostMiddleware,

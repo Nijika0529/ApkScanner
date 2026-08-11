@@ -107,18 +107,35 @@ class AgentWorkspaceManager:
                 self._copy_bounded_workspace(source_workspace, existing.workspace)
                 if context is not None:
                     self._write_context(existing, context)
-                if role == "verifier" and not (existing.home / ".ssh").is_dir():
+                if role in {"verifier", "operator"} and not (existing.home / ".ssh").is_dir():
                     self._copy_verifier_ssh(existing)
                 return existing
+            workspace_key = self._workspace_key(task_id, attempt, role)
+            scan_root = self.prepare_scan(scan_id)
+            self._reserve_retained_uids(scan_id, scan_root)
+            root = scan_root / workspace_key
+            if root.exists():
+                restored = self._restore_session(
+                    scan_id=scan_id,
+                    task_id=task_id,
+                    attempt=attempt,
+                    role=role,
+                    workspace_key=workspace_key,
+                    root=root,
+                )
+                self._copy_bounded_workspace(source_workspace, restored.workspace)
+                if context is not None:
+                    self._write_context(restored, context)
+                if role in {"verifier", "operator"} and not (
+                    restored.home / ".ssh"
+                ).is_dir():
+                    self._copy_verifier_ssh(restored)
+                self._leases[key] = restored
+                return restored
             # Retained role workspaces are audit state, not active Codex workers. Do not make a
             # fourth task fail merely because earlier primary/critic directories still exist.
             # Runtime worker capacity is queued by CodexInvestigator and these UIDs remain unique.
             uid = self._allocate_uid(scan_id)
-            workspace_key = self._workspace_key(task_id, attempt, role)
-            scan_root = self.prepare_scan(scan_id)
-            root = scan_root / workspace_key
-            if root.exists():
-                raise RuntimeError("new Agent session path already exists")
             root.mkdir(mode=0o711)
             root.chmod(0o711)
             paths = {
@@ -170,10 +187,79 @@ class AgentWorkspaceManager:
             )
             self._copy_bounded_workspace(source_workspace, session.workspace)
             self._write_context(session, context or {})
-            if role == "verifier":
+            if role in {"verifier", "operator"}:
                 self._copy_verifier_ssh(session)
             self._leases[key] = session
             return session
+
+    def _reserve_retained_uids(self, scan_id: str, scan_root: Path) -> None:
+        used = self._used_uids.setdefault(scan_id, set())
+        for context_file in scan_root.glob("*/context/session.json"):
+            if context_file.is_symlink() or not context_file.is_file():
+                continue
+            try:
+                payload = json.loads(context_file.read_text(encoding="utf-8"))
+                uid = int(payload["uid"])
+            except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+                continue
+            if self.settings.codex_uid_min <= uid <= self.settings.codex_uid_max:
+                used.add(uid)
+
+    def _restore_session(
+        self,
+        *,
+        scan_id: str,
+        task_id: str,
+        attempt: int,
+        role: str,
+        workspace_key: str,
+        root: Path,
+    ) -> SessionWorkspace:
+        self._reject_symlink(root)
+        context_file = root / "context" / "session.json"
+        try:
+            payload = json.loads(context_file.read_text(encoding="utf-8"))
+            uid = int(payload["uid"])
+            manifest = WorkspaceManifest.model_validate(payload["workspace_manifest"])
+        except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("retained Agent session metadata is invalid") from exc
+        if (
+            payload.get("scan_id") != scan_id
+            or payload.get("task_id") != task_id
+            or payload.get("attempt") != attempt
+            or payload.get("role") != role
+            or manifest.scan_id != scan_id
+            or manifest.workspace_key != workspace_key
+            or manifest.uid != uid
+            or manifest.gid != uid
+            or not self.settings.codex_uid_min <= uid <= self.settings.codex_uid_max
+        ):
+            raise RuntimeError("retained Agent session identity does not match the request")
+        paths = {
+            name: root / name
+            for name in ("workspace", "home", "codex-home", "tmp", "cache", "context")
+        }
+        for path in paths.values():
+            if path.is_symlink() or not path.is_dir():
+                raise RuntimeError("retained Agent session directory is unavailable")
+        self._used_uids.setdefault(scan_id, set()).add(uid)
+        return SessionWorkspace(
+            scan_id=scan_id,
+            task_id=task_id,
+            attempt=attempt,
+            role=role,
+            workspace_key=workspace_key,
+            uid=uid,
+            gid=uid,
+            root=root,
+            workspace=paths["workspace"],
+            home=paths["home"],
+            codex_home=paths["codex-home"],
+            tmp=paths["tmp"],
+            cache=paths["cache"],
+            context=paths["context"],
+            manifest=manifest,
+        )
 
     def forget_scan(self, scan_id: str) -> None:
         """Forget in-memory leases after the container is gone; keep files for audit/ingestion."""

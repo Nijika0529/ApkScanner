@@ -71,6 +71,50 @@ def test_local_api_requires_console_marker_for_mutations(settings) -> None:  # n
         assert {item["name"] for item in health["capabilities"]} >= {"codex"}
 
 
+def test_platform_operator_session_api_and_supervisor_dispatch(settings, monkeypatch) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    monkeypatch.setattr(app.state.platform_operator, "run_turn", lambda *_args: None)
+    with app.state.database.session_factory() as session:
+        scan = Scan(
+            status="final",
+            filename="operator.apk",
+            artifact_sha256="9" * 64,
+            artifact_path=str(settings.data_dir / "operator.apk"),
+        )
+        session.add(scan)
+        session.commit()
+        scan_id = scan.id
+
+    headers = {"X-APKScanner-Request": "console"}
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/operator/sessions",
+            headers=headers,
+            json={
+                "scan_id": scan_id,
+                "instruction": "读取扫描结果并总结高风险入口",
+                "device_mode": "none",
+            },
+        )
+        assert created.status_code == 202
+        session_id = created.json()["id"]
+        assert created.json()["turns"][0]["instruction"] == "读取扫描结果并总结高风险入口"
+        fetched = client.get(f"/api/v1/operator/sessions/{session_id}")
+        assert fetched.status_code == 200
+        assert fetched.json()["primary_scan_id"] == scan_id
+
+        dispatched = client.post(
+            "/api/v1/supervisor/operator-dispatch",
+            headers=headers,
+            json={
+                "scan_id": scan_id,
+                "instruction": "检查历史 PoC 是否可复用",
+                "device_mode": "none",
+            },
+        )
+        assert dispatched.status_code == 202
+
+
 def test_validation_fixture_registry_preserves_account_and_canary_context(settings) -> None:  # noqa: ANN001
     app = create_app(settings)
     with app.state.database.session_factory() as session:

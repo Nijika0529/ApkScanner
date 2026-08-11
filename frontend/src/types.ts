@@ -65,6 +65,83 @@ export interface Finding {
   updated_at: string
 }
 
+export interface FindingReport {
+  schema_version: "1.0"
+  kind: "finding" | "pending_risk"
+  title: string
+  conclusion: string
+  conditions: string[]
+  attack_chain: string[]
+  verification: {
+    status: "confirmed" | "pending" | "refuted" | "inconclusive"
+    established_facts: string[]
+    missing_proof: string | null
+    next_step: string | null
+    evidence_ids: string[]
+    proof_attempt_ids: string[]
+  }
+  remediation: string[]
+  task_id: string
+  hypothesis_id: string
+}
+
+export interface OperatorFindingUpdate {
+  finding_id: string
+  verdict: string
+  conclusion: string
+  evidence_ids: string[]
+  remaining_gap: string | null
+}
+
+export interface OperatorTurn {
+  id: string
+  session_id: string
+  instruction: string
+  status: string
+  device_mode: "auto" | "none" | "required"
+  thread_id: string | null
+  turn_id: string | null
+  receipt_json: Record<string, unknown>
+  error: string | null
+  created_at: string
+  started_at: string | null
+  completed_at: string | null
+}
+
+export interface OperatorSession {
+  id: string
+  primary_scan_id: string | null
+  task_id: string | null
+  title: string
+  instruction: string
+  status: string
+  workspace_path: string
+  thread_id: string | null
+  scope_json: Record<string, unknown>
+  result_json: Record<string, unknown>
+  error: string | null
+  cancel_requested: boolean
+  created_at: string
+  updated_at: string
+  completed_at: string | null
+  turns: OperatorTurn[]
+}
+
+export interface IndexedArtifact {
+  id: string
+  sha256: string
+  artifact_type: string
+  name: string
+  source_path: string
+  size_bytes: number
+  scan_id: string | null
+  task_id: string | null
+  finding_id: string | null
+  operator_session_id: string | null
+  metadata_json: Record<string, unknown>
+  created_at: string
+}
+
 export interface SecuritySnapshot {
   id: string
   scan_id: string

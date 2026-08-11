@@ -9,6 +9,8 @@ import type {
   Health,
   InvestigationTask,
   InvestigatorChoice,
+  IndexedArtifact,
+  OperatorSession,
   PatternMatch,
   Scan,
   ScanDeleteResult,
@@ -218,4 +220,36 @@ export const api = {
     request<TaskDeleteResult>(`/api/v1/tasks/${taskId}`, { method: "DELETE" }),
   deleteScan: (scanId: string) =>
     request<ScanDeleteResult>(`/api/v1/scans/${scanId}`, { method: "DELETE" }),
+  operatorSessions: () => request<OperatorSession[]>("/api/v1/operator/sessions"),
+  operatorSession: (sessionId: string) =>
+    request<OperatorSession>(`/api/v1/operator/sessions/${sessionId}`),
+  createOperatorSession: (payload: {
+    instruction: string
+    title?: string
+    scan_id?: string
+    finding_ids?: string[]
+    device_mode?: "auto" | "none" | "required"
+  }) => request<OperatorSession>("/api/v1/operator/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }),
+  continueOperatorSession: (
+    sessionId: string,
+    instruction: string,
+    deviceMode: "auto" | "none" | "required" = "auto",
+  ) => request<OperatorSession>(`/api/v1/operator/sessions/${sessionId}/turns`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ instruction, device_mode: deviceMode }),
+  }),
+  cancelOperatorSession: (sessionId: string) =>
+    request<{ session_id: string; cancel_requested: boolean }>(`/api/v1/operator/sessions/${sessionId}/cancel`, { method: "POST" }),
+  operatorArtifacts: (query: { scanId?: string; findingId?: string; sessionId?: string } = {}) => {
+    const params = new URLSearchParams()
+    if (query.scanId) params.set("scan_id", query.scanId)
+    if (query.findingId) params.set("finding_id", query.findingId)
+    if (query.sessionId) params.set("operator_session_id", query.sessionId)
+    return request<IndexedArtifact[]>(`/api/v1/operator/artifacts?${params}`)
+  },
 }

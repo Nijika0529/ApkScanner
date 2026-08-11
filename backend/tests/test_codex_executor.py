@@ -184,6 +184,43 @@ def test_workspace_manager_reuses_role_session_and_isolates_critic_uid(settings)
     ] == {"phase": "final_evaluation"}
 
 
+def test_workspace_manager_restores_persistent_session_after_process_restart(settings) -> None:  # noqa: ANN001
+    configured = replace(settings, codex_uid_min=21_100, codex_uid_max=21_110)
+    source = configured.data_dir / "persistent-source"
+    source.mkdir()
+    first_manager = AgentWorkspaceManager(configured)
+    first = first_manager.prepare_session(
+        scan_id=SCAN_ID,
+        task_id=TASK_ID,
+        attempt=1,
+        role="operator",
+        source_workspace=source,
+        context={"phase": "platform_operator"},
+    )
+    (first.workspace / "poc").mkdir()
+    (first.workspace / "poc" / "retained.apk").write_bytes(b"retained")
+    (first.root / "thread.json").write_text(
+        json.dumps({"schema_version": "1.0", "thread_id": "thread-persistent"}),
+        encoding="utf-8",
+    )
+
+    restored = AgentWorkspaceManager(configured).prepare_session(
+        scan_id=SCAN_ID,
+        task_id=TASK_ID,
+        attempt=1,
+        role="operator",
+        source_workspace=source,
+        context={"phase": "platform_operator", "resumed": True},
+    )
+
+    assert restored.uid == first.uid
+    assert restored.root == first.root
+    assert (restored.workspace / "poc" / "retained.apk").read_bytes() == b"retained"
+    assert json.loads((restored.root / "thread.json").read_text(encoding="utf-8"))[
+        "thread_id"
+    ] == "thread-persistent"
+
+
 def test_workspace_manager_canonicalizes_snake_case_roles_for_worker_paths(settings) -> None:  # noqa: ANN001
     configured = replace(settings, codex_uid_min=21_100, codex_uid_max=21_110)
     source = configured.data_dir / "source"

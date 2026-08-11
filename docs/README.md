@@ -33,6 +33,7 @@
 | 文档 | 内容 | 状态 |
 | --- | --- | --- |
 | [版本安全演进](version-security-evolution.md) | 静态 CAS、Security Snapshot、Diff、PoC 重放和 Finding 生命周期 | 当前实现规范 |
+| [Finding 报告与平台 Operator](platform-operator-and-finding-reports.zh-CN.md) | 六段式报告、持久 Agent 会话、PoC 索引、ADB/SSH 执行与 Supervisor 派发 | 运行时操作规范 |
 
 ## 文档维护约定
 

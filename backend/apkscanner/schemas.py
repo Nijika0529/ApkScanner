@@ -1410,7 +1410,7 @@ class InvestigationBriefEvaluation(BaseModel):
     note: StrictStr = Field(min_length=1, max_length=10_000)
 
 
-def _inline_local_json_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:
+def responses_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
     """Inline and normalize Pydantic definitions for provider tool schemas.
 
     DeepSeek's Responses endpoint currently accepts ``additionalProperties`` only
@@ -1461,7 +1461,7 @@ def _inline_local_json_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def _agent_result_wire_schema() -> dict[str, Any]:
-    schema = _inline_local_json_schema_refs(AgentInvestigationResult.model_json_schema())
+    schema = responses_output_schema(AgentInvestigationResult.model_json_schema())
     requested_test = schema["properties"]["requested_tests"]["items"]
     requested_test["properties"]["extras"] = {
         "type": "array",
@@ -1497,6 +1497,6 @@ def _agent_result_wire_schema() -> dict[str, Any]:
 
 
 AGENT_RESULT_JSON_SCHEMA = _agent_result_wire_schema()
-ADAPTIVE_VERIFIER_RESULT_JSON_SCHEMA = _inline_local_json_schema_refs(
+ADAPTIVE_VERIFIER_RESULT_JSON_SCHEMA = responses_output_schema(
     AdaptiveVerificationResult.model_json_schema()
 )

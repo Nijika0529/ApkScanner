@@ -203,6 +203,8 @@ class Database:
         from .models import (
             AgentSessionRecord,
             AgentTurnRecord,
+            OperatorSession,
+            OperatorTurn,
             ProofAttempt,
             ScanContainerRecord,
             SecurityHypothesis,
@@ -238,6 +240,24 @@ class Database:
                 update(ScanContainerRecord)
                 .where(ScanContainerRecord.status.in_({"prepared", "running"}))
                 .values(status="interrupted", completed_at=recovered_at)
+            )
+            session.execute(
+                update(OperatorTurn)
+                .where(OperatorTurn.status.in_({"queued", "running"}))
+                .values(
+                    status="interrupted",
+                    error="recovered after an interrupted platform process",
+                    completed_at=recovered_at,
+                )
+            )
+            session.execute(
+                update(OperatorSession)
+                .where(OperatorSession.status == "running")
+                .values(
+                    status="interrupted",
+                    error="recovered after an interrupted platform process",
+                    completed_at=recovered_at,
+                )
             )
             session.commit()
 

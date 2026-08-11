@@ -751,6 +751,83 @@ class RuntimeObservation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class OperatorSession(Base):
+    """Persistent platform-level Agent conversation spanning findings and artifacts."""
+
+    __tablename__ = "operator_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    primary_scan_id: Mapped[str | None] = mapped_column(
+        ForeignKey("scans.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("investigation_tasks.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    title: Mapped[str] = mapped_column(String(512))
+    instruction: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), default="idle", index=True)
+    workspace_path: Mapped[str] = mapped_column(Text, default="")
+    thread_id: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
+    scope_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class OperatorTurn(Base):
+    __tablename__ = "operator_turns"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("operator_sessions.id", ondelete="CASCADE"), index=True
+    )
+    instruction: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    device_mode: Mapped[str] = mapped_column(String(16), default="auto")
+    thread_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    turn_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    receipt_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class IndexedArtifact(Base):
+    """Searchable, immutable copy of a PoC or other useful Agent product."""
+
+    __tablename__ = "indexed_artifacts"
+    __table_args__ = (UniqueConstraint("index_key", name="uq_indexed_artifact_key"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    index_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    artifact_type: Mapped[str] = mapped_column(String(64), index=True)
+    name: Mapped[str] = mapped_column(String(1024))
+    stored_path: Mapped[str] = mapped_column(Text)
+    source_path: Mapped[str] = mapped_column(Text)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    scan_id: Mapped[str | None] = mapped_column(
+        ForeignKey("scans.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("investigation_tasks.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    finding_id: Mapped[str | None] = mapped_column(
+        ForeignKey("findings.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    operator_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("operator_sessions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class ValidationFixture(Base):
     """Operator-provided account/session/canary state for repeatable dynamic tests."""
 

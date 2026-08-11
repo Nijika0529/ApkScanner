@@ -39,7 +39,7 @@ import { MarkdownContent } from "./components/MarkdownContent"
 import { Badge, Button, Card, Dialog, DialogContent, DialogDescription, DialogTitle, Progress, Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui"
 import { cn, formatDate, shortHash, statusLabel } from "./lib"
 import { markdownToPlainText } from "./markdown"
-import type { AdbDevice, AgentAudit, ArtifactGraph, BenchmarkEvaluation, CoverageItem, EntryPoint, Finding, Health, InvestigationTask, InvestigatorChoice, PatternMatch, Scan, ScanEvent, SecurityHypothesis, SecuritySnapshot, VersionDiff } from "./types"
+import type { AdbDevice, AgentAudit, ArtifactGraph, BenchmarkEvaluation, CoverageItem, EntryPoint, Finding, FindingReport, Health, IndexedArtifact, InvestigationTask, InvestigatorChoice, OperatorSession, PatternMatch, Scan, ScanEvent, SecurityHypothesis, SecuritySnapshot, VersionDiff } from "./types"
 
 const severityTone = {
   critical: "danger",
@@ -174,6 +174,8 @@ function App() {
   const [deleteTarget, setDeleteTarget] = useState<Scan | null>(null)
   const [freshRunTarget, setFreshRunTarget] = useState<Scan | null>(null)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
+  const [operatorOpen, setOperatorOpen] = useState(false)
+  const [operatorFinding, setOperatorFinding] = useState<Finding | null>(null)
   const detailRequestRef = useRef(0)
   const liveRequestRef = useRef(0)
   const latestEventIdRef = useRef(0)
@@ -430,17 +432,19 @@ function App() {
           </div>
           <div className="flex items-center gap-2">
             {detail && <Badge tone={statusTone(detail.scan.status)}><span className={cn("mr-1.5 h-1.5 w-1.5 rounded-full", detail.scan.status === "final" ? "bg-emerald-400" : "animate-pulse bg-current motion-reduce:animate-none")} />{statusLabel(detail.scan.status)}</Badge>}
+            <Button variant="secondary" size="sm" onClick={() => { setOperatorFinding(null); setOperatorOpen(true) }} disabled={!detail}><Bot className="h-3.5 w-3.5" /><span className="hidden sm:inline">平台 Agent</span></Button>
             <Button variant="secondary" size="sm" onClick={() => selectedId && void refreshDetail(selectedId)} disabled={!selectedId} aria-label="刷新数据"><RefreshCw className="h-3.5 w-3.5" /><span className="hidden sm:inline">刷新</span></Button>
           </div>
         </header>
         <div className="mx-auto max-w-[1500px] p-4 sm:p-6 lg:p-8">
           {error && <div role="alert" className="mb-6 flex items-start gap-3 rounded-xl border border-rose-500/35 bg-rose-500/10 p-4 text-sm text-rose-800"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /><span>{error}</span><button className="ml-auto" onClick={() => setError(null)} aria-label="关闭错误"><X className="h-4 w-4" /></button></div>}
-          {loading && !detail ? <LoadingState /> : detail ? <ScanDetailView data={detail} health={health} subscribeEvents={subscribeEvents} onRefresh={() => refreshDetail(detail.scan.id)} onDelete={() => setDeleteTarget(detail.scan)} onFreshRun={() => setFreshRunTarget(detail.scan)} onVersionCreated={onUploaded} /> : <EmptyState onUpload={() => setUploadOpen(true)} />}
+          {loading && !detail ? <LoadingState /> : detail ? <ScanDetailView data={detail} health={health} subscribeEvents={subscribeEvents} onRefresh={() => refreshDetail(detail.scan.id)} onDelete={() => setDeleteTarget(detail.scan)} onFreshRun={() => setFreshRunTarget(detail.scan)} onVersionCreated={onUploaded} onOpenOperator={(finding) => { setOperatorFinding(finding ?? null); setOperatorOpen(true) }} /> : <EmptyState onUpload={() => setUploadOpen(true)} />}
         </div>
       </main>
       <UploadDialog open={uploadOpen} onOpenChange={setUploadOpen} onUploaded={onUploaded} health={health} />
       <DeleteScanDialog scan={deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)} onDeleted={onDeleted} />
       <FreshRunDialog scan={freshRunTarget} onOpenChange={(open) => !open && setFreshRunTarget(null)} onCreated={async (scan) => { setFreshRunTarget(null); await onUploaded(scan) }} />
+      <OperatorDialog open={operatorOpen} onOpenChange={setOperatorOpen} scan={detail?.scan ?? null} finding={operatorFinding} onFindingUpdated={async () => { if (detail) await refreshDetail(detail.scan.id) }} />
     </div>
   )
 }
@@ -481,7 +485,7 @@ function Sidebar({ scans, selectedId, health, onSelect, onUpload }: { scans: Sca
   )
 }
 
-function ScanDetailView({ data, health, subscribeEvents, onRefresh, onDelete, onFreshRun, onVersionCreated }: { data: DetailData; health: Health | null; subscribeEvents: (subscriber: ScanEventSubscriber) => () => void; onRefresh: () => Promise<void>; onDelete: () => void; onFreshRun: () => void; onVersionCreated: (scan: Scan) => Promise<void> }) {
+function ScanDetailView({ data, health, subscribeEvents, onRefresh, onDelete, onFreshRun, onVersionCreated, onOpenOperator }: { data: DetailData; health: Health | null; subscribeEvents: (subscriber: ScanEventSubscriber) => () => void; onRefresh: () => Promise<void>; onDelete: () => void; onFreshRun: () => void; onVersionCreated: (scan: Scan) => Promise<void>; onOpenOperator: (finding?: Finding) => void }) {
   const { scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations } = data
   const [versionData, setVersionData] = useState<{ snapshot: SecuritySnapshot | null; diff: VersionDiff | null; matches: PatternMatch[] } | null>(null)
   const [versionLoading, setVersionLoading] = useState(false)
@@ -585,9 +589,9 @@ function ScanDetailView({ data, health, subscribeEvents, onRefresh, onDelete, on
           <TabsContent value="overview"><Overview scan={scan} health={health} coverage={coverage} /></TabsContent>
           <TabsContent value="assets">{artifactGraphLoading ? <LoadingState /> : artifactGraphError ? <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">{artifactGraphError}<Button className="ml-3" variant="secondary" size="sm" onClick={() => { setArtifactGraphLoaded(false); void loadArtifactGraph() }}>重试</Button></div> : artifactGraph ? <ArtifactGraphView graph={artifactGraph} /> : <EmptyRow text={artifactGraphLoaded ? "当前扫描没有资产图谱" : "正在准备资产图谱"} />}</TabsContent>
           <TabsContent value="entries"><EntryPoints entries={entries} /></TabsContent>
-          <TabsContent value="findings"><Findings findings={findings} verificationCandidates={verificationCandidates} provenanceByFinding={findingProvenance} scanStatus={scan.status} onRefresh={onRefresh} /></TabsContent>
-          <TabsContent value="proof-backlog"><ProofBacklog signals={verificationCandidates} tasks={tasks} provenanceByFinding={findingProvenance} onRefresh={onRefresh} /></TabsContent>
-          <TabsContent value="signals"><Signals signals={staticSignals} provenanceByFinding={findingProvenance} onRefresh={onRefresh} /></TabsContent>
+          <TabsContent value="findings"><Findings findings={findings} verificationCandidates={verificationCandidates} provenanceByFinding={findingProvenance} scanStatus={scan.status} onRefresh={onRefresh} onOpenOperator={onOpenOperator} /></TabsContent>
+          <TabsContent value="proof-backlog"><ProofBacklog signals={verificationCandidates} tasks={tasks} provenanceByFinding={findingProvenance} onRefresh={onRefresh} onOpenOperator={onOpenOperator} /></TabsContent>
+          <TabsContent value="signals"><Signals signals={staticSignals} provenanceByFinding={findingProvenance} onRefresh={onRefresh} onOpenOperator={onOpenOperator} /></TabsContent>
           <TabsContent value="versions">{versionLoading ? <LoadingState /> : versionLoadError ? <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">{versionLoadError}<Button className="ml-3" variant="secondary" size="sm" onClick={() => void loadVersionData()}>重试</Button></div> : versionData ? <VersionEvolution scan={scan} snapshot={versionData.snapshot} diff={versionData.diff} matches={versionData.matches} entries={entries} onCreated={onVersionCreated} /> : <EmptyRow text="正在准备版本演进数据" />}</TabsContent>
           <TabsContent value="coverage"><CoverageMatrix coverage={coverage} /></TabsContent>
           <TabsContent value="tasks"><Tasks scan={scan} tasks={tasks} entries={entries} audits={audits} subscribeEvents={subscribeEvents} health={health} onRefresh={onRefresh} /></TabsContent>
@@ -872,7 +876,7 @@ function VersionEvolution({ scan, snapshot, diff, matches, entries, onCreated }:
   </div>
 }
 
-function Findings({ findings, verificationCandidates, provenanceByFinding, scanStatus, onRefresh }: { findings: Finding[]; verificationCandidates: Finding[]; provenanceByFinding: Map<string, FindingProvenance>; scanStatus: string; onRefresh: () => Promise<void> }) {
+function Findings({ findings, verificationCandidates, provenanceByFinding, scanStatus, onRefresh, onOpenOperator }: { findings: Finding[]; verificationCandidates: Finding[]; provenanceByFinding: Map<string, FindingProvenance>; scanStatus: string; onRefresh: () => Promise<void>; onOpenOperator: (finding: Finding) => void }) {
   const sorted = [...findings].sort((a, b) => ["critical", "high", "medium", "low", "info"].indexOf(a.severity) - ["critical", "high", "medium", "low", "info"].indexOf(b.severity))
   const pending = [...verificationCandidates].sort((a, b) => ["critical", "high", "medium", "low", "info"].indexOf(a.severity) - ["critical", "high", "medium", "low", "info"].indexOf(b.severity))
   const isFinal = ["final", "failed"].includes(scanStatus)
@@ -880,24 +884,24 @@ function Findings({ findings, verificationCandidates, provenanceByFinding, scanS
     <section className="space-y-3">
       <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm leading-relaxed text-emerald-950">这里只展示平台 Oracle 已证明具体安全影响、且所有 Evidence ID 均可核验的漏洞。静态规则与 AI 静态判断不会计入 Finding。</div>
       {!isFinal && <div className="rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-sm leading-relaxed text-cyan-950">扫描尚未完成，后续动态证明可能继续增加 Finding。</div>}
-      {sorted.map((finding) => <FindingCard key={finding.id} finding={finding} provenance={provenanceByFinding.get(finding.id)} onRefresh={onRefresh} />)}
+      {sorted.map((finding) => <FindingCard key={finding.id} finding={finding} provenance={provenanceByFinding.get(finding.id)} onRefresh={onRefresh} onOpenOperator={onOpenOperator} />)}
       {!findings.length && <EmptyRow text="尚无经过动态证据证明的 Finding" />}
     </section>
     {pending.length > 0 && <section className="space-y-3 border-t border-slate-200 pt-6">
       <div className="flex flex-col gap-3 rounded-xl border border-orange-200 bg-orange-50 px-4 py-4 sm:flex-row sm:items-center sm:justify-between">
         <div><div className="flex items-center gap-2"><Bot className="h-4 w-4 text-orange-700" /><h3 className="font-bold text-orange-950">待验证风险</h3><Badge tone="warning">{pending.length}</Badge></div><p className="mt-2 text-sm leading-6 text-orange-900">以下风险已有静态证据支持，但尚未获得平台危害 Oracle。它们不会计入上方已证实 Finding 数量；可在“待验证风险”Tab 中重新验证。</p></div>
       </div>
-      {pending.map((finding) => <FindingCard key={`pending-${finding.id}`} finding={finding} provenance={provenanceByFinding.get(finding.id)} onRefresh={onRefresh} />)}
+      {pending.map((finding) => <FindingCard key={`pending-${finding.id}`} finding={finding} provenance={provenanceByFinding.get(finding.id)} onRefresh={onRefresh} onOpenOperator={onOpenOperator} />)}
     </section>}
   </div>
 }
 
-function Signals({ signals, provenanceByFinding, onRefresh }: { signals: Finding[]; provenanceByFinding: Map<string, FindingProvenance>; onRefresh: () => Promise<void> }) {
+function Signals({ signals, provenanceByFinding, onRefresh, onOpenOperator }: { signals: Finding[]; provenanceByFinding: Map<string, FindingProvenance>; onRefresh: () => Promise<void>; onOpenOperator: (finding: Finding) => void }) {
   const sorted = [...signals].sort((a, b) => ["critical", "high", "medium", "low", "info"].indexOf(a.severity) - ["critical", "high", "medium", "low", "info"].indexOf(b.severity))
-  return <div className="space-y-3"><div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">这些是静态规则、AI 静态支持或尚未完成影响证明的调查线索，用于指导后续验证；它们不计入最终 Finding，也不代表漏洞已经成立。</div>{sorted.map((finding) => <FindingCard key={finding.id} finding={finding} provenance={provenanceByFinding.get(finding.id)} onRefresh={onRefresh} />)}{!signals.length && <EmptyRow text="没有待验证线索" />}</div>
+  return <div className="space-y-3"><div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">这些是静态规则、AI 静态支持或尚未完成影响证明的调查线索，用于指导后续验证；它们不计入最终 Finding，也不代表漏洞已经成立。</div>{sorted.map((finding) => <FindingCard key={finding.id} finding={finding} provenance={provenanceByFinding.get(finding.id)} onRefresh={onRefresh} onOpenOperator={onOpenOperator} />)}{!signals.length && <EmptyRow text="没有待验证线索" />}</div>
 }
 
-function ProofBacklog({ signals, tasks, provenanceByFinding, onRefresh }: { signals: Finding[]; tasks: InvestigationTask[]; provenanceByFinding: Map<string, FindingProvenance>; onRefresh: () => Promise<void> }) {
+function ProofBacklog({ signals, tasks, provenanceByFinding, onRefresh, onOpenOperator }: { signals: Finding[]; tasks: InvestigationTask[]; provenanceByFinding: Map<string, FindingProvenance>; onRefresh: () => Promise<void>; onOpenOperator: (finding: Finding) => void }) {
   const [retrying, setRetrying] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const tasksById = new Map(tasks.map((task) => [task.id, task]))
@@ -935,7 +939,7 @@ function ProofBacklog({ signals, tasks, provenanceByFinding, onRefresh }: { sign
           <div><div className="flex flex-wrap items-center gap-2"><Badge tone="warning">待动态证明</Badge><Badge>{stateLabel}</Badge></div>{gaps.length > 0 && <p className="mt-2 text-xs leading-5 text-orange-900">{gaps.slice(0, 2).join("；")}</p>}</div>
           {task && isTerminalTask(task.status) && <Button variant="secondary" size="sm" onClick={() => retry(task)} disabled={retrying === task.id}>{retrying === task.id ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}重新验证</Button>}
         </div>
-        <FindingCard finding={signal} provenance={provenanceByFinding.get(signal.id)} onRefresh={onRefresh} />
+        <FindingCard finding={signal} provenance={provenanceByFinding.get(signal.id)} onRefresh={onRefresh} onOpenOperator={onOpenOperator} />
       </div>
     })}
     {!sorted.length && <EmptyRow text="没有等待动态证明的风险候选" />}
@@ -1007,9 +1011,66 @@ function isVerificationCandidate(signal: Finding) {
     || signal.status === "supported_static"
 }
 
-function FindingCard({ finding, provenance, onRefresh }: { finding: Finding; provenance?: FindingProvenance; onRefresh: () => Promise<void> }) {
+function findingReport(finding: Finding): FindingReport | null {
+  const value = asRecord(finding.metadata_json.report)
+  const verification = asRecord(value?.verification)
+  if (!value || !verification) {
+    const confirmed = finding.status === "reproduced_blackbox"
+    const legacyStatus: FindingReport["verification"]["status"] = confirmed
+      ? "confirmed"
+      : finding.status === "refuted_static" || finding.status === "false_positive"
+        ? "refuted"
+        : finding.status === "inconclusive" || finding.status === "not_reproduced"
+          ? "inconclusive"
+          : "pending"
+    return {
+      schema_version: "1.0",
+      kind: confirmed ? "finding" : "pending_risk",
+      title: finding.title,
+      conclusion: markdownToPlainText(finding.description).slice(0, 600) || finding.title,
+      conditions: [],
+      attack_chain: [],
+      verification: {
+        status: legacyStatus,
+        established_facts: [],
+        missing_proof: confirmed || legacyStatus === "refuted" ? null : "历史记录未保存结构化危害证明。",
+        next_step: confirmed || legacyStatus === "refuted" ? null : "交给平台 Agent 读取原任务和 PoC，补充动态证据。",
+        evidence_ids: finding.evidence_ids,
+        proof_attempt_ids: stringValues(finding.metadata_json.proof_attempt_ids),
+      },
+      remediation: markdownToPlainText(finding.remediation).split(/\n+/).filter(Boolean).slice(0, 2),
+      task_id: textValue(finding.metadata_json.task_id) ?? "",
+      hypothesis_id: textValue(finding.metadata_json.hypothesis_id) ?? "",
+    }
+  }
+  const kind = textValue(value?.kind)
+  const status = textValue(verification?.status)
+  if (!["finding", "pending_risk"].includes(kind ?? "") || !["confirmed", "pending", "refuted", "inconclusive"].includes(status ?? "")) return null
+  return {
+    schema_version: "1.0",
+    kind: kind as FindingReport["kind"],
+    title: textValue(value.title) ?? finding.title,
+    conclusion: textValue(value.conclusion) ?? finding.description,
+    conditions: stringValues(value.conditions),
+    attack_chain: stringValues(value.attack_chain),
+    verification: {
+      status: status as FindingReport["verification"]["status"],
+      established_facts: stringValues(verification.established_facts),
+      missing_proof: textValue(verification.missing_proof) ?? null,
+      next_step: textValue(verification.next_step) ?? null,
+      evidence_ids: stringValues(verification.evidence_ids),
+      proof_attempt_ids: stringValues(verification.proof_attempt_ids),
+    },
+    remediation: stringValues(value.remediation),
+    task_id: textValue(value.task_id) ?? "",
+    hypothesis_id: textValue(value.hypothesis_id) ?? "",
+  }
+}
+
+function FindingCard({ finding, provenance, onRefresh, onOpenOperator }: { finding: Finding; provenance?: FindingProvenance; onRefresh: () => Promise<void>; onOpenOperator: (finding: Finding) => void }) {
   const [open, setOpen] = useState(false)
   const [reviewOpen, setReviewOpen] = useState(false)
+  const report = findingReport(finding)
   return (
     <article className="content-auto rounded-xl border border-slate-200 bg-slate-50/70">
       <button
@@ -1024,7 +1085,7 @@ function FindingCard({ finding, provenance, onRefresh }: { finding: Finding; pro
             <Badge tone={statusTone(finding.status)}>{statusLabel(finding.status)}</Badge>
           </div>
           <p className="mt-1.5 line-clamp-2 text-sm leading-relaxed text-slate-500">
-            {markdownToPlainText(finding.description)}
+            {report?.conclusion ?? markdownToPlainText(finding.description)}
           </p>
           <div className="mt-3 flex flex-wrap gap-3 text-[11px] text-slate-600">
             <span>{finding.masvs}</span>
@@ -1049,7 +1110,14 @@ function FindingCard({ finding, provenance, onRefresh }: { finding: Finding; pro
       </button>
       {open && (
         <div className="border-t border-slate-200 px-4 py-5 sm:px-5">
-          <div className="grid gap-6 xl:grid-cols-[minmax(0,1.4fr)_minmax(18rem,0.6fr)]">
+          {report ? <div className="grid gap-4 lg:grid-cols-2">
+            <section className="rounded-xl border border-slate-200 bg-white p-4 lg:col-span-2"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">结论</p><p className="mt-2 text-sm leading-6 text-slate-800">{report.conclusion}</p></section>
+            <section className="rounded-xl border border-slate-200 bg-white p-4"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">触发条件</p><ul className="mt-2 space-y-1 text-sm leading-6 text-slate-700">{report.conditions.length ? report.conditions.map((item) => <li key={item}>· {item}</li>) : <li>· 无额外前置条件记录</li>}</ul></section>
+            <section className="rounded-xl border border-slate-200 bg-white p-4"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">验证状态</p><div className="mt-2 flex items-center gap-2"><Badge tone={statusTone(report.verification.status)}>{statusLabel(report.verification.status)}</Badge><span className="text-xs text-slate-500">Evidence {report.verification.evidence_ids.length}</span></div>{report.verification.established_facts.map((item) => <p key={item} className="mt-2 text-sm leading-6 text-slate-700">· {item}</p>)}</section>
+            {report.attack_chain.length > 0 && <section className="rounded-xl border border-cyan-200 bg-cyan-50/60 p-4 lg:col-span-2"><p className="text-xs font-semibold uppercase tracking-wider text-cyan-900">攻击链</p><div className="mt-3 flex flex-wrap items-center gap-2">{report.attack_chain.map((item, index) => <div key={`${index}-${item}`} className="contents"><span className="max-w-full break-all rounded-lg border border-cyan-200 bg-white px-3 py-2 font-mono text-xs text-cyan-950">{item}</span>{index < report.attack_chain.length - 1 && <ChevronRight className="h-4 w-4 text-cyan-600" />}</div>)}</div></section>}
+            {(report.verification.missing_proof || report.verification.next_step) && <section className="rounded-xl border border-orange-200 bg-orange-50 p-4 lg:col-span-2"><p className="text-xs font-semibold uppercase tracking-wider text-orange-900">待补验证</p>{report.verification.missing_proof && <p className="mt-2 text-sm leading-6 text-orange-950">缺口：{report.verification.missing_proof}</p>}{report.verification.next_step && <p className="mt-1 text-sm leading-6 text-orange-900">下一步：{report.verification.next_step}</p>}</section>}
+            <section className="rounded-xl border border-slate-200 bg-white p-4 lg:col-span-2"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">修复建议</p><ol className="mt-2 space-y-1 text-sm leading-6 text-slate-700">{report.remediation.map((item, index) => <li key={item}>{index + 1}. {item}</li>)}</ol></section>
+          </div> : <div className="grid gap-6 xl:grid-cols-[minmax(0,1.4fr)_minmax(18rem,0.6fr)]">
             <div className="min-w-0">
               <p className="mb-3 text-xs font-semibold uppercase tracking-wider text-slate-500">风险说明</p>
               <MarkdownContent>{finding.description}</MarkdownContent>
@@ -1058,7 +1126,7 @@ function FindingCard({ finding, provenance, onRefresh }: { finding: Finding; pro
               <p className="mb-3 text-xs font-semibold uppercase tracking-wider text-slate-500">修复建议</p>
               <MarkdownContent>{finding.remediation}</MarkdownContent>
             </div>
-          </div>
+          </div>}
           <FindingProvenancePanel provenance={provenance} />
           {finding.evidence_ids.length > 0 && (
             <div className="mt-5">
@@ -1074,7 +1142,7 @@ function FindingCard({ finding, provenance, onRefresh }: { finding: Finding; pro
           )}
           <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
             <p className="font-mono text-xs text-slate-600">rule · {finding.rule_id} · evidence {finding.evidence_ids.length}</p>
-            <Button variant="secondary" size="sm" onClick={() => setReviewOpen(true)}>人工审核</Button>
+            <div className="flex gap-2"><Button variant="secondary" size="sm" onClick={() => onOpenOperator(finding)}><Bot className="h-3.5 w-3.5" />交给平台 Agent</Button><Button variant="secondary" size="sm" onClick={() => setReviewOpen(true)}>人工审核</Button></div>
           </div>
         </div>
       )}
@@ -1132,6 +1200,103 @@ function ReviewDialog({ finding, open, onOpenChange, onReviewed }: { finding: Fi
     }
   }
   return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent><DialogTitle className="text-xl font-bold text-slate-950">审核 Finding</DialogTitle><DialogDescription className="mt-2 text-sm text-slate-600">Agent 和规则结论不会自动成为发布门禁，请记录人工判断依据。</DialogDescription><form className="mt-6 space-y-5" onSubmit={submit}><fieldset><legend className="mb-3 text-sm font-semibold text-slate-800">审核结论</legend><div className="grid grid-cols-3 gap-2">{([['accepted','接受'],['false_positive','误报'],['candidate','待确认']] as const).map(([value,label]) => <label key={value} className={cn("cursor-pointer rounded-lg border p-3 text-center text-sm", status === value ? "border-cyan-400 bg-cyan-400/10 text-cyan-800" : "border-slate-300 text-slate-600")}><input type="radio" name="status" value={value} checked={status === value} onChange={() => setStatus(value)} className="sr-only" />{label}</label>)}</div></fieldset><label className="block"><span className="mb-2 block text-sm font-semibold text-slate-800">审核备注 <span className="text-rose-700">*</span></span><textarea required minLength={1} maxLength={4000} value={note} onChange={(event) => setNote(event.target.value)} rows={5} className="field resize-y" placeholder="说明接受、误报或待确认的依据" /></label>{error && <p role="alert" className="text-sm text-rose-700">{error}</p>}<div className="flex justify-end gap-2"><Button type="button" variant="ghost" onClick={() => onOpenChange(false)} disabled={saving}>取消</Button><Button type="submit" disabled={saving || !note.trim()}>{saving && <LoaderCircle className="h-4 w-4 animate-spin" />}保存审核</Button></div></form></DialogContent></Dialog>
+}
+
+function OperatorDialog({ open, onOpenChange, scan, finding, onFindingUpdated }: { open: boolean; onOpenChange: (open: boolean) => void; scan: Scan | null; finding: Finding | null; onFindingUpdated: () => Promise<void> }) {
+  const [sessions, setSessions] = useState<OperatorSession[]>([])
+  const [selected, setSelected] = useState<OperatorSession | null>(null)
+  const [artifacts, setArtifacts] = useState<IndexedArtifact[]>([])
+  const [instruction, setInstruction] = useState("")
+  const [deviceMode, setDeviceMode] = useState<"auto" | "none" | "required">("auto")
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const completionRef = useRef<string | null>(null)
+
+  const loadSessions = useCallback(async () => {
+    const values = await api.operatorSessions()
+    const scoped = scan ? values.filter((item) => item.primary_scan_id === scan.id) : values
+    setSessions(scoped)
+    return scoped
+  }, [scan])
+
+  useEffect(() => {
+    if (!open) return
+    setError(null)
+    if (finding) {
+      setSelected(null)
+      setInstruction(`读取 Finding ${finding.id} 的验证报告和历史工作区，找到已有 PoC；如可复用，请在当前设备重新安装执行，补充证据并更新该 Finding。`)
+    } else {
+      setInstruction("")
+    }
+    void loadSessions().catch((reason: Error) => setError(reason.message))
+  }, [finding, loadSessions, open])
+
+  useEffect(() => {
+    if (!open || !selected || !["queued", "running", "canceling"].includes(selected.status)) return
+    const timer = window.setInterval(() => {
+      void api.operatorSession(selected.id).then(async (value) => {
+        setSelected(value)
+        setSessions((items) => [value, ...items.filter((item) => item.id !== value.id)])
+        if (!["queued", "running", "canceling"].includes(value.status)) {
+          setArtifacts(await api.operatorArtifacts({ sessionId: value.id }))
+          if (completionRef.current !== value.updated_at) {
+            completionRef.current = value.updated_at
+            await onFindingUpdated()
+          }
+        }
+      }).catch((reason: Error) => setError(reason.message))
+    }, 2_000)
+    return () => window.clearInterval(timer)
+  }, [onFindingUpdated, open, selected])
+
+  async function submit(event: FormEvent) {
+    event.preventDefault()
+    if (!instruction.trim() || !scan) return
+    setSubmitting(true)
+    setError(null)
+    try {
+      const value = selected
+        ? await api.continueOperatorSession(selected.id, instruction.trim(), deviceMode)
+        : await api.createOperatorSession({
+          instruction: instruction.trim(),
+          scan_id: scan.id,
+          finding_ids: finding ? [finding.id] : [],
+          device_mode: deviceMode,
+        })
+      setSelected(value)
+      setSessions((items) => [value, ...items.filter((item) => item.id !== value.id)])
+      setInstruction("")
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "平台 Agent 命令提交失败")
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  async function selectSession(value: OperatorSession) {
+    setSelected(value)
+    setError(null)
+    try {
+      const [detail, indexed] = await Promise.all([
+        api.operatorSession(value.id),
+        api.operatorArtifacts({ sessionId: value.id }),
+      ])
+      setSelected(detail)
+      setArtifacts(indexed)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "读取 Operator 会话失败")
+    }
+  }
+
+  const active = selected && ["queued", "running", "canceling"].includes(selected.status)
+  return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent className="max-h-[90vh] max-w-6xl overflow-hidden p-0"><div className="grid min-h-[38rem] md:grid-cols-[17rem_minmax(0,1fr)]">
+    <aside className="border-b border-slate-200 bg-slate-50 p-4 md:border-b-0 md:border-r"><div className="flex items-center justify-between"><div><DialogTitle className="text-lg font-bold text-slate-950">平台 Agent</DialogTitle><DialogDescription className="mt-1 text-xs text-slate-500">持久 Thread · Artifact/PoC 索引 · 动态 ADB</DialogDescription></div><Button size="icon" variant="ghost" onClick={() => { setSelected(null); setArtifacts([]); setInstruction("") }} title="新建会话"><Plus className="h-4 w-4" /></Button></div><div className="mt-5 max-h-[30rem] space-y-2 overflow-y-auto">{sessions.map((item) => <button key={item.id} type="button" onClick={() => void selectSession(item)} className={cn("w-full rounded-lg border p-3 text-left", selected?.id === item.id ? "border-violet-300 bg-violet-50" : "border-slate-200 bg-white hover:bg-slate-50")}><div className="flex items-center justify-between gap-2"><p className="line-clamp-2 text-xs font-semibold text-slate-800">{item.title}</p><Badge tone={statusTone(item.status)}>{statusLabel(item.status)}</Badge></div><p className="mt-2 font-mono text-[10px] text-slate-400">{shortHash(item.id)} · {formatDate(item.created_at)}</p></button>)}{!sessions.length && <p className="py-8 text-center text-xs text-slate-500">当前 Scan 还没有 Operator 会话</p>}</div></aside>
+    <section className="flex min-w-0 flex-col overflow-hidden"><div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-5">
+      {finding && !selected && <div className="rounded-xl border border-orange-200 bg-orange-50 p-4"><p className="text-xs font-semibold text-orange-900">当前委派 Finding</p><p className="mt-2 text-sm font-semibold text-orange-950">{finding.title}</p><p className="mt-1 font-mono text-[10px] text-orange-700">{finding.id}</p></div>}
+      {selected ? <><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-sm font-bold text-slate-900">{selected.title}</p><p className="mt-1 font-mono text-[10px] text-slate-400">Thread {selected.thread_id ?? "等待建立"} · workspace {selected.workspace_path || "等待准备"}</p></div><div className="flex items-center gap-2"><Badge tone={statusTone(selected.status)}>{statusLabel(selected.status)}</Badge>{active && <Button variant="danger" size="sm" onClick={() => void api.cancelOperatorSession(selected.id)}>停止</Button>}</div></div><div className="space-y-3">{selected.turns.map((turn) => { const turnReceipt = asRecord(turn.receipt_json); return <article key={turn.id} className="rounded-xl border border-slate-200 bg-white p-4"><div className="flex items-center justify-between gap-3"><p className="text-xs font-semibold text-violet-800">用户命令</p><Badge tone={statusTone(turn.status)}>{statusLabel(turn.status)}</Badge></div><p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-800">{turn.instruction}</p>{textValue(turnReceipt?.summary) && <div className="mt-3 border-t border-slate-100 pt-3"><p className="text-xs font-semibold text-emerald-800">执行回执</p><p className="mt-2 text-sm leading-6 text-slate-700">{textValue(turnReceipt?.summary)}</p>{stringValues(turnReceipt?.observations).map((item) => <p key={item} className="mt-1 text-xs leading-5 text-slate-600">· {item}</p>)}</div>}{turn.error && <p className="mt-3 text-xs text-rose-700">{turn.error}</p>}</article>})}</div>{artifacts.length > 0 && <section className="rounded-xl border border-cyan-200 bg-cyan-50/50 p-4"><p className="text-xs font-semibold uppercase tracking-wider text-cyan-900">本会话产物</p><div className="mt-3 grid gap-2 sm:grid-cols-2">{artifacts.map((item) => <a key={item.id} href={`/api/v1/operator/artifacts/${item.id}/download`} className="rounded-lg border border-cyan-200 bg-white p-3 hover:border-cyan-400"><p className="truncate text-xs font-semibold text-cyan-950">{item.name}</p><p className="mt-1 text-[10px] text-cyan-700">{item.artifact_type} · {(item.size_bytes / 1024).toFixed(1)} KB</p></a>)}</div></section>}</> : <div className="grid min-h-72 place-items-center rounded-xl border border-dashed border-slate-300 bg-slate-50 text-center"><div><Bot className="mx-auto h-10 w-10 text-violet-500" /><p className="mt-3 text-sm font-semibold text-slate-800">直接告诉平台 Agent 要完成什么</p><p className="mt-1 text-xs text-slate-500">它可以读取报告、复用历史 PoC、构建 APK、申请设备并回写 Evidence。</p></div></div>}
+      {error && <p role="alert" className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}
+    </div><form className="border-t border-slate-200 bg-white p-4" onSubmit={submit}><textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} rows={3} maxLength={20_000} className="field resize-none" placeholder={selected ? "继续给这个 Agent 下达命令…" : "例如：读取这个 Finding 和历史 PoC，在真机重新复现并更新报告"} disabled={!scan || Boolean(active)} /><div className="mt-3 flex flex-wrap items-center justify-between gap-3"><label className="flex items-center gap-2 text-xs text-slate-600">设备策略<select value={deviceMode} onChange={(event) => setDeviceMode(event.target.value as typeof deviceMode)} className="field h-9 w-auto py-1"><option value="auto">有空闲设备则使用</option><option value="required">等待设备</option><option value="none">本轮不使用设备</option></select></label><Button type="submit" disabled={!instruction.trim() || !scan || submitting || Boolean(active)}>{submitting || active ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Bot className="h-4 w-4" />}{active ? "执行中" : selected ? "继续执行" : "创建并执行"}</Button></div></form></section>
+  </div></DialogContent></Dialog>
 }
 
 function CoverageMatrix({ coverage }: { coverage: CoverageItem[] }) {
@@ -1480,6 +1645,7 @@ function taskTypeLabel(taskType: string) {
     deep_link: "Deep Link handler 探索",
     static_review: "静态语义审计",
     adaptive_verification: "高权限批量验证",
+    operator: "平台 Agent 操作",
   }[taskType] ?? "导出组件探索"
 }
 

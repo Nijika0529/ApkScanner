@@ -45,7 +45,7 @@ APKScanner 的核心设计是：**平台保证覆盖和事实，Agent 负责探�
 | 真机验证 | ADB 设备池支持 USB 与 IP:Port 动态接入；一个任务在完整生命周期内独占一个 serial，并可运行 Probe 或 Agent 生成的普通 App UID PoC |
 | 证据闭环 | 持久化 Hypothesis、Argument、ProofAttempt、Evidence、Oracle 和 Verdict；模型文字不能自证漏洞成立 |
 | 版本演进 | 内容寻址复用 JADX/Apktool/代码索引，生成 Manifest、DEX、Native、资源语义 Diff，并在新版本重新构建和回放历史 PoC |
-| 审计控制台 | FastAPI + React/TypeScript；支持实时任务、人工复核、版本比较、运行时观察以及 JSON/HTML/SARIF 报告 |
+| 审计控制台 | FastAPI + React/TypeScript；支持实时任务、结构化 Finding、平台 Operator、Artifact/PoC 索引、版本比较以及 JSON/HTML/SARIF 报告 |
 
 重点覆盖的 Android 攻击链包括：
 
