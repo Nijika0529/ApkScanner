@@ -37,6 +37,8 @@ def test_codex_overrides_use_responses_env_key_and_filter_secrets() -> None:
         base_url="https://api.deepseek.com/",
         model_catalog_path="/opt/apk-scanner/config/deepseek-models.json",
         web_search="live",
+        ida_mcp_url="http://apkscanner-host:8745/mcp",
+        ida_mcp_tool_timeout_seconds=1_800,
     )
     rendered = "\n".join(overrides)
 
@@ -53,6 +55,9 @@ def test_codex_overrides_use_responses_env_key_and_filter_secrets() -> None:
     assert '"APKSCANNER_PROOF_*"' in rendered
     assert '"APKSCANNER_OBSERVATION_*"' in rendered
     assert '"DEEPSEEK_API_KEY"' in rendered
+    assert 'mcp_servers.ida-headless.url="http://apkscanner-host:8745/mcp"' in rendered
+    assert "mcp_servers.ida-headless.required=false" in rendered
+    assert "mcp_servers.ida-headless.tool_timeout_sec=1800" in rendered
     assert "^APKSCANNER" not in rendered
     assert not any("sk-" in item for item in overrides)
 

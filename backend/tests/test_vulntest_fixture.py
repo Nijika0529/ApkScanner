@@ -6,6 +6,7 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
 
+from apkscanner.poc import PocBuilder
 from apkscanner.schemas import BenchmarkSpec
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -134,18 +135,17 @@ def test_vulntest_source_contains_real_attack_paths_and_safe_control() -> None:
     assert "->onTransact" in binder and '"service-secret=hunter2"' in binder
 
 
-def test_platform_probe_supports_shell_gated_binder_transactions() -> None:
-    probe_root = REPOSITORY_ROOT / "probe" / "app" / "src" / "main"
-    manifest = (probe_root / "AndroidManifest.xml").read_text(encoding="utf-8")
-    receiver = (
-        probe_root / "java" / "io" / "apkscanner" / "probe" / "ProbeReceiver.java"
-    ).read_text(encoding="utf-8")
+def test_platform_proof_harness_supports_binder_transactions() -> None:
+    source = PocBuilder._platform_proof_source(
+        package_name="io.apkscanner.poc.proof_fixture",
+        encoded_request="e30=",
+    )
 
-    assert 'android:permission="android.permission.DUMP"' in manifest
-    assert "android.permission.QUERY_ALL_PACKAGES" in manifest
-    assert '"binder_transact"' in receiver
-    assert '"binder_script"' in receiver
-    assert "applyBinderWrites" in receiver
-    assert "readBinderReplies" in receiver
-    assert "service.transact" in receiver
-    assert 'result.put("binderReply"' in receiver
+    assert "class PlatformProofActivity extends Activity" in source
+    assert '"binder_transact"' in source
+    assert '"binder_script"' in source
+    assert "applyBinderWrites" in source
+    assert "readBinderReplies" in source
+    assert "service.transact" in source
+    assert 'result.put("binderReply"' in source
+    assert "security_impact_observed" in source

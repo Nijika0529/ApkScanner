@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import io
 import json
 import os
@@ -14,7 +16,7 @@ from xml.etree import ElementTree
 
 from .artifacts import ArtifactStore
 from .config import Settings
-from .schemas import AgentOracleSpec, AgentPocSpec
+from .schemas import AgentOracleSpec, AgentPocSpec, AgentRequestedTest
 from .tools import CommandResult, ToolRunner
 
 ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android"
@@ -147,6 +149,104 @@ class PocBuilder:
             "max_prebuilt_apk_bytes": self.settings.poc_max_apk_bytes,
             "max_source_files": 64,
         }
+
+    def materialize_proof_harness(
+        self,
+        workspace: Path,
+        request: AgentRequestedTest,
+        *,
+        entry_kind: str,
+        target_package_name: str,
+        target_component: str | None = None,
+        default_uri: str | None = None,
+        provider_authority: str | None = None,
+    ) -> AgentPocSpec:
+        """Create one disposable, platform-owned ordinary-app proof project.
+
+        Its action is fixed at build time from an already validated ``AgentRequestedTest``;
+        the device only supplies the correlation ID when launching it.
+        """
+
+        kind = entry_kind
+        component = (target_component or "").strip()
+        if component.startswith("."):
+            component = f"{target_package_name}{component}"
+        uri = request.uri
+        if kind in {"activity", "activity_alias"} and uri is not None:
+            kind = "deep_link"
+        elif kind == "deep_link":
+            uri = uri or default_uri
+        elif kind == "provider":
+            uri = uri or (f"content://{provider_authority}" if provider_authority else None)
+        if kind in {"activity", "activity_alias", "service", "receiver"} and not component:
+            raise ValueError(f"{kind} proof requires a target component")
+        if kind in {"deep_link", "provider"} and not uri:
+            raise ValueError(f"{kind} proof requires a target URI")
+
+        proof_request: dict[str, object] = {
+            "kind": kind,
+            "package": target_package_name,
+            "component": component,
+            "uri": uri,
+            "extras": request.extras,
+            "operation": request.operation,
+            "method": request.method,
+            "argument": request.argument,
+            "binder_transaction_code": request.binder_transaction_code,
+            "binder_interface_descriptor": request.binder_interface_descriptor,
+            "binder_reply_type": request.binder_reply_type,
+            "binder_read_exception": request.binder_read_exception,
+            "binder_script": (
+                [item.model_dump(mode="json") for item in request.binder_script]
+                if request.binder_script is not None
+                else None
+            ),
+            "intent_action": request.intent_action,
+            "categories": request.categories,
+        }
+        proof_request = {key: value for key, value in proof_request.items() if value is not None}
+        serialized = json.dumps(
+            proof_request,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest = hashlib.sha256(serialized).hexdigest()[:16]
+        package_name = f"io.apkscanner.poc.proof_{digest}"
+        relative_project = Path("poc") / f"platform-proof-{digest}"
+        root = workspace.resolve()
+        project = (root / relative_project).resolve()
+        poc_root = (root / "poc").resolve()
+        if not project.is_relative_to(poc_root):
+            raise ValueError("platform proof project escaped the task PoC workspace")
+        source_dir = project / "src" / Path(*package_name.split("."))
+        source_dir.mkdir(parents=True, exist_ok=True)
+        manifest = project / "AndroidManifest.xml"
+        manifest.write_text(
+            f'''<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="{ANDROID_NAMESPACE}" package="{package_name}">
+  <application android:label="APKScanner Proof" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+    <activity android:name=".PlatformProofActivity" android:exported="true" />
+  </application>
+</manifest>
+''',
+            encoding="utf-8",
+        )
+        (source_dir / "PlatformProofActivity.java").write_text(
+            self._platform_proof_source(
+                package_name=package_name,
+                encoded_request=base64.b64encode(serialized).decode("ascii"),
+            ),
+            encoding="utf-8",
+        )
+        return AgentPocSpec(
+            project_path=str(relative_project),
+            package_name=package_name,
+            launch_component=".PlatformProofActivity",
+            log_tag="APKSCANNER_POC",
+            timeout_seconds=30,
+            harness_mode="custom",
+        )
 
     def build(
         self,
@@ -1167,6 +1267,383 @@ public final class ApkScannerHarnessActivity extends Activity {{
   }}
 }}
 '''
+
+    @staticmethod
+    def _platform_proof_source(*, package_name: str, encoded_request: str) -> str:
+        """Return the platform-owned one-shot Activity used for deterministic proofs."""
+
+        template = r'''package __PACKAGE__;
+
+import android.app.Activity;
+import android.content.ComponentName;
+import android.content.ContentValues;
+import android.content.Context;
+import android.content.Intent;
+import android.content.ServiceConnection;
+import android.database.Cursor;
+import android.net.Uri;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.os.Parcel;
+import android.util.Base64;
+import android.util.Log;
+import java.nio.charset.StandardCharsets;
+import java.util.Iterator;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+public final class PlatformProofActivity extends Activity {
+  private static final String TAG = "APKSCANNER_POC";
+  private static final String REQUEST_BASE64 = "__REQUEST_BASE64__";
+  private static final long BINDER_TIMEOUT_MILLIS = 8000L;
+  private final AtomicBoolean finished = new AtomicBoolean(false);
+  private final Handler handler = new Handler(Looper.getMainLooper());
+  private JSONObject request;
+  private JSONObject result;
+  private ServiceConnection connection;
+  private boolean bound;
+
+  @Override public void onCreate(Bundle state) {
+    super.onCreate(state);
+    try {
+      request = new JSONObject(new String(
+          Base64.decode(REQUEST_BASE64, Base64.DEFAULT), StandardCharsets.UTF_8));
+      result = new JSONObject();
+      String requestId = getIntent().getStringExtra("apkscanner_request_id");
+      result.put("apkscanner_request_id", requestId);
+      result.put("requestId", requestId);
+      result.put("kind", request.getString("kind"));
+      result.put("targetPackage", request.getString("package"));
+      runProof();
+    } catch (Throwable error) {
+      fail(error);
+    }
+  }
+
+  private void runProof() throws Exception {
+    String kind = request.getString("kind");
+    String packageName = request.getString("package");
+    String component = request.optString("component", "");
+    if ("activity".equals(kind) || "activity_alias".equals(kind)) {
+      Intent target = newIntent();
+      target.setComponent(new ComponentName(packageName, component));
+      applyExtras(target, request.optJSONObject("extras"));
+      applyCategories(target, request.optJSONArray("categories"));
+      startActivity(target);
+      result.put("delivered", true);
+      succeed();
+      return;
+    }
+    if ("deep_link".equals(kind)) {
+      Uri uri = Uri.parse(request.getString("uri"));
+      Intent target = new Intent(Intent.ACTION_VIEW, uri);
+      target.setPackage(packageName);
+      applyExtras(target, request.optJSONObject("extras"));
+      applyCategories(target, request.optJSONArray("categories"));
+      ComponentName resolved = target.resolveActivity(getPackageManager());
+      result.put("packageResolvedComponent",
+          resolved == null ? JSONObject.NULL : resolved.flattenToShortString());
+      if (!component.isEmpty()) {
+        ComponentName expected = new ComponentName(packageName, component);
+        result.put("expectedComponent", expected.flattenToShortString());
+        boolean matched = expected.equals(resolved);
+        result.put("targetMatched", matched);
+        if (!matched) {
+          throw new SecurityException("deep link did not resolve to expected component");
+        }
+      }
+      startActivity(target);
+      result.put("delivered", true);
+      succeed();
+      return;
+    }
+    if ("receiver".equals(kind)) {
+      Intent target = newIntent();
+      target.setComponent(new ComponentName(packageName, component));
+      applyExtras(target, request.optJSONObject("extras"));
+      applyCategories(target, request.optJSONArray("categories"));
+      sendBroadcast(target);
+      result.put("delivered", true);
+      succeed();
+      return;
+    }
+    if ("service".equals(kind)) {
+      Intent target = newIntent();
+      target.setComponent(new ComponentName(packageName, component));
+      applyExtras(target, request.optJSONObject("extras"));
+      applyCategories(target, request.optJSONArray("categories"));
+      String operation = request.optString("operation", "auto");
+      if ("binder_transact".equals(operation) || "binder_script".equals(operation)) {
+        startBinderProof(target);
+        return;
+      }
+      ComponentName started = startService(target);
+      result.put("delivered", started != null);
+      succeed();
+      return;
+    }
+    if ("provider".equals(kind)) {
+      runProviderProof(Uri.parse(request.getString("uri")));
+      succeed();
+      return;
+    }
+    throw new IllegalArgumentException("unsupported proof kind: " + kind);
+  }
+
+  private void runProviderProof(Uri uri) throws Exception {
+    String operation = request.optString("operation", "query");
+    if ("auto".equals(operation) || "query".equals(operation)) {
+      Cursor cursor = getContentResolver().query(uri, null, null, null, null);
+      try {
+        result.put("delivered", true);
+        result.put("rowCount", cursor == null ? -1 : cursor.getCount());
+        if (cursor != null) {
+          result.put("columns", join(cursor.getColumnNames()));
+        }
+      } finally {
+        if (cursor != null) cursor.close();
+      }
+      return;
+    }
+    if ("call".equals(operation)) {
+      Bundle returned = getContentResolver().call(
+          uri, request.getString("method"), request.optString("argument", null),
+          toBundle(request.optJSONObject("extras")));
+      result.put("delivered", true);
+      result.put("bundleKeyCount", returned == null ? -1 : returned.keySet().size());
+      return;
+    }
+    if ("insert".equals(operation)) {
+      Uri inserted = getContentResolver().insert(
+          uri, toContentValues(request.optJSONObject("extras")));
+      result.put("delivered", true);
+      result.put("returnedUri", inserted == null ? JSONObject.NULL : inserted.toString());
+      return;
+    }
+    if ("update".equals(operation)) {
+      result.put("affectedRows", getContentResolver().update(
+          uri, toContentValues(request.optJSONObject("extras")), null, null));
+      result.put("delivered", true);
+      return;
+    }
+    if ("delete".equals(operation)) {
+      result.put("affectedRows", getContentResolver().delete(uri, null, null));
+      result.put("delivered", true);
+      return;
+    }
+    throw new IllegalArgumentException("unsupported provider operation: " + operation);
+  }
+
+  private void startBinderProof(final Intent target) throws Exception {
+    connection = new ServiceConnection() {
+      @Override public void onServiceConnected(ComponentName name, IBinder service) {
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+          result.put("boundComponent", name.flattenToShortString());
+          String descriptor = request.optString("binder_interface_descriptor", "");
+          if (!descriptor.isEmpty()) {
+            data.writeInterfaceToken(descriptor);
+            result.put("binderInterfaceDescriptor", descriptor);
+          }
+          JSONArray script = request.optJSONArray("binder_script");
+          if (script != null) {
+            applyBinderWrites(data, script);
+            result.put("binderScriptStepCount", script.length());
+          }
+          int code = request.getInt("binder_transaction_code");
+          String replyType = request.optString("binder_reply_type", "");
+          boolean returned = service.transact(code, data, reply, 0);
+          result.put("binderTransactionCode", code);
+          result.put("binderTransactReturned", returned);
+          if (!replyType.isEmpty()) result.put("binderReplyType", replyType);
+          if (!returned) throw new IllegalStateException("Binder transact returned false");
+          reply.setDataPosition(0);
+          if (request.optBoolean("binder_read_exception", true)) reply.readException();
+          if (script != null) {
+            JSONArray replies = readBinderReplies(reply, script);
+            result.put("binderReplies", replies);
+            if (replies.length() == 1) result.put("binderReply", replies.get(0));
+          } else {
+            result.put("binderReply", readBinderValue(reply, replyType));
+          }
+          result.put("delivered", true);
+          succeed();
+        } catch (Throwable error) {
+          fail(error);
+        } finally {
+          reply.recycle();
+          data.recycle();
+        }
+      }
+      @Override public void onServiceDisconnected(ComponentName name) { }
+      @Override public void onBindingDied(ComponentName name) {
+        fail(new IllegalStateException("Service binding died: " + name));
+      }
+      @Override public void onNullBinding(ComponentName name) {
+        fail(new IllegalStateException("Service returned a null binding: " + name));
+      }
+    };
+    boolean accepted = bindService(target, connection, Context.BIND_AUTO_CREATE);
+    result.put("bound", accepted);
+    if (!accepted) throw new SecurityException("bindService returned false");
+    bound = true;
+    handler.postDelayed(new Runnable() {
+      @Override public void run() {
+        fail(new IllegalStateException("Binder proof timed out"));
+      }
+    }, BINDER_TIMEOUT_MILLIS);
+  }
+
+  private void succeed() {
+    try {
+      result.put("success", true);
+      result.put("security_impact_observed", false);
+    } catch (Throwable ignored) { }
+    finishProof();
+  }
+
+  private void fail(Throwable error) {
+    try {
+      if (result == null) result = new JSONObject();
+      String requestId = getIntent().getStringExtra("apkscanner_request_id");
+      result.put("apkscanner_request_id", requestId);
+      result.put("requestId", requestId);
+      result.put("success", false);
+      result.put("security_impact_observed", false);
+      result.put("errorType", error.getClass().getName());
+      result.put("error", String.valueOf(error.getMessage()));
+    } catch (Throwable ignored) { }
+    finishProof();
+  }
+
+  private void finishProof() {
+    if (!finished.compareAndSet(false, true)) return;
+    handler.removeCallbacksAndMessages(null);
+    if (bound && connection != null) {
+      try { unbindService(connection); } catch (Throwable ignored) { }
+    }
+    Log.i(TAG, result == null ? "{}" : result.toString());
+    finish();
+  }
+
+  private Intent newIntent() {
+    Intent intent = new Intent();
+    String action = request.optString("intent_action", "");
+    if (!action.isEmpty()) intent.setAction(action);
+    return intent;
+  }
+
+  private static void applyBinderWrites(Parcel data, JSONArray script) throws Exception {
+    for (int index = 0; index < script.length(); index++) {
+      JSONObject step = script.getJSONObject(index);
+      String operation = step.getString("operation");
+      if ("write_string".equals(operation)) data.writeString(step.getString("string_value"));
+      else if ("write_integer".equals(operation)) data.writeInt(step.getInt("integer_value"));
+      else if ("write_long".equals(operation)) data.writeLong(step.getLong("integer_value"));
+      else if ("write_boolean".equals(operation)) data.writeInt(step.getBoolean("boolean_value") ? 1 : 0);
+      else if ("write_bytes_base64".equals(operation))
+        data.writeByteArray(Base64.decode(step.getString("string_value"), Base64.DEFAULT));
+      else if (!operation.startsWith("read_"))
+        throw new IllegalArgumentException("unsupported Binder operation: " + operation);
+    }
+  }
+
+  private static JSONArray readBinderReplies(Parcel reply, JSONArray script) throws Exception {
+    JSONArray replies = new JSONArray();
+    for (int index = 0; index < script.length(); index++) {
+      String operation = script.getJSONObject(index).getString("operation");
+      if (operation.startsWith("read_"))
+        replies.put(readBinderValue(reply, operation.substring("read_".length())));
+    }
+    if (replies.length() == 0)
+      throw new IllegalArgumentException("binder_script requires a read step");
+    return replies;
+  }
+
+  private static Object readBinderValue(Parcel reply, String type) {
+    if ("string".equals(type)) {
+      String value = reply.readString();
+      return value == null ? JSONObject.NULL : value;
+    }
+    if ("integer".equals(type)) return reply.readInt();
+    if ("long".equals(type)) return reply.readLong();
+    if ("boolean".equals(type)) return reply.readInt() != 0;
+    if ("bytes_base64".equals(type)) {
+      byte[] value = reply.createByteArray();
+      return value == null ? JSONObject.NULL : Base64.encodeToString(value, Base64.NO_WRAP);
+    }
+    throw new IllegalArgumentException("unsupported Binder reply type: " + type);
+  }
+
+  private static void applyExtras(Intent intent, JSONObject extras) throws Exception {
+    if (extras == null) return;
+    Iterator<String> keys = extras.keys();
+    while (keys.hasNext()) {
+      String key = keys.next();
+      Object value = extras.get(key);
+      if (value instanceof Boolean) intent.putExtra(key, (Boolean) value);
+      else if (value instanceof Integer) intent.putExtra(key, (Integer) value);
+      else if (value instanceof Long) intent.putExtra(key, (Long) value);
+      else if (value instanceof String) intent.putExtra(key, (String) value);
+      else throw new IllegalArgumentException("unsupported extra: " + key);
+    }
+  }
+
+  private static void applyCategories(Intent intent, JSONArray categories) throws Exception {
+    if (categories == null) return;
+    for (int index = 0; index < categories.length(); index++)
+      intent.addCategory(categories.getString(index));
+  }
+
+  private static ContentValues toContentValues(JSONObject extras) throws Exception {
+    ContentValues values = new ContentValues();
+    if (extras == null) return values;
+    Iterator<String> keys = extras.keys();
+    while (keys.hasNext()) {
+      String key = keys.next();
+      Object value = extras.get(key);
+      if (value instanceof Boolean) values.put(key, (Boolean) value);
+      else if (value instanceof Integer) values.put(key, (Integer) value);
+      else if (value instanceof Long) values.put(key, (Long) value);
+      else if (value instanceof String) values.put(key, (String) value);
+      else throw new IllegalArgumentException("unsupported provider value: " + key);
+    }
+    return values;
+  }
+
+  private static Bundle toBundle(JSONObject extras) throws Exception {
+    Bundle values = new Bundle();
+    if (extras == null) return values;
+    Iterator<String> keys = extras.keys();
+    while (keys.hasNext()) {
+      String key = keys.next();
+      Object value = extras.get(key);
+      if (value instanceof Boolean) values.putBoolean(key, (Boolean) value);
+      else if (value instanceof Integer) values.putInt(key, (Integer) value);
+      else if (value instanceof Long) values.putLong(key, (Long) value);
+      else if (value instanceof String) values.putString(key, (String) value);
+      else throw new IllegalArgumentException("unsupported bundle value: " + key);
+    }
+    return values;
+  }
+
+  private static String join(String[] values) {
+    StringBuilder result = new StringBuilder();
+    for (int index = 0; index < values.length; index++) {
+      if (index > 0) result.append(',');
+      result.append(values[index]);
+    }
+    return result.toString();
+  }
+}
+'''
+        return template.replace("__PACKAGE__", package_name).replace(
+            "__REQUEST_BASE64__", encoded_request
+        )
 
     @staticmethod
     def _resolve_source_project(

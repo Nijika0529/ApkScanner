@@ -521,6 +521,7 @@ class CodexInvestigator:
         except PersistentWorkerCancelled as exc:
             raise AgentCancelledError("Adaptive Verifier was cancelled by the user") from exc
         except PersistentWorkerTimeout as exc:
+            self._discard_session(scan.id, task.id, task.attempts, role)
             raise TimeoutError(f"Adaptive Verifier exceeded its timeout: {exc}") from exc
         except PersistentWorkerError as exc:
             self._discard_session(scan.id, task.id, task.attempts, role)
@@ -710,6 +711,10 @@ class CodexInvestigator:
                 "provider_base_url": self.settings.deepseek_base_url,
                 "model_catalog_path": "/opt/apk-scanner/config/deepseek-models.json",
                 "workspace_path": agent_session.container_workspace,
+                "ida_mcp_url": (
+                    self.settings.ida_mcp_url if self.settings.ida_mcp_enabled else None
+                ),
+                "ida_mcp_tool_timeout_seconds": (self.settings.ida_mcp_tool_timeout_seconds),
             }
             thread_file = agent_session.root / "thread.json"
             resume_thread_id = self._read_thread_id(thread_file)
@@ -918,6 +923,8 @@ class CodexInvestigator:
                 base_url=self.settings.deepseek_base_url,
                 model_catalog_path=self.settings.codex_model_catalog,
                 web_search=self.settings.codex_web_search,
+                ida_mcp_url=(self.settings.ida_mcp_url if self.settings.ida_mcp_enabled else None),
+                ida_mcp_tool_timeout_seconds=self.settings.ida_mcp_tool_timeout_seconds,
             ),
         )
         return Codex(config=config)
@@ -1059,9 +1066,11 @@ def codex_config_overrides(
     base_url: str,
     model_catalog_path: str | Path,
     web_search: str,
+    ida_mcp_url: str | None = None,
+    ida_mcp_tool_timeout_seconds: int = 1_800,
 ) -> tuple[str, ...]:
     value = json.dumps
-    return (
+    overrides = (
         f"model={value(model)}",
         f"model_provider={value(provider)}",
         f"model_reasoning_effort={value(reasoning_effort)}",
@@ -1104,3 +1113,11 @@ def codex_config_overrides(
         ),
         ('shell_environment_policy.exclude=["DEEPSEEK_API_KEY","OPENAI_API_KEY","CODEX_API_KEY"]'),
     )
+    if ida_mcp_url:
+        overrides += (
+            f"mcp_servers.ida-headless.url={value(ida_mcp_url)}",
+            "mcp_servers.ida-headless.required=false",
+            "mcp_servers.ida-headless.startup_timeout_sec=20",
+            (f"mcp_servers.ida-headless.tool_timeout_sec={int(ida_mcp_tool_timeout_seconds)}"),
+        )
+    return overrides

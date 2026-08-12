@@ -37,6 +37,8 @@ from .models import (
     ApplicationRelease,
     BenchmarkEvaluation,
     CoverageItem,
+    DynamicExperimentCapsule,
+    DynamicExperimentReceipt,
     EntryPoint,
     Evidence,
     Finding,
@@ -46,6 +48,7 @@ from .models import (
     OperatorSession,
     OperatorTurn,
     PatternMatch,
+    RuntimeArtifact,
     RuntimeObservation,
     Scan,
     ScanContainerRecord,
@@ -79,6 +82,9 @@ from .schemas import (
     BenchmarkSpec,
     Capability,
     CoverageItemOut,
+    DynamicExperimentCreate,
+    DynamicExperimentOut,
+    DynamicExperimentRunRequest,
     EntryPointOut,
     EventOut,
     EvidenceOut,
@@ -91,6 +97,8 @@ from .schemas import (
     InvestigationTaskOut,
     PatternMatchOut,
     RegressionCaseCreate,
+    RuntimeArtifactCaptureRequest,
+    RuntimeArtifactOut,
     ScanAgentControl,
     ScanDeleteResult,
     ScanDetail,
@@ -674,6 +682,267 @@ def delete_validation_fixture(
         raise HTTPException(404, "validation fixture not found")
     session.delete(fixture)
     session.commit()
+
+
+def _dynamic_experiment_payload(
+    session: Session,
+    capsule: DynamicExperimentCapsule,
+) -> dict[str, Any]:
+    receipts = list(
+        session.scalars(
+            select(DynamicExperimentReceipt)
+            .where(DynamicExperimentReceipt.capsule_id == capsule.id)
+            .order_by(
+                DynamicExperimentReceipt.started_at,
+                DynamicExperimentReceipt.attempt,
+            )
+        )
+    )
+    return {
+        column.name: getattr(capsule, column.name)
+        for column in DynamicExperimentCapsule.__table__.columns
+    } | {"receipts": receipts}
+
+
+@router.post(
+    "/scans/{scan_id}/dynamic-experiments",
+    response_model=DynamicExperimentOut,
+    status_code=201,
+)
+def create_dynamic_experiment(
+    scan_id: str,
+    payload: DynamicExperimentCreate,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    require_scan(session, scan_id)
+    if payload.task_id is not None:
+        task = session.get(InvestigationTask, payload.task_id)
+        if task is None or task.scan_id != scan_id:
+            raise HTTPException(409, "dynamic experiment task is outside this scan")
+    if payload.finding_id is not None:
+        finding = session.get(Finding, payload.finding_id)
+        if finding is None or finding.scan_id != scan_id:
+            raise HTTPException(409, "dynamic experiment finding is outside this scan")
+    if payload.fixture_ids:
+        fixture_ids = set(
+            session.scalars(
+                select(ValidationFixture.id).where(
+                    ValidationFixture.scan_id == scan_id,
+                    ValidationFixture.id.in_(payload.fixture_ids),
+                )
+            )
+        )
+        if fixture_ids != set(payload.fixture_ids):
+            raise HTTPException(409, "dynamic experiment references an unknown fixture")
+    capsule = DynamicExperimentCapsule(
+        scan_id=scan_id,
+        task_id=payload.task_id,
+        finding_id=payload.finding_id,
+        name=payload.name,
+        objective=payload.objective,
+        preferred_serial=payload.preferred_serial,
+        fixture_ids=list(payload.fixture_ids),
+        preconditions=list(payload.preconditions),
+        impact_contract=payload.impact_contract,
+        steps=[item.model_dump(mode="json") for item in payload.steps],
+        cleanup_steps=[item.model_dump(mode="json") for item in payload.cleanup_steps],
+        state_json={"scan_id": scan_id},
+    )
+    session.add(capsule)
+    session.flush()
+    add_event(
+        session,
+        scan_id,
+        "dynamic_experiment.created",
+        "已创建可断点续跑的状态化动态实验",
+        {"capsule_id": capsule.id, "name": capsule.name},
+    )
+    session.commit()
+    session.refresh(capsule)
+    return _dynamic_experiment_payload(session, capsule)
+
+
+@router.get(
+    "/scans/{scan_id}/dynamic-experiments",
+    response_model=list[DynamicExperimentOut],
+)
+def list_dynamic_experiments(
+    scan_id: str,
+    session: Session = Depends(get_session),
+) -> list[dict[str, Any]]:
+    require_scan(session, scan_id)
+    capsules = list(
+        session.scalars(
+            select(DynamicExperimentCapsule)
+            .where(DynamicExperimentCapsule.scan_id == scan_id)
+            .order_by(desc(DynamicExperimentCapsule.created_at))
+        )
+    )
+    return [_dynamic_experiment_payload(session, capsule) for capsule in capsules]
+
+
+@router.get(
+    "/dynamic-experiments/{capsule_id}",
+    response_model=DynamicExperimentOut,
+)
+def get_dynamic_experiment(
+    capsule_id: str,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    capsule = session.get(DynamicExperimentCapsule, capsule_id)
+    if capsule is None:
+        raise HTTPException(404, "dynamic experiment not found")
+    return _dynamic_experiment_payload(session, capsule)
+
+
+@router.post(
+    "/dynamic-experiments/{capsule_id}/run",
+    response_model=DynamicExperimentOut,
+    status_code=202,
+)
+async def run_dynamic_experiment(
+    capsule_id: str,
+    payload: DynamicExperimentRunRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> dict[str, Any]:
+    capsule = session.get(DynamicExperimentCapsule, capsule_id)
+    if capsule is None:
+        raise HTTPException(404, "dynamic experiment not found")
+    if capsule.status in {"running", "completed", "canceled"}:
+        raise HTTPException(409, f"dynamic experiment cannot run from status={capsule.status}")
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            orchestrator.dynamic_experiments.run,
+            capsule_id,
+            preferred_serial=payload.preferred_serial,
+        ),
+        name=f"dynamic-experiment-{capsule_id}",
+    )
+    request.app.state.background_tasks.add(task)
+    task.add_done_callback(request.app.state.background_tasks.discard)
+    return _dynamic_experiment_payload(session, capsule)
+
+
+@router.post(
+    "/dynamic-experiments/{capsule_id}/cancel",
+    response_model=DynamicExperimentOut,
+)
+def cancel_dynamic_experiment(
+    capsule_id: str,
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        orchestrator.dynamic_experiments.cancel(capsule_id)
+    except LookupError as exc:
+        raise HTTPException(404, "dynamic experiment not found") from exc
+    capsule = session.get(DynamicExperimentCapsule, capsule_id)
+    assert capsule is not None
+    session.refresh(capsule)
+    return _dynamic_experiment_payload(session, capsule)
+
+
+@router.post(
+    "/scans/{scan_id}/runtime-artifacts/captures",
+    response_model=RuntimeArtifactOut,
+    status_code=202,
+)
+async def capture_runtime_artifact(
+    scan_id: str,
+    payload: RuntimeArtifactCaptureRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> RuntimeArtifact:
+    scan = require_scan(session, scan_id)
+    workspace = (scan.stats or {}).get("workspace")
+    if not isinstance(workspace, str) or not (Path(workspace) / "artifact_graph.json").is_file():
+        raise HTTPException(409, "host scan static analysis must complete before plugin capture")
+    if payload.task_id is not None:
+        task = session.get(InvestigationTask, payload.task_id)
+        if task is None or task.scan_id != scan_id:
+            raise HTTPException(409, "runtime artifact task is outside this scan")
+    artifact = RuntimeArtifact(
+        scan_id=scan_id,
+        task_id=payload.task_id,
+        source_json=payload.model_dump(mode="json"),
+    )
+    session.add(artifact)
+    session.flush()
+    add_event(
+        session,
+        scan_id,
+        "runtime_artifact.queued",
+        "运行时插件已进入设备采集队列",
+        {
+            "runtime_artifact_id": artifact.id,
+            "source_mode": payload.source_mode,
+            "remote_path": payload.remote_path,
+        },
+    )
+    session.commit()
+    session.refresh(artifact)
+
+    async def capture_and_schedule() -> None:
+        try:
+            completed = await asyncio.to_thread(
+                orchestrator.runtime_artifacts.capture,
+                artifact.id,
+                payload,
+            )
+        except Exception as exc:
+            orchestrator.runtime_artifacts.mark_failed(artifact.id, str(exc))
+            return
+        if (
+            payload.schedule_investigations
+            and completed.investigation_task_ids
+            and not completed.result_json.get(
+                "analysis_reused_from_runtime_artifact_id"
+            )
+        ):
+            await orchestrator.submit(scan_id)
+
+    background = asyncio.create_task(
+        capture_and_schedule(),
+        name=f"runtime-artifact-{artifact.id}",
+    )
+    request.app.state.background_tasks.add(background)
+    background.add_done_callback(request.app.state.background_tasks.discard)
+    return artifact
+
+
+@router.get(
+    "/scans/{scan_id}/runtime-artifacts",
+    response_model=list[RuntimeArtifactOut],
+)
+def list_runtime_artifacts(
+    scan_id: str,
+    session: Session = Depends(get_session),
+) -> list[RuntimeArtifact]:
+    require_scan(session, scan_id)
+    return list(
+        session.scalars(
+            select(RuntimeArtifact)
+            .where(RuntimeArtifact.scan_id == scan_id)
+            .order_by(desc(RuntimeArtifact.created_at))
+        )
+    )
+
+
+@router.get(
+    "/runtime-artifacts/{runtime_artifact_id}",
+    response_model=RuntimeArtifactOut,
+)
+def get_runtime_artifact(
+    runtime_artifact_id: str,
+    session: Session = Depends(get_session),
+) -> RuntimeArtifact:
+    artifact = session.get(RuntimeArtifact, runtime_artifact_id)
+    if artifact is None:
+        raise HTTPException(404, "runtime artifact not found")
+    return artifact
 
 
 @router.post(

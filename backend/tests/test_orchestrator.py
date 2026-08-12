@@ -488,14 +488,11 @@ def test_adaptive_verifier_splits_transport_safe_turns_and_merges_results(
 
     assert len(dispatched) > 1
     assert all(
-        int(item["prompt_characters"])
-        <= configured.adaptive_verifier_prompt_max_chars
+        int(item["prompt_characters"]) <= configured.adaptive_verifier_prompt_max_chars
         for item in dispatched
     )
     assert [
-        finding_id
-        for item in dispatched
-        for finding_id in item["candidate_ids"]
+        finding_id for item in dispatched for finding_id in item["candidate_ids"]
     ] == candidate_ids
     assert len(closed_batch_threads) == len(dispatched) - 1
     assert all(item[3] == "verifier" for item in closed_batch_threads)
@@ -509,18 +506,13 @@ def test_adaptive_verifier_splits_transport_safe_turns_and_merges_results(
         assert completed.status == "completed"
         assert len(completed.result["adaptive_batches"]) == len(dispatched)
         assert len(completed.result["response_evidence_ids"]) == len(dispatched)
-        assert persisted_scan.stats["adaptive_verification"]["batch_count"] == len(
-            dispatched
-        )
+        assert persisted_scan.stats["adaptive_verification"]["batch_count"] == len(dispatched)
         assert {finding.status for finding in persisted_findings} == {"supported_static"}
         assert all(finding.evidence_ids for finding in persisted_findings)
         assert {
             finding.metadata_json["adaptive_verification"]["thread_id"]
             for finding in persisted_findings
-        } == {
-            f"thread-budgeted-adaptive-{index}"
-            for index in range(1, len(dispatched) + 1)
-        }
+        } == {f"thread-budgeted-adaptive-{index}" for index in range(1, len(dispatched) + 1)}
         checkpoint_count = len(
             list(
                 session.scalars(
@@ -543,9 +535,136 @@ def test_adaptive_verifier_splits_transport_safe_turns_and_merges_results(
         resumed = session.get(InvestigationTask, task_id)
         assert resumed is not None
         assert resumed.status == "completed"
-        assert {
-            item["status"] for item in resumed.result["adaptive_batches"]
-        } == {"restored_checkpoint"}
+        assert {item["status"] for item in resumed.result["adaptive_batches"]} == {
+            "restored_checkpoint"
+        }
+
+
+def test_adaptive_verifier_automatically_resumes_only_missing_candidates(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    configured = replace(
+        settings,
+        codex_enabled=True,
+        adaptive_verifier_enabled=True,
+        adaptive_verifier_resume_attempts=1,
+    )
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="adaptive-resume.apk",
+            package_name="com.example.adaptiveresume",
+            artifact_sha256="7" * 64,
+            artifact_path=str(configured.data_dir / "adaptive-resume.apk"),
+        )
+        entry = EntryPoint(
+            scan=scan,
+            kind="activity",
+            name="com.example.adaptiveresume.EntryActivity",
+            exported=True,
+        )
+        session.add_all([scan, entry])
+        session.flush()
+        findings = [
+            Finding(
+                scan=scan,
+                dedupe_key=f"adaptive-resume-{index}",
+                rule_id="AGENT-ENTRY-INVESTIGATION",
+                title=f"待验证风险 {index}",
+                description="Static chain requires a terminal runtime assessment.",
+                masvs="MASVS-PLATFORM",
+                severity="high",
+                confidence="medium",
+                status="supported_static",
+                entry_point_ids=[entry.id],
+            )
+            for index in range(2)
+        ]
+        session.add_all(findings)
+        session.commit()
+        scan_id = scan.id
+
+    orchestrator = ScanOrchestrator(configured, database, ArtifactStore(configured))
+    calls: list[int] = []
+
+    def run_pass(_scan_id: str, task_id: str, _cancel_event) -> None:  # noqa: ANN001
+        calls.append(len(calls) + 1)
+        with database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            assert task is not None
+            candidate_ids = list(task.preconditions["candidate_finding_ids"])
+            if len(calls) == 1:
+                response = orchestrator.evidence.json(
+                    session,
+                    scan_id=scan_id,
+                    task_id=task_id,
+                    kind="agent.response",
+                    value={"assessment": candidate_ids[0]},
+                    summary="First candidate assessment",
+                )
+                session.add(
+                    AdaptiveVerificationCheckpoint(
+                        scan_id=scan_id,
+                        task_id=task_id,
+                        finding_id=candidate_ids[0],
+                        batch_index=1,
+                        audit_id="11111111-2222-4333-8444-555555555555",
+                        response_evidence_id=response.id,
+                        thread_id="thread-first",
+                        turn_id="turn-first",
+                        assessment_json={
+                            "finding_id": candidate_ids[0],
+                            "verdict": "supported_static",
+                            "confidence": "medium",
+                            "runtime_observed": False,
+                            "summary": "First candidate is checkpointed.",
+                        },
+                    )
+                )
+                task.status = "inconclusive"
+                task.result = {
+                    "missing_candidate_assessments": [candidate_ids[1]],
+                }
+                task.completed_at = datetime.now(UTC)
+            else:
+                checkpoints = list(
+                    session.scalars(
+                        select(AdaptiveVerificationCheckpoint).where(
+                            AdaptiveVerificationCheckpoint.task_id == task_id
+                        )
+                    )
+                )
+                assert [item.finding_id for item in checkpoints] == [candidate_ids[0]]
+                task.status = "completed"
+                task.result = {
+                    **dict(task.result or {}),
+                    "missing_candidate_assessments": [],
+                }
+                task.completed_at = datetime.now(UTC)
+            session.commit()
+
+    monkeypatch.setattr(orchestrator, "_run_adaptive_verifier_impl", run_pass)
+    orchestrator._run_adaptive_verifier(scan_id)
+
+    assert calls == [1, 2]
+    with database.session_factory() as session:
+        task = session.scalar(
+            select(InvestigationTask).where(
+                InvestigationTask.scan_id == scan_id,
+                InvestigationTask.task_type == "adaptive_verification",
+            )
+        )
+        scan = session.get(Scan, scan_id)
+        assert task is not None and scan is not None
+        assert task.status == "completed"
+        assert task.attempts == 2
+        assert len(task.result["adaptive_resume_history"]) == 1
+        assert task.result["adaptive_resume_history"][0]["checkpoint_count"] == 1
+        assert scan.stats["adaptive_verification"]["restored_checkpoint_count"] == 1
 
 
 @pytest.mark.parametrize(
@@ -667,12 +786,8 @@ def test_adaptive_verifier_cannot_promote_without_platform_proof_attempt(
         assert verification["android16_verdict_eligible"] is android16_eligible
         assert task.status == "completed"
         assert task.thread_id == "thread-adaptive"
-        assert scan.stats["adaptive_verification"]["verdict_counts"] == {
-            expected_status: 1
-        }
-        assert scan.stats["adaptive_verification"][
-            "compatibility_override_count"
-        ] == 1
+        assert scan.stats["adaptive_verification"]["verdict_counts"] == {expected_status: 1}
+        assert scan.stats["adaptive_verification"]["compatibility_override_count"] == 1
 
 
 def test_adaptive_verifier_preserves_an_existing_platform_proof(settings) -> None:  # noqa: ANN001
@@ -792,8 +907,9 @@ def test_adaptive_verifier_preserves_an_existing_platform_proof(settings) -> Non
         assert finding.metadata_json["harm_demonstrated"] is True
         assert finding.metadata_json["proof_attempt_ids"] == [proof_id]
         assert proof_evidence_id in finding.evidence_ids
-        assert "cannot downgrade" in (
-            finding.metadata_json["adaptive_verification"]["verdict_override_reason"]
+        assert (
+            "cannot downgrade"
+            in (finding.metadata_json["adaptive_verification"]["verdict_override_reason"])
         )
 
 
@@ -948,6 +1064,145 @@ def test_exact_finding_identity_is_consolidated_across_tasks(settings) -> None: 
         assert signals == []
 
 
+def test_same_task_hypotheses_sharing_one_platform_oracle_are_consolidated(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="binder.apk",
+            package_name="com.example.binder",
+            artifact_sha256="b" * 64,
+            artifact_path=str(settings.data_dir / "binder.apk"),
+        )
+        task = InvestigationTask(scan=scan, task_type="component", status="completed")
+        entry = EntryPoint(
+            scan=scan,
+            kind="service",
+            name="com.example.binder.SecretService",
+            exported=True,
+        )
+        session.add_all([scan, task, entry])
+        session.flush()
+        reachability = SecurityHypothesis(
+            scan_id=scan.id,
+            task_id=task.id,
+            fingerprint="1" * 64,
+            category="android.exported_component",
+            claim="A third-party application can bind to the service.",
+            entry_point_ids=[entry.id],
+        )
+        impact = SecurityHypothesis(
+            scan_id=scan.id,
+            task_id=task.id,
+            fingerprint="2" * 64,
+            category="android.exported_component",
+            claim="The exported service returns a native secret without caller authorization.",
+            entry_point_ids=[entry.id],
+        )
+        session.add_all([reachability, impact])
+        session.flush()
+        shared_plan = {
+            "entry_point_id": entry.id,
+            "operation": "binder_transact",
+            "binder_transaction_code": 1,
+            "binder_interface_descriptor": None,
+            "binder_reply_type": "long",
+            "binder_script": None,
+            "poc": None,
+            "oracle": {
+                "kind": "binder_reply",
+                "impact": "unauthorized_data_access",
+                "impact_contract_id": "builtin:binder_reply:unauthorized_data_access",
+                "expected_text": "87109624524081870",
+                "match_mode": "exact",
+                "reply_index": 0,
+                "target_path": None,
+            },
+        }
+        first_proof = ProofAttempt(
+            scan_id=scan.id,
+            task_id=task.id,
+            hypothesis_id=reachability.id,
+            test_case_id="binder-reachability",
+            status="proven",
+            plan={**shared_plan, "hypothesis_id": reachability.id},
+            harm_demonstrated=True,
+        )
+        second_proof = ProofAttempt(
+            scan_id=scan.id,
+            task_id=task.id,
+            hypothesis_id=impact.id,
+            test_case_id="binder-impact",
+            status="proven",
+            plan={**shared_plan, "hypothesis_id": impact.id},
+            harm_demonstrated=True,
+        )
+        session.add_all([first_proof, second_proof])
+        session.flush()
+        first_finding = Finding(
+            scan=scan,
+            dedupe_key=f"agent:{task.id}:hypothesis:{reachability.id}",
+            rule_id="AGENT-ENTRY-INVESTIGATION",
+            source="codex",
+            title="Service is reachable",
+            description="Reachability hypothesis",
+            remediation="Restrict the service.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            confidence="high",
+            status="reproduced_blackbox",
+            entry_point_ids=[entry.id],
+            metadata_json={
+                "identity": {"finding_id": "3" * 64},
+                "harm_demonstrated": True,
+                "task_id": task.id,
+                "hypothesis_id": reachability.id,
+                "proof_attempt_ids": [first_proof.id],
+            },
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        second_finding = Finding(
+            scan=scan,
+            dedupe_key=f"agent:{task.id}:hypothesis:{impact.id}",
+            rule_id="AGENT-ENTRY-INVESTIGATION",
+            source="codex",
+            title="Native Binder secret disclosure",
+            description="Concrete unauthorized data access",
+            remediation="Authorize the Binder caller.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            confidence="high",
+            status="reproduced_blackbox",
+            entry_point_ids=[entry.id],
+            metadata_json={
+                "identity": {"finding_id": "4" * 64},
+                "harm_demonstrated": True,
+                "task_id": task.id,
+                "hypothesis_id": impact.id,
+                "proof_attempt_ids": [second_proof.id],
+            },
+            created_at=datetime(2026, 1, 2, tzinfo=UTC),
+        )
+        session.add_all([first_finding, second_finding])
+        session.flush()
+        reachability.final_finding_id = first_finding.id
+        impact.final_finding_id = second_finding.id
+
+        merged = orchestrator._consolidate_findings(session, scan_id=scan.id)
+        session.flush()
+
+        assert merged == {first_finding.id: second_finding.id}
+        assert second_finding.status == "reproduced_blackbox"
+        assert second_finding.title == "Native Binder secret disclosure"
+        assert first_finding.status == "inconclusive"
+        assert first_finding.metadata_json["merge_basis"] == "shared_platform_proof_oracle"
+        assert reachability.final_finding_id == second_finding.id
+        assert impact.final_finding_id == second_finding.id
+
+
 def test_adaptive_verifier_merges_semantic_duplicate_ingress_findings(settings) -> None:  # noqa: ANN001
     settings.ensure_directories()
     database = Database(settings)
@@ -1047,14 +1302,17 @@ def test_adaptive_verifier_merges_semantic_duplicate_ingress_findings(settings) 
         duplicate = session.get(Finding, duplicate_id)
         scan = session.get(Scan, scan_id)
         task = session.get(InvestigationTask, task_id)
-        assert canonical is not None and duplicate is not None and scan is not None and task is not None
+        assert (
+            canonical is not None
+            and duplicate is not None
+            and scan is not None
+            and task is not None
+        )
         assert canonical.status == "supported_static"
         assert canonical.metadata_json["harm_demonstrated"] is False
         assert duplicate.metadata_json["merged_into_finding_id"] == canonical_id
         assert task.result["merged_finding_map"] == {duplicate_id: canonical_id}
-        assert scan.stats["adaptive_verification"]["verdict_counts"] == {
-            "supported_static": 1
-        }
+        assert scan.stats["adaptive_verification"]["verdict_counts"] == {"supported_static": 1}
         records = list(session.scalars(select(Finding).where(Finding.scan_id == scan_id)))
         confirmed, signals = partition_findings(session, records)
         assert confirmed == []
@@ -1115,14 +1373,10 @@ def test_live_runtime_observation_is_persisted_and_deduplicated(settings) -> Non
     assert second["id"] == first["id"]
     with database.session_factory() as session:
         observations = list(
-            session.scalars(
-                select(RuntimeObservation).where(RuntimeObservation.task_id == task_id)
-            )
+            session.scalars(select(RuntimeObservation).where(RuntimeObservation.task_id == task_id))
         )
         assert len(observations) == 1
-        assert observations[0].environment["validation"]["verdict_scope"] == (
-            "development_legacy"
-        )
+        assert observations[0].environment["validation"]["verdict_scope"] == ("development_legacy")
 
 
 def test_runtime_event_projection_is_idempotent_across_spool_replay(settings) -> None:  # noqa: ANN001
@@ -1500,9 +1754,7 @@ def test_paused_scan_does_not_claim_queued_tasks_until_resumed(settings) -> None
     with database.session_factory() as session:
         statuses = list(
             session.scalars(
-                select(InvestigationTask.status).where(
-                    InvestigationTask.scan_id == scan_id
-                )
+                select(InvestigationTask.status).where(InvestigationTask.scan_id == scan_id)
             )
         )
     assert statuses == ["completed", "completed"]
@@ -2544,8 +2796,7 @@ def test_positive_debate_is_single_pass_and_arbitrates_only_real_objections(
             if phase == "final_evaluation":
                 assert critic_objects
                 assert (
-                    context["debate"]["critic"]["review_objections"][0]["objection_id"]
-                    == "OBJ-1"
+                    context["debate"]["critic"]["review_objections"][0]["objection_id"] == "OBJ-1"
                 )
                 return SimpleNamespace(
                     thread_id="thread-final",
@@ -2614,9 +2865,7 @@ def test_positive_debate_is_single_pass_and_arbitrates_only_real_objections(
                                 "sink": "",
                                 "reachable_path": "Caller -> EntryActivity",
                                 "boundary": "android_component_export_boundary",
-                                "counterevidence": [
-                                    "Independent review found no sensitive sink"
-                                ],
+                                "counterevidence": ["Independent review found no sensitive sink"],
                                 "proof_gaps": [],
                                 "evidence_ids": [cited_id],
                                 "confidence": "high",
@@ -2692,9 +2941,7 @@ def test_positive_debate_is_single_pass_and_arbitrates_only_real_objections(
         assert policy["phase_counts"].get("rescue_review", 0) == 0
         assert policy["phase_counts"].get("final_evaluation", 0) == int(critic_objects)
         assert policy["outcome"] == (
-            "arbiter_completed"
-            if critic_objects
-            else "candidate_kept_without_arbiter"
+            "arbiter_completed" if critic_objects else "candidate_kept_without_arbiter"
         )
 
 
@@ -2816,9 +3063,7 @@ def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # no
         ]
         == materialized
     )
-    manifest_payload = json.loads(
-        (first / "context-manifest.json").read_text(encoding="utf-8")
-    )
+    manifest_payload = json.loads((first / "context-manifest.json").read_text(encoding="utf-8"))
     assert manifest_payload["read_order"] == ["stable", "evidence", "latest_round"]
     for document in manifest_payload["documents"].values():
         content = (first / document["path"]).read_bytes()
@@ -2833,9 +3078,7 @@ def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # no
         [dict(evidence_summary)],
         platform_context=next_context,
     )
-    next_manifest = json.loads(
-        (first / "context-manifest.json").read_text(encoding="utf-8")
-    )
+    next_manifest = json.loads((first / "context-manifest.json").read_text(encoding="utf-8"))
     assert next_manifest["documents"]["stable"]["sha256"] == stable_digest
     assert next_manifest["documents"]["latest_round"]["path"] == (
         "rounds/001-exploration-round.json"
@@ -2867,6 +3110,27 @@ def test_agent_attempt_workspaces_are_isolated_per_task(settings) -> None:  # no
     )
     assert bounded_context["platform_context"]["bounded_manifest"]["package_name"] == ("example")
     assert (bounded / "target_source/AndroidManifest.xml").is_file()
+
+    native_root = settings.data_dir / "workspaces" / scan_id / "native"
+    native_root.mkdir()
+    (native_root / "libdemo.so").write_bytes(b"ELF-test-placeholder")
+    ida_settings = replace(settings, ida_mcp_enabled=True)
+    ida_orchestrator = ScanOrchestrator(ida_settings, database, store)
+    ida_workspace = ida_orchestrator._materialize_agent_evidence(
+        scan_id,
+        "00000000-0000-0000-0000-000000000074",
+        1,
+        [dict(evidence_summary)],
+        platform_context=context(),
+    )
+    ida_context = json.loads((ida_workspace / "context.json").read_text(encoding="utf-8"))
+    ida_mcp = ida_context["workspace_policy"]["ida_mcp"]
+    assert ida_mcp["available"] is True
+    assert ida_mcp["server"] == "ida-headless"
+    assert {
+        "container_prefix": "/scan-input/native",
+        "host_prefix": str(native_root.resolve()),
+    } in ida_mcp["path_mappings"]
 
 
 def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(
@@ -2922,9 +3186,9 @@ def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(
         static_task = next(task for task in tasks if task.task_type == "static_review")
         assert static_task.status == "inconclusive"
         assert static_task.result["failure_category"] == "agent_unavailable"
-        assert {
-            task.status for task in tasks if task.task_type != "static_review"
-        } == {"blocked_device"}
+        assert {task.status for task in tasks if task.task_type != "static_review"} == {
+            "blocked_device"
+        }
         assert all(
             task.result["failure_category"] == "device_unavailable"
             for task in tasks
@@ -3006,8 +3270,7 @@ def test_agent_schema_failure_is_not_misreported_as_device_blocking(
     assert tasks
     assert {task.status for task in tasks} == {"failed"}
     assert all(
-        task.result["failure_category"] == "agent_structured_output_or_runtime"
-        for task in tasks
+        task.result["failure_category"] == "agent_structured_output_or_runtime" for task in tasks
     )
     assert all("counterevidence" in str(task.error) for task in tasks)
 

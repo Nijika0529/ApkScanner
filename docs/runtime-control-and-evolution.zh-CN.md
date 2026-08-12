@@ -59,7 +59,7 @@ Evidence、模型结论、Thread/Turn、版本 PoC 回放和历史 Finding。该
 
 探索 worker 不再有固定的 3 任务上限。可提交并发动态跟随当前未排空的 ADB 设备数量；没有设备时只
 保留一个静态分析 lane。运行中的 dispatcher 每 500ms 重新读取容量，因此中途接入第二台设备后会
-直接领取第二个任务。每个任务从 prepare、Probe、Agent 多轮、PoC、Oracle 到 cleanup 全程独占同一
+直接领取第二个任务。每个任务从 prepare、Agent 多轮、临时 Harness/PoC、Oracle 到 cleanup 全程独占同一
 serial；跨扫描的最终 ADB 并发仍由全局 device lease 队列约束。
 
 宿主和容器的 ADB 命令空间必须分离：宿主通过 `APKSCANNER_HOST_ADB` 固定真实
@@ -110,6 +110,23 @@ PoC compileSdk 和 targetSdk 在两种 Profile 下都保持 36+。发布门禁�
 - 常驻扫描侧栏最多首屏 100 项；攻击面、覆盖、任务、验证链和审计均分批挂载，并对离屏卡片使用
   `content-visibility`。固定侧栏、顶栏和普通 Card 不使用大面积 backdrop blur，减少选择文本和滚动时重绘。
 
+## 3.2 状态化 Dynamic Experiment Capsule
+
+单次 `am start` 无法表达登录态、授权代理、动态插件、PendingIntent 或回调链。平台提供扫描级
+Dynamic Experiment Capsule，把前置状态、多条 ADB 动作、中间观察、最终断言和清理步骤保存在同一对象：
+
+- `POST /scans/{scan_id}/dynamic-experiments` 创建实验；步骤可声明 exit code、stdout 子串/正则、
+  状态变量和 Runtime Observation 类型；
+- `POST /dynamic-experiments/{id}/run` 获取全局设备独占 lease 并执行，每步 ADB 输出单独进入 Evidence；
+- 步骤未满足断言时状态变为 `paused`，再次调用 `run` 只继续失败或未执行步骤；
+- cleanup 有独立回执。控制面重启时，正在执行的步骤记为失败，Capsule 回到 `paused`，不会丢失之前
+  已完成的步骤；
+- `POST /dynamic-experiments/{id}/cancel` 可取消排队或运行中的实验。目标应用数据仍遵守 preserve-state
+  约定，Capsule 不隐式执行 `pm clear`。
+
+Capsule 的 `impact_contract` 只描述要证明的事实；命令成功不会自动升级 Finding。步骤生成的
+Runtime Observation、Evidence 和既有 ProofAttempt/ImpactContract 仍由终局裁决统一绑定。
+
 ## 4. 静态资产和版本演进
 
 静态缓存键是 `artifact_sha256 + analysis_profile`。只有完整、可缓存的反编译结果才原子发布到
@@ -130,6 +147,28 @@ PoC compileSdk 和 targetSdk 在两种 Profile 下都保持 36+。发布门禁�
 原 Finding，也不会把人工文字升级为动态 Evidence。后继版本仅在稳定入口 identity 可映射时生成
 `pending_revalidation` occurrence；无法唯一映射则是 `unmappable`。旧证据只用于生成回放配方，新版本必须
 产生自己的 Proof/Evidence 后才能判断“仍存在”；回放失败只能是 `inconclusive`，不能单独证明“已修复”。
+
+每个新建 `ProofAttempt` 都保存平台生成的 `ProofRecipe`。配方去掉 scan-local 的 hypothesis/entry ID，
+保留操作、输入、Oracle、Harness 生成器版本和源码依赖模式。平台 Harness 在后继版本直接重新生成；
+Agent 源码型 PoC 才要求恢复内容寻址的源码归档。两种路径都会绑定新版本的入口和 Hypothesis，并产生
+全新的 build、ADB、Oracle 与 Proof Evidence，不复制旧版本动态结论。
+
+## 4.1 运行时插件采集与增量调查
+
+静态包内不存在、启动后才下载或解出的插件可通过
+`POST /scans/{scan_id}/runtime-artifacts/captures` 导入。当前支持两种来源：
+
+- `device_path`：从目标设备的普通可读路径执行 `adb pull`；
+- `run_as`：对可调试测试包从应用私有相对路径进行二进制采集，适合本地 fixture。正式包无法
+  `run-as` 时，可由具备相应权限的测试设备把文件放到可读路径后使用前一种方式。
+
+采集期间只占用一个设备 lease；文件立即按 SHA-256 写入 CAS。随后复用同一 `ApkInspector` 与静态缓存，
+生成 Manifest、JADX/Apktool、Native/JNI、插件入口和子 ArtifactGraph。平台在宿主图谱中追加
+`loader → loads_runtime_apk → plugin entry` 链，并只为新插件入口创建 InvestigationTask。
+
+同一 scan 再次采集相同 SHA-256 时，不重复反编译或创建任务；仅复用既有入口/任务，并在发现新的
+Loader 来源时补充加载边。运行时采集对象、状态和复用来源可通过
+`GET /scans/{scan_id}/runtime-artifacts` 查询。
 
 ## 5. 扩展调查入口与监督 Campaign
 

@@ -397,7 +397,9 @@ class InvestigationPlanner:
     def _base(self) -> dict:
         allowed_side_effects = [
             "install_target_apk",
-            "install_probe_apk",
+            "build_platform_proof_harness",
+            "install_platform_proof_harness",
+            "uninstall_platform_proof_harness",
             "build_agent_poc_apk",
             "install_agent_poc_apk",
             "uninstall_agent_poc_apk",

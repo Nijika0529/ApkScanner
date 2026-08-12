@@ -30,7 +30,9 @@ class ReportBuilder:
     ) -> dict[str, Any]:
         entries = list(
             session.scalars(
-                select(EntryPoint).where(EntryPoint.scan_id == scan.id).order_by(EntryPoint.kind, EntryPoint.name)
+                select(EntryPoint)
+                .where(EntryPoint.scan_id == scan.id)
+                .order_by(EntryPoint.kind, EntryPoint.name)
             )
         )
         finding_records = list(
@@ -123,12 +125,8 @@ class ReportBuilder:
             "findings": [self._finding(item) for item in findings],
             "signals": [self._finding(item) for item in signals],
             "tasks": [self._task(item) for item in tasks],
-            "security_hypotheses": [
-                self._security_hypothesis(item) for item in hypotheses
-            ],
-            "benchmark_evaluations": [
-                self._benchmark_evaluation(item) for item in evaluations
-            ],
+            "security_hypotheses": [self._security_hypothesis(item) for item in hypotheses],
+            "benchmark_evaluations": [self._benchmark_evaluation(item) for item in evaluations],
             "agent_audits": agent_audits or [],
             "coverage": [self._coverage(item) for item in coverage],
             "evidence": [self._evidence(item) for item in evidence],
@@ -229,13 +227,12 @@ class ReportBuilder:
                     "prover": proof.prover,
                     "status": proof.status,
                     "plan": proof.plan,
+                    "proof_recipe": proof.proof_recipe,
                     "oracle": proof.oracle,
                     "evidence_ids": proof.evidence_ids,
                     "harm_demonstrated": proof.harm_demonstrated,
                     "error": proof.error,
-                    "started_at": (
-                        proof.started_at.isoformat() if proof.started_at else None
-                    ),
+                    "started_at": (proof.started_at.isoformat() if proof.started_at else None),
                     "completed_at": (
                         proof.completed_at.isoformat() if proof.completed_at else None
                     ),
@@ -403,8 +400,8 @@ class ReportBuilder:
 <style>body{{font:14px system-ui;max-width:1100px;margin:40px auto;color:#17202a}}
 table{{border-collapse:collapse;width:100%}}th,td{{padding:10px;border:1px solid #d9e2ec;text-align:left}}
 th{{background:#eef4f7}}code{{background:#eef4f7;padding:2px 5px}}</style></head>
-<body><h1>APK 安全扫描报告</h1><p><strong>{html.escape(scan['package_name'] or scan['filename'])}</strong>
- · {html.escape(scan['status'])} · <code>{scan['artifact_sha256']}</code></p>
+<body><h1>APK 安全扫描报告</h1><p><strong>{html.escape(scan["package_name"] or scan["filename"])}</strong>
+ · {html.escape(scan["status"])} · <code>{scan["artifact_sha256"]}</code></p>
 <h2>Finding</h2><table><thead><tr><th>Severity</th><th>Status</th><th>Title</th><th>MASVS</th></tr></thead>
 <tbody>{finding_rows}</tbody></table>
 <h2>静态与待验证线索</h2><table><thead><tr><th>Severity</th><th>Status</th><th>Title</th><th>Source</th></tr></thead>

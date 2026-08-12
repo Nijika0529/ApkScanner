@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8" standalone="no"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="io.apkscanner.copilotfixture"
+    package="io.apkscanner.nativecases"
     android:versionCode="1"
     android:versionName="1.0">
 
@@ -8,46 +8,40 @@
 
     <application
         android:allowBackup="false"
-        android:debuggable="true"
-        android:label="APKScanner Copilot Fixture"
+        android:debuggable="false"
+        android:label="APKScanner Native Cases"
         android:theme="@android:style/Theme.Material.Light">
 
         <activity
-            android:name=".MainActivity"
+            android:name=".NativeGateActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
             <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
+                <action android:name="io.apkscanner.nativecases.ADMIN_ACTION" />
                 <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="copilotfixture" android:host="plugin" />
             </intent-filter>
         </activity>
-
-        <activity-alias
-            android:name=".PluginAliasActivity"
-            android:targetActivity=".MainActivity"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="copilotfixture" android:host="plugin-alt" />
-            </intent-filter>
-        </activity-alias>
 
         <activity
-            android:name=".BridgeActivity"
+            android:name=".DynamicLinkActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="copilotfixture" android:host="web" />
+                <data android:scheme="nativecases" android:host="elevate" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".NativeSecretService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.apkscanner.nativecases.READ_NATIVE_SECRET" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

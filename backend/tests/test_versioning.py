@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 import zipfile
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
+from apkscanner.artifacts import ArtifactStore
 from apkscanner.db import Database
 from apkscanner.models import (
     ApplicationRecord,
@@ -18,6 +21,10 @@ from apkscanner.models import (
     VulnerabilityCase,
     VulnerabilityOccurrence,
 )
+from apkscanner.orchestrator import ScanOrchestrator
+from apkscanner.proof_recipes import plan_with_proof_recipe
+from apkscanner.schemas import AgentOracleSpec, AgentRequestedTest
+from apkscanner.tools import TimeBudget
 from apkscanner.versioning import SecurityEvolutionService
 from sqlalchemy import select
 
@@ -199,6 +206,7 @@ def test_snapshot_diff_migrates_only_proven_poc(settings, tmp_path) -> None:  # 
         assert diff.baseline_scan_id == old_snapshot.scan_id
         assert diff.summary["replay_candidate_count"] == 1
         assert diff.deltas[0]["category"] == "security_hardened"
+        assert attempt.proof_recipe["execution_mode"] == "agent_source"
         replay_tasks: list[InvestigationTask] = []
         service.apply_diff_and_patterns(
             session,
@@ -214,6 +222,154 @@ def test_snapshot_diff_migrates_only_proven_poc(settings, tmp_path) -> None:  # 
         replay = task.preconditions["version_replays"][0]
         assert replay["source_finding_id"] == finding.id
         assert replay["target_entry_id"] == new_entry.id
+
+
+def test_snapshot_diff_regenerates_platform_harness_without_source_archive(
+    settings,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    service = SecurityEvolutionService()
+    with database.session_factory() as session:
+        baseline = _scan("1", "d")
+        baseline.created_at = datetime.now(UTC) - timedelta(seconds=5)
+        old_entry = _entry(baseline)
+        old_task = InvestigationTask(
+            scan=baseline,
+            task_type="provider",
+            target_entry_ids=[],
+            hypotheses=["Third-party caller can read provider rows."],
+        )
+        session.add_all([baseline, old_entry, old_task])
+        session.flush()
+        old_task.target_entry_ids = [old_entry.id]
+        hypothesis = SecurityHypothesis(
+            scan=baseline,
+            task_id=old_task.id,
+            fingerprint="8" * 64,
+            category="provider_access",
+            claim="Third-party caller can read provider rows.",
+            entry_point_ids=[old_entry.id],
+        )
+        session.add(hypothesis)
+        session.flush()
+        request = AgentRequestedTest(
+            hypothesis_id=hypothesis.id,
+            entry_point_id=old_entry.id,
+            uri="content://io.apkscanner.versiontest.secrets/items",
+            extras={},
+            operation="query",
+            oracle=AgentOracleSpec(
+                kind="provider_rows",
+                minimum_rows=1,
+                impact="unauthorized_data_access",
+            ),
+            rationale="Read one secret row with a generated ordinary-app Harness.",
+        )
+        attempt = ProofAttempt(
+            scan_id=baseline.id,
+            task_id=old_task.id,
+            hypothesis_id=hypothesis.id,
+            test_case_id="platform-harness-proof",
+            prover="platform_ephemeral_harness",
+            status="proven",
+            harm_demonstrated=True,
+            plan=plan_with_proof_recipe(request),
+            oracle=request.oracle.model_dump(mode="json"),
+        )
+        session.add(attempt)
+        session.flush()
+        finding = Finding(
+            scan=baseline,
+            dedupe_key="platform-harness-proof",
+            rule_id="AGENT-ENTRY-INVESTIGATION",
+            title="Unauthorized provider read",
+            description="A generated Harness read one target-owned row.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            status="reproduced_blackbox",
+            entry_point_ids=[old_entry.id],
+            metadata_json={"proof_attempt_ids": [attempt.id]},
+        )
+        session.add(finding)
+        service.build_snapshot(
+            session,
+            scan=baseline,
+            entries=[old_entry],
+            code_index=_code_index(),
+        )
+        session.commit()
+
+        target = _scan("2", "e")
+        new_entry = _entry(target)
+        session.add_all([target, new_entry])
+        session.flush()
+        target_snapshot = service.build_snapshot(
+            session,
+            scan=target,
+            entries=[new_entry],
+            code_index=_code_index(),
+        )
+        diff = service.build_version_diff(session, scan=target, snapshot=target_snapshot)
+        assert diff is not None
+        assert len(diff.replay_candidates) == 1
+        replay = diff.replay_candidates[0]
+        assert replay["proof_recipe"]["execution_mode"] == "platform_harness"
+        assert replay["source_archive_path"] is None
+        replay_tasks: list[InvestigationTask] = []
+        service.apply_diff_and_patterns(
+            session,
+            scan=target,
+            entries=[new_entry],
+            tasks=replay_tasks,
+            diff=diff,
+        )
+        session.commit()
+        replay_task = replay_tasks[0]
+
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    target_hypothesis = orchestrator.hypothesis_ledger.ensure_task_hypotheses(replay_task)[0]
+    captured: list[AgentRequestedTest] = []
+
+    def build(*, requests, **_kwargs):  # noqa: ANN001
+        return requests, {}, []
+
+    def execute(*, requests, **_kwargs):  # noqa: ANN001
+        captured.extend(requests)
+        return [{"test_case_id": "version-replay"}], []
+
+    monkeypatch.setattr(orchestrator, "_build_requested_pocs", build)
+    monkeypatch.setattr(orchestrator, "_execute_requested_tests", execute)
+    executed, gaps = orchestrator._execute_version_replays(
+        scan_id=target.id,
+        task_id=replay_task.id,
+        package_name=target.package_name or "",
+        attempt=1,
+        replay_candidates=[replay],
+        entries=[new_entry],
+        hypothesis_context=[
+            {
+                "id": target_hypothesis.id,
+                "claim": target_hypothesis.claim,
+                "category": target_hypothesis.category,
+                "entry_point_ids": target_hypothesis.entry_point_ids,
+            }
+        ],
+        hypothesis_ids={target_hypothesis.id},
+        budget=TimeBudget.from_seconds(30),
+        evidence_summaries=[],
+        cancel_event=threading.Event(),
+        device=SimpleNamespace(serial="test-device"),
+    )
+
+    assert executed == [{"test_case_id": "version-replay"}]
+    assert gaps == []
+    assert len(captured) == 1
+    assert captured[0].poc is None
+    assert captured[0].entry_point_id == new_entry.id
+    assert captured[0].hypothesis_id == target_hypothesis.id
 
 
 def test_proven_finding_becomes_pattern_but_match_stays_candidate(settings) -> None:  # noqa: ANN001

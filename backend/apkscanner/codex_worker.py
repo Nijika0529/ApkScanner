@@ -38,6 +38,8 @@ class WorkerConfiguration(BaseModel):
     provider_base_url: str = Field(min_length=1, max_length=2048)
     model_catalog_path: str = Field(min_length=1, max_length=4096)
     workspace_path: str = Field(pattern=r"^/agent-workspaces/[a-z0-9-]+/workspace$")
+    ida_mcp_url: AnyHttpUrl | None = None
+    ida_mcp_tool_timeout_seconds: int = Field(default=1_800, ge=60, le=14_400)
 
 
 class BaseCommand(BaseModel):
@@ -164,6 +166,10 @@ class PersistentCodexWorker:
                         base_url=config.provider_base_url,
                         model_catalog_path=config.model_catalog_path,
                         web_search="live",
+                        ida_mcp_url=(
+                            str(config.ida_mcp_url) if config.ida_mcp_url is not None else None
+                        ),
+                        ida_mcp_tool_timeout_seconds=config.ida_mcp_tool_timeout_seconds,
                     )
                 )
             )

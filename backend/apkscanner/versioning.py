@@ -28,6 +28,7 @@ from .models import (
     VulnerabilityOccurrence,
     VulnerabilityPattern,
 )
+from .proof_recipes import proof_recipe_from_plan
 from .repository import add_event
 
 _SMALI_NOISE = re.compile(
@@ -178,10 +179,7 @@ class SecurityEvolutionService:
                         "chain_fingerprints": sorted(
                             str(item.get("fingerprint"))
                             for item in (
-                                (entry.metadata_json or {}).get(
-                                    "static_review_attack_chains"
-                                )
-                                or []
+                                (entry.metadata_json or {}).get("static_review_attack_chains") or []
                             )
                             if isinstance(item, dict) and item.get("fingerprint")
                         ),
@@ -189,9 +187,7 @@ class SecurityEvolutionService:
                             {
                                 str(item.get("chain_kind"))
                                 for item in (
-                                    (entry.metadata_json or {}).get(
-                                        "static_review_attack_chains"
-                                    )
+                                    (entry.metadata_json or {}).get("static_review_attack_chains")
                                     or []
                                 )
                                 if isinstance(item, dict) and item.get("chain_kind")
@@ -201,9 +197,7 @@ class SecurityEvolutionService:
                             {
                                 str(item.get("engine_version"))
                                 for item in (
-                                    (entry.metadata_json or {}).get(
-                                        "static_review_attack_chains"
-                                    )
+                                    (entry.metadata_json or {}).get("static_review_attack_chains")
                                     or []
                                 )
                                 if isinstance(item, dict) and item.get("engine_version")
@@ -245,12 +239,8 @@ class SecurityEvolutionService:
                 "analysis_profile": (scan.stats or {}).get("analysis_profile"),
                 "archive_fingerprint": (scan.stats or {}).get("archive_fingerprint"),
                 "dex_files": list((scan.stats or {}).get("dex_files") or []),
-                "native_libraries": list(
-                    (scan.stats or {}).get("native_libraries") or []
-                ),
-                "security_resources": list(
-                    (scan.stats or {}).get("security_resources") or []
-                ),
+                "native_libraries": list((scan.stats or {}).get("native_libraries") or []),
+                "security_resources": list((scan.stats or {}).get("security_resources") or []),
             },
         }
         hash_payload = {
@@ -440,9 +430,7 @@ class SecurityEvolutionService:
             if (item.payload or {}).get("identity", {}).get("artifact_sha256")
             != scan.artifact_sha256
         ]
-        requested_baseline = dict((scan.stats or {}).get("version_baseline") or {}).get(
-            "scan_id"
-        )
+        requested_baseline = dict((scan.stats or {}).get("version_baseline") or {}).get("scan_id")
         baseline = (
             next(
                 (item for item in history if item.scan_id == requested_baseline),
@@ -512,9 +500,7 @@ class SecurityEvolutionService:
             baseline_scan_id=baseline.scan_id,
             target_scan_id=scan.id,
             summary={
-                "baseline_selection": (
-                    "explicit" if requested_baseline else "automatic_legacy"
-                ),
+                "baseline_selection": ("explicit" if requested_baseline else "automatic_legacy"),
                 "identity_result": {
                     "package_match": baseline.package_name == snapshot.package_name,
                     "signer_match": baseline.signer_digest == snapshot.signer_digest,
@@ -563,8 +549,7 @@ class SecurityEvolutionService:
             older = [
                 item
                 for item in history
-                if (code := numeric_version(item.version_code)) is not None
-                and code < target_code
+                if (code := numeric_version(item.version_code)) is not None and code < target_code
             ]
             if older:
                 return max(
@@ -698,17 +683,13 @@ class SecurityEvolutionService:
                 (new_manifest.get("static_surface") or {}).get("chain_fingerprints") or []
             )
             old_chain_engines = set(
-                (old_manifest.get("static_surface") or {}).get("chain_engine_versions")
-                or []
+                (old_manifest.get("static_surface") or {}).get("chain_engine_versions") or []
             )
             new_chain_engines = set(
-                (new_manifest.get("static_surface") or {}).get("chain_engine_versions")
-                or []
+                (new_manifest.get("static_surface") or {}).get("chain_engine_versions") or []
             )
             chain_engine_changed = bool(
-                old_chain_engines
-                and new_chain_engines
-                and old_chain_engines != new_chain_engines
+                old_chain_engines and new_chain_engines and old_chain_engines != new_chain_engines
             )
             if chain_engine_changed:
                 # Fingerprints intentionally include the engine version. Comparing
@@ -718,12 +699,8 @@ class SecurityEvolutionService:
                 removed_chain_fingerprints: list[str] = []
                 changes.append("attack_chain_engine_changed")
             else:
-                added_chain_fingerprints = sorted(
-                    new_chain_fingerprints - old_chain_fingerprints
-                )
-                removed_chain_fingerprints = sorted(
-                    old_chain_fingerprints - new_chain_fingerprints
-                )
+                added_chain_fingerprints = sorted(new_chain_fingerprints - old_chain_fingerprints)
+                removed_chain_fingerprints = sorted(old_chain_fingerprints - new_chain_fingerprints)
             if added_chain_fingerprints:
                 changes.append("candidate_attack_chains_added")
             if removed_chain_fingerprints:
@@ -812,6 +789,8 @@ class SecurityEvolutionService:
                 else []
             )
             for attempt in attempts:
+                if not attempt.harm_demonstrated:
+                    continue
                 source_hypothesis = session.get(
                     SecurityHypothesis,
                     attempt.hypothesis_id,
@@ -819,32 +798,38 @@ class SecurityEvolutionService:
                 old_entry_id = str((attempt.plan or {}).get("entry_point_id") or "")
                 target_entry_id = target_for_old.get(old_entry_id)
                 plan = dict(attempt.plan or {})
-                poc = plan.get("poc")
-                if not target_entry_id or not isinstance(poc, dict):
+                recipe = proof_recipe_from_plan(plan)
+                if not target_entry_id or recipe is None:
                     continue
-                build_evidence = next(
-                    (
-                        item
-                        for item in session.scalars(
-                            select(Evidence)
-                            .where(
-                                Evidence.scan_id == baseline_scan_id,
-                                Evidence.task_id == attempt.task_id,
-                                Evidence.kind == "poc.build_artifact",
+                if not isinstance(plan.get("proof_recipe"), dict):
+                    plan["proof_recipe"] = recipe.model_dump(mode="json")
+                    attempt.plan = plan
+                build_evidence = None
+                if recipe.source_archive_required:
+                    build_evidence = next(
+                        (
+                            item
+                            for item in session.scalars(
+                                select(Evidence)
+                                .where(
+                                    Evidence.scan_id == baseline_scan_id,
+                                    Evidence.task_id == attempt.task_id,
+                                    Evidence.kind == "poc.build_artifact",
+                                )
+                                .order_by(desc(Evidence.created_at))
                             )
-                            .order_by(desc(Evidence.created_at))
-                        )
-                        if (item.metadata_json or {}).get("hypothesis_id") == attempt.hypothesis_id
-                    ),
-                    None,
-                )
+                            if (item.metadata_json or {}).get("hypothesis_id")
+                            == attempt.hypothesis_id
+                        ),
+                        None,
+                    )
                 source_path = (
                     str((build_evidence.metadata_json or {}).get("source_path"))
                     if build_evidence is not None
                     and (build_evidence.metadata_json or {}).get("source_path")
                     else None
                 )
-                if not source_path:
+                if recipe.source_archive_required and not source_path:
                     continue
                 candidates.append(
                     {
@@ -863,13 +848,18 @@ class SecurityEvolutionService:
                         "baseline_entry": old_by_id.get(old_entry_id, {}),
                         "target_entry": new_by_id.get(target_entry_id, {}),
                         "plan": plan,
+                        "proof_recipe": recipe.model_dump(mode="json"),
                         "source_archive_path": source_path,
                         "source_archive_sha256": (
                             (build_evidence.metadata_json or {}).get("poc_source_sha256")
                             if build_evidence is not None
                             else None
                         ),
-                        "status": "ready",
+                        "status": (
+                            "ready_regenerate_harness"
+                            if recipe.execution_mode == "platform_harness"
+                            else "ready_restore_source"
+                        ),
                     }
                 )
         return candidates
@@ -1075,6 +1065,7 @@ class SecurityEvolutionService:
             select(VulnerabilityPattern).where(VulnerabilityPattern.fingerprint == fingerprint)
         )
         proof_plan = dict(attempts[0].plan or {}) if attempts else {}
+        portable_recipe = proof_recipe_from_plan(proof_plan)
         if pattern is None:
             pattern = VulnerabilityPattern(
                 fingerprint=fingerprint,
@@ -1100,7 +1091,11 @@ class SecurityEvolutionService:
                     "platform proof Oracle does not demonstrate harm",
                 ],
                 proof_recipe={
-                    "request": proof_plan,
+                    **(
+                        portable_recipe.model_dump(mode="json")
+                        if portable_recipe is not None
+                        else {"legacy_request": proof_plan}
+                    ),
                     "impact": impact,
                     "source_proof_attempt_ids": proof_attempt_ids,
                 },

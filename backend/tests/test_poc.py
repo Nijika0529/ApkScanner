@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
+import re
 import threading
 import zipfile
 from dataclasses import replace
@@ -88,7 +90,7 @@ def test_live_proof_replay_accepts_platform_binder_transaction_without_poc() -> 
             expected_text="service-secret=hunter2",
             impact="unauthorized_data_access",
         ),
-        rationale="Read the exported Service reply through the platform Probe.",
+        rationale="Read the exported Service reply through a generated proof Harness.",
     )
 
     assert replay.poc is None
@@ -100,6 +102,142 @@ def test_live_proof_replay_accepts_platform_binder_transaction_without_poc() -> 
             oracle=AgentOracleSpec(),
             rationale="A non-Binder replay still needs an ordinary-app PoC.",
         )
+
+
+def test_platform_materializes_a_request_scoped_binder_harness(settings, tmp_path) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    builder = PocBuilder(settings, ToolRunner(settings), ArtifactStore(settings))
+    request = AgentRequestedTest(
+        hypothesis_id="11111111-2222-4333-8444-555555555555",
+        entry_point_id="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        uri=None,
+        extras={},
+        operation="binder_script",
+        binder_transaction_code=7,
+        binder_interface_descriptor="com.example.ISecret",
+        binder_script=[
+            AgentBinderScriptStep(operation="write_integer", integer_value=42),
+            AgentBinderScriptStep(operation="read_string"),
+        ],
+        oracle=AgentOracleSpec(
+            kind="binder_reply",
+            expected_text="secret",
+            match_mode="contains",
+            impact="unauthorized_data_access",
+        ),
+        rationale="Exercise the typed Binder protocol from an ordinary application UID.",
+    )
+
+    spec = builder.materialize_proof_harness(
+        tmp_path,
+        request,
+        entry_kind="service",
+        target_package_name="com.example.target",
+        target_component="com.example.target.SecretService",
+    )
+
+    source = next((tmp_path / spec.project_path / "src").rglob("*.java")).read_text()
+    encoded = re.search(r'REQUEST_BASE64 = "([A-Za-z0-9+/=]+)"', source)
+    assert encoded is not None
+    payload = json.loads(base64.b64decode(encoded.group(1)))
+    assert spec.package_name.startswith("io.apkscanner.poc.proof_")
+    assert spec.harness_mode == "custom"
+    assert payload["package"] == "com.example.target"
+    assert payload["component"] == "com.example.target.SecretService"
+    assert payload["binder_transaction_code"] == 7
+    assert [step["operation"] for step in payload["binder_script"]] == [
+        "write_integer",
+        "read_string",
+    ]
+    assert "security_impact_observed" in source
+
+
+def test_platform_harness_build_stage_is_completed_not_skipped(
+    settings,
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="harness-stage.apk",
+            package_name="com.example.harnessstage",
+            artifact_sha256="9" * 64,
+            artifact_path=str(tmp_path / "harness-stage.apk"),
+        )
+        entry = EntryPoint(
+            scan=scan,
+            kind="service",
+            name="com.example.harnessstage.SecretService",
+            owner_component="com.example.harnessstage.SecretService",
+            exported=True,
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="running",
+            target_entry_ids=[],
+            hypotheses=["The Binder reply exposes a secret."],
+        )
+        session.add_all([scan, entry, task])
+        session.flush()
+        task.target_entry_ids = [entry.id]
+        session.commit()
+        scan_id, task_id, entry_id = scan.id, task.id, entry.id
+
+    hypothesis = orchestrator.hypothesis_ledger.ensure_task_hypotheses(task)[0]
+    request = AgentRequestedTest(
+        hypothesis_id=hypothesis.id,
+        entry_point_id=entry_id,
+        uri=None,
+        extras={},
+        operation="binder_transact",
+        binder_transaction_code=1,
+        binder_reply_type="string",
+        oracle=AgentOracleSpec(
+            kind="binder_reply",
+            expected_text="secret",
+            impact="unauthorized_data_access",
+        ),
+        rationale="Regenerate the platform-owned Binder Harness.",
+    )
+    apk_path = tmp_path / "generated-harness.apk"
+    apk_path.write_bytes(b"APK")
+
+    def build(_workspace, spec, **_kwargs):  # noqa: ANN001, ANN202
+        return PocBuildResult(
+            ok=True,
+            apk_sha256="a" * 64,
+            apk_path=apk_path,
+            source_sha256="b" * 64,
+            source_path=tmp_path / "generated-harness-source.zip",
+            effective_spec=spec,
+            metadata={"platform_generated_proof": True},
+        )
+
+    monkeypatch.setattr(orchestrator.poc_builder, "build", build)
+    accepted, _artifacts, gaps = orchestrator._build_requested_pocs(
+        scan_id=scan_id,
+        task_id=task_id,
+        workspace=tmp_path,
+        requests=[request],
+        evidence_summaries=[],
+        cancel_event=threading.Event(),
+    )
+
+    assert accepted == [request]
+    assert gaps == []
+    with database.session_factory() as session:
+        persisted = session.get(InvestigationTask, task_id)
+        assert persisted is not None
+        stage = persisted.result["execution_dag"]["nodes"]["poc_build"]
+        assert stage["status"] == "completed"
+        assert stage["metadata"]["platform_harness_built_count"] == 1
+        assert stage["metadata"]["agent_poc_built_count"] == 0
 
 
 def test_embedded_live_proof_endpoint_rejects_an_unregistered_task(settings) -> None:  # noqa: ANN001
@@ -1137,6 +1275,7 @@ def test_platform_builds_poc_before_device_queue_and_records_artifact(
             id="00000000-0000-0000-0000-000000000101",
             status="investigating",
             filename="poc.apk",
+            package_name="io.apkscanner.target",
             artifact_sha256="a" * 64,
             artifact_path=str(settings.data_dir / "target.apk"),
         )
@@ -1169,10 +1308,11 @@ def test_platform_builds_poc_before_device_queue_and_records_artifact(
         rationale="A custom ordinary-UID caller is required.",
         poc=poc_spec(),
     )
-    monkeypatch.setattr(
-        orchestrator.poc_builder,
-        "build",
-        lambda *_args, **_kwargs: PocBuildResult(
+    build_kwargs: dict[str, object] = {}
+
+    def build(*_args, **kwargs):  # noqa: ANN001, ANN202
+        build_kwargs.update(kwargs)
+        return PocBuildResult(
             ok=True,
             apk_sha256="b" * 64,
             apk_path=apk_path,
@@ -1184,8 +1324,9 @@ def test_platform_builds_poc_before_device_queue_and_records_artifact(
                 "source_sha256": "c" * 64,
                 "source_path": str(source_path),
             },
-        ),
-    )
+        )
+
+    monkeypatch.setattr(orchestrator.poc_builder, "build", build)
     evidence: list[dict] = []
     accepted, artifacts, gaps = orchestrator._build_requested_pocs(
         scan_id=scan.id,
@@ -1197,6 +1338,7 @@ def test_platform_builds_poc_before_device_queue_and_records_artifact(
     )
     assert accepted == [request]
     assert not gaps
+    assert build_kwargs["visible_packages"] == ("io.apkscanner.target",)
     assert artifacts[orchestrator._poc_request_key(request)].apk_sha256 == "b" * 64
     assert any(item["kind"] == "poc.build_artifact" for item in evidence)
 
@@ -1636,7 +1778,7 @@ def test_poc_execution_is_correlated_into_the_hypothesis_proof(
                         "test_case_id": test_case_id,
                     },
                 ),
-            ]
+            ],
         ),
     )
     evidence: list[dict] = []

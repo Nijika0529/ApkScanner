@@ -42,7 +42,7 @@ APKScanner 的核心设计是：**平台保证覆盖和事实，Agent 负责探�
 | 目标感知规划 | 通用枚举之后应用显式目标 Profile；按同一实现和攻击链归并入口变体，保留全部入口 ID、合并原因与成本回执，并把插件、Web 和 Native 子链限制为少量高价值任务 |
 | 深度 Agent 调查 | `openai-codex==0.144.4` + DeepSeek Responses API；持久 Thread、多轮证据回灌、Critic/Rescue/Final 有界扇出、终局 Adaptive Verifier |
 | Docker 隔离 | 一次扫描一个无密钥 keeper 容器；每个 `task + attempt + role` 使用独立 Unix UID、HOME、`CODEX_HOME`、临时目录和可写工作区 |
-| 真机验证 | ADB 设备池支持 USB 与 IP:Port 动态接入；一个任务在完整生命周期内独占一个 serial，并可运行 Probe 或 Agent 生成的普通 App UID PoC |
+| 真机验证 | ADB 设备池支持 USB 与 IP:Port 动态接入；一个任务在完整生命周期内独占一个 serial，并按 ProofSpec 临时生成普通 App UID Harness 或运行 Agent PoC |
 | 证据闭环 | 持久化 Hypothesis、Argument、ProofAttempt、Evidence、Oracle 和 Verdict；模型文字不能自证漏洞成立 |
 | 版本演进 | 内容寻址复用 JADX/Apktool/代码索引，生成 Manifest、DEX、Native、资源语义 Diff，并在新版本重新构建和回放历史 PoC |
 | 审计控制台 | FastAPI + React/TypeScript；支持实时任务、结构化 Finding、平台 Operator、Artifact/PoC 索引、版本比较以及 JSON/HTML/SARIF 报告 |
@@ -101,7 +101,7 @@ flowchart LR
 | --- | --- |
 | `supported_static` | 引用当前 Scan 的静态 Evidence，能够说明 source、control、sink 和可达路径 |
 | `refuted_static` | 静态证据表明入口受保护、路径不可达或没有实际安全影响 |
-| `reproduced_blackbox` | 普通 App UID Probe/PoC 与平台观察使用同一 request/test-case ID，且 Oracle 独立观察到具体危害 |
+| `reproduced_blackbox` | 临时普通 App UID Harness/PoC 与平台观察使用同一 request/test-case ID，且 Oracle 独立观察到具体危害 |
 | `not_reproduced` | 已执行的普通 App UID 用例被平台负向 Oracle 明确反驳；只反驳该用例，不宣称应用整体安全 |
 
 当前 Oracle 覆盖 Binder reply、Provider rows、目标 UID 日志、UI 文本、进程崩溃、文件状态变化
@@ -244,9 +244,10 @@ ground truth、Evidence 准入规则和评测命令构成当前的结果口径�
 | 静态缓存、版本快照、语义 Diff、历史 PoC 重放 | 已实现第一阶段 |
 | 内嵌 APK/JS/SO ArtifactGraph、宿主→插件入口、Java↔JNI↔SO 静态链接 | 已实现第一阶段 |
 | Copilot 7.x 目标 Profile、Zeus/Native 子链和任务归并回执 | 已实现第一阶段 |
+| Linux IDALib Headless MCP、Docker→WSL 路径映射和共享 worker 池 | 已实现第一阶段，按需启用 |
 | Android 16 自托管正式回归 | 工作流已提供，需要实际设备与仓库 Secret |
 | 企业多用户、RBAC、Provider egress 治理 | 不属于当前个人版本，保留架构接口 |
-| Native 函数级数据流、动态脱壳、IDA MCP、应用内部业务流程测试 | 后续扩展方向 |
+| Native 自动语义归纳、动态脱壳、应用内部业务流程测试 | 后续扩展方向 |
 
 ## 文档导航
 
@@ -265,7 +266,6 @@ ground truth、Evidence 准入规则和评测命令构成当前的结果口径�
 backend/apkscanner/     FastAPI、静态分析、编排、设备、Codex、证据与报告
 backend/tests/          单元、契约、Docker、ADB 和真实 Provider 可选测试
 frontend/               React + TypeScript + Vite 审计控制台
-probe/                  普通 App UID 通用验证 Probe
 testapk/                故意脆弱的公开 APK、源码和 ground truth
 config/                 模型目录、SDK 基线和 benchmark 示例
 docker/                 Worker 包装器与本地 vendored 工具目录
@@ -278,5 +278,5 @@ docs/                   架构、运行时、攻击链、评测与版本演进�
 - Web 服务默认只监听 `127.0.0.1`，不应直接暴露到公网；
 - Docker Worker 内部使用 full-access sandbox，但容器边界不等于多租户安全隔离；
 - Provider 会接收任务上下文和反编译证据，生产使用前应确认数据处理与网络出口策略；
-- Probe 和测试 APK 均为故意危险工具，测试结束后应从设备卸载；
+- 平台临时 Harness 会在单次证明后卸载；测试 APK 仅应安装在专用设备；
 - 仓库当前未声明开源许可证；公开可见不等于获得复制、修改或分发授权。

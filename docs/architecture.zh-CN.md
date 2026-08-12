@@ -17,7 +17,7 @@ flowchart LR
     A[APK intake] --> B[ZIP/签名/Manifest/JADX·Apktool]
     B --> C[版本化 Security IR]
     C --> D[入口枚举与平台任务规划]
-    D --> E[普通应用 UID 黑盒：可选 Probe / Agent PoC]
+    D --> E[普通应用 UID 黑盒：临时 Harness / Agent PoC]
     E --> I[选定 Agent 提出下一组测试]
     I --> J{需要补充测试?}
     J -- 是 --> K[平台校验并执行本轮全部有效用例]
@@ -95,14 +95,15 @@ Web 健康检查使用真正的非阻塞锁；设备繁忙时读取最近一次�
 | 本地控制面 | SQLite、APK、workspace、evidence | FastAPI 仅监听 loopback；变更 API 需要自定义请求头；内容寻址文件拒绝 symlink/摘要冲突 |
 | Codex 扫描级 Docker worker | 扫描只读输入、每 role 独立可写 workspace、DeepSeek/Web 网络 | 一个 scan 一个无密钥 keeper；每个 task/attempt/role 独立 UID/HOME/CODEX_HOME/TMPDIR；Codex `Sandbox.full_access`；rootfs 只读、capabilities 全丢弃、PID/CPU/内存限制；不挂 Docker socket 或设备 |
 | Codex host worker | 当前任务 attempt workspace、主机工具和模型网络 | 仅作为双开关启用的个人诊断模式；full-access sandbox，没有容器/UID/资源边界，不能作为默认部署 |
-| 云真机 | 目标 APK、可选 Probe APK、Agent PoC、测试账号 | 配置声明目标 Android/API；串行 lease；默认跨任务保留登录、协议和本地数据；可丢弃 fixture 可显式启用 `pm clear`，不声称完整快照复位 |
-| Probe APK | 可选的普通 App UID 通用入口快速执行器 | 只接受最初发送者为 shell/root 的调度；复杂 Binder/AIDL/漏洞链改用 Agent 专用 PoC；仍只允许安装在专用测试设备 |
+| WSL IDALib MCP | 显式映射的 APK 静态工作区、IDA 数据库和 Hex-Rays worker | 宿主机共享服务；最多 4 个 worker；Agent 仅在具体 JNI/native 链断点按需打开 SO，并显式绑定 database session |
+| 云真机 | 目标 APK、平台临时 Harness、Agent PoC、测试账号 | 配置声明目标 Android/API；串行 lease；默认跨任务保留登录、协议和本地数据；可丢弃 fixture 可显式启用 `pm clear`，不声称完整快照复位 |
+| 临时 Proof Harness | 平台按已校验 ProofSpec 生成的普通 App UID 执行器 | 每个请求固化目标与动作，平台构建、签名、安装、关联结果并卸载；复杂 AIDL/回调链改用 Agent 专用 PoC |
 
 APK、反编译代码、资源、日志、网页和工具输出都属于不可信数据。Codex developer
 instructions 明确禁止服从这些内容中的指令。每个 `task_id + attempt + role` 获得独立 UID
 和可写 workspace；并发 Agent 不共享可写目录，同时可读取完整只读 Apktool/JADX/archive
 根，创建本地脚本、Android 工程和预编译 PoC。平台最终只把带稳定
-test-case/request ID 的 Probe/PoC 与客观 Oracle 作为复现证据。模型网络出口应分别限制到
+test-case/request ID 的 Harness/PoC 与客观 Oracle 作为复现证据。模型网络出口应分别限制到
 获批的 DeepSeek/代理端点。
 
 ## Security IR
@@ -117,6 +118,7 @@ test-case/request ID 的 Probe/PoC 与客观 Oracle 作为复现证据。模型�
 - `CoverageItem`：每个 MASVS 域和每个入口在 static、deterministic、blackbox、agent 阶段的状态及 gap。
 - `AgentSessionRecord` / `AgentTurnRecord` / `ScanContainerRecord`：独立于高频事件流的运行生命周期台账。
 - `AdaptiveVerificationCheckpoint`：终局验证按候选持久化的恢复断点。
+- `ProofRecipe`：随 ProofAttempt 持久化的版本可移植实验配方，用于重新生成 Harness 或恢复 Agent PoC 源码。
 - `RuntimeObservation` / `ValidationFixture`：自由实验的语义观测与账号、会话、Canary 测试状态。
 - `CampaignRun` / `CampaignEntryRecord`：监督控制面的持久目标、DAG、预算和执行状态。
 
@@ -138,7 +140,7 @@ Supervisor 生命周期由服务内第一方循环推进，不依赖浏览器保
 | --- | --- |
 | `supported_static` | 引用了本 scan 的 `static.*` Evidence ID |
 | `refuted_static` | 静态证据表明攻击路径受保护、不可达或无实际危害 |
-| `reproduced_blackbox` | 同一 request/test-case ID 的 Probe 调用+日志或专用 PoC 启动+日志成功关联，并由平台 Oracle 独立观察到具体危害；`adb shell` 成功不等价 |
+| `reproduced_blackbox` | 同一 request/test-case ID 的临时 Harness/专用 PoC 启动与日志成功关联，并由平台 Oracle 独立观察到具体危害；`adb shell` 成功不等价 |
 | `not_reproduced` | 同一 test-case/request ID 的普通 App UID 尝试与结果日志存在，且平台 Prover 明确产生 `oracle_refuted=true`；它只反驳该已执行用例，不证明全局安全 |
 
 Agent 声称但不属于本 scan/task 的 Evidence ID 会被删除。动态证据不足以支撑复现或负向
@@ -147,7 +149,7 @@ Oracle 时，平台保留由已引用静态证据支撑的明确正向/负向结
 
 ## 能力恢复后的增量补扫
 
-连接 ADB、补齐可选 Probe/专用 PoC 执行能力或恢复模型后端后，不需要重新上传 APK。单任务“重新分析”
+连接 ADB、补齐临时 Harness/专用 PoC 执行能力或恢复模型后端后，不需要重新上传 APK。单任务“重新分析”
 和扫描级“补扫信息不全项”都会把目标任务重新置为 `queued`，将扫描恢复为
 `investigating`，随后复用已有 workspace、代码索引和静态 Evidence，重新执行设备租约、
 动态验证和按当前开关决定的 Agent 调用。批量补扫仅选择设备阻塞、证据不足、超时、失败及
@@ -159,7 +161,7 @@ AI 审计；旧 Evidence 不删除。批量补扫仅允许在当前扫描已经 
 
 单任务默认预算为 20 分钟。任务进入 `timed_out` 后，Web 提供“继续深度探索”而不是普通
 重跑：控制面重新排队同一 `task_id`，分配一份新的 20 分钟预算，并将该任务历次静态、
-ADB、Probe、Agent 请求/响应和平台校验 Evidence 一并装载给新一轮 Agent。续跑轮次
+ADB、Harness/PoC、Agent 请求/响应和平台校验 Evidence 一并装载给新一轮 Agent。续跑轮次
 记录在 `manual_continuation.continuation_number`，旧 thread/turn 仅作为关联信息保留，新轮
 仍产生独立可审计调用。显式续跑不受原扫描 24 小时截止时间或自动尝试次数限制，但每轮仍
 重新获取设备租约、执行准备与最终清理，且只能由已经 `timed_out` 的任务触发。
@@ -182,8 +184,8 @@ PoC 构建、全局串行 ADB、Oracle 和 Evidence 记录，并把结果同步�
 
 `requested_tests` 仅作为实时通道不可用时的兼容后备；通过边界校验的请求同样必须关联
 当前任务的 Hypothesis，并形成 `ProofAttempt`。`android_entry_probe` Prover 复用现有
-ADB/Probe 能力；
-Oracle 将“入口执行成功”和“实际危害”分开：普通应用 UID Probe 回执只能设置
+ADB/临时 Harness 能力；
+Oracle 将“入口执行成功”和“实际危害”分开：普通应用 UID Harness 回执只能设置
 `execution_demonstrated=true`；只有领域 Prover 同时给出平台可校验的
 `security_impact_observed=true`（例如敏感数据实际返回、未授权状态确实变化或认证边界被
 绕过），才设置 `harm_demonstrated=true`。模型文字、导出声明、危险 API 名称、单独

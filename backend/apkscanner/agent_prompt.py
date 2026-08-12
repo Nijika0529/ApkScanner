@@ -101,7 +101,13 @@ def developer_instructions(
         "symbol. When the exact edge crosses Java/JNI/native code, consult the supplied "
         "artifact_graph.json and the referenced native/index.json or per-SO summary before reading "
         "the binary; use its Java load edge, JNI binding, ABI, ELF dependencies, and symbol facts "
-        "as the starting chain rather than treating native code as an opaque gap. A search used to "
+        "as the starting chain rather than treating native code as an opaque gap. If "
+        "platform_context.workspace.ida_mcp.available is true and those summaries leave one "
+        "concrete security-relevant native edge unresolved, use the ida-headless MCP server. "
+        "Translate /scan-input paths with its path_mappings before idb_open, assign one stable "
+        "preferred_session_id per SO, pass database explicitly to every IDB-dependent call, and "
+        "close the session after resolving that edge. Do not open every library or repeat facts "
+        "already present in the native summary. A search used to "
         "resolve that exact name may be broad in location but narrow in "
         "pattern; open only matching files that contain the concrete edge. A zero-result search "
         "ends that proposed branch. Do not turn unrelated components into a synthetic vulnerability "
@@ -110,9 +116,12 @@ def developer_instructions(
         "or logcat variants unless the prior output identifies a specific changed input that can "
         "resolve a different hypothesis. Shell-UID reachability cannot prove ordinary-app impact; "
         "when impact requires an app UID, returned Provider data, or WebView result capture, prefer "
-        "a dedicated PoC or platform Probe instead of searching logcat for an observation the target "
-        "does not emit. For a no-argument Service Binder transaction with a primitive reply, use "
-        "the platform binder_transact replay instead of authoring a Binder PoC. After preparing "
+        "a dedicated PoC or platform-generated proof Harness instead of searching logcat for an observation the target "
+        "does not emit. For a no-argument Service Binder transaction with a primitive reply, inspect "
+        "platform_context.proof_capabilities.ephemeral_app_harness first. When it is true, use the "
+        "platform binder_transact replay instead of authoring a Binder PoC; the platform builds, "
+        "installs, executes, and removes a one-shot ordinary-app Harness for that request. When it "
+        "is false, use an Agent-built ordinary-app PoC if further app-UID evidence is useful. After preparing "
         "the smallest supported replay, submit a live proof replay rather than continuing equivalent "
         "raw ADB exploration. Keep a primary strategy, materially distinct fallback strategies, "
         "and a disconfirming test; "
@@ -183,8 +192,8 @@ the complete read-only JADX/apktool/archive views under /scan-input, Bash, Pytho
 tools, live web search, public network access, and task-scoped ADB while the device lease is held.
 You may build complete Android PoCs, helper programs, HTML/JavaScript pages, and local or remote
 test services. You may use several materially different approaches and adapt after failures.
-Do not stop merely because apkscanner-proof has no matching Oracle or because a fixed Probe
-cannot express the observation. {ssh_instruction}
+Do not stop merely because apkscanner-proof has no matching Oracle or because the generated
+proof Harness cannot express the observation. {ssh_instruction}
 Reusable attacker primitives are available in attacker-templates/catalog.json. Authorized
 account/session/canary state is listed in context.json under validation_fixtures. Persist WebView,
 network callback, localhost/Unix-socket, SSH-remote, and other semantic facts by POSTing JSON to
@@ -305,7 +314,7 @@ def adaptive_verification_prompt(
         + batch_instruction
         + "批量验证下面所有候选风险。先读取当前工作区的 context.json，再按风险和共享攻击链"
         "制定验证顺序；可以把同一 WebView、组件或登录态相关候选合并到一次实验中。不要重复"
-        "普通调查 Agent 已完成的静态摘要，而要补齐外部攻击者到真实影响的链路。固定 Probe、"
+        "普通调查 Agent 已完成的静态摘要，而要补齐外部攻击者到真实影响的链路。平台临时 Harness、"
         "apkscanner-proof、原始 ADB、完整 PoC、远端 HTML/回调和 SSH 日志都只是可选证据来源。"
         "若第一次方案失败，依据具体错误改变实现、输入、时序或观测位置。每个 finding_id 必须"
         "且只能返回一条 assessment；不要创造新的 finding_id。最终由你对返回值、token、账号"
@@ -754,7 +763,7 @@ def investigation_prompt(
         "Apktool Smali, manifest XML, resources, archive contents, grep, and local helper scripts. "
         "Do not infer successful exploitation merely from an exported declaration "
         "or a zero exit code. For black-box reproduction, cite a platform-correlated ordinary-app "
-        "execution pair: either Probe request plus Probe log, or dedicated PoC launch plus PoC log. "
+        "execution pair: a platform-generated Harness or dedicated PoC launch plus its correlated PoC log. "
         "The same request ID and test-case ID must appear in both records, and a platform Oracle "
         "must independently observe concrete security impact. During test_planning and "
         "exploration_round phases, choose every materially useful follow-up test against supplied "
@@ -784,7 +793,7 @@ def investigation_prompt(
         "The proof JSON contains mandatory hypothesis_id and entry_point_id plus oracle and "
         "rationale. It contains either poc for a custom app, operation=binder_transact, or "
         "operation=binder_script with "
-        "Binder fields for the platform Probe; extras/reset are optional. Copy both IDs exactly from the supplied task "
+        "Binder fields for a platform-generated proof Harness; extras/reset are optional. Copy both IDs exactly from the supplied task "
         'context. Use this shape: {"hypothesis_id":"<exact-id>","entry_point_id":'
         '"<exact-seed-id>","poc":{"project_path":"poc/name","package_name":'
         '"io.apkscanner.poc.name","launch_component":".ApkScannerHarnessActivity",'
@@ -802,7 +811,8 @@ def investigation_prompt(
         "and argument. For a no-argument Service Binder call whose Parcel reply is string, integer, "
         "long, or boolean, use operation=binder_transact, binder_transaction_code, optional "
         "binder_interface_descriptor, binder_reply_type, binder_read_exception, and a binder_reply "
-        "Oracle. Do not include poc: the shell-gated platform Probe binds from its ordinary app UID, "
+        "Oracle only when proof_capabilities.ephemeral_app_harness=true. In that case do not include "
+        "poc: the platform generates a request-specific APK, binds from its ordinary app UID, "
         "performs transact, reads the reply, and correlates the value by request ID. Example: "
         '{"operation":"binder_transact","binder_transaction_code":1,'
         '"binder_interface_descriptor":null,"binder_reply_type":"string",'
@@ -812,11 +822,12 @@ def investigation_prompt(
         "operation=binder_script. Keep binder_transaction_code and optional descriptor/readException, "
         "then provide binder_script steps: write_string/write_integer/write_long/write_boolean/"
         "write_bytes_base64 followed by read_string/read_integer/read_long/read_boolean/"
-        "read_bytes_base64. The platform Probe performs every step from its ordinary app UID. "
+        "read_bytes_base64. The generated proof Harness performs every step from its ordinary app UID. "
         "binder_reply supports exact, contains, regex, and sha256 match_mode plus reply_index; "
         "non_empty is diagnostic reachability only and cannot prove harm. Use a dedicated ordinary-"
         "app PoC only when callbacks, multiple transactions, Parcelable objects, or another "
-        "unsupported Binder protocol are required. Android "
+        "unsupported Binder protocol is required, or the platform source-build toolchain is "
+        "unavailable. Never repeat an unchanged no-PoC Binder request after that failure. Android "
         "Activity lifecycle callbacks run on the main thread: never use Thread.sleep, await, or "
         "other blocking work in onCreate/onStart/onResume to keep a PoC visible. Set the view and "
         "return; use Handler.postDelayed only when a later action is truly required, because "
@@ -846,7 +857,7 @@ def investigation_prompt(
         "becomes platform harm evidence. The live Proof Gateway rejects every impact=none replay, "
         "so do not submit a log_contains reachability PoC there; use the task-scoped ADB gateway for "
         "diagnostics. binder_reply may use unauthorized_data_access only; it becomes platform harm "
-        "evidence only when the Probe successfully binds, transact returns true, and the typed reply "
+        "evidence only when the generated Harness successfully binds, transact returns true, and the typed reply "
         "exactly matches expected_text. "
         "target_uid_log_contains supports impact=none only; target UID attribution is an observed "
         "fact, not a security-impact decision. "

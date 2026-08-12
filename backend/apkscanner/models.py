@@ -174,9 +174,7 @@ class VulnerabilityOccurrence(Base):
     case_id: Mapped[str] = mapped_column(
         ForeignKey("vulnerability_cases.id", ondelete="CASCADE"), index=True
     )
-    scan_id: Mapped[str] = mapped_column(
-        ForeignKey("scans.id", ondelete="CASCADE"), index=True
-    )
+    scan_id: Mapped[str] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
     finding_id: Mapped[str | None] = mapped_column(
         ForeignKey("findings.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -215,9 +213,7 @@ class EntryPoint(Base):
 
 class Finding(Base):
     __tablename__ = "findings"
-    __table_args__ = (
-        UniqueConstraint("scan_id", "dedupe_key", name="uq_findings_scan_dedupe"),
-    )
+    __table_args__ = (UniqueConstraint("scan_id", "dedupe_key", name="uq_findings_scan_dedupe"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     scan_id: Mapped[str] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
@@ -387,6 +383,11 @@ class ProofAttempt(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     hypothesis: Mapped[SecurityHypothesis] = relationship(back_populates="proof_attempts")
+
+    @property
+    def proof_recipe(self) -> dict[str, Any]:
+        value = (self.plan or {}).get("proof_recipe")
+        return dict(value) if isinstance(value, dict) else {}
 
 
 class SecuritySnapshot(Base):
@@ -572,9 +573,7 @@ class AgentRuntimeEventRecord(Base):
     """Idempotency ledger for live and spool-recovered Agent runtime events."""
 
     __tablename__ = "agent_runtime_event_records"
-    __table_args__ = (
-        UniqueConstraint("record_key", name="uq_agent_runtime_event_record_key"),
-    )
+    __table_args__ = (UniqueConstraint("record_key", name="uq_agent_runtime_event_record_key"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     scan_id: Mapped[str] = mapped_column(
@@ -600,14 +599,10 @@ class ScanContainerRecord(Base):
     """Durable lifecycle record for a scan-scoped worker container/workspace."""
 
     __tablename__ = "scan_container_records"
-    __table_args__ = (
-        UniqueConstraint("container_key", name="uq_scan_container_record_key"),
-    )
+    __table_args__ = (UniqueConstraint("container_key", name="uq_scan_container_record_key"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    scan_id: Mapped[str] = mapped_column(
-        ForeignKey("scans.id", ondelete="CASCADE"), index=True
-    )
+    scan_id: Mapped[str] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
     task_id: Mapped[str | None] = mapped_column(
         ForeignKey("investigation_tasks.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -628,14 +623,10 @@ class AgentSessionRecord(Base):
     """Stable Agent session identity independent from verbose runtime events."""
 
     __tablename__ = "agent_session_records"
-    __table_args__ = (
-        UniqueConstraint("session_key", name="uq_agent_session_record_key"),
-    )
+    __table_args__ = (UniqueConstraint("session_key", name="uq_agent_session_record_key"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    scan_id: Mapped[str] = mapped_column(
-        ForeignKey("scans.id", ondelete="CASCADE"), index=True
-    )
+    scan_id: Mapped[str] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
     task_id: Mapped[str] = mapped_column(
         ForeignKey("investigation_tasks.id", ondelete="CASCADE"), index=True
     )
@@ -665,9 +656,7 @@ class AgentTurnRecord(Base):
     __table_args__ = (UniqueConstraint("audit_id", name="uq_agent_turn_audit_id"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    scan_id: Mapped[str] = mapped_column(
-        ForeignKey("scans.id", ondelete="CASCADE"), index=True
-    )
+    scan_id: Mapped[str] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
     task_id: Mapped[str] = mapped_column(
         ForeignKey("investigation_tasks.id", ondelete="CASCADE"), index=True
     )
@@ -700,9 +689,7 @@ class AdaptiveVerificationCheckpoint(Base):
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    scan_id: Mapped[str] = mapped_column(
-        ForeignKey("scans.id", ondelete="CASCADE"), index=True
-    )
+    scan_id: Mapped[str] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
     task_id: Mapped[str] = mapped_column(
         ForeignKey("investigation_tasks.id", ondelete="CASCADE"), index=True
     )
@@ -728,14 +715,10 @@ class RuntimeObservation(Base):
     """Normalized runtime fact emitted by ADB, a PoC, WebView, socket, or callback sink."""
 
     __tablename__ = "runtime_observations"
-    __table_args__ = (
-        UniqueConstraint("observation_key", name="uq_runtime_observation_key"),
-    )
+    __table_args__ = (UniqueConstraint("observation_key", name="uq_runtime_observation_key"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    scan_id: Mapped[str] = mapped_column(
-        ForeignKey("scans.id", ondelete="CASCADE"), index=True
-    )
+    scan_id: Mapped[str] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
     task_id: Mapped[str | None] = mapped_column(
         ForeignKey("investigation_tasks.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -749,6 +732,102 @@ class RuntimeObservation(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     environment: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class DynamicExperimentCapsule(Base):
+    """Persisted multi-step device experiment with resumable step receipts."""
+
+    __tablename__ = "dynamic_experiment_capsules"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scan_id: Mapped[str] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
+    task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("investigation_tasks.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    finding_id: Mapped[str | None] = mapped_column(
+        ForeignKey("findings.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    name: Mapped[str] = mapped_column(String(256))
+    objective: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    preferred_serial: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    device_serial: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    fixture_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    preconditions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    impact_contract: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    steps: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    cleanup_steps: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    state_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class DynamicExperimentReceipt(Base):
+    """One durable checkpoint for one Dynamic Experiment step attempt."""
+
+    __tablename__ = "dynamic_experiment_receipts"
+    __table_args__ = (
+        UniqueConstraint(
+            "capsule_id",
+            "step_id",
+            "attempt",
+            name="uq_dynamic_experiment_step_attempt",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    capsule_id: Mapped[str] = mapped_column(
+        ForeignKey("dynamic_experiment_capsules.id", ondelete="CASCADE"), index=True
+    )
+    step_id: Mapped[str] = mapped_column(String(128), index=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    phase: Mapped[str] = mapped_column(String(32), default="action")
+    status: Mapped[str] = mapped_column(String(32), default="running", index=True)
+    command: Mapped[list[str]] = mapped_column(JSON, default=list)
+    evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    observation_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RuntimeArtifact(Base):
+    """APK or other executable artifact collected after the target started running."""
+
+    __tablename__ = "runtime_artifacts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scan_id: Mapped[str] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
+    task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("investigation_tasks.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    artifact_type: Mapped[str] = mapped_column(String(64), default="plugin_apk", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    stored_path: Mapped[str] = mapped_column(Text, default="")
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    package_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    version_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    version_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    graph_node_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    entry_point_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    investigation_task_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
 
 
 class OperatorSession(Base):
@@ -832,14 +911,10 @@ class ValidationFixture(Base):
     """Operator-provided account/session/canary state for repeatable dynamic tests."""
 
     __tablename__ = "validation_fixtures"
-    __table_args__ = (
-        UniqueConstraint("scan_id", "name", name="uq_validation_fixture_scan_name"),
-    )
+    __table_args__ = (UniqueConstraint("scan_id", "name", name="uq_validation_fixture_scan_name"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    scan_id: Mapped[str] = mapped_column(
-        ForeignKey("scans.id", ondelete="CASCADE"), index=True
-    )
+    scan_id: Mapped[str] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
     task_id: Mapped[str | None] = mapped_column(
         ForeignKey("investigation_tasks.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -881,9 +956,7 @@ class CampaignEntryRecord(Base):
     """Persistent DAG node controlled by the supervisor reconciliation loop."""
 
     __tablename__ = "campaign_entry_records"
-    __table_args__ = (
-        UniqueConstraint("campaign_id", "entry_key", name="uq_campaign_entry_key"),
-    )
+    __table_args__ = (UniqueConstraint("campaign_id", "entry_key", name="uq_campaign_entry_key"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     campaign_id: Mapped[str] = mapped_column(

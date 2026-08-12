@@ -193,7 +193,8 @@ Critic、Rescue 和 Final 在单个 Task 中各最多启动一次。这个限制
 普通入口任务结束后，扫描级 Adaptive Verifier 处理静态证据较强但尚未动态闭环的候选：
 
 - 候选按提示词字符预算拆批，不按数量静默截断；
-- 每批 assessment 和 checkpoint 持久化，失败后只恢复未完成批次；
+- 每个已返回 assessment 都独立写入候选 checkpoint；worker 失败、结构化结果缺项或服务重启后，
+  新 attempt 跳过已有 checkpoint，只补跑缺失候选；
 - 可以组合普通 App PoC、Web 回调、Socket、文件状态、固定 Python/MCP Capability 和可选 SSH；
 - 可以通过 `duplicate_of_finding_id` 归并同一根因的跨任务 Finding；
 - 无设备、实验不足或结构化结果失败时保留原静态风险和明确 gap。
@@ -217,8 +218,13 @@ Gateway Token 绑定 scan、task、attempt、serial、允许动作和过期时�
 - 没有设备时静态分析仍可进行，动态任务保留明确状态；
 - 默认 reset policy 为 `never`，不会自动清除目标应用登录态和本地数据。
 
-Proof Gateway 接受平台 Probe、源码型 PoC 和经过校验的预构建 PoC。控制面检查包名、签名、大小、
-minSdk/targetSdk、入口和 SHA-256，再进入同一设备队列执行。
+Proof Gateway 接受 ProofSpec、源码型 PoC 和经过校验的预构建 PoC。简单组件、Provider 与 Binder
+请求由平台生成一次性普通 App UID Harness；控制面检查包名、签名、大小、minSdk/targetSdk、入口和
+SHA-256，再进入同一设备队列执行，结束后卸载 Harness。
+
+ProofAttempt 同时持久化版本无关的 `ProofRecipe`。平台 Harness 的配方只保存动作和 Oracle，版本回放时
+重新生成 APK；自定义 PoC 的配方额外引用已归档源码。Harness 成功生成时执行 DAG 的 `poc_build` 必须
+记录为 `completed` 并标明生成数量，不能因为请求没有 Agent `poc` 字段而显示为 skipped。
 
 ## 9. Oracle 与 Verdict
 
@@ -271,6 +277,37 @@ Campaign Supervisor 持久化 goal、DAG entry、依赖、总预算和最大并�
 循环只启动依赖已经完成的节点，重启后从数据库继续观察已有 Scan，并支持追加 entry、继续和取消。
 Campaign 并发控制扫描级任务，不绕过单个 Scan 内的设备租约、Capability allowlist 或 Evidence 规则。
 
+### Linux IDALib MCP
+
+IDA 不进入扫描镜像，而是在 WSL 宿主机运行一个共享 `idalib-mcp` supervisor。扫描容器通过
+`apkscanner-host:8745/mcp` 连接，最多并行打开 4 个数据库。平台在任务上下文中提供
+`/scan-input/{apktool,archive,native,artifacts}` 到宿主机静态工作区的精确前缀映射，Agent 在调用
+`idb_open` 前完成路径转换。
+
+该能力默认关闭。启用后也不对所有 SO 做全量 IDA 分析：Agent 先读取 ArtifactGraph、ELF/JNI 摘要，
+只有具体 Java→JNI→SO 安全链仍缺少函数级证据时才打开对应 SO。每个 SO 使用稳定
+`preferred_session_id`，所有查询显式传 `database`，完成后调用 `idb_close`，避免多 Agent 串库和
+无意义占用 Hex-Rays worker。
+
+本地参考部署：
+
+```bash
+python3 -m venv /opt/ida-mcp
+/opt/ida-mcp/bin/pip install /opt/ida-pro-9.4/idalib/python/idapro-*.whl
+/opt/ida-mcp/bin/pip install \
+  https://github.com/mrexodia/ida-pro-mcp/archive/0b5f7ae4026d3c770b190ca93c0692d1b0ceab22.zip
+/opt/ida-mcp/bin/python \
+  /opt/ida-pro-9.4/idalib/python/py-activate-idalib.py -d /opt/ida-pro-9.4
+/opt/ida-mcp/bin/idalib-mcp --host 0.0.0.0 --port 8745 --max-workers 4
+```
+
+交互式 WSL Codex 可直接使用 STDIO：
+
+```bash
+codex mcp add ida-headless -- \
+  /opt/ida-mcp/bin/idalib-mcp --stdio --max-workers 4
+```
+
 ## 12. 资源与失败恢复
 
 默认资源边界由以下配置控制：
@@ -292,7 +329,11 @@ Campaign 并发控制扫描级任务，不绕过单个 Scan 内的设备租约�
 | `APKSCANNER_CODEX_MEMORY_LIMIT` | `12g` | 单容器内存上限 |
 | `APKSCANNER_CODEX_TURN_TIMEOUT` | `3600` | 单 Turn 生命周期 |
 | `APKSCANNER_CODEX_NO_EVENT_TIMEOUT` | `900` | 无事件超时 |
+| `APKSCANNER_IDA_MCP_ENABLED` | `false` | 向平台 Codex 会话注入共享 IDA MCP |
+| `APKSCANNER_IDA_MCP_URL` | `http://apkscanner-host:8745/mcp` | Docker worker 访问 WSL supervisor 的地址 |
+| `APKSCANNER_IDA_MCP_TOOL_TIMEOUT` | `1800` | 单次 IDA MCP 工具调用超时 |
 | `APKSCANNER_ADAPTIVE_VERIFIER_TIMEOUT` | `3600` | 扫描终局验证总时间 |
+| `APKSCANNER_ADAPTIVE_VERIFIER_RESUME_ATTEMPTS` | `1` | worker 失败或候选缺失时，保留候选断点后的自动恢复次数 |
 
 Provider/transport 错误、schema 错误、设备阻塞、取消、无事件超时和资源终止使用不同错误码，前端不再
 统一显示为“证据、工具或预算不足”。重试只在副作用边界明确时执行；已形成的平台 Proof 是不可变事实，
@@ -326,5 +367,5 @@ APKSCANNER_RUN_REAL_PROVIDER_TESTS=1 \
 - 将开发旧机结果外推为 Android 16 正式结论；
 - 自动管理生产账号、生产 SSH 凭据或未授权网络目标。
 
-Native/IDA、Frida、外部业务流程和其他测试系统只能通过显式 Capability 接入；未注册能力不会因为
-Agent 在 Prompt 中提出而自动获得权限。
+IDA 只有在显式启用共享 MCP 且任务上下文提供路径映射时可用；Frida、外部业务流程和其他测试系统
+仍只能通过显式 Capability 接入。未注册能力不会因为 Agent 在 Prompt 中提出而自动获得权限。

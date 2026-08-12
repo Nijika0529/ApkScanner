@@ -635,6 +635,50 @@ def test_service_request_preserves_platform_binder_transaction() -> None:
     assert accepted[0].operation == "binder_transact"
 
 
+def test_service_request_preserves_platform_binder_script() -> None:
+    entry = EntryPoint(
+        id="11111111-1111-1111-1111-111111111111",
+        scan_id="scan",
+        kind="service",
+        name="io.apkscanner.vulntest.CommandService",
+        owner_component="io.apkscanner.vulntest.CommandService",
+        exported=True,
+    )
+    request = AgentRequestedTest(
+        hypothesis_id="22222222-2222-2222-2222-222222222222",
+        entry_point_id=entry.id,
+        state="guest",
+        uri=None,
+        extras={},
+        operation="binder_script",
+        binder_transaction_code=7,
+        binder_script=[
+            {
+                "operation": "read_long",
+                "string_value": None,
+                "integer_value": None,
+                "boolean_value": None,
+            }
+        ],
+        oracle={
+            "kind": "binder_reply",
+            "expected_text": "87109624524081870",
+            "impact": "unauthorized_data_access",
+        },
+        rationale="Read a long Binder reply as an ordinary application UID.",
+    )
+
+    accepted, gaps = ScanOrchestrator._validate_requested_tests(
+        [request],
+        [entry],
+        hypothesis_ids={request.hypothesis_id},
+    )
+
+    assert gaps == []
+    assert accepted == [request]
+    assert accepted[0].operation == "binder_script"
+
+
 def test_platform_binder_transaction_is_rejected_for_non_service_entry() -> None:
     request = AgentRequestedTest(
         hypothesis_id="22222222-2222-2222-2222-222222222222",

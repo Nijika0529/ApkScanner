@@ -22,7 +22,7 @@
 
 - Android platform-tools `adb`；
 - 已授权的 USB 设备或 IP:Port 云真机；
-- 只在专用测试设备上安装 Probe、PoC 和故意脆弱测试 APK。
+- 只在专用测试设备上安装临时验证 Harness、PoC 和故意脆弱测试 APK。
 
 ## 2. 安装项目
 

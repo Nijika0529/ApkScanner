@@ -1,0 +1,46 @@
+{
+  "schema_version": "1.0",
+  "name": "APKScanner Java-JNI-SO attack-chain fixture",
+  "apk_sha256": "9e62c938e95aac6db9f884a3c73c1686bc2fffdac5065d932a2b67b6b143b4a2",
+  "required_dynamic_scope": "any_dynamic",
+  "quality_gate": {
+    "minimum_precision": 1.0,
+    "minimum_recall": 1.0,
+    "maximum_false_positives": 0
+  },
+  "vulnerabilities": [
+    {
+      "id": "NC-001",
+      "title": "Exported Activity trusts an unconditional native authorization decision",
+      "harm": "An ordinary app invokes the exported admin entry with an untrusted action value; the JNI gate ignores it and authorizes the privileged action.",
+      "severity": "high",
+      "minimum_proof": "dynamic",
+      "match": {
+        "entry_names": ["io.apkscanner.nativecases.NativeGateActivity"],
+        "title_contains": ["native"]
+      }
+    },
+    {
+      "id": "NC-002",
+      "title": "Exported Binder returns a secret sourced from a native library",
+      "harm": "An ordinary app binds to the unprotected service, sends transaction 1, and receives the hard-coded native account secret as a long value.",
+      "severity": "high",
+      "minimum_proof": "dynamic",
+      "match": {
+        "entry_names": ["io.apkscanner.nativecases.NativeSecretService"],
+        "title_contains": ["Binder"]
+      }
+    },
+    {
+      "id": "NC-003",
+      "title": "Deep link reaches a dynamically registered native privilege bypass",
+      "harm": "An ordinary app opens the exported deep link with level=0; the RegisterNatives implementation ignores the requested level and returns an elevated decision.",
+      "severity": "high",
+      "minimum_proof": "dynamic",
+      "match": {
+        "entry_names": ["io.apkscanner.nativecases.DynamicLinkActivity"],
+        "title_contains": ["native"]
+      }
+    }
+  ]
+}

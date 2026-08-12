@@ -387,9 +387,7 @@ class AgentPocSpec(BaseModel):
     harness_mode: Literal["platform_generated", "custom"] = "custom"
     attack_class: str | None = Field(
         default=None,
-        pattern=(
-            r"^[A-Za-z][A-Za-z0-9_$]*(?:\.[A-Za-z][A-Za-z0-9_$]*)+$"
-        ),
+        pattern=(r"^[A-Za-z][A-Za-z0-9_$]*(?:\.[A-Za-z][A-Za-z0-9_$]*)+$"),
         max_length=300,
     )
     attack_method: str = Field(
@@ -415,7 +413,7 @@ class AgentPocSpec(BaseModel):
 
 
 class AgentBinderScriptStep(BaseModel):
-    """One bounded primitive Parcel write/read performed by the platform Probe."""
+    """One bounded primitive Parcel write/read performed by a platform proof Harness."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -528,9 +526,7 @@ class AgentOracleSpec(BaseModel):
             and not self.expected_text
         ):
             raise ValueError(f"{self.kind} requires expected_text")
-        if self.kind != "binder_reply" and (
-            self.match_mode != "exact" or self.reply_index != 0
-        ):
+        if self.kind != "binder_reply" and (self.match_mode != "exact" or self.reply_index != 0):
             raise ValueError("match_mode and reply_index are supported only by binder_reply")
         if self.kind == "binder_reply" and self.match_mode == "non_empty" and self.impact != "none":
             raise ValueError("a non-empty Binder reply alone cannot prove security impact")
@@ -659,9 +655,7 @@ class AgentRequestedTest(BaseModel):
         )
         if self.operation in {"binder_transact", "binder_script"}:
             if self.binder_transaction_code is None:
-                raise ValueError(
-                    f"{self.operation} requires binder_transaction_code"
-                )
+                raise ValueError(f"{self.operation} requires binder_transaction_code")
             if self.operation == "binder_transact" and self.binder_reply_type is None:
                 raise ValueError("binder_transact requires binder_reply_type")
             if self.operation == "binder_script" and not self.binder_script:
@@ -671,7 +665,9 @@ class AgentRequestedTest(BaseModel):
             if self.operation == "binder_transact" and self.binder_script is not None:
                 raise ValueError("binder_script steps require operation=binder_script")
             if self.poc is not None:
-                raise ValueError(f"{self.operation} is a platform Probe action and cannot include poc")
+                raise ValueError(
+                    f"{self.operation} uses a platform-generated proof Harness and cannot include poc"
+                )
             if self.binder_read_exception is None:
                 self.binder_read_exception = True
             if self.oracle.kind != "binder_reply":
@@ -1126,9 +1122,7 @@ class AgentInvestigationResult(BaseModel):
             ]
         repairs = audit.get("normalization_repairs")
         if isinstance(repairs, list):
-            self._normalization_repairs = [
-                dict(item) for item in repairs if isinstance(item, dict)
-            ]
+            self._normalization_repairs = [dict(item) for item in repairs if isinstance(item, dict)]
         return self
 
     @model_validator(mode="after")
@@ -1229,6 +1223,7 @@ class ProofAttemptOut(ApiModel):
     prover: str
     status: str
     plan: dict[str, Any]
+    proof_recipe: dict[str, Any] = Field(default_factory=dict)
     oracle: dict[str, Any]
     evidence_ids: list[str]
     harm_demonstrated: bool
@@ -1302,9 +1297,7 @@ class BenchmarkSpec(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
     name: str = Field(min_length=1, max_length=256)
     apk_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
-    required_dynamic_scope: Literal["android16_release", "any_dynamic"] = (
-        "android16_release"
-    )
+    required_dynamic_scope: Literal["android16_release", "any_dynamic"] = "android16_release"
     vulnerabilities: list[GroundTruthVulnerability] = Field(min_length=1, max_length=500)
     quality_gate: BenchmarkQualityGate = Field(default_factory=BenchmarkQualityGate)
 
@@ -1391,6 +1384,151 @@ class ValidationFixtureOut(ApiModel):
     setup_instructions: list[str]
     cleanup_instructions: list[str]
     created_at: datetime
+    updated_at: datetime
+
+
+class DynamicExperimentStepSpec(BaseModel):
+    """One deterministic ADB step in a stateful runtime experiment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: StrictStr = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    title: StrictStr = Field(min_length=1, max_length=512)
+    phase: Literal["prepare", "action", "observe", "assert", "cleanup"] = "action"
+    adb_args: list[StrictStr] = Field(min_length=1, max_length=64)
+    timeout_seconds: StrictInt = Field(default=30, ge=1, le=120)
+    expected_exit_code: StrictInt = Field(default=0, ge=0, le=255)
+    stdout_contains: list[StrictStr] = Field(default_factory=list, max_length=32)
+    stdout_regex: StrictStr | None = Field(default=None, min_length=1, max_length=2000)
+    capture_stdout_as: StrictStr | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$",
+    )
+    observation_kind: StrictStr | None = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_.-]{2,127}$",
+    )
+    continue_on_failure: StrictBool = False
+
+
+class DynamicExperimentCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: StrictStr | None = Field(default=None, pattern=r"^[a-f0-9-]{36}$")
+    finding_id: StrictStr | None = Field(default=None, pattern=r"^[a-f0-9-]{36}$")
+    name: StrictStr = Field(min_length=1, max_length=256)
+    objective: StrictStr = Field(min_length=1, max_length=10_000)
+    preferred_serial: StrictStr | None = Field(default=None, min_length=1, max_length=255)
+    fixture_ids: list[StrictStr] = Field(default_factory=list, max_length=64)
+    preconditions: list[StrictStr] = Field(default_factory=list, max_length=64)
+    impact_contract: dict[str, Any] = Field(default_factory=dict)
+    steps: list[DynamicExperimentStepSpec] = Field(min_length=1, max_length=128)
+    cleanup_steps: list[DynamicExperimentStepSpec] = Field(default_factory=list, max_length=32)
+
+    @model_validator(mode="after")
+    def require_unique_step_ids(self) -> Self:
+        all_steps = [*self.steps, *self.cleanup_steps]
+        identifiers = [item.id for item in all_steps]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("dynamic experiment step IDs must be unique")
+        if any(item.phase == "cleanup" for item in self.steps):
+            raise ValueError("cleanup steps belong in cleanup_steps")
+        if any(item.phase != "cleanup" for item in self.cleanup_steps):
+            raise ValueError("every cleanup_steps item must use phase=cleanup")
+        return self
+
+
+class DynamicExperimentRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    preferred_serial: StrictStr | None = Field(default=None, min_length=1, max_length=255)
+
+
+class DynamicExperimentReceiptOut(ApiModel):
+    id: str
+    capsule_id: str
+    step_id: str
+    attempt: int
+    phase: str
+    status: str
+    command: list[str]
+    evidence_ids: list[str]
+    observation_ids: list[str]
+    result_json: dict[str, Any]
+    error: str | None
+    started_at: datetime
+    completed_at: datetime | None
+
+
+class DynamicExperimentOut(ApiModel):
+    id: str
+    scan_id: str
+    task_id: str | None
+    finding_id: str | None
+    name: str
+    objective: str
+    status: str
+    preferred_serial: str | None
+    device_serial: str | None
+    fixture_ids: list[str]
+    preconditions: list[str]
+    impact_contract: dict[str, Any]
+    steps: list[dict[str, Any]]
+    cleanup_steps: list[dict[str, Any]]
+    state_json: dict[str, Any]
+    result_json: dict[str, Any]
+    cancel_requested: bool
+    error: str | None
+    receipts: list[DynamicExperimentReceiptOut] = Field(default_factory=list)
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+    updated_at: datetime
+
+
+class RuntimeArtifactCaptureRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_mode: Literal["device_path", "run_as"]
+    remote_path: StrictStr = Field(min_length=1, max_length=2048)
+    package_name: StrictStr | None = Field(default=None, min_length=3, max_length=512)
+    task_id: StrictStr | None = Field(default=None, pattern=r"^[a-f0-9-]{36}$")
+    preferred_serial: StrictStr | None = Field(default=None, min_length=1, max_length=255)
+    loader_node_id: StrictStr | None = Field(default=None, min_length=1, max_length=2048)
+    loader_anchor: dict[str, Any] = Field(default_factory=dict)
+    schedule_investigations: StrictBool = True
+
+    @model_validator(mode="after")
+    def validate_capture_source(self) -> Self:
+        if self.source_mode == "run_as" and self.package_name is None:
+            raise ValueError("run_as capture requires package_name")
+        return self
+
+
+class RuntimeArtifactOut(ApiModel):
+    id: str
+    scan_id: str
+    task_id: str | None
+    artifact_type: str
+    status: str
+    sha256: str | None
+    stored_path: str
+    size_bytes: int
+    package_name: str | None
+    version_name: str | None
+    version_code: str | None
+    source_json: dict[str, Any]
+    graph_node_id: str | None
+    entry_point_ids: list[str]
+    investigation_task_ids: list[str]
+    result_json: dict[str, Any]
+    error: str | None
+    created_at: datetime
+    completed_at: datetime | None
     updated_at: datetime
 
 

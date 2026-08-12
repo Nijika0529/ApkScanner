@@ -31,6 +31,7 @@ class Settings:
     adaptive_verifier_min_severity: str = "info"
     adaptive_verifier_timeout_seconds: int = 3_600
     adaptive_verifier_prompt_max_chars: int = 400_000
+    adaptive_verifier_resume_attempts: int = 1
     adaptive_verifier_copy_host_ssh: bool = True
     adaptive_verifier_ssh_source: Path | None = None
     agent_permission_profile: str = "personal_lab"
@@ -66,11 +67,13 @@ class Settings:
     codex_tmpfs_size: str = "1g"
     codex_turn_timeout_seconds: int = 3_600
     codex_no_event_timeout_seconds: int = 900
+    ida_mcp_enabled: bool = False
+    ida_mcp_url: str = "http://apkscanner-host:8745/mcp"
+    ida_mcp_tool_timeout_seconds: int = 1_800
     deepseek_base_url: str = "https://api.deepseek.com/"
     host_adb_executable: str = "adb"
     adb_serial: str | None = None
     adb_serials: tuple[str, ...] = ()
-    probe_apk_path: Path | None = None
     android_sdk_root: Path | None = None
     android_build_tools_version: str | None = None
     poc_enabled: bool = True
@@ -109,9 +112,9 @@ class Settings:
         if not configured_serials and legacy_serial:
             configured_serials = (legacy_serial,)
         configured_verifier_ssh = os.getenv("APKSCANNER_ADAPTIVE_VERIFIER_SSH_SOURCE")
-        validation_profile = os.getenv(
-            "APKSCANNER_VALIDATION_PROFILE", "development"
-        ).strip().lower()
+        validation_profile = (
+            os.getenv("APKSCANNER_VALIDATION_PROFILE", "development").strip().lower()
+        )
         if configured_verifier_ssh is None:
             verifier_ssh_source: Path | None = (Path.home() / ".ssh").resolve()
         elif configured_verifier_ssh.strip():
@@ -135,9 +138,7 @@ class Settings:
             scan_deadline_seconds=int(os.getenv("APKSCANNER_SCAN_DEADLINE", 86_400)),
             task_timeout_seconds=int(os.getenv("APKSCANNER_TASK_TIMEOUT", 14_400)),
             task_max_attempts=int(os.getenv("APKSCANNER_TASK_MAX_ATTEMPTS", 2)),
-            adaptive_verifier_enabled=_env_bool(
-                "APKSCANNER_ADAPTIVE_VERIFIER_ENABLED", True
-            ),
+            adaptive_verifier_enabled=_env_bool("APKSCANNER_ADAPTIVE_VERIFIER_ENABLED", True),
             adaptive_verifier_min_severity=os.getenv(
                 "APKSCANNER_ADAPTIVE_VERIFIER_MIN_SEVERITY", "info"
             ).lower(),
@@ -155,6 +156,13 @@ class Settings:
                     int(os.getenv("APKSCANNER_ADAPTIVE_VERIFIER_PROMPT_MAX_CHARS", 400_000)),
                 ),
             ),
+            adaptive_verifier_resume_attempts=max(
+                0,
+                min(
+                    3,
+                    int(os.getenv("APKSCANNER_ADAPTIVE_VERIFIER_RESUME_ATTEMPTS", 1)),
+                ),
+            ),
             adaptive_verifier_copy_host_ssh=_env_bool(
                 "APKSCANNER_ADAPTIVE_VERIFIER_COPY_HOST_SSH", True
             ),
@@ -162,21 +170,15 @@ class Settings:
             agent_permission_profile=os.getenv(
                 "APKSCANNER_AGENT_PERMISSION_PROFILE", "personal_lab"
             ).lower(),
-            investigator_backend=os.getenv(
-                "APKSCANNER_INVESTIGATOR_BACKEND", "codex"
-            ).lower(),
+            investigator_backend=os.getenv("APKSCANNER_INVESTIGATOR_BACKEND", "codex").lower(),
             codex_enabled=_env_bool("APKSCANNER_CODEX_ENABLED"),
             codex_provider=os.getenv("APKSCANNER_CODEX_PROVIDER", "deepseek").lower(),
             codex_model=os.getenv("APKSCANNER_CODEX_MODEL", "deepseek-v4-flash"),
-            codex_reasoning_effort=os.getenv(
-                "APKSCANNER_CODEX_REASONING_EFFORT", "high"
-            ).lower(),
+            codex_reasoning_effort=os.getenv("APKSCANNER_CODEX_REASONING_EFFORT", "high").lower(),
             codex_bin=os.getenv("APKSCANNER_CODEX_BIN"),
             codex_isolation=os.getenv("APKSCANNER_CODEX_ISOLATION", "docker").lower(),
             codex_allow_host=_env_bool("APKSCANNER_ALLOW_HOST_CODEX"),
-            codex_container_scope=os.getenv(
-                "APKSCANNER_CODEX_CONTAINER_SCOPE", "scan"
-            ).lower(),
+            codex_container_scope=os.getenv("APKSCANNER_CODEX_CONTAINER_SCOPE", "scan").lower(),
             codex_docker_image=os.getenv(
                 "APKSCANNER_CODEX_DOCKER_IMAGE", "apk-scanner-codex-worker:0.2.0"
             ),
@@ -187,21 +189,13 @@ class Settings:
             codex_shell_network=os.getenv(
                 "APKSCANNER_CODEX_SHELL_NETWORK", "public_egress"
             ).lower(),
-            codex_max_containers=max(
-                1, int(os.getenv("APKSCANNER_CODEX_MAX_CONTAINERS", 2))
-            ),
-            codex_max_sessions=max(
-                1, int(os.getenv("APKSCANNER_CODEX_MAX_SESSIONS", 8))
-            ),
+            codex_max_containers=max(1, int(os.getenv("APKSCANNER_CODEX_MAX_CONTAINERS", 2))),
+            codex_max_sessions=max(1, int(os.getenv("APKSCANNER_CODEX_MAX_SESSIONS", 8))),
             codex_max_sessions_per_scan=max(
                 1, int(os.getenv("APKSCANNER_CODEX_MAX_SESSIONS_PER_SCAN", 6))
             ),
-            agent_analysis_slots=max(
-                1, int(os.getenv("APKSCANNER_AGENT_ANALYSIS_SLOTS", 4))
-            ),
-            poc_build_slots=max(
-                1, int(os.getenv("APKSCANNER_POC_BUILD_SLOTS", 2))
-            ),
+            agent_analysis_slots=max(1, int(os.getenv("APKSCANNER_AGENT_ANALYSIS_SLOTS", 4))),
+            poc_build_slots=max(1, int(os.getenv("APKSCANNER_POC_BUILD_SLOTS", 2))),
             agent_initial_phase_seconds=max(
                 60, int(os.getenv("APKSCANNER_AGENT_INITIAL_PHASE_SECONDS", 900))
             ),
@@ -214,9 +208,7 @@ class Settings:
             agent_final_phase_seconds=max(
                 60, int(os.getenv("APKSCANNER_AGENT_FINAL_PHASE_SECONDS", 180))
             ),
-            agent_no_progress_limit=max(
-                1, int(os.getenv("APKSCANNER_AGENT_NO_PROGRESS_LIMIT", 3))
-            ),
+            agent_no_progress_limit=max(1, int(os.getenv("APKSCANNER_AGENT_NO_PROGRESS_LIMIT", 3))),
             rescue_audit_sample_rate=max(
                 0.0,
                 min(
@@ -228,9 +220,7 @@ class Settings:
             codex_uid_max=int(os.getenv("APKSCANNER_CODEX_UID_MAX", 21_999)),
             codex_cpu_limit=float(os.getenv("APKSCANNER_CODEX_CPU_LIMIT", 6)),
             codex_memory_limit=os.getenv("APKSCANNER_CODEX_MEMORY_LIMIT", "12g"),
-            codex_pids_limit=max(
-                64, int(os.getenv("APKSCANNER_CODEX_PIDS_LIMIT", 768))
-            ),
+            codex_pids_limit=max(64, int(os.getenv("APKSCANNER_CODEX_PIDS_LIMIT", 768))),
             codex_tmpfs_size=os.getenv("APKSCANNER_CODEX_TMPFS_SIZE", "1g"),
             codex_turn_timeout_seconds=max(
                 30, int(os.getenv("APKSCANNER_CODEX_TURN_TIMEOUT", 3_600))
@@ -238,17 +228,23 @@ class Settings:
             codex_no_event_timeout_seconds=max(
                 30, int(os.getenv("APKSCANNER_CODEX_NO_EVENT_TIMEOUT", 900))
             ),
+            ida_mcp_enabled=_env_bool("APKSCANNER_IDA_MCP_ENABLED"),
+            ida_mcp_url=os.getenv(
+                "APKSCANNER_IDA_MCP_URL", "http://apkscanner-host:8745/mcp"
+            ).strip(),
+            ida_mcp_tool_timeout_seconds=max(
+                60,
+                min(
+                    4 * 60 * 60,
+                    int(os.getenv("APKSCANNER_IDA_MCP_TOOL_TIMEOUT", 1_800)),
+                ),
+            ),
             deepseek_base_url=os.getenv(
                 "APKSCANNER_DEEPSEEK_BASE_URL", "https://api.deepseek.com/"
             ),
             host_adb_executable=host_adb_executable,
             adb_serial=configured_serials[0] if configured_serials else legacy_serial,
             adb_serials=configured_serials,
-            probe_apk_path=(
-                Path(os.environ["APKSCANNER_PROBE_APK"]).resolve()
-                if os.getenv("APKSCANNER_PROBE_APK")
-                else None
-            ),
             android_sdk_root=(
                 Path(
                     os.environ.get("APKSCANNER_ANDROID_SDK_ROOT")
@@ -290,9 +286,7 @@ class Settings:
                 if os.getenv("APKSCANNER_POC_COMPILE_API")
                 else None
             ),
-            poc_min_api=max(
-                1, int(os.getenv("APKSCANNER_POC_MIN_API", 21))
-            ),
+            poc_min_api=max(1, int(os.getenv("APKSCANNER_POC_MIN_API", 21))),
             poc_target_api=(
                 int(os.environ["APKSCANNER_POC_TARGET_API"])
                 if os.getenv("APKSCANNER_POC_TARGET_API")
@@ -320,9 +314,7 @@ class Settings:
             device_install_policy=os.getenv(
                 "APKSCANNER_DEVICE_INSTALL_POLICY", "install_or_reuse"
             ).lower(),
-            device_reset_policy=os.getenv(
-                "APKSCANNER_DEVICE_RESET_POLICY", "never"
-            ).lower(),
+            device_reset_policy=os.getenv("APKSCANNER_DEVICE_RESET_POLICY", "never").lower(),
             frontend_dist=Path(frontend).resolve() if frontend else None,
         )
         settings.validate_codex_configuration()
@@ -332,9 +324,7 @@ class Settings:
         from .agent_execution import frozen_agent_configuration
 
         if self.device_reset_policy not in {"never", "per_round", "per_test"}:
-            raise ValueError(
-                "APKSCANNER_DEVICE_RESET_POLICY must be never, per_round, or per_test"
-            )
+            raise ValueError("APKSCANNER_DEVICE_RESET_POLICY must be never, per_round, or per_test")
         if self.device_android_api < 36:
             raise ValueError("APKScanner PoC target requires Android API 36 or newer")
         if self.validation_profile not in {"development", "android16_release"}:
@@ -342,17 +332,14 @@ class Settings:
                 "APKSCANNER_VALIDATION_PROFILE must be development or android16_release"
             )
         if self.validation_profile == "android16_release" and self.device_min_api < 36:
-            raise ValueError(
-                "android16_release requires APKSCANNER_DEVICE_MIN_API=36 or newer"
-            )
+            raise ValueError("android16_release requires APKSCANNER_DEVICE_MIN_API=36 or newer")
         if (
             self.validation_profile == "development"
             and self.device_min_api < 36
             and not self.allow_legacy_device_smoke
         ):
             raise ValueError(
-                "development devices below API 36 require "
-                "APKSCANNER_ALLOW_LEGACY_DEVICE_SMOKE=true"
+                "development devices below API 36 require APKSCANNER_ALLOW_LEGACY_DEVICE_SMOKE=true"
             )
         if self.poc_compile_api is not None and self.poc_compile_api < 36:
             raise ValueError("APKSCANNER_POC_COMPILE_API must be at least 36")
@@ -368,9 +355,7 @@ class Settings:
             "low",
             "info",
         }:
-            raise ValueError(
-                "APKSCANNER_ADAPTIVE_VERIFIER_MIN_SEVERITY must be a valid severity"
-            )
+            raise ValueError("APKSCANNER_ADAPTIVE_VERIFIER_MIN_SEVERITY must be a valid severity")
         if self.codex_isolation not in {"docker", "host"}:
             raise ValueError("APKSCANNER_CODEX_ISOLATION must be docker or host")
         if self.codex_isolation == "host" and not self.codex_allow_host:
@@ -392,6 +377,8 @@ class Settings:
             raise ValueError("Codex no-event timeout cannot exceed the turn timeout")
         if self.codex_turn_timeout_seconds > self.task_timeout_seconds:
             raise ValueError("Codex turn timeout cannot exceed the task timeout")
+        if self.ida_mcp_enabled and not self.ida_mcp_url.startswith(("http://", "https://")):
+            raise ValueError("APKSCANNER_IDA_MCP_URL must use http:// or https://")
         frozen_agent_configuration(self)
 
     def frozen_agent_configuration(self):  # noqa: ANN202

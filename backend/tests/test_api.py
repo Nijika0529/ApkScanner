@@ -156,6 +156,65 @@ def test_validation_fixture_registry_preserves_account_and_canary_context(settin
         assert removed.status_code == 204
 
 
+def test_dynamic_experiment_api_persists_stateful_steps(settings) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    with app.state.database.session_factory() as session:
+        scan = Scan(
+            status="static_complete",
+            filename="experiment.apk",
+            artifact_sha256="d" * 64,
+            artifact_path="experiment.apk",
+        )
+        session.add(scan)
+        session.commit()
+        scan_id = scan.id
+
+    headers = {"X-APKScanner-Request": "console"}
+    with TestClient(app) as client:
+        created = client.post(
+            f"/api/v1/scans/{scan_id}/dynamic-experiments",
+            headers=headers,
+            json={
+                "name": "login-state callback chain",
+                "objective": "Keep state across two Android commands and record the callback.",
+                "preconditions": ["test account is already logged in"],
+                "impact_contract": {"expected_fact": "callback_received"},
+                "steps": [
+                    {
+                        "id": "trigger",
+                        "title": "Trigger the external entry",
+                        "phase": "action",
+                        "adb_args": ["shell", "am", "start", "-W", "demo://entry"],
+                    },
+                    {
+                        "id": "observe",
+                        "title": "Observe the callback",
+                        "phase": "assert",
+                        "adb_args": ["shell", "logcat", "-d"],
+                        "stdout_contains": ["CALLBACK_OK"],
+                        "observation_kind": "callback.received",
+                    },
+                ],
+                "cleanup_steps": [
+                    {
+                        "id": "cleanup",
+                        "title": "Stop the test package",
+                        "phase": "cleanup",
+                        "adb_args": ["shell", "am", "force-stop", "com.example.test"],
+                    }
+                ],
+            },
+        )
+        assert created.status_code == 201
+        capsule_id = created.json()["id"]
+        assert created.json()["status"] == "queued"
+        assert created.json()["receipts"] == []
+        listed = client.get(f"/api/v1/scans/{scan_id}/dynamic-experiments")
+        assert listed.status_code == 200
+        assert listed.json()[0]["id"] == capsule_id
+        assert listed.json()[0]["steps"][1]["observation_kind"] == "callback.received"
+
+
 def test_artifact_graph_api_returns_native_relationships(settings) -> None:  # noqa: ANN001
     app = create_app(settings)
     workspace = settings.data_dir / "workspaces" / "native-graph-api"

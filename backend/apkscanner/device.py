@@ -317,18 +317,11 @@ class AdbDeviceAdapter:
         self._last_capability: dict[str, Any] | None = None
         self._last_capability_at: float | None = None
         self._active_cancel_event: threading.Event | None = None
-        self._probe_apk_sha256: str | None = None
-        self._probe_ready = False
         self._ui_dump_latencies: list[float] = []
 
     @property
     def configured(self) -> bool:
         return bool(self.serial and self.runner.available("adb"))
-
-    @property
-    def probe_ready(self) -> bool:
-        """Whether the optional ordinary-app Probe fast path is usable."""
-        return self._probe_ready
 
     @contextmanager
     def lease(self):  # noqa: ANN201
@@ -522,7 +515,6 @@ class AdbDeviceAdapter:
         self, apk_path: Path, package_name: str, budget: TimeBudget | None = None
     ) -> list[tuple[str, CommandResult, dict]]:
         self._validate_package(package_name)
-        self._probe_ready = False
         commands: list[tuple[str, CommandResult, dict]] = []
         health = self._adb_budget(["get-state"], budget, 30)
         commands.append(("device.health", health, {}))
@@ -609,50 +601,6 @@ class AdbDeviceAdapter:
                 )
         if install.exit_code != 0:
             return commands
-        if self.settings.probe_apk_path and self.settings.probe_apk_path.is_file():
-            probe_sha256 = self._file_sha256(self.settings.probe_apk_path)
-            probe_status = self._adb_budget(
-                ["shell", "pm", "path", "io.apkscanner.probe"],
-                budget,
-                45,
-            )
-            if self._probe_apk_sha256 == probe_sha256 and probe_status.exit_code == 0:
-                probe_install = CommandResult(
-                    ["adb", "-s", self.serial or "", "reuse-probe"],
-                    0,
-                    probe_status.stdout,
-                    "",
-                )
-                commands.append(
-                    (
-                        "device.probe_cached",
-                        probe_install,
-                        {
-                            "package": "io.apkscanner.probe",
-                            "apk_sha256": probe_sha256,
-                        },
-                    )
-                )
-                self._probe_ready = True
-            else:
-                probe_install = self._adb_budget(
-                    ["install", "-r", "-t", str(self.settings.probe_apk_path)],
-                    budget,
-                    300,
-                )
-                commands.append(
-                    (
-                        "device.install_probe",
-                        probe_install,
-                        {
-                            "package": "io.apkscanner.probe",
-                            "apk_sha256": probe_sha256,
-                        },
-                    )
-                )
-                if probe_install.exit_code == 0:
-                    self._probe_apk_sha256 = probe_sha256
-                    self._probe_ready = True
         if self.settings.device_reset_policy != "never":
             commands.append(
                 (
@@ -740,84 +688,17 @@ class AdbDeviceAdapter:
         *,
         state: str = "guest",
         budget: TimeBudget | None = None,
-        uri_override: str | None = None,
-        extras: dict[str, str | int | bool] | None = None,
-        operation: str = "auto",
-        method: str | None = None,
-        argument: str | None = None,
-        binder_transaction_code: int | None = None,
-        binder_interface_descriptor: str | None = None,
-        binder_reply_type: str | None = None,
-        binder_read_exception: bool | None = None,
-        binder_script: list[dict[str, Any]] | None = None,
-        intent_action: str | None = None,
-        categories: list[str] | None = None,
-        oracle: AgentOracleSpec | None = None,
-        test_case_id: str | None = None,
     ) -> DeviceProbeResult:
+        """Run the initial shell-identity reachability check.
+
+        Ordinary-app proof requests use a disposable platform-generated PoC Harness instead.
+        """
         if not self.configured:
             raise RuntimeError("remote ADB device is not configured")
         self._validate_package(package_name)
         commands: list[tuple[str, CommandResult, dict[str, Any]]] = []
         with self._lease:
-            direct_argv = (
-                self._direct_probe_args(entry, package_name)
-                if (
-                    uri_override is None
-                    and extras is None
-                    and operation == "auto"
-                    and intent_action is None
-                    and not categories
-                )
-                else None
-            )
-            probe_request = (
-                self._probe_request(
-                    entry,
-                    package_name,
-                    uri_override=uri_override,
-                    extras=extras,
-                    operation=operation,
-                    method=method,
-                    argument=argument,
-                    binder_transaction_code=binder_transaction_code,
-                    binder_interface_descriptor=binder_interface_descriptor,
-                    binder_reply_type=binder_reply_type,
-                    binder_read_exception=binder_read_exception,
-                    binder_script=binder_script,
-                    intent_action=intent_action,
-                    categories=categories,
-                )
-                if self._probe_ready
-                else None
-            )
-            request_id = secrets.token_hex(8) if probe_request else None
-            action_attempted = bool(direct_argv or probe_request)
-            ui_baseline: CommandResult | None = None
-            if action_attempted and oracle is not None and oracle.kind == "ui_text":
-                ui_baseline, baseline_attempts = self._dump_ui_hierarchy_with_retry(
-                    budget=budget,
-                    cap=45,
-                )
-                commands.append(
-                    (
-                        "blackbox.ui_baseline",
-                        ui_baseline,
-                        {
-                            "entry_point": entry.id,
-                            "session_state": state,
-                            "test_case_id": test_case_id,
-                            "observation_role": "pre_action_baseline",
-                            "poll_attempts": baseline_attempts,
-                            "target_package": package_name,
-                            "target_text_present": self._ui_text_in_package(
-                                ui_baseline.stdout,
-                                oracle.expected_text or "",
-                                package_name,
-                            ),
-                        },
-                    )
-                )
+            direct_argv = self._direct_probe_args(entry, package_name)
             if direct_argv:
                 commands.append(
                     (
@@ -827,75 +708,10 @@ class AdbDeviceAdapter:
                             "caller_identity": "adb_shell",
                             "entry_point": entry.id,
                             "session_state": state,
-                            "test_case_id": test_case_id,
                         },
                     )
                 )
-            if probe_request:
-                probe_request["request_id"] = request_id
-                encoded = base64.urlsafe_b64encode(json.dumps(probe_request).encode()).decode()
-                commands.append(
-                    (
-                        "blackbox.probe_app",
-                        self._adb_budget(
-                            [
-                                "shell",
-                                "am",
-                                "broadcast",
-                                "-a",
-                                "io.apkscanner.probe.EXECUTE",
-                                "-n",
-                                "io.apkscanner.probe/.ProbeReceiver",
-                                "--es",
-                                "request_base64",
-                                encoded,
-                            ],
-                            budget,
-                            90,
-                        ),
-                        {
-                            "caller_identity": "probe_app",
-                            "entry_point": entry.id,
-                            "session_state": state,
-                            "request_id": request_id,
-                            "test_case_id": test_case_id,
-                        },
-                    )
-                )
-            if probe_request:
-                log_result, matching_log, poll_attempts, poll_seconds = self._poll_probe_logcat(
-                    request_id=str(request_id),
-                    timeout_seconds=15,
-                    budget=budget,
-                )
-                probe_payload = self._last_json_payload(matching_log)
-                oracle_metadata = self._evaluate_probe_oracle(
-                    oracle,
-                    probe_payload=probe_payload,
-                    output=log_result.stdout,
-                )
-                commands.append(
-                    (
-                        "blackbox.logcat",
-                        log_result,
-                        {
-                            "entry_point": entry.id,
-                            "session_state": state,
-                            "request_id": request_id,
-                            "test_case_id": test_case_id,
-                            "request_observed": bool(matching_log),
-                            "poll_attempts": poll_attempts,
-                            "poll_seconds": round(poll_seconds, 3),
-                            "probe_success": any(
-                                '"success":true' in line.replace('\\"', '"')
-                                for line in matching_log
-                            ),
-                            "probe_result": probe_payload,
-                            **oracle_metadata,
-                        },
-                    )
-                )
-            if action_attempted:
+            if direct_argv:
                 ui_result, ui_attempts = self._dump_ui_hierarchy_with_retry(
                     budget=budget,
                     cap=45,
@@ -907,38 +723,7 @@ class AdbDeviceAdapter:
                         {
                             "entry_point": entry.id,
                             "session_state": state,
-                            "test_case_id": test_case_id,
                             "poll_attempts": ui_attempts,
-                            **self._evaluate_ui_oracle(
-                                oracle,
-                                ui_result.stdout,
-                                package_name=package_name,
-                                baseline_output=(
-                                    ui_baseline.stdout if ui_baseline is not None else None
-                                ),
-                                baseline_valid=bool(
-                                    ui_baseline is not None and ui_baseline.exit_code == 0
-                                ),
-                                observation_valid=ui_result.exit_code == 0,
-                            ),
-                        },
-                    )
-                )
-            if action_attempted and oracle and oracle.kind in {"log_contains", "process_crash"}:
-                target_log = self._adb_budget(["logcat", "-d", "-t", "800"], budget, 60)
-                commands.append(
-                    (
-                        "blackbox.target_logcat",
-                        target_log,
-                        {
-                            "entry_point": entry.id,
-                            "session_state": state,
-                            "test_case_id": test_case_id,
-                            **self._evaluate_target_log_oracle(
-                                oracle,
-                                target_log.stdout,
-                                package_name,
-                            ),
                         },
                     )
                 )
@@ -948,38 +733,10 @@ class AdbDeviceAdapter:
             summary={
                 "entry_point": entry.id,
                 "session_state": state,
-                "probe_identity_attempted": probe_request is not None,
+                "caller_identity": "adb_shell",
                 "command_count": len(commands),
             },
         )
-
-    def _poll_probe_logcat(
-        self,
-        *,
-        request_id: str,
-        timeout_seconds: int,
-        budget: TimeBudget | None,
-    ) -> tuple[CommandResult, list[str], int, float]:
-        """Wait for an asynchronous Probe result correlated to one request."""
-
-        started = time.monotonic()
-        deadline = started + max(timeout_seconds, 1)
-        attempts = 0
-        last = self._budget_exhausted(["adb", "-s", self.serial or "", "logcat"])
-        while True:
-            attempts += 1
-            remaining = max(1, int(deadline - time.monotonic()))
-            last = self._adb_budget(
-                ["logcat", "-d", "-t", "300", "-s", "APKSCANNER_PROBE:I"],
-                budget,
-                min(15, remaining),
-            )
-            matching = [line for line in last.stdout.splitlines() if request_id in line]
-            if matching or last.exit_code != 0:
-                return last, matching, attempts, time.monotonic() - started
-            if time.monotonic() >= deadline or (budget is not None and budget.expired):
-                return last, matching, attempts, time.monotonic() - started
-            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
 
     @staticmethod
     def _poc_install_diagnostics(result: CommandResult) -> dict[str, Any]:
@@ -1098,7 +855,9 @@ class AdbDeviceAdapter:
             or self.settings.device_android_api
         )
         common = {
-            "caller_identity": "agent_poc_app",
+            "caller_identity": (
+                (build_metadata or {}).get("caller_identity") or "agent_poc_app"
+            ),
             "poc_package": spec.package_name,
             "poc_compile_api": (build_metadata or {}).get("compile_api"),
             "poc_min_api": (build_metadata or {}).get("min_api"),
@@ -1815,9 +1574,20 @@ class AdbDeviceAdapter:
                 return None
             return ["shell", "am", "start", "-W", "-n", f"{package_name}/{entry.name}"]
         if entry.kind == "deep_link":
-            # Manifest URI values are untrusted and adb shell has a remote shell boundary.
-            # Deep links are dispatched through the base64 Probe APK protocol instead.
-            return None
+            if not entry.name or any(character in entry.name for character in "\r\n\x00"):
+                return None
+            return [
+                "shell",
+                "am",
+                "start",
+                "-W",
+                "-a",
+                "android.intent.action.VIEW",
+                "-d",
+                entry.name,
+                "-p",
+                package_name,
+            ]
         if entry.kind == "service":
             if not re.fullmatch(r"[A-Za-z0-9_.$]+", entry.name):
                 return None
@@ -1848,78 +1618,6 @@ class AdbDeviceAdapter:
             )
             for line in relevant
         )
-
-    @staticmethod
-    def _probe_request(
-        entry: EntryPoint,
-        package_name: str,
-        *,
-        uri_override: str | None = None,
-        extras: dict[str, str | int | bool] | None = None,
-        operation: str = "auto",
-        method: str | None = None,
-        argument: str | None = None,
-        binder_transaction_code: int | None = None,
-        binder_interface_descriptor: str | None = None,
-        binder_reply_type: str | None = None,
-        binder_read_exception: bool | None = None,
-        binder_script: list[dict[str, Any]] | None = None,
-        intent_action: str | None = None,
-        categories: list[str] | None = None,
-    ) -> dict[str, Any] | None:
-        request: dict[str, Any] = {
-            "kind": entry.kind,
-            "package": package_name,
-            "component": (
-                entry.owner_component or ("" if entry.kind == "deep_link" else entry.name)
-            ),
-        }
-        if entry.kind in {"activity", "activity_alias"} and uri_override is not None:
-            # Preserve implicit URI dispatch semantics even when the planner
-            # attached a manifest deep link to its owning Activity entry.
-            # Older Probe APKs already understand the deep_link request kind.
-            request["kind"] = "deep_link"
-            request["uri"] = uri_override
-        elif entry.kind == "deep_link":
-            request["uri"] = uri_override or entry.name
-        elif entry.kind == "provider":
-            authority = entry.metadata_json.get("authorities")
-            if not authority:
-                return None
-            authority = str(authority).split(";", 1)[0]
-            request["uri"] = uri_override or f"content://{authority}"
-        if extras:
-            request["extras"] = extras
-        if operation != "auto":
-            request["operation"] = operation
-        if method is not None:
-            request["method"] = method
-        if argument is not None:
-            request["argument"] = argument
-        if operation in {"binder_transact", "binder_script"}:
-            request["binder_transaction_code"] = binder_transaction_code
-            request["binder_read_exception"] = (
-                True if binder_read_exception is None else binder_read_exception
-            )
-            if binder_reply_type is not None:
-                request["binder_reply_type"] = binder_reply_type
-            if binder_script is not None:
-                request["binder_script"] = binder_script
-            if binder_interface_descriptor is not None:
-                request["binder_interface_descriptor"] = binder_interface_descriptor
-        if intent_action is not None:
-            request["intent_action"] = intent_action
-        if categories:
-            request["categories"] = categories
-        return request
-
-    @staticmethod
-    def _file_sha256(path: Path) -> str:
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                digest.update(chunk)
-        return digest.hexdigest()
 
     def _target_file_snapshot(
         self,
@@ -2154,7 +1852,7 @@ class AdbDeviceAdapter:
         payload = dict(poc_payload or {})
         if "rowCount" not in payload and "row_count" in payload:
             payload["rowCount"] = payload["row_count"]
-        if oracle.kind in {"reachability", "provider_rows"}:
+        if oracle.kind in {"reachability", "provider_rows", "binder_reply"}:
             return cls._evaluate_probe_oracle(
                 oracle,
                 probe_payload=payload or None,

@@ -1,0 +1,16 @@
+version: 2.9.3
+apkFileName: nativecases.apk
+isFrameworkApk: false
+usesFramework:
+  ids:
+  - 1
+sdkInfo:
+  minSdkVersion: '26'
+  targetSdkVersion: '36'
+packageInfo:
+  forcedPackageId: 127
+versionInfo:
+  versionCode: '1'
+  versionName: '1.0'
+doNotCompress:
+- resources.arsc

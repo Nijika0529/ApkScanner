@@ -157,7 +157,7 @@ def test_agent_adb_policy_keeps_full_access_with_hard_safety_boundary() -> None:
     assert "A reproduced_blackbox receipt ends that hypothesis" in instructions
     assert "never reconstruct a task UUID" in instructions
     assert "Avoid redundant existence/path checks for unchanged PoC sources" in instructions
-    assert "prefer a dedicated PoC or platform Probe" in instructions
+    assert "prefer a dedicated PoC or platform-generated proof Harness" in instructions
     assert "materially distinct fallback strategies" in instructions
     assert "submit a live proof replay" in instructions
     assert "without discovering or invoking an Android SDK toolchain" in instructions
@@ -280,6 +280,8 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     assert "A PoC log_contains Oracle records only the PoC's claim" in planning
     assert "live Proof Gateway rejects every impact=none replay" in planning
     assert "operation=binder_transact" in planning
+    assert "proof_capabilities.ephemeral_app_harness" in planning
+    assert "Never repeat an unchanged no-PoC Binder request" in planning
     assert "binder_reply may use unauthorized_data_access only" in planning
     assert "target_uid_log_contains supports impact=none only" in planning
     critic = _phase_prompt("adversarial_review")

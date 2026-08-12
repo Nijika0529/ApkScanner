@@ -17,6 +17,7 @@ from .models import (
     ProofAttempt,
     SecurityHypothesis,
 )
+from .proof_recipes import plan_with_proof_recipe
 from .repository import now
 from .schemas import AgentRequestedTest
 
@@ -276,9 +277,12 @@ class HypothesisLedger:
                 task_id=task_id,
                 hypothesis_id=hypothesis.id,
                 test_case_id=test_case_id,
-                prover="android_entry_probe",
+                prover=(
+                    "platform_ephemeral_harness" if request.poc is None else "agent_android_poc"
+                ),
                 status=ProofAttemptStatus.PLANNED.value,
-                plan=request.model_dump(mode="json"),
+                plan=plan_with_proof_recipe(request),
+                oracle=request.oracle.model_dump(mode="json"),
             )
             if hypothesis.status != HypothesisStatus.PROVEN.value:
                 hypothesis.status = HypothesisStatus.PROOF_PLANNED.value
@@ -370,9 +374,7 @@ class HypothesisLedger:
             and item.get("metadata", {}).get("impact_contract_satisfied") is True
             for item in evidence
         )
-        execution_demonstrated = (
-            probe_succeeded or poc_succeeded or platform_observed_poc_effect
-        )
+        execution_demonstrated = probe_succeeded or poc_succeeded or platform_observed_poc_effect
         observed_facts: list[dict[str, Any]] = []
         for item in evidence:
             metadata = item.get("metadata", {})
@@ -385,21 +387,17 @@ class HypothesisLedger:
             observed_facts.append(
                 {
                     **fact,
-                    "evidence_ids": (
-                        [str(item["id"])] if isinstance(item.get("id"), str) else []
-                    ),
+                    "evidence_ids": ([str(item["id"])] if isinstance(item.get("id"), str) else []),
                 }
             )
         impact_observed = any(
-            item.get("metadata", {}).get("impact_contract_satisfied") is True
-            for item in evidence
+            item.get("metadata", {}).get("impact_contract_satisfied") is True for item in evidence
         )
         oracle_refuted = any(
             item.get("metadata", {}).get("oracle_refuted") is True for item in evidence
         )
         android16_verdict_eligible = not any(
-            item.get("metadata", {}).get("android16_verdict_eligible") is False
-            for item in evidence
+            item.get("metadata", {}).get("android16_verdict_eligible") is False for item in evidence
         )
         dynamic_verdict_eligible = not any(
             item.get("metadata", {}).get(
@@ -434,11 +432,7 @@ class HypothesisLedger:
         if verdict_scopes:
             verdict_scope = verdict_scopes[0]
         compatibility_smoke_only = not dynamic_verdict_eligible
-        harm_demonstrated = (
-            dynamic_verdict_eligible
-            and execution_demonstrated
-            and impact_observed
-        )
+        harm_demonstrated = dynamic_verdict_eligible and execution_demonstrated and impact_observed
         status = (
             ProofAttemptStatus.FAILED.value
             if error
@@ -469,11 +463,7 @@ class HypothesisLedger:
                     dict.fromkeys(
                         str(contract_id)
                         for item in evidence
-                        if (
-                            contract_id := item.get("metadata", {}).get(
-                                "impact_contract_id"
-                            )
-                        )
+                        if (contract_id := item.get("metadata", {}).get("impact_contract_id"))
                     )
                 ),
                 "observed_facts": observed_facts,
@@ -846,8 +836,7 @@ class HypothesisLedger:
             elif any(item.status == ProofAttemptStatus.REFUTED.value for item in owned_attempts):
                 stage = "case_refuted"
             elif any(
-                bool((item.oracle or {}).get("execution_demonstrated"))
-                for item in owned_attempts
+                bool((item.oracle or {}).get("execution_demonstrated")) for item in owned_attempts
             ):
                 stage = "ordinary_uid_reachable"
             elif owned_attempts:
@@ -867,9 +856,7 @@ class HypothesisLedger:
                 "stage": stage,
                 "hypothesis_status": hypothesis.status,
                 "proof_attempt_count": len(owned_attempts),
-                "latest_attempt_status": (
-                    owned_attempts[-1].status if owned_attempts else None
-                ),
+                "latest_attempt_status": (owned_attempts[-1].status if owned_attempts else None),
                 "latest_error": owned_attempts[-1].error if owned_attempts else None,
             }
         return {

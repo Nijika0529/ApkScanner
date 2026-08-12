@@ -181,9 +181,7 @@ def test_hypothesis_ledger_tracks_arguments_and_concrete_proof(settings) -> None
         assert ui_proof.oracle["platform_observed_poc_effect"] is True
         arguments = list(
             session.scalars(
-                select(HypothesisArgument).where(
-                    HypothesisArgument.hypothesis_id == hypothesis_id
-                )
+                select(HypothesisArgument).where(HypothesisArgument.hypothesis_id == hypothesis_id)
             )
         )
         assert [argument.role for argument in arguments] == ["hunter", "critic"]
@@ -332,18 +330,9 @@ def test_critic_and_arbiter_cannot_downgrade_platform_proven_hypothesis(
             "log-webview",
         ]
         assert persisted.metadata_json["platform_proof_override"] is True
-        assert (
-            persisted.metadata_json["assessment"]["verdict"]
-            == "reproduced_blackbox"
-        )
-        assert (
-            persisted.metadata_json["model_assessment"]["verdict"]
-            == "refuted_static"
-        )
-        assert (
-            persisted.metadata_json["closure_receipt"]["disposition"]
-            == "platform_proven"
-        )
+        assert persisted.metadata_json["assessment"]["verdict"] == "reproduced_blackbox"
+        assert persisted.metadata_json["model_assessment"]["verdict"] == "refuted_static"
+        assert persisted.metadata_json["closure_receipt"]["disposition"] == "platform_proven"
 
 
 def test_identical_claims_in_separate_tasks_do_not_collide(settings) -> None:  # noqa: ANN001
@@ -503,6 +492,11 @@ def test_plan_proof_allows_related_exported_entry_in_same_scan(settings) -> None
         proof = session.get(ProofAttempt, proof_id)
         assert proof is not None
         assert proof.plan["entry_point_id"] == related_id
+        assert proof.prover == "platform_ephemeral_harness"
+        assert proof.proof_recipe["execution_mode"] == "platform_harness"
+        assert proof.proof_recipe["generator"] == "ephemeral_android_app.v1"
+        assert "hypothesis_id" not in proof.proof_recipe["request_template"]
+        assert "entry_point_id" not in proof.proof_recipe["request_template"]
 
 
 def test_platform_proof_result_is_independent_from_model_verdict(settings) -> None:  # noqa: ANN001
@@ -637,9 +631,7 @@ def test_one_platform_proof_does_not_close_other_hypotheses(settings) -> None:  
     progress = ledger.task_hypothesis_progress(task.id)
     assert progress["proven_hypothesis_ids"] == [hypotheses[0].id]
     assert progress["unresolved_hypothesis_ids"] == [hypotheses[1].id]
-    assert progress["proof_stage_by_hypothesis"][hypotheses[0].id]["stage"] == (
-        "impact_reproduced"
-    )
+    assert progress["proof_stage_by_hypothesis"][hypotheses[0].id]["stage"] == ("impact_reproduced")
     assert progress["proof_stage_by_hypothesis"][hypotheses[1].id]["stage"] == "untriaged"
     assert progress["all_platform_proven"] is False
     assert ledger.task_all_hypotheses_proven(task.id) is False
@@ -823,9 +815,7 @@ def test_finalize_closes_each_hypothesis_from_its_own_receipt(settings) -> None:
     hypotheses = ledger.ensure_task_hypotheses(task)
     by_claim = {hypothesis.claim: hypothesis for hypothesis in hypotheses}
     blocked_id = by_claim["A caller check blocks the path."].id
-    supported_id = by_claim[
-        "A separate exported action reaches a sensitive sink."
-    ].id
+    supported_id = by_claim["A separate exported action reaches a sensitive sink."].id
     unassessed_id = by_claim["A third path was not assessed."].id
 
     ledger.finalize(
@@ -851,12 +841,8 @@ def test_finalize_closes_each_hypothesis_from_its_own_receipt(settings) -> None:
                     "hypothesis_id": supported_id,
                     "verdict": "supported_static",
                     "sink": "Sensitive preference mutation",
-                    "reachable_path": (
-                        "Exported receiver reaches the mutation without a guard."
-                    ),
-                    "proof_gaps": [
-                        "Ordinary-app replay remains required for a Finding."
-                    ],
+                    "reachable_path": ("Exported receiver reaches the mutation without a guard."),
+                    "proof_gaps": ["Ordinary-app replay remains required for a Finding."],
                     "evidence_ids": ["static-sink"],
                     "confidence": "medium",
                 },
@@ -879,10 +865,7 @@ def test_finalize_closes_each_hypothesis_from_its_own_receipt(settings) -> None:
         assert supported.status == "accepted_for_proof"
         assert supported.support_evidence_ids == ["static-sink"]
         assert unassessed.status == "inconclusive"
-        assert (
-            unassessed.metadata_json["closure_receipt"]["disposition"]
-            == "not_assessed_by_agent"
-        )
+        assert unassessed.metadata_json["closure_receipt"]["disposition"] == "not_assessed_by_agent"
         arguments = list(
             session.scalars(
                 select(HypothesisArgument)

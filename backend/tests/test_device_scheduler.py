@@ -940,7 +940,7 @@ def test_target_uid_log_oracle_records_target_owned_reachability_only() -> None:
     assert wrong_uid["security_impact_observed"] is False
 
 
-def test_missing_optional_probe_does_not_emit_a_failed_probe_broadcast(settings) -> None:  # noqa: ANN001
+def test_initial_probe_uses_only_shell_reachability(settings) -> None:  # noqa: ANN001
     calls: list[list[str]] = []
 
     class RecordingRunner:
@@ -954,7 +954,7 @@ def test_missing_optional_probe_does_not_emit_a_failed_probe_broadcast(settings)
             return CommandResult(argv, 0, "", "")
 
     adapter = AdbDeviceAdapter(
-        replace(settings, adb_serial="cloud-device:5555", probe_apk_path=None),
+        replace(settings, adb_serial="cloud-device:5555"),
         RecordingRunner(),  # type: ignore[arg-type]
     )
     entry = EntryPoint(
@@ -967,12 +967,11 @@ def test_missing_optional_probe_does_not_emit_a_failed_probe_broadcast(settings)
 
     result = adapter.probe(entry, "com.example")
 
-    assert adapter.probe_ready is False
     assert [kind for kind, _result, _metadata in result.commands] == [
         "blackbox.adb_shell",
         "blackbox.ui_dump",
     ]
-    assert not any("io.apkscanner.probe/.ProbeReceiver" in argv for argv in calls)
+    assert not any("broadcast" in argv for argv in calls)
 
 
 def test_android13_device_is_local_verdict_but_not_release_gate_eligible(
@@ -1585,104 +1584,3 @@ def test_process_crash_oracle_requires_the_target_process() -> None:
 
     assert unrelated["security_impact_observed"] is False
     assert target["security_impact_observed"] is True
-
-
-def test_activity_deep_link_probe_preserves_uri_and_expected_component() -> None:
-    entry = EntryPoint(
-        id="11111111-1111-1111-1111-111111111111",
-        scan_id="scan",
-        kind="activity",
-        name="com.example.LinkActivity",
-        owner_component="com.example.LinkActivity",
-        exported=True,
-        deep_links=[
-            {
-                "scheme": "example",
-                "host": "open",
-                "uri_template": "example://open/path",
-            }
-        ],
-    )
-
-    request = AdbDeviceAdapter._probe_request(
-        entry,
-        "com.example",
-        uri_override="example://open/path?source=test",
-        extras={":settings:fragment_args_key": "privacy"},
-    )
-
-    assert request == {
-        "kind": "deep_link",
-        "package": "com.example",
-        "component": "com.example.LinkActivity",
-        "uri": "example://open/path?source=test",
-        "extras": {":settings:fragment_args_key": "privacy"},
-    }
-
-
-def test_service_probe_serializes_binder_transaction_parameters() -> None:
-    entry = EntryPoint(
-        id="11111111-1111-1111-1111-111111111111",
-        scan_id="scan",
-        kind="service",
-        name="io.apkscanner.vulntest.CommandService",
-        owner_component="io.apkscanner.vulntest.CommandService",
-        exported=True,
-    )
-
-    request = AdbDeviceAdapter._probe_request(
-        entry,
-        "io.apkscanner.vulntest",
-        operation="binder_transact",
-        binder_transaction_code=1,
-        binder_reply_type="string",
-        binder_read_exception=True,
-    )
-
-    assert request == {
-        "kind": "service",
-        "package": "io.apkscanner.vulntest",
-        "component": "io.apkscanner.vulntest.CommandService",
-        "operation": "binder_transact",
-        "binder_transaction_code": 1,
-        "binder_reply_type": "string",
-        "binder_read_exception": True,
-    }
-
-
-def test_service_probe_serializes_bounded_binder_script() -> None:
-    entry = EntryPoint(
-        id="11111111-1111-1111-1111-111111111111",
-        scan_id="scan",
-        kind="service",
-        name="io.apkscanner.vulntest.CommandService",
-        owner_component="io.apkscanner.vulntest.CommandService",
-        exported=True,
-    )
-    script = [
-        {
-            "operation": "write_integer",
-            "string_value": None,
-            "integer_value": 42,
-            "boolean_value": None,
-        },
-        {
-            "operation": "read_string",
-            "string_value": None,
-            "integer_value": None,
-            "boolean_value": None,
-        },
-    ]
-
-    request = AdbDeviceAdapter._probe_request(
-        entry,
-        "io.apkscanner.vulntest",
-        operation="binder_script",
-        binder_transaction_code=7,
-        binder_script=script,
-    )
-
-    assert request is not None
-    assert request["operation"] == "binder_script"
-    assert request["binder_transaction_code"] == 7
-    assert request["binder_script"] == script

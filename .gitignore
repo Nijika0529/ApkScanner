@@ -29,6 +29,7 @@ testapk/*
 !testapk/build-version-evolution-fixtures.sh
 !testapk/build-adaptivecases.sh
 !testapk/build-copilotfixture.sh
+!testapk/build-nativecases.sh
 !testapk/version-evolution-manifest.xml
 !testapk/rescuetest.apk
 !testapk/rescuetest-ground-truth.json
@@ -50,6 +51,12 @@ testapk/*
 !testapk/copilotfixture-plugin-src/**
 !testapk/copilotfixture-native/
 !testapk/copilotfixture-native/**
+!testapk/nativecases.apk
+!testapk/nativecases-ground-truth.json
+!testapk/nativecases-src/
+!testapk/nativecases-src/**
+!testapk/nativecases-native/
+!testapk/nativecases-native/**
 testapk/vulntest-src/build/
 testapk/vulntest-src/dist/
 testapk/adaptivecases-src/build/
@@ -58,6 +65,7 @@ testapk/rescuetest-src/build/
 testapk/rescuetest-src/dist/
 testapk/copilotfixture-src/build/
 testapk/copilotfixture-plugin-src/build/
+testapk/nativecases-src/build/
 testapk/rescuetest-unsigned.apk
 testapk/rescuetest-aligned.apk
 testapk/vulntest-unsigned.apk

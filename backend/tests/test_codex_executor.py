@@ -244,8 +244,11 @@ def test_workspace_manager_canonicalizes_snake_case_roles_for_worker_paths(setti
         provider_base_url="https://api.deepseek.com/",
         model_catalog_path="/opt/apk-scanner/config/deepseek-models.json",
         workspace_path=workspace.container_workspace,
+        ida_mcp_url="http://apkscanner-host:8745/mcp",
+        ida_mcp_tool_timeout_seconds=1_800,
     )
     assert configuration.workspace_path == workspace.container_workspace
+    assert str(configuration.ida_mcp_url) == "http://apkscanner-host:8745/mcp"
 
 
 def test_workspace_manager_releases_terminal_task_slot_without_reusing_uid(settings) -> None:  # noqa: ANN001
