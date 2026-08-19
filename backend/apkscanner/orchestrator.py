@@ -63,6 +63,8 @@ from .models import (
     AgentSessionRecord,
     AgentTurnRecord,
     CoverageItem,
+    DynamicExperimentCapsule,
+    DynamicExperimentReceipt,
     EntryPoint,
     Evidence,
     Finding,
@@ -4984,6 +4986,70 @@ class ScanOrchestrator:
             self.device_pool.wake_waiters()
             return True
 
+    def run_dynamic_experiment(
+        self,
+        capsule_id: str,
+        *,
+        preferred_serial: str | None = None,
+    ) -> DynamicExperimentCapsule:
+        """Run or resume a standalone Capsule and close its bound Proof when terminal."""
+
+        capsule = self.dynamic_experiments.run(
+            capsule_id,
+            preferred_serial=preferred_serial,
+        )
+        self._reconcile_dynamic_experiment_proof(capsule)
+        return capsule
+
+    def cancel_dynamic_experiment(self, capsule_id: str) -> DynamicExperimentCapsule:
+        capsule = self.dynamic_experiments.cancel(capsule_id)
+        self._reconcile_dynamic_experiment_proof(capsule)
+        return capsule
+
+    def _reconcile_dynamic_experiment_proof(
+        self,
+        capsule: DynamicExperimentCapsule,
+    ) -> None:
+        if capsule.status not in {"completed", "canceled"}:
+            return
+        proof_attempt_id = (capsule.impact_contract or {}).get("proof_attempt_id")
+        if not isinstance(proof_attempt_id, str):
+            return
+        with self.database.session_factory() as session:
+            receipts = list(
+                session.scalars(
+                    select(DynamicExperimentReceipt)
+                    .where(DynamicExperimentReceipt.capsule_id == capsule.id)
+                    .order_by(
+                        DynamicExperimentReceipt.started_at,
+                        DynamicExperimentReceipt.attempt,
+                    )
+                )
+            )
+            evidence_ids = list(
+                dict.fromkeys(
+                    evidence_id
+                    for receipt in receipts
+                    for evidence_id in receipt.evidence_ids
+                )
+            )
+            evidence_by_id = {
+                item.id: item
+                for item in session.scalars(
+                    select(Evidence).where(Evidence.id.in_(evidence_ids))
+                )
+            }
+            summaries = [
+                self._evidence_summary(evidence_by_id[evidence_id])
+                for evidence_id in evidence_ids
+                if evidence_id in evidence_by_id
+            ]
+        self.hypothesis_ledger.complete_proof(
+            proof_attempt_id,
+            summaries,
+            error=(capsule.error if capsule.status == "canceled" else None),
+        )
+
     def stop_scan_tasks(self, scan_id: str) -> dict[str, int]:
         """Stop every unfinished task while preserving completed evidence."""
         requested_at = now()
@@ -6297,6 +6363,16 @@ class ScanOrchestrator:
                             "rationale_summary": request.rationale,
                             "poc_package": (request.poc.package_name if request.poc else None),
                             "poc_project_path": (request.poc.project_path if request.poc else None),
+                            "execution_mode": (
+                                "dynamic_experiment"
+                                if request.experiment is not None
+                                else "android_poc"
+                            ),
+                            "experiment_step_count": (
+                                len(request.experiment.steps)
+                                if request.experiment is not None
+                                else 0
+                            ),
                         },
                     )
                 agent_round_history.append(
@@ -8128,6 +8204,8 @@ class ScanOrchestrator:
                 (
                     "旧版本 ProofRecipe 已绑定当前入口，平台将重新生成验证 Harness"
                     if recipe.execution_mode == "platform_harness"
+                    else "旧版本 Dynamic Experiment 已绑定当前入口并等待重新执行"
+                    if recipe.execution_mode == "dynamic_experiment"
                     else "旧版本 ProofRecipe 与 PoC 源码已迁移到当前版本任务工作区"
                 ),
                 {
@@ -8196,7 +8274,9 @@ class ScanOrchestrator:
         evidence_summaries: list[dict[str, Any]],
         cancel_event: threading.Event,
     ) -> tuple[list[AgentRequestedTest], dict[str, PocBuildResult], list[str]]:
-        accepted: list[AgentRequestedTest] = []
+        experiment_requests = [request for request in requests if request.experiment is not None]
+        build_requests = [request for request in requests if request.experiment is None]
+        accepted: list[AgentRequestedTest] = list(experiment_requests)
         artifacts: dict[str, PocBuildResult] = {}
         gaps: list[str] = []
         with self.database.session_factory() as session:
@@ -8209,15 +8289,15 @@ class ScanOrchestrator:
                     select(EntryPoint).where(EntryPoint.id.in_(requested_entry_ids))
                 )
             }
-        if requests:
+        if build_requests:
             self._set_task_stage(
                 scan_id,
                 task_id,
                 "poc_build",
                 "running",
-                requested_count=len(requests),
+                requested_count=len(build_requests),
             )
-        for request in requests:
+        for request in build_requests:
             key = self._poc_request_key(request)
             outcome = artifacts.get(key)
             if outcome is None:
@@ -8409,13 +8489,13 @@ class ScanOrchestrator:
                     "Rejected ordinary-app proof test for "
                     f"{request.entry_point_id}: {outcome.error or 'build failed'}."
                 )
-        if requests:
+        if build_requests:
             self._set_task_stage(
                 scan_id,
                 task_id,
                 "poc_build",
                 "completed" if not gaps else "inconclusive",
-                accepted_count=len(accepted),
+                accepted_count=sum(request.experiment is None for request in accepted),
                 gap_count=len(gaps),
                 artifact_count=len(
                     {
@@ -8424,10 +8504,27 @@ class ScanOrchestrator:
                         if artifact.ok and artifact.apk_sha256
                     }
                 ),
-                platform_harness_requested_count=sum(request.poc is None for request in requests),
-                platform_harness_built_count=sum(request.poc is None for request in accepted),
-                agent_poc_requested_count=sum(request.poc is not None for request in requests),
-                agent_poc_built_count=sum(request.poc is not None for request in accepted),
+                platform_harness_requested_count=sum(
+                    request.poc is None for request in build_requests
+                ),
+                platform_harness_built_count=sum(
+                    request.experiment is None and request.poc is None for request in accepted
+                ),
+                agent_poc_requested_count=sum(
+                    request.poc is not None for request in build_requests
+                ),
+                agent_poc_built_count=sum(
+                    request.experiment is None and request.poc is not None for request in accepted
+                ),
+            )
+        elif experiment_requests:
+            self._set_task_stage(
+                scan_id,
+                task_id,
+                "poc_build",
+                "skipped",
+                reason="dynamic_experiment_requires_no_apk_build",
+                experiment_count=len(experiment_requests),
             )
         return accepted, artifacts, gaps
 
@@ -8559,8 +8656,32 @@ class ScanOrchestrator:
                         "requested_reset": requested_reset,
                         "reset_overridden_by_policy": requested_reset != request.reset,
                         "oracle": request.oracle.model_dump(mode="json"),
+                        "execution_mode": (
+                            "dynamic_experiment"
+                            if request.experiment is not None
+                            else "android_poc"
+                        ),
                     },
                 )
+
+                if request.experiment is not None:
+                    experiment_result, experiment_error = (
+                        self._execute_requested_dynamic_experiment(
+                            scan_id=scan_id,
+                            task_id=task_id,
+                            test_case_id=test_case_id,
+                            proof_attempt_id=proof_attempt_id,
+                            request=request,
+                            device=active_device,
+                            runtime_verdict_metadata=runtime_verdict_metadata,
+                            evidence_summaries=evidence_summaries,
+                        )
+                    )
+                    if experiment_error is not None:
+                        gaps.append(experiment_error)
+                    if experiment_result is not None:
+                        executed.append(experiment_result)
+                    continue
 
                 def tagged(commands, *, case_id: str = test_case_id):  # noqa: ANN001, ANN202
                     return [
@@ -8698,6 +8819,181 @@ class ScanOrchestrator:
                     },
                 )
         return executed, gaps
+
+    def _execute_requested_dynamic_experiment(
+        self,
+        *,
+        scan_id: str,
+        task_id: str,
+        test_case_id: str,
+        proof_attempt_id: str | None,
+        request: AgentRequestedTest,
+        device: AdbDeviceAdapter,
+        runtime_verdict_metadata: dict[str, Any],
+        evidence_summaries: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        plan = request.experiment
+        if plan is None or proof_attempt_id is None:
+            error = "Dynamic experiment could not be bound to a platform ProofAttempt."
+            self.hypothesis_ledger.complete_proof(proof_attempt_id, [], error=error)
+            return None, error
+        contract = {
+            **plan.proof.model_dump(mode="json"),
+            "proof_attempt_id": proof_attempt_id,
+            "test_case_id": test_case_id,
+            "hypothesis_id": request.hypothesis_id,
+            "entry_point_id": request.entry_point_id,
+            "runtime_verdict_metadata": runtime_verdict_metadata,
+        }
+        with self.database.session_factory() as session:
+            capsule = DynamicExperimentCapsule(
+                scan_id=scan_id,
+                task_id=task_id,
+                name=plan.name,
+                objective=plan.objective,
+                preferred_serial=device.serial,
+                preconditions=list(plan.preconditions),
+                impact_contract=contract,
+                steps=[item.model_dump(mode="json") for item in plan.steps],
+                cleanup_steps=[
+                    item.model_dump(mode="json") for item in plan.cleanup_steps
+                ],
+                state_json={
+                    "scan_id": scan_id,
+                    "task_id": task_id,
+                    "test_case_id": test_case_id,
+                },
+            )
+            session.add(capsule)
+            session.flush()
+            capsule_id = capsule.id
+            add_event(
+                session,
+                scan_id,
+                "dynamic_experiment.created",
+                "Agent 多步骤验证计划已编译为平台动态实验",
+                {
+                    "capsule_id": capsule_id,
+                    "task_id": task_id,
+                    "test_case_id": test_case_id,
+                    "proof_attempt_id": proof_attempt_id,
+                    "hypothesis_id": request.hypothesis_id,
+                    "step_count": len(plan.steps),
+                },
+            )
+            session.commit()
+
+        try:
+            completed = self.dynamic_experiments.run_on_leased_device(capsule_id, device)
+        except Exception as exc:
+            error = f"Dynamic experiment {test_case_id} failed to execute: {exc}"
+            self.hypothesis_ledger.complete_proof(proof_attempt_id, [], error=error)
+            return None, error
+
+        with self.database.session_factory() as session:
+            receipts = list(
+                session.scalars(
+                    select(DynamicExperimentReceipt)
+                    .where(DynamicExperimentReceipt.capsule_id == capsule_id)
+                    .order_by(
+                        DynamicExperimentReceipt.started_at,
+                        DynamicExperimentReceipt.attempt,
+                    )
+                )
+            )
+            evidence_ids = list(
+                dict.fromkeys(
+                    evidence_id
+                    for receipt in receipts
+                    for evidence_id in receipt.evidence_ids
+                )
+            )
+            evidence_by_id = {
+                item.id: item
+                for item in session.scalars(
+                    select(Evidence).where(Evidence.id.in_(evidence_ids))
+                )
+            }
+            proof_evidence = [
+                self._evidence_summary(evidence_by_id[evidence_id])
+                for evidence_id in evidence_ids
+                if evidence_id in evidence_by_id
+            ]
+        known_evidence_ids = {
+            str(item.get("id")) for item in evidence_summaries if item.get("id")
+        }
+        evidence_summaries.extend(
+            item for item in proof_evidence if item["id"] not in known_evidence_ids
+        )
+        platform_error = (completed.result_json or {}).get("platform_error")
+        proof_error = (
+            str(platform_error)
+            if platform_error
+            else completed.error
+            if completed.status == "canceled"
+            else None
+        )
+        if completed.status != "paused":
+            self.hypothesis_ledger.complete_proof(
+                proof_attempt_id,
+                proof_evidence,
+                error=proof_error,
+            )
+        else:
+            # A paused Capsule is not a verdict, but its completed receipts are
+            # still durable Proof progress and must survive task finalization.
+            with self.database.session_factory() as session:
+                attempt = session.get(ProofAttempt, proof_attempt_id)
+                if attempt is not None and attempt.status == "executing":
+                    attempt.evidence_ids = list(
+                        dict.fromkeys([*attempt.evidence_ids, *evidence_ids])
+                    )
+                    attempt.oracle = {
+                        **dict(attempt.oracle or {}),
+                        "dynamic_experiment_capsule_id": capsule_id,
+                        "dynamic_experiment_status": "paused",
+                        "resumable": True,
+                        "harm_demonstrated": False,
+                    }
+                    session.commit()
+        result = {
+            "test_case_id": test_case_id,
+            "proof_attempt_id": proof_attempt_id,
+            "hypothesis_id": request.hypothesis_id,
+            "request": request.model_dump(mode="json"),
+            "evidence_ids": evidence_ids,
+            "dynamic_experiment": {
+                "capsule_id": capsule_id,
+                "status": completed.status,
+                "result": completed.result_json,
+                "resumable": completed.status == "paused",
+            },
+        }
+        self._record_exploration_event(
+            scan_id,
+            task_id,
+            "action.completed" if completed.status == "completed" else "action.paused",
+            (
+                "Agent 多步骤动态实验已完成并回写 Proof Evidence"
+                if completed.status == "completed"
+                else "Agent 多步骤动态实验已保留断点，当前 Proof 保持未闭合"
+            ),
+            {
+                "source": "platform",
+                "test_case_id": test_case_id,
+                "proof_attempt_id": proof_attempt_id,
+                "hypothesis_id": request.hypothesis_id,
+                "capsule_id": capsule_id,
+                "capsule_status": completed.status,
+                "evidence_ids": evidence_ids,
+            },
+        )
+        error = (
+            f"Agent-requested dynamic experiment {test_case_id} paused: {completed.error}"
+            if completed.status == "paused"
+            else proof_error
+        )
+        return result, error
 
     @staticmethod
     def _agent_role_for_phase(phase: str) -> str:
@@ -10297,31 +10593,42 @@ class ScanOrchestrator:
             for request_id, test_case_id in poc_request_tests & poc_log_request_tests
             if request_id is not None and test_case_id is not None
         }
+        dynamic_experiment_test_ids = {
+            item.get("metadata", {}).get("test_case_id")
+            for item in cited
+            if item["kind"] == "dynamic_experiment.adb"
+            and item.get("metadata", {}).get(
+                "dynamic_experiment_execution_demonstrated"
+            )
+            is True
+        } - {None}
         correlated_request_tests = probe_correlated_tests | poc_correlated_tests
-        correlated_blackbox = bool(correlated_request_tests)
+        correlated_blackbox = bool(correlated_request_tests or dynamic_experiment_test_ids)
         correlated_blackbox_test_ids = {
             test_case_id for _request_id, test_case_id in correlated_request_tests
-        }
-        successful_blackbox = correlated_blackbox and any(
-            (
-                item["kind"] == "blackbox.logcat"
-                and item.get("metadata", {}).get("probe_success")
-                and (
-                    item.get("metadata", {}).get("request_id"),
-                    item.get("metadata", {}).get("test_case_id"),
+        } | dynamic_experiment_test_ids
+        successful_blackbox = bool(dynamic_experiment_test_ids) or (
+            correlated_blackbox and any(
+                (
+                    item["kind"] == "blackbox.logcat"
+                    and item.get("metadata", {}).get("probe_success")
+                    and (
+                        item.get("metadata", {}).get("request_id"),
+                        item.get("metadata", {}).get("test_case_id"),
+                    )
+                    in probe_correlated_tests
                 )
-                in probe_correlated_tests
-            )
-            or (
-                item["kind"] == "blackbox.poc_logcat"
-                and item.get("metadata", {}).get("poc_success")
-                and (
-                    item.get("metadata", {}).get("request_id"),
-                    item.get("metadata", {}).get("test_case_id"),
+                or (
+                    item["kind"] == "blackbox.poc_logcat"
+                    and item.get("metadata", {}).get("poc_success")
+                    and (
+                        item.get("metadata", {}).get("request_id"),
+                        item.get("metadata", {}).get("test_case_id"),
+                    )
+                    in poc_correlated_tests
                 )
-                in poc_correlated_tests
+                for item in cited
             )
-            for item in cited
         )
         successful_blackbox_test_ids = {
             item.get("metadata", {}).get("test_case_id")
@@ -10347,6 +10654,7 @@ class ScanOrchestrator:
                 )
             )
         } - {None}
+        successful_blackbox_test_ids |= dynamic_experiment_test_ids
         impact_test_ids = {
             item.get("metadata", {}).get("test_case_id")
             for item in cited

@@ -57,10 +57,11 @@ Evidence、模型结论、Thread/Turn、版本 PoC 回放和历史 Finding。该
 
 ## 3. 动态 ADB 设备池
 
-探索 worker 不再有固定的 3 任务上限。可提交并发动态跟随当前未排空的 ADB 设备数量；没有设备时只
-保留一个静态分析 lane。运行中的 dispatcher 每 500ms 重新读取容量，因此中途接入第二台设备后会
-直接领取第二个任务。每个任务从 prepare、Agent 多轮、临时 Harness/PoC、Oracle 到 cleanup 全程独占同一
-serial；跨扫描的最终 ADB 并发仍由全局 device lease 队列约束。
+探索 worker 不再有固定的 3 任务上限。静态分析和 Agent 推理受各自资源池控制；可并行的真机批次数量
+跟随当前未排空的 ADB 设备数量。运行中的 dispatcher 每 500ms 重新读取容量，因此中途接入第二台设备
+后可以直接扩大动态验证并发。任务只在健康检查、安装、执行、观察和清理组成的短动态批次内独占
+serial；代码阅读、Critic/Rescue、下一轮规划和 PoC 构建不占设备。后续批次优先回到原 serial，设备不可用
+时可以迁移并重新准备目标；跨扫描的最终 ADB 并发仍由全局 device lease 队列约束。
 
 宿主和容器的 ADB 命令空间必须分离：宿主通过 `APKSCANNER_HOST_ADB` 固定真实
 platform-tools 绝对路径，`ToolRunner` 在执行时解析该覆盖值但 Evidence 仍记录规范化的 `adb`
@@ -124,8 +125,20 @@ Dynamic Experiment Capsule，把前置状态、多条 ADB 动作、中间观察�
 - `POST /dynamic-experiments/{id}/cancel` 可取消排队或运行中的实验。目标应用数据仍遵守 preserve-state
   约定，Capsule 不隐式执行 `pm clear`。
 
-Capsule 的 `impact_contract` 只描述要证明的事实；命令成功不会自动升级 Finding。步骤生成的
-Runtime Observation、Evidence 和既有 ProofAttempt/ImpactContract 仍由终局裁决统一绑定。
+Agent 可在 `requested_tests[].experiment` 中提交同一结构。平台先校验步骤 ID、action/assert 组成、
+assertion 与 observation kind 的绑定，再创建 Capsule，并将其关联到当前 Hypothesis 的
+`ProofAttempt(platform_dynamic_experiment)`。assert 步骤只有在全部声明断言通过、语义
+ImpactContract 完整且设备满足当前 validation profile 时，才会形成 `harm_demonstrated=true`；普通
+action 成功只证明执行发生。暂停的 Capsule 保留正在执行的 Proof，人工或平台再次 `run` 后只执行失败或
+未执行步骤，进入 completed/canceled 终态时再统一闭合 Proof。
+
+## 3.3 扫描质量漏斗
+
+`GET /scans/{scan_id}/quality-summary` 从结构化台账实时聚合入口、任务、Hypothesis、静态支持、
+Proof 规划、设备执行、危害证明和动态 Finding 八个阶段，并按 schema/provider/构建/安装/运行时/设备/
+Oracle/超时/取消分类失败。总览同时展示 Agent 调用与 token、缓存输入比例、各 phase 耗时、设备等待与
+持有时间、PoC 构建数和 Dynamic Experiment 数。接口不读取大型 artifact 正文，且在没有新事件时返回
+稳定的 `generated_at`，避免事件轮询制造无意义重渲染。
 
 ## 4. 静态资产和版本演进
 
@@ -149,8 +162,8 @@ Runtime Observation、Evidence 和既有 ProofAttempt/ImpactContract 仍由终�
 产生自己的 Proof/Evidence 后才能判断“仍存在”；回放失败只能是 `inconclusive`，不能单独证明“已修复”。
 
 每个新建 `ProofAttempt` 都保存平台生成的 `ProofRecipe`。配方去掉 scan-local 的 hypothesis/entry ID，
-保留操作、输入、Oracle、Harness 生成器版本和源码依赖模式。平台 Harness 在后继版本直接重新生成；
-Agent 源码型 PoC 才要求恢复内容寻址的源码归档。两种路径都会绑定新版本的入口和 Hypothesis，并产生
+保留操作、输入、Oracle、生成器版本和源码依赖模式。平台 Harness 在后继版本直接重新生成；Agent 源码型
+PoC 恢复内容寻址的源码归档；Dynamic Experiment 则重新绑定新版本入口后回放步骤与语义断言。三种路径都会绑定新版本的入口和 Hypothesis，并产生
 全新的 build、ADB、Oracle 与 Proof Evidence，不复制旧版本动态结论。
 
 ## 4.1 运行时插件采集与增量调查

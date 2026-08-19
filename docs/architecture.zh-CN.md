@@ -17,7 +17,7 @@ flowchart LR
     A[APK intake] --> B[ZIP/签名/Manifest/JADX·Apktool]
     B --> C[版本化 Security IR]
     C --> D[入口枚举与平台任务规划]
-    D --> E[普通应用 UID 黑盒：临时 Harness / Agent PoC]
+    D --> E[Proof 执行：临时 Harness / Agent PoC / Dynamic Experiment]
     E --> I[选定 Agent 提出下一组测试]
     I --> J{需要补充测试?}
     J -- 是 --> K[平台校验并执行本轮全部有效用例]
@@ -31,8 +31,9 @@ flowchart LR
 
 平台按风险优先级领取入口任务；没有动态设备时保留一个静态分析 lane，动态任务并发随当前可用
 ADB 设备数变化。一个导出组件对应一个任务；同一 handler 的 Deep Links 合并成一个任务。Agent 不能创建子 Agent，也不能
-直接把自己的文字当作复现证据。调查过程不设置工具调用、PoC 重建、Proof Replay、探索
-轮次或单轮测试数量上限；平台校验本轮提交的全部测试。测试只能使用当前任务的入口 ID；
+直接把自己的文字当作复现证据。调查过程不设置固定工具调用、PoC 重建、Proof Replay 或单轮测试
+配额；平台校验本轮提交的全部测试，但连续多个轮次没有新增 Evidence、Proof 状态、实质不同测试或
+Hypothesis 变化时按配置收敛。测试只能使用当前任务的入口 ID；
 Deep Link 和 Provider URI 必须保持 Manifest 声明的
 scheme、host/authority 和 port；额外参数有数量、键名、类型和长度上限。每轮证据都会回灌
 下一次判断，直到 Agent 判断没有进一步实质动作、全部假设已有 Proof、任务被取消或生命周期
@@ -59,10 +60,10 @@ JADX 的非零退出码不直接等同于反编译不可用。平台把结果归
 ## 多云真机调度
 
 `APKSCANNER_ADB_SERIALS` 接受逗号分隔的设备池；未设置时继续兼容单个
-`APKSCANNER_ADB_SERIAL`。调查并发数自动等于设备数。控制面按风险优先级领取任务，每个任务
-从健康检查、安装/复用、初始探索、Agent 多轮分析、实时 PoC 回放、Review 到最终清理始终
-绑定同一个 serial。同一台设备上不会穿插其他 APK 的状态和日志，两台设备则可各运行一个
-完整任务。
+`APKSCANNER_ADB_SERIAL`。控制面按风险优先级领取任务。设备租约只覆盖健康检查、安装/复用、动作、
+观察和清理组成的动态批次；Agent 多轮分析、Review 和 PoC 构建在租约外执行。任务后续动态批次优先
+请求原 serial，以便复用状态；原设备不可用时平台允许迁移并重新准备目标。任何时刻同一 serial 仍只
+服务一个动态批次，两台设备可同时运行两条验证链。
 
 宿主控制面通过 `APKSCANNER_HOST_ADB` 固定真实 platform-tools 的绝对路径；容器中的 `adb` 则是
 任务级 Gateway wrapper。项目安装不再注册名为 `adb` 的宿主 console script，避免 pyenv/venv PATH
@@ -118,13 +119,15 @@ test-case/request ID 的 Harness/PoC 与客观 Oracle 作为复现证据。模�
 - `CoverageItem`：每个 MASVS 域和每个入口在 static、deterministic、blackbox、agent 阶段的状态及 gap。
 - `AgentSessionRecord` / `AgentTurnRecord` / `ScanContainerRecord`：独立于高频事件流的运行生命周期台账。
 - `AdaptiveVerificationCheckpoint`：终局验证按候选持久化的恢复断点。
-- `ProofRecipe`：随 ProofAttempt 持久化的版本可移植实验配方，用于重新生成 Harness 或恢复 Agent PoC 源码。
+- `ProofRecipe`：随 ProofAttempt 持久化的版本可移植实验配方，用于重新生成 Harness、恢复 Agent PoC 源码或回放 Dynamic Experiment。
+- `DynamicExperimentCapsule` / `DynamicExperimentReceipt`：Agent 或操作者提交的多步骤 ADB 实验及逐步断点回执。
 - `RuntimeObservation` / `ValidationFixture`：自由实验的语义观测与账号、会话、Canary 测试状态。
 - `CampaignRun` / `CampaignEntryRecord`：监督控制面的持久目标、DAG、预算和执行状态。
 
 运行控制接口：
 
 - `GET /scans/{scan_id}/agent-runtime`：读取 Container、Session、Turn 与 Adaptive Checkpoint 台账；
+- `GET /scans/{scan_id}/quality-summary`：读取扫描漏斗、失败分类和 Agent/设备/构建成本；
 - `GET /scans/{scan_id}/runtime-observations`：读取 WebView/网络/Socket/SSH 等标准化语义观测；
 - `POST/GET/DELETE /validation-fixtures`：管理账号、会话、Canary 与应用状态夹具；
 - `POST /supervisor/campaigns/launch` 与 `GET /supervisor/campaigns/{id}`：创建、观察持久 Campaign；
@@ -140,7 +143,7 @@ Supervisor 生命周期由服务内第一方循环推进，不依赖浏览器保
 | --- | --- |
 | `supported_static` | 引用了本 scan 的 `static.*` Evidence ID |
 | `refuted_static` | 静态证据表明攻击路径受保护、不可达或无实际危害 |
-| `reproduced_blackbox` | 同一 request/test-case ID 的临时 Harness/专用 PoC 启动与日志成功关联，并由平台 Oracle 独立观察到具体危害；`adb shell` 成功不等价 |
+| `reproduced_blackbox` | 同一 request/test-case ID 的 Harness/专用 PoC，或绑定 ProofAttempt 的 Dynamic Experiment，由平台 Oracle/语义 ImpactContract 独立观察到具体危害；`adb shell` 成功不等价 |
 | `not_reproduced` | 同一 test-case/request ID 的普通 App UID 尝试与结果日志存在，且平台 Prover 明确产生 `oracle_refuted=true`；它只反驳该已执行用例，不证明全局安全 |
 
 Agent 声称但不属于本 scan/task 的 Evidence ID 会被删除。动态证据不足以支撑复现或负向
@@ -182,9 +185,10 @@ host `personal_lab` 模式的主验证路径是实时 Proof Replay：Agent 自�
 PoC 构建、全局串行 ADB、Oracle 和 Evidence 记录，并把结果同步返回给仍在运行的 Agent，
 从而允许其基于失败结果修正 PoC 后继续下一轮。相同回放按内容去重。
 
-`requested_tests` 仅作为实时通道不可用时的兼容后备；通过边界校验的请求同样必须关联
-当前任务的 Hypothesis，并形成 `ProofAttempt`。`android_entry_probe` Prover 复用现有
-ADB/临时 Harness 能力；
+`requested_tests` 承载平台生成 Harness 和状态化 `experiment`；源码型 PoC 优先通过实时 Proof Replay
+迭代。所有路径都必须关联当前任务的 Hypothesis，并形成 `ProofAttempt`。普通入口 Prover 复用现有
+ADB/临时 Harness 能力；Dynamic Experiment 则把 Agent 的 action/assert 计划编译为持久 Capsule，
+逐步写入 Evidence，并在断言全部满足或明确反证后闭合 Proof；
 Oracle 将“入口执行成功”和“实际危害”分开：普通应用 UID Harness 回执只能设置
 `execution_demonstrated=true`；只有领域 Prover 同时给出平台可校验的
 `security_impact_observed=true`（例如敏感数据实际返回、未授权状态确实变化或认证边界被

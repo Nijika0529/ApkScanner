@@ -278,7 +278,11 @@ class HypothesisLedger:
                 hypothesis_id=hypothesis.id,
                 test_case_id=test_case_id,
                 prover=(
-                    "platform_ephemeral_harness" if request.poc is None else "agent_android_poc"
+                    "platform_dynamic_experiment"
+                    if request.experiment is not None
+                    else "platform_ephemeral_harness"
+                    if request.poc is None
+                    else "agent_android_poc"
                 ),
                 status=ProofAttemptStatus.PLANNED.value,
                 plan=plan_with_proof_recipe(request),
@@ -374,7 +378,20 @@ class HypothesisLedger:
             and item.get("metadata", {}).get("impact_contract_satisfied") is True
             for item in evidence
         )
-        execution_demonstrated = probe_succeeded or poc_succeeded or platform_observed_poc_effect
+        dynamic_experiment_succeeded = any(
+            item.get("kind") == "dynamic_experiment.adb"
+            and item.get("metadata", {}).get(
+                "dynamic_experiment_execution_demonstrated"
+            )
+            is True
+            for item in evidence
+        )
+        execution_demonstrated = (
+            probe_succeeded
+            or poc_succeeded
+            or platform_observed_poc_effect
+            or dynamic_experiment_succeeded
+        )
         observed_facts: list[dict[str, Any]] = []
         for item in evidence:
             metadata = item.get("metadata", {})
@@ -457,6 +474,7 @@ class HypothesisLedger:
                 "poc_succeeded": poc_succeeded,
                 "poc_claimed_security_impact": poc_claimed_impact,
                 "platform_observed_poc_effect": platform_observed_poc_effect,
+                "dynamic_experiment_succeeded": dynamic_experiment_succeeded,
                 "execution_demonstrated": execution_demonstrated,
                 "security_impact_observed": impact_observed,
                 "impact_contract_ids": list(

@@ -1803,3 +1803,145 @@ def test_poc_execution_is_correlated_into_the_hypothesis_proof(
         assert proof.status == "inconclusive"
         assert proof.oracle["poc_succeeded"] is True
         assert proof.harm_demonstrated is False
+
+
+def test_agent_dynamic_experiment_closes_the_bound_proof(
+    settings,
+) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    store = ArtifactStore(settings)
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="target.apk",
+            artifact_sha256="1" * 64,
+            artifact_path=str(settings.data_dir / "target.apk"),
+        )
+        entry = EntryPoint(
+            scan=scan,
+            kind="activity",
+            name="com.example.target/.BridgeActivity",
+            exported=True,
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="running",
+            hypotheses=["An untrusted caller can receive a target-owned token."],
+        )
+        session.add_all([scan, entry, task])
+        session.flush()
+        task.target_entry_ids = [entry.id]
+        session.commit()
+
+    orchestrator = ScanOrchestrator(settings, database, store)
+    hypothesis = orchestrator.hypothesis_ledger.ensure_task_hypotheses(task)[0]
+    request = AgentRequestedTest.model_validate(
+        {
+            "hypothesis_id": hypothesis.id,
+            "entry_point_id": entry.id,
+            "rationale": "A two-step callback is required to observe the returned token.",
+            "experiment": {
+                "name": "Bridge callback token",
+                "objective": "Trigger the bridge and observe the callback token.",
+                "steps": [
+                    {
+                        "id": "trigger",
+                        "title": "Trigger bridge",
+                        "phase": "action",
+                        "adb_args": ["shell", "echo", "TRIGGERED"],
+                        "stdout_contains": ["TRIGGERED"],
+                    },
+                    {
+                        "id": "assert-token",
+                        "title": "Observe callback token",
+                        "phase": "assert",
+                        "adb_args": ["shell", "logcat", "-d", "-s", "TARGET_CALLBACK"],
+                        "stdout_regex": "TOKEN=.+",
+                        "observation_kind": "token.callback",
+                    },
+                ],
+                "cleanup_steps": [],
+                "proof": {
+                    "contract_id": "semantic:bridge.token.callback",
+                    "impact": "unauthorized_data_access",
+                    "observed_fact": "The target returned a token to the untrusted callback.",
+                    "assertion_step_ids": ["assert-token"],
+                    "observation_kinds": ["token.callback"],
+                },
+            },
+        }
+    )
+
+    class ExperimentDevice:
+        serial = "device-36"
+        observation_attempts = 0
+
+        @staticmethod
+        def capability(*, non_blocking=False):  # noqa: ANN001, ARG004
+            return {
+                "api_level": 36,
+                "validation_profile": "release",
+                "android16_verdict_eligible": True,
+                "dynamic_verdict_eligible": True,
+                "release_gate_eligible": True,
+                "compatibility_smoke_only": False,
+                "verdict_scope": "android16_release",
+            }
+
+        @classmethod
+        def execute_gateway(cls, args, **_kwargs):  # noqa: ANN001, ANN206
+            if "logcat" in args:
+                cls.observation_attempts += 1
+                stdout = (
+                    "TOKEN=fixture-secret"
+                    if cls.observation_attempts > 1
+                    else "WAITING_FOR_CALLBACK"
+                )
+            else:
+                stdout = "TRIGGERED"
+            return CommandResult(["adb", *args], 0, stdout, "")
+
+    evidence: list[dict] = []
+    executed, gaps = orchestrator._execute_requested_tests(
+        scan_id=scan.id,
+        task_id=task.id,
+        package_name="com.example.target",
+        entries=[entry],
+        requests=[request],
+        budget=TimeBudget.from_seconds(30),
+        evidence_summaries=evidence,
+        round_index=1,
+        device=ExperimentDevice(),  # type: ignore[arg-type]
+    )
+
+    assert len(gaps) == 1
+    assert "paused" in gaps[0]
+    assert len(executed) == 1
+    assert executed[0]["dynamic_experiment"]["status"] == "paused"
+    with database.session_factory() as session:
+        proof = session.get(ProofAttempt, executed[0]["proof_attempt_id"])
+        assert proof is not None
+        assert proof.prover == "platform_dynamic_experiment"
+        assert proof.status == "executing"
+        assert proof.evidence_ids
+        assert proof.oracle["resumable"] is True
+
+    capsule_id = executed[0]["dynamic_experiment"]["capsule_id"]
+    completed = orchestrator.dynamic_experiments.run_on_leased_device(
+        capsule_id,
+        ExperimentDevice(),  # type: ignore[arg-type]
+    )
+    orchestrator._reconcile_dynamic_experiment_proof(completed)
+    assert completed.status == "completed"
+    with database.session_factory() as session:
+        proof = session.get(ProofAttempt, executed[0]["proof_attempt_id"])
+        assert proof is not None
+        assert proof.status == "proven"
+        assert proof.harm_demonstrated is True
+        assert proof.oracle["dynamic_experiment_succeeded"] is True
+        assert proof.oracle["impact_contract_ids"] == [
+            "semantic:bridge.token.callback"
+        ]

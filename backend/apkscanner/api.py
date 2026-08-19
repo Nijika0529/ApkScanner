@@ -70,6 +70,7 @@ from .operator_schemas import (
 )
 from .operator_service import PlatformOperatorService
 from .orchestrator import ScanOrchestrator
+from .quality_metrics import build_scan_quality_summary
 from .reports import ReportBuilder
 from .repository import add_event, now
 from .schemas import (
@@ -103,6 +104,7 @@ from .schemas import (
     ScanDeleteResult,
     ScanDetail,
     ScanExecutionControl,
+    ScanQualitySummary,
     ScanRerunResult,
     ScanSummary,
     SecurityHypothesisOut,
@@ -814,7 +816,7 @@ async def run_dynamic_experiment(
         raise HTTPException(409, f"dynamic experiment cannot run from status={capsule.status}")
     task = asyncio.create_task(
         asyncio.to_thread(
-            orchestrator.dynamic_experiments.run,
+            orchestrator.run_dynamic_experiment,
             capsule_id,
             preferred_serial=payload.preferred_serial,
         ),
@@ -835,7 +837,7 @@ def cancel_dynamic_experiment(
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     try:
-        orchestrator.dynamic_experiments.cancel(capsule_id)
+        orchestrator.cancel_dynamic_experiment(capsule_id)
     except LookupError as exc:
         raise HTTPException(404, "dynamic experiment not found") from exc
     capsule = session.get(DynamicExperimentCapsule, capsule_id)
@@ -1462,6 +1464,18 @@ def get_scan(scan_id: str, session: Session = Depends(get_session)) -> Scan:
     if scan is None:
         raise HTTPException(404, "Scan not found")
     return scan
+
+
+@router.get(
+    "/scans/{scan_id}/quality-summary",
+    response_model=ScanQualitySummary,
+)
+def get_scan_quality_summary(
+    scan_id: str,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    require_scan(session, scan_id)
+    return build_scan_quality_summary(session, scan_id)
 
 
 @router.get("/scans/{scan_id}/artifact-graph")

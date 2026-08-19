@@ -165,7 +165,8 @@ export APKSCANNER_ADB_SERIALS=192.0.2.10:5555
 - `POST /api/v1/devices/{serial}/reconnect`：重连空闲设备；
 - `DELETE /api/v1/devices/{serial}`：移除空闲设备。
 
-设备数量决定动态验证并发：一台设备同一时间只租给一个完整任务，多台设备可以运行多条验证链。
+设备数量决定动态验证并发：一台设备同一时间只租给一个安装/执行/观察/清理批次；Agent 阅读、规划和
+PoC 构建不占设备。多台设备可以运行多条验证链，同一任务的后续批次会优先请求原设备。
 
 ## 6. 开发与正式验证 Profile
 

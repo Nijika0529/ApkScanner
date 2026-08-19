@@ -46,6 +46,41 @@ class ScanDetail(ScanSummary):
     tool_versions: dict[str, Any]
 
 
+class ScanQualityFunnelStage(BaseModel):
+    key: str
+    label: str
+    count: int = Field(ge=0)
+
+
+class ScanQualityFailure(BaseModel):
+    kind: str
+    label: str
+    count: int = Field(ge=1)
+    examples: list[str] = Field(default_factory=list)
+
+
+class ScanQualityPhaseUsage(BaseModel):
+    phase: str
+    calls: int = Field(ge=0)
+    input_tokens: int = Field(ge=0)
+    cached_input_tokens: int = Field(ge=0)
+    output_tokens: int = Field(ge=0)
+    duration_seconds: float = Field(ge=0)
+
+
+class ScanQualitySummary(BaseModel):
+    schema_version: Literal["1.0"] = "1.0"
+    scan_id: str
+    generated_at: datetime
+    funnel: list[ScanQualityFunnelStage]
+    task_statuses: dict[str, int]
+    proof_statuses: dict[str, int]
+    failure_reasons: list[ScanQualityFailure]
+    cost: dict[str, int | float]
+    efficiency: dict[str, int | float | None]
+    phase_usage: list[ScanQualityPhaseUsage]
+
+
 class EntryPointOut(ApiModel):
     id: str
     schema_version: str
@@ -593,14 +628,109 @@ class AgentOracleSpec(BaseModel):
         return self
 
 
+class AgentExperimentStepSpec(BaseModel):
+    """A bounded ADB step proposed by an Agent for a platform-owned experiment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: StrictStr = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    title: StrictStr = Field(min_length=1, max_length=512)
+    phase: Literal["prepare", "action", "observe", "assert", "cleanup"] = "action"
+    adb_args: list[StrictStr] = Field(min_length=1, max_length=64)
+    timeout_seconds: StrictInt = Field(default=30, ge=1, le=120)
+    expected_exit_code: StrictInt = Field(default=0, ge=0, le=255)
+    stdout_contains: list[StrictStr] = Field(default_factory=list, max_length=32)
+    stdout_regex: StrictStr | None = Field(default=None, min_length=1, max_length=2000)
+    capture_stdout_as: StrictStr | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$",
+    )
+    observation_kind: StrictStr | None = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_.-]{2,127}$",
+    )
+    continue_on_failure: StrictBool = False
+
+
+class AgentExperimentProofSpec(BaseModel):
+    """The exact assertion receipts that may satisfy a semantic impact contract."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    contract_id: StrictStr = Field(
+        pattern=r"^semantic:[a-z0-9_.:-]{3,160}$",
+        max_length=192,
+    )
+    impact: Literal[
+        "unauthorized_data_access",
+        "unauthorized_state_change",
+        "privileged_action",
+        "denial_of_service",
+    ]
+    observed_fact: StrictStr = Field(min_length=1, max_length=1000)
+    assertion_step_ids: list[StrictStr] = Field(min_length=1, max_length=16)
+    observation_kinds: list[StrictStr] = Field(min_length=1, max_length=16)
+    refute_on_failure: StrictBool = False
+
+
+class AgentExperimentPlan(BaseModel):
+    """A stateful platform experiment embedded in an Agent proof request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"] = "1.0"
+    name: StrictStr = Field(min_length=1, max_length=256)
+    objective: StrictStr = Field(min_length=1, max_length=4000)
+    preconditions: list[StrictStr] = Field(default_factory=list, max_length=32)
+    steps: list[AgentExperimentStepSpec] = Field(min_length=1, max_length=32)
+    cleanup_steps: list[AgentExperimentStepSpec] = Field(default_factory=list, max_length=16)
+    proof: AgentExperimentProofSpec
+
+    @model_validator(mode="after")
+    def validate_plan(self) -> Self:
+        all_steps = [*self.steps, *self.cleanup_steps]
+        identifiers = [item.id for item in all_steps]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("experiment step IDs must be unique")
+        if any(item.phase == "cleanup" for item in self.steps):
+            raise ValueError("cleanup steps belong in cleanup_steps")
+        if any(item.phase != "cleanup" for item in self.cleanup_steps):
+            raise ValueError("every cleanup_steps item must use phase=cleanup")
+        if not any(item.phase == "action" for item in self.steps):
+            raise ValueError("dynamic experiments require at least one action step")
+        assertion_steps = {item.id: item for item in self.steps if item.phase == "assert"}
+        required_ids = set(self.proof.assertion_step_ids)
+        if len(required_ids) != len(self.proof.assertion_step_ids) or not required_ids:
+            raise ValueError("assertion_step_ids must be unique and non-empty")
+        if not required_ids <= set(assertion_steps):
+            raise ValueError("every assertion_step_id must reference an assert step")
+        required_kinds = set(self.proof.observation_kinds)
+        if len(required_kinds) != len(self.proof.observation_kinds):
+            raise ValueError("observation_kinds must be unique")
+        for step_id in required_ids:
+            observation_kind = assertion_steps[step_id].observation_kind
+            if observation_kind is None or observation_kind not in required_kinds:
+                raise ValueError(
+                    "proof assertion steps must emit a declared observation_kind"
+                )
+        return self
+
+
 class AgentRequestedTest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     hypothesis_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
     entry_point_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
     state: Literal["guest"] = "guest"
-    uri: str | None = Field(max_length=4096)
-    extras: dict[str, StrictStr | StrictInt | StrictBool] = Field(max_length=16)
+    uri: str | None = Field(default=None, max_length=4096)
+    extras: dict[str, StrictStr | StrictInt | StrictBool] = Field(
+        default_factory=dict,
+        max_length=16,
+    )
     operation: Literal[
         "auto",
         "query",
@@ -639,9 +769,45 @@ class AgentRequestedTest(BaseModel):
     oracle: AgentOracleSpec = Field(default_factory=AgentOracleSpec)
     rationale: str = Field(min_length=1, max_length=1000)
     poc: AgentPocSpec | None = None
+    experiment: AgentExperimentPlan | None = None
 
     @model_validator(mode="after")
     def validate_action(self) -> Self:
+        if self.experiment is not None:
+            if self.operation != "auto":
+                raise ValueError("dynamic experiments require operation=auto")
+            if self.poc is not None:
+                raise ValueError("dynamic experiments cannot include a PoC project")
+            if any(
+                (
+                    self.uri is not None,
+                    bool(self.extras),
+                    self.method is not None,
+                    self.argument is not None,
+                    self.intent_action is not None,
+                    bool(self.categories),
+                    self.reset != "preserve",
+                )
+            ):
+                raise ValueError(
+                    "dynamic experiment actions belong in experiment.steps, not legacy fields"
+                )
+            if any(
+                value is not None
+                for value in (
+                    self.binder_transaction_code,
+                    self.binder_interface_descriptor,
+                    self.binder_reply_type,
+                    self.binder_read_exception,
+                    self.binder_script,
+                )
+            ):
+                raise ValueError("dynamic experiments cannot include legacy Binder fields")
+            if self.oracle.kind != "reachability" or self.oracle.impact != "none":
+                raise ValueError(
+                    "dynamic experiment proof semantics belong in experiment.proof"
+                )
+            return self
         if self.operation == "call" and not self.method:
             raise ValueError("provider call requires method")
         if self.operation != "call" and (self.method is not None or self.argument is not None):

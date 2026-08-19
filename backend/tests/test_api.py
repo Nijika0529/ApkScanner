@@ -215,6 +215,32 @@ def test_dynamic_experiment_api_persists_stateful_steps(settings) -> None:  # no
         assert listed.json()[0]["steps"][1]["observation_kind"] == "callback.received"
 
 
+def test_scan_quality_summary_api_returns_empty_funnel(settings) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    with app.state.database.session_factory() as session:
+        scan = Scan(
+            filename="quality-empty.apk",
+            artifact_sha256="e" * 64,
+            artifact_path="quality-empty.apk",
+        )
+        session.add(scan)
+        session.commit()
+        scan_id = scan.id
+
+    with TestClient(app) as client:
+        response = client.get(f"/api/v1/scans/{scan_id}/quality-summary")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["scan_id"] == scan_id
+    assert payload["funnel"][0] == {
+        "key": "entry_points",
+        "label": "攻击入口",
+        "count": 0,
+    }
+    assert payload["cost"]["agent_calls"] == 0
+
+
 def test_artifact_graph_api_returns_native_relationships(settings) -> None:  # noqa: ANN001
     app = create_app(settings)
     workspace = settings.data_dir / "workspaces" / "native-graph-api"

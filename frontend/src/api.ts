@@ -16,6 +16,7 @@ import type {
   ScanDeleteResult,
   ScanRerunResult,
   ScanEvent,
+  ScanQualitySummary,
   SecurityHypothesis,
   SecuritySnapshot,
   TaskDeleteResult,
@@ -131,6 +132,8 @@ export const api = {
   scans: () => request<Scan[]>("/api/v1/scans"),
   scan: (id: string, signal?: AbortSignal) =>
     request<Scan>(`/api/v1/scans/${id}`, { signal }),
+  qualitySummary: (id: string, signal?: AbortSignal) =>
+    request<ScanQualitySummary>(`/api/v1/scans/${id}/quality-summary`, { signal }),
   artifactGraph: (id: string, signal?: AbortSignal) =>
     cachedOptionalRequest<ArtifactGraph>(`/api/v1/scans/${id}/artifact-graph`, signal, 300_000),
   entries: (id: string, signal?: AbortSignal) =>

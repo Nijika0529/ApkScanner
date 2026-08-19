@@ -39,7 +39,7 @@ import { MarkdownContent } from "./components/MarkdownContent"
 import { Badge, Button, Card, Dialog, DialogContent, DialogDescription, DialogTitle, Progress, Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui"
 import { cn, formatDate, shortHash, statusLabel } from "./lib"
 import { markdownToPlainText } from "./markdown"
-import type { AdbDevice, AgentAudit, ArtifactGraph, BenchmarkEvaluation, CoverageItem, EntryPoint, Finding, FindingReport, Health, IndexedArtifact, InvestigationTask, InvestigatorChoice, OperatorSession, PatternMatch, Scan, ScanEvent, SecurityHypothesis, SecuritySnapshot, VersionDiff } from "./types"
+import type { AdbDevice, AgentAudit, ArtifactGraph, BenchmarkEvaluation, CoverageItem, EntryPoint, Finding, FindingReport, Health, IndexedArtifact, InvestigationTask, InvestigatorChoice, OperatorSession, PatternMatch, Scan, ScanEvent, ScanQualitySummary, SecurityHypothesis, SecuritySnapshot, VersionDiff } from "./types"
 
 const severityTone = {
   critical: "danger",
@@ -76,6 +76,13 @@ const DETAIL_REFRESH_EVENTS = [
   "task.cancelled_after_deletion",
   "task.deleted",
   "exploration.update",
+  "exploration.action.paused",
+  "dynamic_experiment.created",
+  "dynamic_experiment.started",
+  "dynamic_experiment.step_completed",
+  "dynamic_experiment.paused",
+  "dynamic_experiment.completed",
+  "dynamic_experiment.recovered",
   "device.pool.connected",
   "device.pool.draining",
   "device.pool.removed",
@@ -83,6 +90,7 @@ const DETAIL_REFRESH_EVENTS = [
 
 const MUTABLE_EXPLORATION_EVENTS = new Set([
   "exploration.action.completed",
+  "exploration.action.paused",
   "exploration.cancelled",
   "exploration.completed",
   "exploration.conclusion.recorded",
@@ -128,6 +136,7 @@ function replaceScanIfChanged(items: Scan[], scan: Scan) {
 
 interface DetailData {
   scan: Scan
+  quality: ScanQualitySummary
   entries: EntryPoint[]
   findings: Finding[]
   signals: Finding[]
@@ -207,8 +216,9 @@ function App() {
   const loadDetail = useCallback(async (id: string, signal?: AbortSignal) => {
     const requestId = ++detailRequestRef.current
     try {
-      const [scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, eventCursor] = await Promise.all([
+      const [scan, quality, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations, eventCursor] = await Promise.all([
         api.scan(id, signal),
+        api.qualitySummary(id, signal),
         api.entries(id, signal),
         api.findings(id, signal),
         api.signals(id, signal),
@@ -220,7 +230,7 @@ function App() {
         api.events(id, signal, 0, 1),
       ])
       if (signal?.aborted || requestId !== detailRequestRef.current) return false
-      const data = { scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations }
+      const data = { scan, quality, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations }
       latestEventIdRef.current = eventCursor.at(-1)?.id ?? 0
       setDetail(data)
       setScans((items) => replaceScanIfChanged(items, scan))
@@ -238,8 +248,9 @@ function App() {
   const refreshMutableDetail = useCallback(async (id: string, signal?: AbortSignal) => {
     const requestId = ++liveRequestRef.current
     try {
-      const [scan, findings, signals, coverage, tasks, audits, hypotheses] = await Promise.all([
+      const [scan, quality, findings, signals, coverage, tasks, audits, hypotheses] = await Promise.all([
         api.scan(id, signal),
+        api.qualitySummary(id, signal),
         api.findings(id, signal),
         api.signals(id, signal),
         api.coverage(id, signal),
@@ -252,6 +263,7 @@ function App() {
         if (current?.scan.id !== id) return current
         if (
           sameJsonValue(current.scan, scan)
+          && sameJsonValue(current.quality, quality)
           && sameJsonValue(current.findings, findings)
           && sameJsonValue(current.signals, signals)
           && sameJsonValue(current.coverage, coverage)
@@ -262,6 +274,7 @@ function App() {
         return {
           ...current,
           scan,
+          quality,
           findings,
           signals,
           coverage,
@@ -486,7 +499,7 @@ function Sidebar({ scans, selectedId, health, onSelect, onUpload }: { scans: Sca
 }
 
 function ScanDetailView({ data, health, subscribeEvents, onRefresh, onDelete, onFreshRun, onVersionCreated, onOpenOperator }: { data: DetailData; health: Health | null; subscribeEvents: (subscriber: ScanEventSubscriber) => () => void; onRefresh: () => Promise<void>; onDelete: () => void; onFreshRun: () => void; onVersionCreated: (scan: Scan) => Promise<void>; onOpenOperator: (finding?: Finding) => void }) {
-  const { scan, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations } = data
+  const { scan, quality, entries, findings, signals, coverage, tasks, audits, hypotheses, evaluations } = data
   const [versionData, setVersionData] = useState<{ snapshot: SecuritySnapshot | null; diff: VersionDiff | null; matches: PatternMatch[] } | null>(null)
   const [versionLoading, setVersionLoading] = useState(false)
   const [versionLoadError, setVersionLoadError] = useState<string | null>(null)
@@ -586,7 +599,7 @@ function ScanDetailView({ data, health, subscribeEvents, onRefresh, onDelete, on
           <TabsList aria-label="扫描详情">
             <TabsTrigger value="overview">总览</TabsTrigger><TabsTrigger value="assets">资产图谱</TabsTrigger><TabsTrigger value="entries">攻击面 <span className="ml-1 text-xs text-slate-500">{entries.length}</span></TabsTrigger><TabsTrigger value="findings">已证实 Finding <span className="ml-1 text-xs text-slate-500">{findings.length}</span></TabsTrigger><TabsTrigger value="proof-backlog">待验证风险 <span className="ml-1 text-xs text-slate-500">{verificationCandidates.length}</span></TabsTrigger><TabsTrigger value="signals">静态线索 <span className="ml-1 text-xs text-slate-500">{staticSignals.length}</span></TabsTrigger><TabsTrigger value="versions">版本演进{versionData && <span className="ml-1 text-xs text-slate-500">{versionData.matches.length}</span>}</TabsTrigger><TabsTrigger value="coverage">覆盖矩阵</TabsTrigger><TabsTrigger value="tasks">探索任务</TabsTrigger><TabsTrigger value="proofs">验证链 <span className="ml-1 text-xs text-slate-500">{hypotheses.length}</span></TabsTrigger><TabsTrigger value="audits">AI 审计 <span className="ml-1 text-xs text-slate-500">{audits.length}</span></TabsTrigger>
           </TabsList>
-          <TabsContent value="overview"><Overview scan={scan} health={health} coverage={coverage} /></TabsContent>
+          <TabsContent value="overview"><Overview scan={scan} health={health} coverage={coverage} quality={quality} /></TabsContent>
           <TabsContent value="assets">{artifactGraphLoading ? <LoadingState /> : artifactGraphError ? <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">{artifactGraphError}<Button className="ml-3" variant="secondary" size="sm" onClick={() => { setArtifactGraphLoaded(false); void loadArtifactGraph() }}>重试</Button></div> : artifactGraph ? <ArtifactGraphView graph={artifactGraph} /> : <EmptyRow text={artifactGraphLoaded ? "当前扫描没有资产图谱" : "正在准备资产图谱"} />}</TabsContent>
           <TabsContent value="entries"><EntryPoints entries={entries} /></TabsContent>
           <TabsContent value="findings"><Findings findings={findings} verificationCandidates={verificationCandidates} provenanceByFinding={findingProvenance} scanStatus={scan.status} onRefresh={onRefresh} onOpenOperator={onOpenOperator} /></TabsContent>
@@ -603,13 +616,48 @@ function ScanDetailView({ data, health, subscribeEvents, onRefresh, onDelete, on
   )
 }
 
-function Overview({ scan, health, coverage }: { scan: Scan; health: Health | null; coverage: CoverageItem[] }) {
+function Overview({ scan, health, coverage, quality }: { scan: Scan; health: Health | null; coverage: CoverageItem[]; quality: ScanQualitySummary }) {
   const baselines = coverage.filter((item) => item.control_id.endsWith("-BASELINE"))
-  return <div className="grid gap-6 xl:grid-cols-2">
-    <DevicePoolPanel />
-    <div className="space-y-6"><div><SectionTitle icon={ListChecks} title="MASVS 基线" description="APK-only 初始覆盖" /><div className="mt-4 space-y-3">{baselines.map((item) => <div key={item.id} className="rounded-xl border border-slate-200 bg-slate-50 p-3"><div className="mb-2 flex items-center justify-between gap-3"><span className="text-xs font-semibold text-slate-700">{item.domain.replace("MASVS-", "")}</span><Badge tone={statusTone(item.status)}>{statusLabel(item.status)}</Badge></div><p className="text-xs leading-relaxed text-slate-500">{item.gap_reason ?? item.title}</p></div>)}</div></div><div><SectionTitle icon={ServerCog} title="运行能力" description="缺失能力会形成覆盖缺口" /><div className="mt-4 grid grid-cols-2 gap-2">{health?.capabilities.map((item) => <div key={item.name} title={item.detail ?? undefined} className="flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-xs"><span className={cn("h-2 w-2 rounded-full", item.busy ? "bg-amber-400" : item.available ? "bg-emerald-400" : "bg-slate-300")} /><span className="truncate text-slate-600">{item.name}{item.busy ? " · 忙碌" : ""}</span></div>)}</div></div></div>
+  return <div className="space-y-6">
+    <QualityFunnel quality={quality} />
+    <div className="grid gap-6 xl:grid-cols-2">
+      <DevicePoolPanel />
+      <div className="space-y-6"><div><SectionTitle icon={ListChecks} title="MASVS 基线" description="APK-only 初始覆盖" /><div className="mt-4 space-y-3">{baselines.map((item) => <div key={item.id} className="rounded-xl border border-slate-200 bg-slate-50 p-3"><div className="mb-2 flex items-center justify-between gap-3"><span className="text-xs font-semibold text-slate-700">{item.domain.replace("MASVS-", "")}</span><Badge tone={statusTone(item.status)}>{statusLabel(item.status)}</Badge></div><p className="text-xs leading-relaxed text-slate-500">{item.gap_reason ?? item.title}</p></div>)}</div></div><div><SectionTitle icon={ServerCog} title="运行能力" description="缺失能力会形成覆盖缺口" /><div className="mt-4 grid grid-cols-2 gap-2">{health?.capabilities.map((item) => <div key={item.name} title={item.detail ?? undefined} className="flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-xs"><span className={cn("h-2 w-2 rounded-full", item.busy ? "bg-amber-400" : item.available ? "bg-emerald-400" : "bg-slate-300")} /><span className="truncate text-slate-600">{item.name}{item.busy ? " · 忙碌" : ""}</span></div>)}</div></div></div>
+    </div>
     {scan.error && <p className="text-rose-700">{scan.error}</p>}
   </div>
+}
+
+function QualityFunnel({ quality }: { quality: ScanQualitySummary }) {
+  const cacheRate = quality.efficiency.cached_input_rate
+  const formatCount = (value: number) => new Intl.NumberFormat("zh-CN").format(value)
+  const formatMinutes = (seconds: number) => `${(seconds / 60).toFixed(seconds >= 600 ? 0 : 1)} 分钟`
+  return <section className="space-y-4">
+    <SectionTitle icon={Activity} title="扫描质量漏斗" description="从确定性入口到动态危害证明；用于定位时间、Token 和设备消耗发生在哪一层" />
+    <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8">
+      {quality.funnel.map((stage, index) => <div key={stage.key} className={cn("relative rounded-xl border p-3", index >= quality.funnel.length - 2 ? "border-emerald-200 bg-emerald-50/60" : "border-slate-200 bg-slate-50")}>
+        <p className="text-[11px] font-medium text-slate-500">{stage.label}</p>
+        <p className="mt-1 text-2xl font-bold tabular-nums text-slate-900">{formatCount(stage.count)}</p>
+        {index < quality.funnel.length - 1 && <ChevronRight className="absolute -right-2.5 top-1/2 z-10 hidden h-5 w-5 -translate-y-1/2 rounded-full bg-white text-slate-400 xl:block" />}
+      </div>)}
+    </div>
+    <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-6">
+      <QualityCost label="Agent 调用" value={formatCount(quality.cost.agent_calls)} detail={`${formatCount(quality.cost.completed_agent_calls)} 次完成`} />
+      <QualityCost label="模型 Token" value={formatCount(quality.cost.total_tokens)} detail={`输入 ${formatCount(quality.cost.input_tokens)} · 输出 ${formatCount(quality.cost.output_tokens)}`} />
+      <QualityCost label="输入缓存" value={cacheRate === null ? "暂无" : `${Math.round(cacheRate * 100)}%`} detail={`${formatCount(quality.cost.cached_input_tokens)} cached tokens`} />
+      <QualityCost label="Agent 时长" value={formatMinutes(quality.cost.agent_seconds)} detail={`${quality.phase_usage.length} 个阶段`} />
+      <QualityCost label="设备占用" value={formatMinutes(quality.cost.device_held_seconds)} detail={`${quality.cost.device_lease_count} 次租约 · 等待 ${formatMinutes(quality.cost.device_wait_seconds)}`} />
+      <QualityCost label="验证产物" value={`${quality.cost.poc_builds} PoC`} detail={`${quality.cost.dynamic_experiments} 个动态实验 · 合并 ${quality.efficiency.merged_entry_variants} 个入口变体`} />
+    </div>
+    {quality.failure_reasons.length > 0 && <div className="rounded-xl border border-amber-200 bg-amber-50/60 p-4">
+      <div className="flex items-center gap-2"><AlertTriangle className="h-4 w-4 text-amber-700" /><p className="text-sm font-semibold text-amber-950">未闭合与失败原因</p></div>
+      <div className="mt-3 grid gap-2 lg:grid-cols-2">{quality.failure_reasons.slice(0, 6).map((item) => <div key={item.kind} className="rounded-lg border border-amber-200 bg-white px-3 py-2"><div className="flex items-center justify-between gap-3"><p className="text-xs font-semibold text-slate-800">{item.label}</p><Badge tone="warning">{item.count}</Badge></div>{item.examples[0] && <p className="mt-1 line-clamp-2 text-[11px] leading-5 text-slate-500" title={item.examples[0]}>{item.examples[0]}</p>}</div>)}</div>
+    </div>}
+  </section>
+}
+
+function QualityCost({ label, value, detail }: { label: string; value: string; detail: string }) {
+  return <div className="rounded-xl border border-slate-200 bg-white p-3"><p className="text-[11px] font-medium text-slate-500">{label}</p><p className="mt-1 text-lg font-bold tabular-nums text-slate-900">{value}</p><p className="mt-1 truncate text-[10px] text-slate-500" title={detail}>{detail}</p></div>
 }
 
 function ArtifactGraphView({ graph }: { graph: ArtifactGraph }) {

@@ -327,7 +327,8 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     assert "Do not assign the final platform verdict" in memo
     assert "Make an explicit evidence-weighted decision" not in memo
     assert "Unless the result is reproduced_blackbox" not in memo
-    assert "requested_tests is a deprecated compatibility field" in planning
+    assert "execute a stateful multi-step experiment" in planning
+    assert "never manufacture the expected value" in planning
     assert "apkscanner-proof" in planning
     assert "proof JSON hypothesis_id is mandatory" in planning
     assert "never use Thread.sleep" in planning

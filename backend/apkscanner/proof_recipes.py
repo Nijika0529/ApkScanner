@@ -11,6 +11,7 @@ from .schemas import AgentRequestedTest
 
 PLATFORM_HARNESS_GENERATOR = "ephemeral_android_app.v1"
 AGENT_SOURCE_GENERATOR = "agent_android_project.v1"
+DYNAMIC_EXPERIMENT_GENERATOR = "dynamic_experiment.v1"
 
 
 class ProofRecipe(BaseModel):
@@ -24,8 +25,12 @@ class ProofRecipe(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: Literal["1.0"] = "1.0"
-    execution_mode: Literal["platform_harness", "agent_source"]
-    generator: Literal["ephemeral_android_app.v1", "agent_android_project.v1"]
+    execution_mode: Literal["platform_harness", "agent_source", "dynamic_experiment"]
+    generator: Literal[
+        "ephemeral_android_app.v1",
+        "agent_android_project.v1",
+        "dynamic_experiment.v1",
+    ]
     request_template: dict[str, Any]
     source_archive_required: bool
     fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -36,10 +41,17 @@ class ProofRecipe(BaseModel):
         if "hypothesis_id" in template or "entry_point_id" in template:
             raise ValueError("ProofRecipe request_template cannot contain scan-local IDs")
         has_poc = isinstance(template.get("poc"), dict)
+        has_experiment = isinstance(template.get("experiment"), dict)
         if self.execution_mode == "platform_harness" and has_poc:
             raise ValueError("platform Harness recipes cannot contain Agent PoC source")
         if self.execution_mode == "agent_source" and not has_poc:
             raise ValueError("Agent source recipes require a PoC specification")
+        if self.execution_mode == "dynamic_experiment" and not has_experiment:
+            raise ValueError("dynamic experiment recipes require an experiment plan")
+        if self.execution_mode != "dynamic_experiment" and has_experiment:
+            raise ValueError("only dynamic experiment recipes may contain an experiment plan")
+        if self.execution_mode == "dynamic_experiment" and has_poc:
+            raise ValueError("dynamic experiment recipes cannot contain Agent PoC source")
         if self.source_archive_required != (self.execution_mode == "agent_source"):
             raise ValueError("source_archive_required conflicts with execution_mode")
         expected = _recipe_fingerprint(
@@ -77,9 +89,17 @@ def proof_recipe_for_request(request: AgentRequestedTest) -> ProofRecipe:
     template = request.model_dump(mode="json")
     template.pop("hypothesis_id", None)
     template.pop("entry_point_id", None)
-    execution_mode = "platform_harness" if request.poc is None else "agent_source"
+    execution_mode = (
+        "dynamic_experiment"
+        if request.experiment is not None
+        else "platform_harness"
+        if request.poc is None
+        else "agent_source"
+    )
     generator = (
-        PLATFORM_HARNESS_GENERATOR
+        DYNAMIC_EXPERIMENT_GENERATOR
+        if execution_mode == "dynamic_experiment"
+        else PLATFORM_HARNESS_GENERATOR
         if execution_mode == "platform_harness"
         else AGENT_SOURCE_GENERATOR
     )

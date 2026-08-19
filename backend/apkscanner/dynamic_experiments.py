@@ -121,6 +121,30 @@ class DynamicExperimentService:
             with self._lock:
                 self._cancellations.pop(capsule_id, None)
 
+    def run_on_leased_device(
+        self,
+        capsule_id: str,
+        adapter: AdbDeviceAdapter,
+    ) -> DynamicExperimentCapsule:
+        """Run a Capsule on a device already leased by its investigation task."""
+
+        cancel_event = threading.Event()
+        with self._lock:
+            if capsule_id in self._cancellations:
+                raise RuntimeError("dynamic experiment is already running")
+            self._cancellations[capsule_id] = cancel_event
+        try:
+            self._prepare_run(capsule_id, adapter.serial)
+            self._record_acquired(capsule_id, 0.0, adapter)
+            try:
+                self._execute_pending_steps(capsule_id, adapter, cancel_event)
+            except Exception as exc:
+                self._mark_execution_error(capsule_id, str(exc))
+            return self.get(capsule_id)
+        finally:
+            with self._lock:
+                self._cancellations.pop(capsule_id, None)
+
     def cancel(self, capsule_id: str) -> DynamicExperimentCapsule:
         with self.database.session_factory() as session:
             capsule = session.get(DynamicExperimentCapsule, capsule_id)
@@ -130,6 +154,7 @@ class DynamicExperimentService:
             if capsule.status in {"queued", "paused"}:
                 capsule.status = "canceled"
                 capsule.completed_at = _now()
+                capsule.error = "dynamic experiment was canceled"
             session.commit()
         with self._lock:
             event = self._cancellations.get(capsule_id)
@@ -280,18 +305,88 @@ class DynamicExperimentService:
             capsule = session.get(DynamicExperimentCapsule, capsule_id)
             receipt = session.get(DynamicExperimentReceipt, receipt_id)
             assert capsule is not None and receipt is not None
+            contract = dict(capsule.impact_contract or {})
+            assertion_step_ids = {
+                str(value)
+                for value in contract.get("assertion_step_ids", [])
+                if isinstance(value, str)
+            }
+            observation_kinds = {
+                str(value)
+                for value in contract.get("observation_kinds", [])
+                if isinstance(value, str)
+            }
+            required_assertion = step.id in assertion_step_ids
+            other_assertions_passed = all(
+                other_id == step.id or self._step_passed(capsule_id, other_id)
+                for other_id in assertion_step_ids
+            )
+            contract_satisfied = bool(
+                passed
+                and required_assertion
+                and step.phase == "assert"
+                and step.observation_kind in observation_kinds
+                and other_assertions_passed
+                and contract.get("contract_id")
+                and contract.get("impact")
+                and contract.get("observed_fact")
+            )
+            oracle_refuted = bool(
+                not passed
+                and required_assertion
+                and contract.get("refute_on_failure") is True
+            )
+            runtime_metadata = {
+                key: value
+                for key, value in dict(contract.get("runtime_verdict_metadata") or {}).items()
+                if key
+                in {
+                    "validation_profile",
+                    "android16_verdict_eligible",
+                    "dynamic_verdict_eligible",
+                    "release_gate_eligible",
+                    "compatibility_smoke_only",
+                    "verdict_scope",
+                }
+            }
+            evidence_metadata = {
+                "capsule_id": capsule.id,
+                "step_id": step.id,
+                "attempt": receipt.attempt,
+                "phase": step.phase,
+                "test_case_id": contract.get("test_case_id"),
+                "proof_attempt_id": contract.get("proof_attempt_id"),
+                "hypothesis_id": contract.get("hypothesis_id"),
+                "entry_point_id": contract.get("entry_point_id"),
+                "device_serial": capsule.device_serial,
+                "dynamic_experiment_execution_demonstrated": bool(
+                    passed and step.phase in {"action", "observe", "assert"}
+                ),
+                "impact_contract_id": contract.get("contract_id"),
+                "impact_contract_satisfied": contract_satisfied,
+                "oracle_refuted": oracle_refuted,
+                "oracle": (
+                    {
+                        "observed_fact": {
+                            "kind": step.observation_kind,
+                            "fact": contract.get("observed_fact"),
+                            "impact": contract.get("impact"),
+                            "capsule_id": capsule.id,
+                            "step_id": step.id,
+                        }
+                    }
+                    if contract_satisfied
+                    else {}
+                ),
+                **runtime_metadata,
+            }
             evidence = self.evidence.command(
                 session,
                 scan_id=capsule.scan_id,
                 task_id=capsule.task_id,
                 kind="dynamic_experiment.adb",
                 result=result,
-                metadata={
-                    "capsule_id": capsule.id,
-                    "step_id": step.id,
-                    "attempt": receipt.attempt,
-                    "phase": step.phase,
-                },
+                metadata=evidence_metadata,
             )
             observation_ids: list[str] = []
             if step.observation_kind is not None:
@@ -424,6 +519,7 @@ class DynamicExperimentService:
             session.commit()
 
     def _mark_completed(self, capsule_id: str, cleanup_failures: list[str]) -> None:
+        contract_satisfied = self._contract_satisfied(capsule_id)
         with self.database.session_factory() as session:
             capsule = session.get(DynamicExperimentCapsule, capsule_id)
             assert capsule is not None
@@ -437,9 +533,7 @@ class DynamicExperimentService:
             capsule.result_json = {
                 **dict(capsule.result_json or {}),
                 "verdict": "passed",
-                "harm_demonstrated": bool(
-                    (capsule.impact_contract or {}).get("harm_demonstrated_on_success")
-                ),
+                "harm_demonstrated": contract_satisfied,
                 "cleanup_complete": not cleanup_failures,
                 "cleanup_failed_step_ids": cleanup_failures,
             }
@@ -454,6 +548,52 @@ class DynamicExperimentService:
                 },
             )
             session.commit()
+
+    def _contract_satisfied(self, capsule_id: str) -> bool:
+        with self.database.session_factory() as session:
+            capsule = session.get(DynamicExperimentCapsule, capsule_id)
+            if capsule is None:
+                return False
+            contract = dict(capsule.impact_contract or {})
+            assertion_step_ids = [
+                str(value)
+                for value in contract.get("assertion_step_ids", [])
+                if isinstance(value, str)
+            ]
+            observation_kinds = {
+                str(value)
+                for value in contract.get("observation_kinds", [])
+                if isinstance(value, str)
+            }
+            steps_by_id = {
+                str(item.get("id")): item
+                for item in capsule.steps
+                if isinstance(item, dict) and item.get("id")
+            }
+            if not (
+                assertion_step_ids
+                and observation_kinds
+                and contract.get("contract_id")
+                and contract.get("impact")
+                and contract.get("observed_fact")
+                and all(
+                    isinstance(step := steps_by_id.get(step_id), dict)
+                    and step.get("phase") == "assert"
+                    and step.get("observation_kind") in observation_kinds
+                    for step_id in assertion_step_ids
+                )
+            ):
+                return False
+            passed = set(
+                session.scalars(
+                    select(DynamicExperimentReceipt.step_id).where(
+                        DynamicExperimentReceipt.capsule_id == capsule_id,
+                        DynamicExperimentReceipt.status == "passed",
+                        DynamicExperimentReceipt.step_id.in_(assertion_step_ids),
+                    )
+                )
+            )
+            return set(assertion_step_ids) <= passed
 
     def _mark_canceled(self, capsule_id: str) -> None:
         with self.database.session_factory() as session:

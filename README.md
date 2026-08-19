@@ -40,10 +40,10 @@ APKScanner 的核心设计是：**平台保证覆盖和事实，Agent 负责探�
 | 确定性攻击面 | 解析生效 Manifest，枚举 Activity、Service、Receiver、Provider、Alias、权限与 Deep Link；结合 Apktool/Smali、JADX 和归档规则生成 Security IR |
 | 产品资产图谱 | 递归拆解内嵌 APK 与 H5/JS 资源；连接宿主加载证据、内嵌 APK 与插件入口；枚举 SO 并生成 ELF、动态符号、JNI 摘要，连接 Java native 声明、`loadLibrary`、JNI 导出与具体 ABI 库 |
 | 目标感知规划 | 通用枚举之后应用显式目标 Profile；按同一实现和攻击链归并入口变体，保留全部入口 ID、合并原因与成本回执，并把插件、Web 和 Native 子链限制为少量高价值任务 |
-| 深度 Agent 调查 | `openai-codex==0.144.4` + DeepSeek Responses API；持久 Thread、多轮证据回灌、Critic/Rescue/Final 有界扇出、终局 Adaptive Verifier |
+| 深度 Agent 调查 | `openai-codex==0.144.4` + DeepSeek Responses API；持久 Thread、多轮增量证据回灌、Critic/Rescue/Final 有界扇出，并按证据增量收敛无进展轮次 |
 | Docker 隔离 | 一次扫描一个无密钥 keeper 容器；每个 `task + attempt + role` 使用独立 Unix UID、HOME、`CODEX_HOME`、临时目录和可写工作区 |
-| 真机验证 | ADB 设备池支持 USB 与 IP:Port 动态接入；一个任务在完整生命周期内独占一个 serial，并按 ProofSpec 临时生成普通 App UID Harness 或运行 Agent PoC |
-| 证据闭环 | 持久化 Hypothesis、Argument、ProofAttempt、Evidence、Oracle 和 Verdict；模型文字不能自证漏洞成立 |
+| 真机验证 | ADB 设备池支持 USB 与 IP:Port 动态接入；仅安装、执行、观察、清理的短动态批次占用 serial，静态阅读、Agent 推理和构建阶段不占设备 |
+| 证据闭环 | 持久化 Hypothesis、Argument、ProofAttempt、Evidence、Oracle 和 Verdict；支持普通 App UID Harness、Agent PoC 与可断点恢复的多步骤 Dynamic Experiment，模型文字不能自证漏洞成立 |
 | 版本演进 | 内容寻址复用 JADX/Apktool/代码索引，生成 Manifest、DEX、Native、资源语义 Diff，并在新版本重新构建和回放历史 PoC |
 | 审计控制台 | FastAPI + React/TypeScript；支持实时任务、结构化 Finding、平台 Operator、Artifact/PoC 索引、版本比较以及 JSON/HTML/SARIF 报告 |
 
@@ -105,7 +105,8 @@ flowchart LR
 | `not_reproduced` | 已执行的普通 App UID 用例被平台负向 Oracle 明确反驳；只反驳该用例，不宣称应用整体安全 |
 
 当前 Oracle 覆盖 Binder reply、Provider rows、目标 UID 日志、UI 文本、进程崩溃、文件状态变化
-以及 Web/网络/Socket/SSH 等标准化语义观察。无法形成客观动态证据时，结论保持
+以及 Web/网络/Socket/SSH 等标准化语义观察。Agent 也可提交由平台执行的多步骤实验，但必须提前
+声明具体 assertion step、观察类型和 ImpactContract；命令成功本身不等于危害成立。无法形成客观动态证据时，结论保持
 `supported_static` 或待验证状态，不会被模型自行提升。
 
 ## 演示

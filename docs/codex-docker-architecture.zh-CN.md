@@ -212,7 +212,8 @@ Gateway Token 绑定 scan、task、attempt、serial、允许动作和过期时�
 
 设备池支持 USB serial 与 IP:Port：
 
-- 一个任务从 prepare、安装、探索、PoC、Oracle 到 cleanup 始终独占同一 serial；
+- 只有 prepare、安装、动作、观察、Oracle 和 cleanup 组成的短动态批次占用 serial；Agent 推理、Critic/Rescue 和 PoC 构建不占设备；
+- 同一任务的后续批次优先请求原 serial；迁移到其他设备时必须重新 prepare；
 - 在线设备数量决定动态验证容量；运行中接入设备可以扩大并发；
 - drain 停止新 lease，不打断当前任务；活跃设备不能重连或删除；
 - 没有设备时静态分析仍可进行，动态任务保留明确状态；
@@ -223,7 +224,8 @@ Proof Gateway 接受 ProofSpec、源码型 PoC 和经过校验的预构建 PoC�
 SHA-256，再进入同一设备队列执行，结束后卸载 Harness。
 
 ProofAttempt 同时持久化版本无关的 `ProofRecipe`。平台 Harness 的配方只保存动作和 Oracle，版本回放时
-重新生成 APK；自定义 PoC 的配方额外引用已归档源码。Harness 成功生成时执行 DAG 的 `poc_build` 必须
+重新生成 APK；自定义 PoC 的配方额外引用已归档源码；Dynamic Experiment 配方保存多步骤动作、断言和
+语义 ImpactContract。Harness 成功生成时执行 DAG 的 `poc_build` 必须
 记录为 `completed` 并标明生成数量，不能因为请求没有 Agent `poc` 字段而显示为 skipped。
 
 ## 9. Oracle 与 Verdict

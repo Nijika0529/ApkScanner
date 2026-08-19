@@ -29,6 +29,52 @@ export interface Scan {
   updated_at: string
 }
 
+export interface ScanQualitySummary {
+  schema_version: "1.0"
+  scan_id: string
+  generated_at: string
+  funnel: Array<{ key: string; label: string; count: number }>
+  task_statuses: Record<string, number>
+  proof_statuses: Record<string, number>
+  failure_reasons: Array<{
+    kind: string
+    label: string
+    count: number
+    examples: string[]
+  }>
+  cost: {
+    agent_calls: number
+    completed_agent_calls: number
+    input_tokens: number
+    cached_input_tokens: number
+    output_tokens: number
+    total_tokens: number
+    agent_seconds: number
+    device_lease_count: number
+    device_wait_seconds: number
+    device_held_seconds: number
+    poc_builds: number
+    dynamic_experiments: number
+  }
+  efficiency: {
+    static_to_proof_rate: number | null
+    proof_to_device_rate: number | null
+    device_to_harm_rate: number | null
+    hypothesis_to_finding_rate: number | null
+    cached_input_rate: number | null
+    merged_entry_variants: number
+    assigned_entry_variants: number
+  }
+  phase_usage: Array<{
+    phase: string
+    calls: number
+    input_tokens: number
+    cached_input_tokens: number
+    output_tokens: number
+    duration_seconds: number
+  }>
+}
+
 export interface EntryPoint {
   id: string
   kind: string
