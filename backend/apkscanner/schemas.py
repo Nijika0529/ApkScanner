@@ -1147,9 +1147,13 @@ class AgentInvestigationResult(BaseModel):
             )
             if isinstance(normalized_request, dict):
                 oracle = normalized_request.get("oracle")
-                if isinstance(oracle, dict) and oracle.get("kind") != "binder_reply":
+                if isinstance(oracle, dict):
                     repaired_oracle = dict(oracle)
-                    if repaired_oracle.get("match_mode", "exact") != "exact":
+                    oracle_repaired = False
+                    if (
+                        repaired_oracle.get("kind") != "binder_reply"
+                        and repaired_oracle.get("match_mode", "exact") != "exact"
+                    ):
                         repairs.append(
                             {
                                 "location": f"requested_tests.{index}.oracle.match_mode",
@@ -1158,7 +1162,11 @@ class AgentInvestigationResult(BaseModel):
                             }
                         )
                         repaired_oracle["match_mode"] = "exact"
-                    if repaired_oracle.get("reply_index", 0) != 0:
+                        oracle_repaired = True
+                    if (
+                        repaired_oracle.get("kind") != "binder_reply"
+                        and repaired_oracle.get("reply_index", 0) != 0
+                    ):
                         repairs.append(
                             {
                                 "location": f"requested_tests.{index}.oracle.reply_index",
@@ -1167,10 +1175,28 @@ class AgentInvestigationResult(BaseModel):
                             }
                         )
                         repaired_oracle["reply_index"] = 0
-                    normalized_request = {
-                        **normalized_request,
-                        "oracle": repaired_oracle,
-                    }
+                        oracle_repaired = True
+                    if (
+                        repaired_oracle.get("kind") != "target_file_sha256"
+                        and repaired_oracle.get("target_path") is not None
+                    ):
+                        repairs.append(
+                            {
+                                "location": f"requested_tests.{index}.oracle.target_path",
+                                "repair": "cleared_target_file_only_field",
+                                "original_value": repaired_oracle.get("target_path"),
+                            }
+                        )
+                        # The provider wire schema requires this nullable field even
+                        # when its semantic use is forbidden. Preserve that shape while
+                        # repairing the unambiguous cross-field mismatch.
+                        repaired_oracle["target_path"] = None
+                        oracle_repaired = True
+                    if oracle_repaired:
+                        normalized_request = {
+                            **normalized_request,
+                            "oracle": repaired_oracle,
+                        }
                 poc = normalized_request.get("poc")
                 if (
                     isinstance(poc, dict)

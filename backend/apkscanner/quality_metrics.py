@@ -358,6 +358,8 @@ def _failure_summary(
         grouped[_classify_failure(normalized)].append(message)
     labels = {
         "schema_output": "模型结构化输出",
+        "planning": "Proof 请求未被接受",
+        "runtime_correlation": "运行期关联缺失",
         "provider": "模型服务调用",
         "poc_build": "PoC/Harness 构建",
         "install": "APK 安装",
@@ -399,8 +401,26 @@ def _object_failures(error: str | None, payload: Any) -> list[str]:
 
 
 def _classify_failure(message: str) -> str:
+    if "no_accepted_proof_request" in message:
+        return "planning"
     if any(value in message for value in ("schema", "validation", "trailing json", "json-rpc")):
         return "schema_output"
+    if any(
+        value in message
+        for value in (
+            "poc_execution_receipt",
+            "structured_result_missing",
+            "request_observed=false",
+            "durable_receipt",
+        )
+    ):
+        return "runtime_correlation"
+    # A timeout or Oracle error often includes a historical ADB command. Prefer
+    # the actionable terminal cause over that incidental transport detail.
+    if any(value in message for value in ("timeout", "timed out", "budget expired")):
+        return "timeout"
+    if any(value in message for value in ("oracle", "impact contract", "without a satisfied")):
+        return "oracle"
     if any(value in message for value in ("provider", "responses api", "rate limit", "api key")):
         return "provider"
     if any(value in message for value in ("build", "compile", "d8", "aapt2", "apksigner")):
@@ -411,10 +431,6 @@ def _classify_failure(message: str) -> str:
         return "launch_runtime"
     if any(value in message for value in ("device", "adb", "serial", "lease", "offline")):
         return "device"
-    if any(value in message for value in ("oracle", "impact contract", "without a satisfied")):
-        return "oracle"
-    if any(value in message for value in ("timeout", "timed out", "budget expired")):
-        return "timeout"
     if any(value in message for value in ("cancel", "停止", "暂停")):
         return "canceled"
     return "other"

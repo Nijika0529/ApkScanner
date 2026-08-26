@@ -20,6 +20,8 @@ from .models import EntryPoint
 from .schemas import AgentOracleSpec, AgentPocSpec
 from .tools import CommandResult, TimeBudget, ToolRunner
 
+POC_DURABLE_RECEIPT_FILENAME = "apkscanner-proof-receipt.json"
+
 
 @dataclass(slots=True)
 class DeviceProbeResult:
@@ -865,6 +867,9 @@ class AdbDeviceAdapter:
             "request_id": request_id,
             "session_state": state,
             "test_case_id": test_case_id,
+            "durable_receipt_expected": bool(
+                (build_metadata or {}).get("durable_receipt_supported")
+            ),
         }
         commands: list[tuple[str, CommandResult, dict[str, Any]]] = []
         with self._lease:
@@ -1138,31 +1143,65 @@ class AdbDeviceAdapter:
                     ),
                     budget=budget,
                 )
-                normalized = [line.lower().replace(" ", "") for line in matching]
-                poc_payload = self._last_json_payload(matching)
-                poc_result_observed = bool(matching)
-                poc_oracle = self._evaluate_poc_oracle(
+                request_matching = [line for line in matching if request_id in line]
+                pid_fallback_matching = [
+                    line for line in matching if request_id not in line
+                ]
+                normalized = [line.lower().replace(" ", "") for line in request_matching]
+                log_poc_payload = self._last_json_payload(request_matching)
+                log_poc_oracle = self._evaluate_poc_oracle(
                     oracle,
-                    poc_payload=poc_payload,
-                    output="\n".join(matching),
+                    poc_payload=log_poc_payload,
+                    output="\n".join(request_matching),
                 )
-                oracle_matched = bool((poc_oracle.get("oracle") or {}).get("matched"))
-                poc_success = any('"success":true' in line for line in normalized) or oracle_matched
+                log_oracle_matched = bool(
+                    (log_poc_oracle.get("oracle") or {}).get("matched")
+                )
+                log_poc_success = (
+                    any('"success":true' in line for line in normalized)
+                    or bool(log_poc_payload and log_poc_payload.get("success") is True)
+                    or log_oracle_matched
+                )
+                receipt_result: CommandResult | None = None
+                receipt_payload: dict[str, Any] | None = None
+                receipt_metadata: dict[str, Any] = {}
+                receipt_poc_oracle: dict[str, Any] = {}
+                if common["durable_receipt_expected"] is True:
+                    receipt_result, receipt_payload, receipt_metadata = (
+                        self._poll_poc_durable_receipt(
+                            package_name=spec.package_name,
+                            request_id=request_id,
+                            timeout_seconds=min(5, max(1, spec.timeout_seconds)),
+                            budget=budget,
+                        )
+                    )
+                    if receipt_metadata.get("receipt_terminal") is True:
+                        receipt_poc_oracle = self._evaluate_poc_oracle(
+                            oracle,
+                            poc_payload=receipt_payload,
+                            output=json.dumps(
+                                receipt_payload,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                            if receipt_payload is not None
+                            else "",
+                        )
+                receipt_observed = receipt_metadata.get("request_observed") is True
+                receipt_terminal = receipt_metadata.get("receipt_terminal") is True
+                poc_result_observed = bool(request_matching) or receipt_observed
+                poc_terminal_observed = bool(request_matching) or receipt_terminal
                 commands.append(
                     (
                         "blackbox.poc_logcat",
                         log_result,
                         {
                             **common,
-                            "request_observed": bool(matching),
-                            "correlation_mode": (
-                                "request_id"
-                                if any(request_id in line for line in matching)
-                                else "poc_process_id"
-                                if matching and poc_process_ids
-                                else None
-                            ),
-                            "poc_success": poc_success,
+                            # PID-only lines remain useful diagnostics, but are
+                            # not a request-bound execution receipt.
+                            "request_observed": bool(request_matching),
+                            "correlation_mode": "request_id" if request_matching else None,
+                            "poc_success": log_poc_success,
                             "poc_claimed_security_impact": any(
                                 (
                                     '"security_impact_observed":true' in line
@@ -1171,13 +1210,42 @@ class AdbDeviceAdapter:
                                 for line in normalized
                             ),
                             "matching_line_count": len(matching),
+                            "pid_fallback_line_count": len(pid_fallback_matching),
+                            "durable_receipt_observed": receipt_observed,
                             "poll_attempts": poll_attempts,
                             "observation_window_seconds": observation_seconds,
-                            **poc_oracle,
+                            **log_poc_oracle,
                         },
                     )
                 )
-                if not poc_result_observed or launch_diagnostics["launch_accepted"] is not True:
+                if receipt_result is not None:
+                    commands.append(
+                        (
+                            "blackbox.poc_durable_receipt",
+                            receipt_result,
+                            {
+                                **common,
+                                **receipt_metadata,
+                                **receipt_poc_oracle,
+                            },
+                        )
+                    )
+                if (
+                    launch_diagnostics["launch_accepted"] is True
+                    and not poc_terminal_observed
+                ):
+                    receipt_gap = (
+                        str(receipt_metadata.get("receipt_validation_error"))
+                        if receipt_metadata
+                        else "logcat_request_id_missing"
+                    )
+                    runtime_diagnostics["poc_execution_receipt_gap"] = (
+                        f"poc_execution_receipt_missing:{receipt_gap}"
+                    )
+                    runtime_diagnostics["poc_execution_receipt_terminal"] = False
+                elif poc_terminal_observed:
+                    runtime_diagnostics["poc_execution_receipt_terminal"] = True
+                if not poc_terminal_observed or launch_diagnostics["launch_accepted"] is not True:
                     runtime_log = self._adb_budget(
                         [
                             "logcat",
@@ -1192,14 +1260,17 @@ class AdbDeviceAdapter:
                         budget,
                         60,
                     )
-                    runtime_diagnostics = self._poc_runtime_diagnostics(
-                        "\n".join(
-                            value
-                            for value in (runtime_log.stdout, runtime_log.stderr)
-                            if value
+                    runtime_diagnostics = {
+                        **runtime_diagnostics,
+                        **self._poc_runtime_diagnostics(
+                            "\n".join(
+                                value
+                                for value in (runtime_log.stdout, runtime_log.stderr)
+                                if value
+                            ),
+                            spec.package_name,
                         ),
-                        spec.package_name,
-                    )
+                    }
                     commands.append(
                         (
                             "blackbox.poc_runtime_logcat",
@@ -1303,26 +1374,51 @@ class AdbDeviceAdapter:
                     "target_uid_log_contains",
                     "process_crash",
                 }:
-                    target_log = self._adb_budget(
+                    target_log_poll_attempts = 1
+                    target_log_observation_seconds = 0.0
+                    target_log_window_complete = False
+                    if oracle.kind == "process_crash" and oracle.refute_on_miss:
                         (
-                            ["logcat", "-d", "-v", "uid", "-t", "800"]
-                            if oracle.kind == "target_uid_log_contains"
-                            else ["logcat", "-d", "-t", "800"]
-                        ),
-                        budget,
-                        60,
-                    )
+                            target_log,
+                            target_log_poll_attempts,
+                            target_log_observation_seconds,
+                            target_log_window_complete,
+                        ) = self._poll_target_process_crash_log(
+                            package_name=target_package_name,
+                            timeout_seconds=min(15, max(1, spec.timeout_seconds)),
+                            budget=budget,
+                        )
+                    else:
+                        target_log = self._adb_budget(
+                            (
+                                ["logcat", "-d", "-v", "uid", "-t", "800"]
+                                if oracle.kind == "target_uid_log_contains"
+                                else ["logcat", "-d", "-t", "800"]
+                            ),
+                            budget,
+                            60,
+                        )
                     commands.append(
                         (
                             "blackbox.poc_target_logcat",
                             target_log,
                             {
                                 **common,
+                                "poll_attempts": target_log_poll_attempts,
+                                "observation_window_seconds": target_log_observation_seconds,
+                                "observation_window_complete": target_log_window_complete,
                                 **self._evaluate_target_log_oracle(
                                     oracle,
                                     target_log.stdout,
                                     target_package_name,
                                     target_uid=target_uid,
+                                    refutation_observed=bool(
+                                        oracle.kind == "process_crash"
+                                        and oracle.refute_on_miss
+                                        and poc_terminal_observed
+                                        and target_log.exit_code == 0
+                                        and target_log_window_complete
+                                    ),
                                 ),
                             },
                         )
@@ -1389,6 +1485,133 @@ class AdbDeviceAdapter:
                 return last, matching, attempts, time.monotonic() - started
             if time.monotonic() >= deadline or (budget is not None and budget.expired):
                 return last, matching, attempts, time.monotonic() - started
+            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+
+    def _poll_poc_durable_receipt(
+        self,
+        *,
+        package_name: str,
+        request_id: str,
+        timeout_seconds: int,
+        budget: TimeBudget | None,
+    ) -> tuple[CommandResult, dict[str, Any] | None, dict[str, Any]]:
+        """Read a temporary platform PoC's request-bound private receipt.
+
+        The receipt is intentionally scoped to the generated ``io.apkscanner.poc``
+        package and is not an observation of target-app private data. A nonterminal
+        ``started`` receipt proves only entry into the PoC; callers must still use a
+        terminal receipt or an independent target Oracle before treating execution as
+        demonstrated.
+        """
+
+        started = time.monotonic()
+        deadline = started + max(timeout_seconds, 1)
+        attempts = 0
+        last = self._budget_exhausted(["adb", "-s", self.serial or "", "run-as"])
+        observed_payload: dict[str, Any] | None = None
+        validation_error = "receipt_unreadable"
+
+        def metadata(
+            payload: dict[str, Any] | None,
+            *,
+            error: str | None,
+        ) -> dict[str, Any]:
+            terminal = bool(payload and payload.get("receipt_terminal") is True)
+            return {
+                "durable_receipt_supported": True,
+                "durable_receipt_filename": POC_DURABLE_RECEIPT_FILENAME,
+                "receipt_readable": last.exit_code == 0,
+                "request_observed": payload is not None,
+                "correlation_mode": "durable_receipt" if payload is not None else None,
+                "receipt_schema_version": (
+                    payload.get("receipt_schema_version") if payload is not None else None
+                ),
+                "receipt_stage": payload.get("receipt_stage") if payload is not None else None,
+                "receipt_terminal": terminal,
+                "receipt_validation_error": error,
+                "poc_success": bool(terminal and payload and payload.get("success") is True),
+                "poc_claimed_security_impact": bool(
+                    terminal
+                    and payload
+                    and payload.get("security_impact_observed") is True
+                ),
+                "poll_attempts": attempts,
+                "observation_window_seconds": round(time.monotonic() - started, 3),
+            }
+
+        while True:
+            attempts += 1
+            remaining = max(1, int(deadline - time.monotonic()))
+            last = self._adb_budget(
+                [
+                    "shell",
+                    "run-as",
+                    package_name,
+                    "cat",
+                    f"files/{POC_DURABLE_RECEIPT_FILENAME}",
+                ],
+                budget,
+                min(15, remaining),
+            )
+            if last.exit_code == 0:
+                try:
+                    value = json.loads(last.stdout)
+                except json.JSONDecodeError:
+                    validation_error = "receipt_json_invalid"
+                else:
+                    if not isinstance(value, dict):
+                        validation_error = "receipt_not_object"
+                    elif value.get("apkscanner_request_id") != request_id:
+                        validation_error = (
+                            "receipt_request_id_missing"
+                            if value.get("apkscanner_request_id") is None
+                            else "receipt_request_id_mismatch"
+                        )
+                    else:
+                        observed_payload = value
+                        if value.get("receipt_terminal") is True:
+                            return last, observed_payload, metadata(observed_payload, error=None)
+                        validation_error = (
+                            "receipt_started_without_terminal"
+                            if value.get("receipt_stage") == "started"
+                            else "receipt_not_terminal"
+                        )
+            else:
+                validation_error = "receipt_unreadable"
+            if time.monotonic() >= deadline or (budget is not None and budget.expired):
+                return last, observed_payload, metadata(observed_payload, error=validation_error)
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+
+    def _poll_target_process_crash_log(
+        self,
+        *,
+        package_name: str,
+        timeout_seconds: int,
+        budget: TimeBudget | None,
+    ) -> tuple[CommandResult, int, float, bool]:
+        """Observe an isolated target log window before refuting a crash claim."""
+
+        started = time.monotonic()
+        deadline = started + max(timeout_seconds, 1)
+        attempts = 0
+        last = self._budget_exhausted(["adb", "-s", self.serial or "", "logcat"])
+        while True:
+            attempts += 1
+            remaining = max(1, int(deadline - time.monotonic()))
+            last = self._adb_budget(
+                ["logcat", "-d", "-t", "800"],
+                budget,
+                min(15, remaining),
+            )
+            if last.exit_code != 0 or self._target_process_crashed(last.stdout, package_name):
+                return last, attempts, time.monotonic() - started, False
+            if time.monotonic() >= deadline or (budget is not None and budget.expired):
+                return (
+                    last,
+                    attempts,
+                    time.monotonic() - started,
+                    budget is None or not budget.expired,
+                )
             time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
 
     def _poll_poc_ui(
@@ -2019,6 +2242,7 @@ class AdbDeviceAdapter:
         package_name: str,
         *,
         target_uid: int | None = None,
+        refutation_observed: bool = False,
     ) -> dict[str, Any]:
         if oracle.kind == "log_contains" and oracle.expected_text:
             matched = oracle.expected_text in output
@@ -2056,6 +2280,7 @@ class AdbDeviceAdapter:
             matched=matched,
             observation=observation,
             impact_observed=impact_observed,
+            refutation_observed=refutation_observed,
         )
 
     @staticmethod

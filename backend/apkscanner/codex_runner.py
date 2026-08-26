@@ -431,6 +431,11 @@ class CodexInvestigator:
                 "containerized Codex investigation was cancelled by the user"
             ) from exc
         except PersistentWorkerTimeout as exc:
+            # PersistentWorkerClient has already asked the SDK to interrupt, but
+            # an interrupted session is not a reliable starting point for a
+            # later corrective exploration turn. Match Adaptive Verifier's
+            # timeout recovery and resume from the persisted thread context.
+            self._discard_session(scan.id, task.id, task.attempts, role)
             raise TimeoutError(
                 f"containerized Codex investigation exceeded its timeout: {exc}"
             ) from exc

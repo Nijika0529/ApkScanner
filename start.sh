@@ -152,6 +152,7 @@ detect_adb_serials() {
   for attempt in $(seq 1 5); do
     mapfile -t devices < <(
       "$APKSCANNER_HOST_ADB" devices 2>/dev/null |
+        tr -d '\r' |
         awk 'NR > 1 && $2 == "device" { print $1 }'
     )
     if [ "${#devices[@]}" -gt 0 ]; then

@@ -144,6 +144,16 @@ def test_hypothesis_ledger_tracks_arguments_and_concrete_proof(settings) -> None
                 "metadata": {"request_id": "request-ui"},
             },
             {
+                "id": "poc-receipt-ui",
+                "kind": "blackbox.poc_durable_receipt",
+                "exit_code": 0,
+                "metadata": {
+                    "request_id": "request-ui",
+                    "request_observed": True,
+                    "receipt_terminal": False,
+                },
+            },
+            {
                 "id": "poc-ui",
                 "kind": "blackbox.poc_ui_dump",
                 "exit_code": 0,

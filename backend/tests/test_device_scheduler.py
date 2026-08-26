@@ -47,6 +47,20 @@ def test_settings_accept_an_absolute_host_adb_executable(
     assert settings.host_adb_executable == "/opt/android/platform-tools/adb"
 
 
+def test_settings_parse_an_independent_exploration_phase_budget(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # noqa: ANN001
+    monkeypatch.setenv("APKSCANNER_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("APKSCANNER_AGENT_INITIAL_PHASE_SECONDS", "900")
+    monkeypatch.setenv("APKSCANNER_AGENT_EXPLORATION_PHASE_SECONDS", "725")
+
+    settings = Settings.from_env()
+
+    assert settings.agent_initial_phase_seconds == 900
+    assert settings.agent_exploration_phase_seconds == 725
+
+
 def test_settings_reject_a_relative_host_adb_executable(
     monkeypatch,
     tmp_path: Path,
@@ -1250,6 +1264,50 @@ def test_poc_log_collection_accepts_debug_priority(settings) -> None:  # noqa: A
     assert attempts == 1
 
 
+def test_poc_durable_receipt_is_a_terminal_request_bound_observation(settings) -> None:  # noqa: ANN001
+    class ReceiptRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @staticmethod
+        def run(argv, **_kwargs):  # noqa: ANN001, ANN205
+            assert argv[-2:] == [
+                "cat",
+                "files/apkscanner-proof-receipt.json",
+            ]
+            return CommandResult(
+                argv,
+                0,
+                (
+                    '{"apkscanner_request_id":"request-receipt",'
+                    '"receipt_schema_version":"1.0",'
+                    '"receipt_stage":"completed","receipt_terminal":true,'
+                    '"success":true}'
+                ),
+                "",
+            )
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        ReceiptRunner(),  # type: ignore[arg-type]
+    )
+
+    result, payload, metadata = adapter._poll_poc_durable_receipt(
+        package_name="io.apkscanner.poc.receipt",
+        request_id="request-receipt",
+        timeout_seconds=5,
+        budget=None,
+    )
+
+    assert result.exit_code == 0
+    assert payload is not None and payload["success"] is True
+    assert metadata["request_observed"] is True
+    assert metadata["correlation_mode"] == "durable_receipt"
+    assert metadata["receipt_terminal"] is True
+    assert metadata["poc_success"] is True
+
+
 def test_poc_runtime_diagnostics_classify_install_launch_and_dex_failures() -> None:
     install = AdbDeviceAdapter._poc_install_diagnostics(
         CommandResult(
@@ -1584,3 +1642,27 @@ def test_process_crash_oracle_requires_the_target_process() -> None:
 
     assert unrelated["security_impact_observed"] is False
     assert target["security_impact_observed"] is True
+
+
+def test_process_crash_miss_requires_a_completed_isolated_observation_window() -> None:
+    oracle = AgentOracleSpec(
+        kind="process_crash",
+        impact="denial_of_service",
+        refute_on_miss=True,
+    )
+
+    incomplete = AdbDeviceAdapter._evaluate_target_log_oracle(
+        oracle,
+        "Activity started without a fatal exception",
+        "com.example.target",
+        refutation_observed=False,
+    )
+    complete = AdbDeviceAdapter._evaluate_target_log_oracle(
+        oracle,
+        "Activity started without a fatal exception",
+        "com.example.target",
+        refutation_observed=True,
+    )
+
+    assert incomplete["oracle_refuted"] is False
+    assert complete["oracle_refuted"] is True

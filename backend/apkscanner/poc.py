@@ -27,6 +27,7 @@ AAPT2_RESOURCE_TABLE_COMPATIBILITY_ERRORS = (
     "resources.arsc is corrupt",
     "invalid resource table",
 )
+PROOF_RECEIPT_FILENAME = "apkscanner-proof-receipt.json"
 
 
 @dataclass(slots=True)
@@ -225,7 +226,7 @@ class PocBuilder:
         manifest.write_text(
             f'''<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="{ANDROID_NAMESPACE}" package="{package_name}">
-  <application android:label="APKScanner Proof" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+  <application android:label="APKScanner Proof" android:debuggable="true" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
     <activity android:name=".PlatformProofActivity" android:exported="true" />
   </application>
 </manifest>
@@ -282,6 +283,11 @@ class PocBuilder:
                 workspace,
                 spec,
                 oracle=oracle,
+            )
+            durable_receipt_supported = any(
+                PROOF_RECEIPT_FILENAME
+                in source.read_text(encoding="utf-8", errors="replace")
+                for source in sources
             )
             effective_project_path = str(project.relative_to(workspace.resolve()))
             effective_spec = effective_spec.model_copy(
@@ -627,6 +633,11 @@ class PocBuilder:
                 "apk_sha256": apk_sha256,
                 "apk_path": str(apk_path),
                 "source_path": str(source_path),
+                "harness_mode": effective_spec.harness_mode,
+                "durable_receipt_supported": durable_receipt_supported,
+                "durable_receipt_filename": (
+                    PROOF_RECEIPT_FILENAME if durable_receipt_supported else None
+                ),
             },
             effective_spec=effective_spec,
         )
@@ -1163,6 +1174,10 @@ class PocBuilder:
         application = manifest_root.find("application")
         if application is None:
             raise ValueError("PoC manifest requires an application")
+        # The platform owns this short-lived io.apkscanner.poc.* package. Mark it
+        # debuggable solely so the host can read its private, request-bound proof
+        # receipt with `run-as` before it is uninstalled.
+        application.set(f"{{{ANDROID_NAMESPACE}}}debuggable", "true")
         harness_class = f"{package_name}.ApkScannerHarnessActivity"
         activity = next(
             (
@@ -1219,23 +1234,32 @@ import android.app.Activity;
 import android.content.Intent;
 import android.os.Bundle;
 import android.util.Log;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
 import org.json.JSONObject;
 
 public final class ApkScannerHarnessActivity extends Activity {{
   private static final String TAG = "{log_tag}";
+  private static final String RECEIPT_FILENAME = "{PROOF_RECEIPT_FILENAME}";
 
   @Override public void onCreate(Bundle state) {{
     super.onCreate(state);
     Intent launch = getIntent();
     String requestId = launch.getStringExtra("apkscanner_request_id");
     JSONObject record = new JSONObject();
+    boolean success = false;
+    try {{
+      record.put("apkscanner_request_id", requestId);
+    }} catch (Throwable ignored) {{ }}
+    persistReceipt(record, "started", false);
     try {{
       Class<?> attack = Class.forName("{attack_class}");
       Method method = attack.getMethod("{attack_method}", Activity.class, Intent.class);
       Object value = method.invoke(null, this, launch);
-      boolean success = true;
+      success = true;
       if (value instanceof Bundle) {{
         Bundle result = (Bundle) value;
         success = result.getBoolean("success", true);
@@ -1250,9 +1274,9 @@ public final class ApkScannerHarnessActivity extends Activity {{
       }} else if (value != null) {{
         record.put("result_summary", String.valueOf(value));
       }}
-      record.put("apkscanner_request_id", requestId);
       record.put("success", success);
     }} catch (Throwable error) {{
+      success = false;
       Throwable cause = error instanceof InvocationTargetException
           && error.getCause() != null ? error.getCause() : error;
       try {{
@@ -1262,8 +1286,38 @@ public final class ApkScannerHarnessActivity extends Activity {{
         record.put("error", String.valueOf(cause.getMessage()));
       }} catch (Throwable ignored) {{ }}
     }}
+    persistReceipt(record, success ? "completed" : "failed", true);
     Log.i(TAG, record.toString());
     finish();
+  }}
+
+  private void persistReceipt(JSONObject record, String stage, boolean terminal) {{
+    try {{
+      JSONObject receipt = new JSONObject(record.toString());
+      receipt.put("receipt_schema_version", "1.0");
+      receipt.put("receipt_stage", stage);
+      receipt.put("receipt_terminal", terminal);
+      byte[] payload = receipt.toString().getBytes(StandardCharsets.UTF_8);
+      File receiptFile = new File(getFilesDir(), RECEIPT_FILENAME);
+      File tempFile = new File(getFilesDir(), RECEIPT_FILENAME + ".tmp");
+      FileOutputStream stream = new FileOutputStream(tempFile, false);
+      try {{
+        stream.write(payload);
+        stream.getFD().sync();
+      }} finally {{
+        stream.close();
+      }}
+      if (!tempFile.renameTo(receiptFile)) {{
+        FileOutputStream direct = new FileOutputStream(receiptFile, false);
+        try {{
+          direct.write(payload);
+          direct.getFD().sync();
+        }} finally {{
+          direct.close();
+        }}
+        tempFile.delete();
+      }}
+    }} catch (Throwable ignored) {{ }}
   }}
 }}
 '''
@@ -1289,6 +1343,8 @@ import android.os.Looper;
 import android.os.Parcel;
 import android.util.Base64;
 import android.util.Log;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Iterator;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -1298,8 +1354,10 @@ import org.json.JSONObject;
 public final class PlatformProofActivity extends Activity {
   private static final String TAG = "APKSCANNER_POC";
   private static final String REQUEST_BASE64 = "__REQUEST_BASE64__";
+  private static final String RECEIPT_FILENAME = "__RECEIPT_FILENAME__";
   private static final long BINDER_TIMEOUT_MILLIS = 8000L;
   private final AtomicBoolean finished = new AtomicBoolean(false);
+  private final AtomicBoolean proofStarted = new AtomicBoolean(false);
   private final Handler handler = new Handler(Looper.getMainLooper());
   private JSONObject request;
   private JSONObject result;
@@ -1317,10 +1375,28 @@ public final class PlatformProofActivity extends Activity {
       result.put("requestId", requestId);
       result.put("kind", request.getString("kind"));
       result.put("targetPackage", request.getString("package"));
-      runProof();
+      persistReceipt("started", false);
     } catch (Throwable error) {
       fail(error);
     }
+  }
+
+  @Override protected void onResume() {
+    super.onResume();
+    if (!proofStarted.compareAndSet(false, true)) return;
+    // A bind performed while Activity.onCreate is still running can be treated
+    // as a background launch on Android 13+. Wait for the first frame so the
+    // temporary PoC has ordinary foreground caller identity.
+    handler.postDelayed(new Runnable() {
+      @Override public void run() {
+        if (finished.get()) return;
+        try {
+          runProof();
+        } catch (Throwable error) {
+          fail(error);
+        }
+      }
+    }, 150L);
   }
 
   private void runProof() throws Exception {
@@ -1487,10 +1563,13 @@ public final class PlatformProofActivity extends Activity {
         fail(new IllegalStateException("Service returned a null binding: " + name));
       }
     };
+    // Some Android releases retain the ServiceConnection even when package
+    // visibility or a policy check makes bindService return false. Mark it for
+    // cleanup before the call so finishProof() can always unbind defensively.
+    bound = true;
     boolean accepted = bindService(target, connection, Context.BIND_AUTO_CREATE);
     result.put("bound", accepted);
     if (!accepted) throw new SecurityException("bindService returned false");
-    bound = true;
     handler.postDelayed(new Runnable() {
       @Override public void run() {
         fail(new IllegalStateException("Binder proof timed out"));
@@ -1526,8 +1605,40 @@ public final class PlatformProofActivity extends Activity {
     if (bound && connection != null) {
       try { unbindService(connection); } catch (Throwable ignored) { }
     }
+    persistReceipt(
+        result != null && result.optBoolean("success", false) ? "completed" : "failed",
+        true);
     Log.i(TAG, result == null ? "{}" : result.toString());
     finish();
+  }
+
+  private void persistReceipt(String stage, boolean terminal) {
+    try {
+      JSONObject receipt = result == null ? new JSONObject() : new JSONObject(result.toString());
+      receipt.put("receipt_schema_version", "1.0");
+      receipt.put("receipt_stage", stage);
+      receipt.put("receipt_terminal", terminal);
+      byte[] payload = receipt.toString().getBytes(StandardCharsets.UTF_8);
+      File receiptFile = new File(getFilesDir(), RECEIPT_FILENAME);
+      File tempFile = new File(getFilesDir(), RECEIPT_FILENAME + ".tmp");
+      FileOutputStream stream = new FileOutputStream(tempFile, false);
+      try {
+        stream.write(payload);
+        stream.getFD().sync();
+      } finally {
+        stream.close();
+      }
+      if (!tempFile.renameTo(receiptFile)) {
+        FileOutputStream direct = new FileOutputStream(receiptFile, false);
+        try {
+          direct.write(payload);
+          direct.getFD().sync();
+        } finally {
+          direct.close();
+        }
+        tempFile.delete();
+      }
+    } catch (Throwable ignored) { }
   }
 
   private Intent newIntent() {
@@ -1641,8 +1752,10 @@ public final class PlatformProofActivity extends Activity {
   }
 }
 '''
-        return template.replace("__PACKAGE__", package_name).replace(
-            "__REQUEST_BASE64__", encoded_request
+        return (
+            template.replace("__PACKAGE__", package_name)
+            .replace("__REQUEST_BASE64__", encoded_request)
+            .replace("__RECEIPT_FILENAME__", PROOF_RECEIPT_FILENAME)
         )
 
     @staticmethod

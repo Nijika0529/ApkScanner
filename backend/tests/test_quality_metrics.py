@@ -15,7 +15,16 @@ from apkscanner.models import (
     ScanEvent,
     SecurityHypothesis,
 )
-from apkscanner.quality_metrics import build_scan_quality_summary
+from apkscanner.quality_metrics import _classify_failure, build_scan_quality_summary
+
+
+def test_failure_classifier_distinguishes_planning_and_runtime_receipt_gaps() -> None:
+    assert _classify_failure("no_accepted_proof_request") == "planning"
+    assert (
+        _classify_failure("adb logcat: poc_execution_receipt_missing:receipt_unreadable")
+        == "runtime_correlation"
+    )
+    assert _classify_failure("adb worker timed out while observing Oracle") == "timeout"
 
 
 def test_quality_summary_tracks_funnel_cost_and_failures(settings) -> None:  # noqa: ANN001

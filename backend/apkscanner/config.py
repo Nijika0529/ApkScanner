@@ -54,6 +54,7 @@ class Settings:
     agent_analysis_slots: int = 4
     poc_build_slots: int = 2
     agent_initial_phase_seconds: int = 15 * 60
+    agent_exploration_phase_seconds: int = 10 * 60
     agent_critic_phase_seconds: int = 5 * 60
     agent_rescue_phase_seconds: int = 8 * 60
     agent_final_phase_seconds: int = 3 * 60
@@ -198,6 +199,9 @@ class Settings:
             poc_build_slots=max(1, int(os.getenv("APKSCANNER_POC_BUILD_SLOTS", 2))),
             agent_initial_phase_seconds=max(
                 60, int(os.getenv("APKSCANNER_AGENT_INITIAL_PHASE_SECONDS", 900))
+            ),
+            agent_exploration_phase_seconds=max(
+                60, int(os.getenv("APKSCANNER_AGENT_EXPLORATION_PHASE_SECONDS", 600))
             ),
             agent_critic_phase_seconds=max(
                 60, int(os.getenv("APKSCANNER_AGENT_CRITIC_PHASE_SECONDS", 300))

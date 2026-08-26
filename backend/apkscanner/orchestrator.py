@@ -5789,8 +5789,12 @@ class ScanOrchestrator:
         agent_enabled = self.settings.investigator_enabled(agent_backend)
 
         def phase_budget(phase: str) -> tuple[str, int]:
-            if phase in {"static_only", "test_planning", "exploration_round"}:
+            if phase in {"static_only", "test_planning"}:
                 return "primary_analysis", self.settings.agent_initial_phase_seconds
+            if phase == "exploration_round":
+                # A rejected plan must not leave its corrective turn with only
+                # the few seconds remaining from primary analysis.
+                return "adaptive_analysis", self.settings.agent_exploration_phase_seconds
             if phase == "adversarial_review":
                 return "critic", self.settings.agent_critic_phase_seconds
             if phase in {"rescue_review", "rescue_exploration"}:
@@ -8775,6 +8779,17 @@ class ScanOrchestrator:
                     self._record_commands(scan_id, task_id, probe.commands, evidence_summaries)
                     if probe.stage == "poc_incompatible":
                         raise RuntimeError(str(probe.summary.get("error") or probe.stage))
+                    probe_summary = getattr(probe, "summary", {})
+                    receipt_gap = (
+                        probe_summary.get("poc_execution_receipt_gap")
+                        if isinstance(probe_summary, dict)
+                        else None
+                    )
+                    if isinstance(receipt_gap, str) and receipt_gap:
+                        gaps.append(
+                            f"Agent-requested test {test_case_id} executed but could not close "
+                            f"the ordinary-app execution receipt: {receipt_gap}."
+                        )
                 except Exception as exc:
                     execution_error = exc
 
@@ -10579,18 +10594,22 @@ class ScanOrchestrator:
             and item.get("metadata", {}).get("caller_identity")
             in {"agent_poc_app", "platform_generated_poc"}
         }
-        poc_log_request_tests = {
+        poc_observation_kinds = {
+            "blackbox.poc_logcat",
+            "blackbox.poc_durable_receipt",
+        }
+        poc_observation_request_tests = {
             (
                 item.get("metadata", {}).get("request_id"),
                 item.get("metadata", {}).get("test_case_id"),
             )
             for item in cited
-            if item["kind"] == "blackbox.poc_logcat"
+            if item["kind"] in poc_observation_kinds
             and item.get("metadata", {}).get("request_observed")
         }
         poc_correlated_tests = {
             (request_id, test_case_id)
-            for request_id, test_case_id in poc_request_tests & poc_log_request_tests
+            for request_id, test_case_id in poc_request_tests & poc_observation_request_tests
             if request_id is not None and test_case_id is not None
         }
         dynamic_experiment_test_ids = {
@@ -10607,6 +10626,17 @@ class ScanOrchestrator:
         correlated_blackbox_test_ids = {
             test_case_id for _request_id, test_case_id in correlated_request_tests
         } | dynamic_experiment_test_ids
+        independent_poc_effect_test_ids = {
+            item.get("metadata", {}).get("test_case_id")
+            for item in cited
+            if item["kind"] == "blackbox.poc_ui_dump"
+            and item.get("metadata", {}).get("impact_contract_satisfied") is True
+            and (
+                item.get("metadata", {}).get("request_id"),
+                item.get("metadata", {}).get("test_case_id"),
+            )
+            in poc_correlated_tests
+        } - {None}
         successful_blackbox = bool(dynamic_experiment_test_ids) or (
             correlated_blackbox and any(
                 (
@@ -10619,8 +10649,12 @@ class ScanOrchestrator:
                     in probe_correlated_tests
                 )
                 or (
-                    item["kind"] == "blackbox.poc_logcat"
+                    item["kind"] in poc_observation_kinds
                     and item.get("metadata", {}).get("poc_success")
+                    and (
+                        item["kind"] != "blackbox.poc_durable_receipt"
+                        or item.get("metadata", {}).get("receipt_terminal") is True
+                    )
                     and (
                         item.get("metadata", {}).get("request_id"),
                         item.get("metadata", {}).get("test_case_id"),
@@ -10629,7 +10663,7 @@ class ScanOrchestrator:
                 )
                 for item in cited
             )
-        )
+        ) or bool(independent_poc_effect_test_ids)
         successful_blackbox_test_ids = {
             item.get("metadata", {}).get("test_case_id")
             for item in cited
@@ -10644,8 +10678,12 @@ class ScanOrchestrator:
                     in probe_correlated_tests
                 )
                 or (
-                    item["kind"] == "blackbox.poc_logcat"
+                    item["kind"] in poc_observation_kinds
                     and item.get("metadata", {}).get("poc_success")
+                    and (
+                        item["kind"] != "blackbox.poc_durable_receipt"
+                        or item.get("metadata", {}).get("receipt_terminal") is True
+                    )
                     and (
                         item.get("metadata", {}).get("request_id"),
                         item.get("metadata", {}).get("test_case_id"),
@@ -10654,7 +10692,7 @@ class ScanOrchestrator:
                 )
             )
         } - {None}
-        successful_blackbox_test_ids |= dynamic_experiment_test_ids
+        successful_blackbox_test_ids |= dynamic_experiment_test_ids | independent_poc_effect_test_ids
         impact_test_ids = {
             item.get("metadata", {}).get("test_case_id")
             for item in cited

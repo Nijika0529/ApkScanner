@@ -113,6 +113,52 @@ def test_agent_poc_can_supply_the_correlated_ordinary_app_execution_pair() -> No
     assert payload["evidence_ids"] == ["launch", "log", "oracle"]
 
 
+def test_terminal_durable_receipt_can_supply_the_poc_execution_pair() -> None:
+    evidence = [
+        {
+            "id": "launch",
+            "kind": "blackbox.poc_launch",
+            "exit_code": 0,
+            "metadata": {
+                "caller_identity": "platform_generated_poc",
+                "request_id": "request-receipt",
+                "test_case_id": "agent-r1-1",
+            },
+        },
+        {
+            "id": "receipt",
+            "kind": "blackbox.poc_durable_receipt",
+            "exit_code": 0,
+            "metadata": {
+                "request_id": "request-receipt",
+                "request_observed": True,
+                "receipt_terminal": True,
+                "poc_success": True,
+                "test_case_id": "agent-r1-1",
+            },
+        },
+        {
+            "id": "oracle",
+            "kind": "blackbox.poc_ui_dump",
+            "exit_code": 0,
+            "metadata": {
+                "request_id": "request-receipt",
+                "test_case_id": "agent-r1-1",
+                "security_impact_observed": True,
+                "impact_contract_satisfied": True,
+            },
+        },
+    ]
+
+    payload, result = ScanOrchestrator._validated_agent_payload(
+        _payload("reproduced_blackbox", ["launch", "receipt", "oracle"]),
+        evidence,
+    )
+
+    assert result == "reproduced_blackbox"
+    assert payload["evidence_ids"] == ["launch", "receipt", "oracle"]
+
+
 def test_optional_jadx_absence_is_not_preserved_as_a_verdict_gap() -> None:
     payload = _payload("refuted_static", ["static"])
     payload["coverage_gaps"] = [

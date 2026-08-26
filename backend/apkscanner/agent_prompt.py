@@ -877,6 +877,7 @@ def investigation_prompt(
         "fact, not a security-impact decision. "
         "target_file_sha256 uses an app-data-relative target_path and may prove "
         "unauthorized_state_change only when the platform obtains comparable before/after hashes; "
+        "for every other Oracle kind, output target_path as null (never a path). "
         "run-as unavailability is an Oracle gap, not negative evidence. "
         "ui_text may use unauthorized_data_access or unauthorized_state_change and becomes harm "
         "evidence only for a new target-package-owned UI transition; process_crash may use "

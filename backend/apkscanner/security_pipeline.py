@@ -347,10 +347,14 @@ class HypothesisLedger:
             for item in evidence
             if item.get("kind") == "blackbox.poc_launch" and item.get("exit_code") == 0
         }
+        poc_observation_kinds = {
+            "blackbox.poc_logcat",
+            "blackbox.poc_durable_receipt",
+        }
         poc_observed_ids = {
             item.get("metadata", {}).get("request_id")
             for item in evidence
-            if item.get("kind") == "blackbox.poc_logcat"
+            if item.get("kind") in poc_observation_kinds
             and item.get("metadata", {}).get("request_observed")
         }
         correlated = bool((request_ids & observed_ids) - {None})
@@ -362,17 +366,25 @@ class HypothesisLedger:
             for item in evidence
         )
         poc_succeeded = poc_correlated and any(
-            item.get("kind") == "blackbox.poc_logcat"
+            item.get("kind") in poc_observation_kinds
             and item.get("metadata", {}).get("request_id") in poc_request_ids
             and item.get("metadata", {}).get("poc_success")
+            and (
+                item.get("kind") != "blackbox.poc_durable_receipt"
+                or item.get("metadata", {}).get("receipt_terminal") is True
+            )
             for item in evidence
         )
         poc_claimed_impact = any(
-            item.get("kind") == "blackbox.poc_logcat"
+            item.get("kind") in poc_observation_kinds
             and item.get("metadata", {}).get("poc_claimed_security_impact") is True
+            and (
+                item.get("kind") != "blackbox.poc_durable_receipt"
+                or item.get("metadata", {}).get("receipt_terminal") is True
+            )
             for item in evidence
         )
-        platform_observed_poc_effect = any(
+        platform_observed_poc_effect = poc_correlated and any(
             item.get("kind") == "blackbox.poc_ui_dump"
             and item.get("metadata", {}).get("request_id") in poc_request_ids
             and item.get("metadata", {}).get("impact_contract_satisfied") is True
@@ -456,7 +468,7 @@ class HypothesisLedger:
             else ProofAttemptStatus.PROVEN.value
             if harm_demonstrated
             else ProofAttemptStatus.REFUTED.value
-            if oracle_refuted and dynamic_verdict_eligible
+            if oracle_refuted and execution_demonstrated and dynamic_verdict_eligible
             else ProofAttemptStatus.INCONCLUSIVE.value
         )
         with self.database.session_factory() as session:

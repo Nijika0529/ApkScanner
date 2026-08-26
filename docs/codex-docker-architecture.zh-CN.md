@@ -322,6 +322,7 @@ codex mcp add ida-headless -- \
 | `APKSCANNER_AGENT_ANALYSIS_SLOTS` | `4` | 无设备 Agent 分析并发 |
 | `APKSCANNER_POC_BUILD_SLOTS` | `2` | PoC 编译并发 |
 | `APKSCANNER_AGENT_INITIAL_PHASE_SECONDS` | `900` | 首轮分析阶段时限 |
+| `APKSCANNER_AGENT_EXPLORATION_PHASE_SECONDS` | `600` | 后续纠错/探索阶段时限（独立于首轮） |
 | `APKSCANNER_AGENT_CRITIC_PHASE_SECONDS` | `300` | Critic 阶段时限 |
 | `APKSCANNER_AGENT_RESCUE_PHASE_SECONDS` | `480` | Rescue 阶段时限 |
 | `APKSCANNER_AGENT_FINAL_PHASE_SECONDS` | `180` | 终局裁决阶段时限 |

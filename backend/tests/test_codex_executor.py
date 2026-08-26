@@ -12,7 +12,11 @@ from types import SimpleNamespace
 import pytest
 from apkscanner.agent_workspace import AgentWorkspaceManager
 from apkscanner.codex_executor import CodexDockerExecutor, ScanContainer
-from apkscanner.codex_protocol import PersistentWorkerClient, PersistentWorkerError
+from apkscanner.codex_protocol import (
+    PersistentWorkerClient,
+    PersistentWorkerError,
+    PersistentWorkerTimeout,
+)
 from apkscanner.codex_runner import CodexInvestigator, _ActiveDockerSession
 from apkscanner.codex_worker import WorkerConfiguration
 from pydantic import ValidationError
@@ -398,6 +402,57 @@ def test_worker_capacity_evicts_an_idle_resumable_session_instead_of_failing(set
 
     assert client.closed is True
     assert investigator._sessions == {}
+
+
+def test_normal_investigator_timeout_discards_the_interrupted_session(
+    settings,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # noqa: ANN001
+    investigator = CodexInvestigator(settings)
+    scan_workspace = settings.data_dir / "workspaces" / SCAN_ID
+    scan_workspace.mkdir(parents=True)
+    source_workspace = tmp_path / "source"
+    source_workspace.mkdir()
+
+    class TimeoutClient:
+        @staticmethod
+        def turn(**_kwargs):  # noqa: ANN003
+            raise PersistentWorkerTimeout("worker exceeded 128 seconds")
+
+    active = SimpleNamespace(client=TimeoutClient())
+    discarded: list[tuple[str, str, int, str]] = []
+    released: list[tuple[str, str, int, str]] = []
+    monkeypatch.setattr(investigator, "_docker_capability", lambda capability: capability)
+    monkeypatch.setattr(investigator, "_prepare_active_session", lambda **_kwargs: active)
+    monkeypatch.setattr(
+        investigator,
+        "_discard_session",
+        lambda scan_id, task_id, attempt, role: discarded.append(
+            (scan_id, task_id, attempt, role)
+        ),
+    )
+    monkeypatch.setattr(
+        investigator,
+        "_release_active_session",
+        lambda key: released.append(key),
+    )
+
+    with pytest.raises(TimeoutError, match="worker exceeded 128 seconds"):
+        investigator._investigate_docker(
+            scan=SimpleNamespace(id=SCAN_ID),
+            prompt="return structured JSON",
+            task=SimpleNamespace(id=TASK_ID, attempts=1),
+            workspace=source_workspace,
+            platform_context={"phase": "test_planning"},
+            timeout_seconds=128,
+            event_callback=None,
+            cancel_event=None,
+            gateway_environment=None,
+        )
+
+    assert discarded == [(SCAN_ID, TASK_ID, 1, "primary")]
+    assert released == [(SCAN_ID, TASK_ID, 1, "primary")]
 
 
 def test_scan_container_command_has_scan_scope_and_no_provider_secret(

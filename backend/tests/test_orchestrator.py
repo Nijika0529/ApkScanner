@@ -2151,6 +2151,8 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
         adb_serial="iterative-device:5555",
         codex_enabled=True,
         rescue_audit_sample_rate=0.0,
+        agent_initial_phase_seconds=91,
+        agent_exploration_phase_seconds=73,
     )
     configured.ensure_directories()
     database = Database(configured)
@@ -2223,6 +2225,7 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
         lambda payload, _evidence: (payload, "refuted_static"),
     )
     phases: list[str] = []
+    dispatch_timeouts: list[int | None] = []
 
     class FakeInvestigator:
         @staticmethod
@@ -2234,6 +2237,7 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
             context = kwargs["platform_context"]
             phase = context["phase"]
             phases.append(phase)
+            dispatch_timeouts.append(kwargs.get("timeout_seconds"))
             assert context["exploration_policy"] == {
                 "mode": "agent_directed",
                 "count_limits": False,
@@ -2315,9 +2319,10 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
             )
 
     orchestrator.investigators["codex"] = FakeInvestigator()
-    orchestrator._run_task(scan_id, task_id, 120)
+    orchestrator._run_task(scan_id, task_id, 3600)
 
     assert phases == ["test_planning", "exploration_round"]
+    assert dispatch_timeouts == [91, 73]
     with database.session_factory() as session:
         completed_task = session.get(InvestigationTask, task_id)
         assert completed_task is not None

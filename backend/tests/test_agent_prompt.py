@@ -631,6 +631,50 @@ def test_agent_result_repairs_fields_from_the_wrong_execution_mode() -> None:
     ]
 
 
+def test_agent_result_clears_target_path_from_non_file_oracle() -> None:
+    payload = {
+        "summary": "静态证据支持风险，申请目标界面验证。",
+        "result": "supported_static",
+        "hypotheses_tested": [],
+        "test_cases": [],
+        "evidence_ids": [],
+        "severity_proposal": "high",
+        "confidence": "high",
+        "coverage_gaps": [],
+        "followups": [],
+        "requested_tests": [
+            {
+                "hypothesis_id": "00000000-0000-0000-0000-000000000001",
+                "entry_point_id": "00000000-0000-0000-0000-000000000002",
+                "state": "guest",
+                "uri": None,
+                "extras": {},
+                "operation": "auto",
+                "oracle": {
+                    "kind": "ui_text",
+                    "expected_text": "导入完成",
+                    "target_path": "shared_prefs/session.xml",
+                    "impact": "unauthorized_state_change",
+                },
+                "poc": None,
+                "rationale": "验证目标应用中新出现的状态提示。",
+            }
+        ],
+    }
+
+    result = AgentInvestigationResult.model_validate(payload)
+
+    assert result.rejected_requested_tests == []
+    assert result.requested_tests[0].oracle.target_path is None
+    assert result.normalization_repairs == [
+        {
+            "location": "requested_tests.0.oracle.target_path",
+            "repair": "cleared_target_file_only_field",
+            "original_value": "shared_prefs/session.xml",
+        }
+    ]
+
+
 def test_content_provider_method_implies_call_operation() -> None:
     payload = {
         "summary": "静态证据支持风险，申请验证 Provider 自定义调用。",

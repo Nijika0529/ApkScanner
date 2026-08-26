@@ -150,6 +150,15 @@ def test_platform_materializes_a_request_scoped_binder_harness(settings, tmp_pat
         "read_string",
     ]
     assert "security_impact_observed" in source
+    assert "apkscanner-proof-receipt.json" in source
+    assert 'persistReceipt("started", false)' in source
+    assert 'receipt.put("receipt_terminal", terminal)' in source
+    assert "@Override protected void onResume()" in source
+    assert "}, 150L);" in source
+    manifest = (tmp_path / spec.project_path / "AndroidManifest.xml").read_text(
+        encoding="utf-8"
+    )
+    assert 'android:debuggable="true"' in manifest
 
 
 def test_platform_harness_build_stage_is_completed_not_skipped(
@@ -351,6 +360,16 @@ def test_target_file_oracle_rejects_unsafe_paths(target_path: str) -> None:
         AgentOracleSpec(
             kind="target_file_sha256",
             target_path=target_path,
+            impact="unauthorized_state_change",
+        )
+
+
+def test_non_file_oracle_keeps_strict_target_path_validation() -> None:
+    with pytest.raises(ValueError, match="target_path is supported only"):
+        AgentOracleSpec(
+            kind="ui_text",
+            expected_text="完成",
+            target_path="shared_prefs/session.xml",
             impact="unauthorized_state_change",
         )
 
@@ -571,6 +590,8 @@ public final class Exploit {
     assert harness in sources
     assert 'getStringExtra("apkscanner_request_id")' in harness_text
     assert 'record.put("row_count"' in harness_text
+    assert "apkscanner-proof-receipt.json" in harness_text
+    assert 'persistReceipt(record, "started", false)' in harness_text
     assert "security_impact_observed" not in harness_text
     assert effective.launch_component.endswith(".ApkScannerHarnessActivity")
     activities = ElementTree.parse(manifest).getroot().findall("application/activity")
@@ -582,6 +603,9 @@ public final class Exploit {
     )
     assert generated.get("{http://schemas.android.com/apk/res/android}exported") == "true"
     assert generated.find("intent-filter/action") is not None
+    application = ElementTree.parse(manifest).getroot().find("application")
+    assert application is not None
+    assert application.get("{http://schemas.android.com/apk/res/android}debuggable") == "true"
 
 
 def test_poc_builder_allows_platform_owned_ui_oracle_without_poc_self_report(
