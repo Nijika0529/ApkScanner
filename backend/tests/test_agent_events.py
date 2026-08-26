@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from apkscanner.agent_events import (
+from apkscanner.runtime.agent_events import (
     normalize_codex_notification,
     redact_event_data,
     runtime_event_from_mapping,

@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 import pytest
-from apkscanner.tools import CommandResult, TimeBudget, ToolRunner
+from apkscanner.platform.tools import CommandResult, TimeBudget, ToolRunner
 
 
 def test_explicit_zero_timeout_does_not_fall_back_to_default(monkeypatch) -> None:  # noqa: ANN001

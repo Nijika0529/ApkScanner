@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import pytest
-from apkscanner.benchmark import BenchmarkEvaluator
-from apkscanner.db import Database
-from apkscanner.models import (
+from apkscanner.core.db import Database
+from apkscanner.core.models import (
     BenchmarkEvaluation,
     EntryPoint,
     Evidence,
@@ -13,7 +12,8 @@ from apkscanner.models import (
     Scan,
     SecurityHypothesis,
 )
-from apkscanner.schemas import BenchmarkSpec
+from apkscanner.core.schemas import BenchmarkSpec
+from apkscanner.runtime.benchmark import BenchmarkEvaluator
 from pydantic import ValidationError
 from sqlalchemy import select
 

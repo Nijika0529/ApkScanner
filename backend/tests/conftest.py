@@ -4,7 +4,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
-from apkscanner.config import Settings
+from apkscanner.core.config import Settings
 
 MANIFEST = """<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"

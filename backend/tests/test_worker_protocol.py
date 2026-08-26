@@ -6,7 +6,7 @@ import threading
 import time
 
 import pytest
-from apkscanner.worker_protocol import (
+from apkscanner.runtime.worker_protocol import (
     WorkerCancelledError,
     WorkerTimeoutError,
     consume_worker_process,

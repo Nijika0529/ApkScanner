@@ -248,7 +248,7 @@ ground truth、Evidence 准入规则和评测命令构成当前的结果口径�
 | Linux IDALib Headless MCP、Docker→WSL 路径映射和共享 worker 池 | 已实现第一阶段，按需启用 |
 | Android 16 自托管正式回归 | 工作流已提供，需要实际设备与仓库 Secret |
 | 企业多用户、RBAC、Provider egress 治理 | 不属于当前个人版本，保留架构接口 |
-| Native 自动语义归纳、动态脱壳、应用内部业务流程测试 | 后续扩展方向 |
+| 漏洞挖掘方向与 Agent 架构演进 | 见 [下一步开发 Spec](docs/next-development-spec.zh-CN.md)（7 大方向 + 分阶段计划） |
 
 ## 文档导航
 
@@ -260,6 +260,7 @@ ground truth、Evidence 准入规则和评测命令构成当前的结果口径�
 4. [Codex Docker 执行架构](docs/codex-docker-architecture.zh-CN.md)
 5. [Android 攻击链分析](docs/android-attack-chain-analysis.zh-CN.md)
 6. [版本安全演进](docs/version-security-evolution.md)
+7. [下一步开发 Spec](docs/next-development-spec.zh-CN.md)
 
 ## 项目结构
 

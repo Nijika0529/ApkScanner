@@ -3,12 +3,12 @@ from __future__ import annotations
 import os
 
 import pytest
-from apkscanner.codex_worker import PersistentCodexWorker, TurnCommand
-from apkscanner.runtime_contracts import (
+from apkscanner.core.schemas import AGENT_RESULT_JSON_SCHEMA
+from apkscanner.runtime.codex_worker import PersistentCodexWorker, TurnCommand
+from apkscanner.runtime.runtime_contracts import (
     GATEWAY_ENVIRONMENT_NAMES,
     task_gateway_environment,
 )
-from apkscanner.schemas import AGENT_RESULT_JSON_SCHEMA
 from pydantic import ValidationError
 
 

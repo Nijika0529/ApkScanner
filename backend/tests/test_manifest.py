@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from apkscanner.manifest import parse_manifest
-from apkscanner.models import EntryPoint
-from apkscanner.planner import InvestigationPlanner
-from apkscanner.rules import BuiltinRuleEngine
+from apkscanner.analysis.manifest import parse_manifest
+from apkscanner.analysis.rules import BuiltinRuleEngine
+from apkscanner.core.models import EntryPoint
+from apkscanner.runtime.planner import InvestigationPlanner
 
 from .conftest import MANIFEST
 

@@ -3,6 +3,12 @@
 本文档目录只保留当前实现规范、可复现评测和明确标注的能力边界。若文档与代码行为冲突，
 以根目录 `README.md`、`backend/apkscanner/config.py` 和自动化测试为准。
 
+## 开发方向
+
+| 文档 | 内容 | 状态 |
+| --- | --- | --- |
+| [下一步开发 Spec](next-development-spec.zh-CN.md) | 7 大漏洞挖掘方向、Agent 架构调整、分阶段实施计划与验收指标 | **当前权威方向** |
+
 ## 从这里开始
 
 | 文档 | 适合读者 | 状态 |
@@ -17,7 +23,7 @@
 | 文档 | 内容 | 状态 |
 | --- | --- | --- |
 | [Android 攻击链分析](android-attack-chain-analysis.zh-CN.md) | PendingIntent、文件导入、动态 Receiver、Socket、WebView/JSBridge 等 | 当前实现与扩展方法 |
-| [Samsung 漏洞案例集覆盖分析](samsung-vulnerability-coverage-review.zh-CN.md) | 140 份详细案例的模式映射、本轮补齐与后续边界 | 研究报告与实现映射 |
+| [Samsung 漏洞案例集覆盖分析](samsung-vulnerability-coverage-review.zh-CN.md) | 140 份详细案例的模式映射（历史研究，方向见「下一步开发 Spec」） | 历史研究 |
 | [AdaptiveCases 真机评测](adaptivecases-real-device-evaluation.zh-CN.md) | 合成 APK 的测试口径、已知限制与动态证明要求 | 评测记录 |
 | [私有已知漏洞集盲测计划](private-benchmark-plan.zh-CN.md) | Ground truth 隔离、验收分层和公开披露规则 | 验收计划 |
 | [运行时控制与版本演进](runtime-control-and-evolution.zh-CN.md) | 设备池、重新分析、验证 Profile、事件性能 | 当前实现 |

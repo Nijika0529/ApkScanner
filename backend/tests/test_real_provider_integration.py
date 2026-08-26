@@ -5,8 +5,8 @@ import shutil
 from dataclasses import replace
 
 import pytest
-from apkscanner.codex_runner import CodexInvestigator
-from apkscanner.models import EntryPoint, InvestigationTask, Scan
+from apkscanner.core.models import EntryPoint, InvestigationTask, Scan
+from apkscanner.runtime.codex_runner import CodexInvestigator
 
 
 @pytest.mark.skipif(

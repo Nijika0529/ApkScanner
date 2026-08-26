@@ -7,10 +7,10 @@ from io import BytesIO
 from pathlib import Path
 
 import pytest
-from apkscanner import permissions
-from apkscanner.artifacts import ArtifactStore
-from apkscanner.db import Database
-from apkscanner.models import Finding, Scan
+from apkscanner.core import permissions
+from apkscanner.core.db import Database
+from apkscanner.core.models import Finding, Scan
+from apkscanner.platform.artifacts import ArtifactStore
 from fastapi import UploadFile
 from sqlalchemy import select, text
 

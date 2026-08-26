@@ -2,19 +2,19 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from apkscanner.artifacts import ArtifactStore
-from apkscanner.db import Database
-from apkscanner.dynamic_experiments import DynamicExperimentService
-from apkscanner.evidence import EvidenceRecorder
-from apkscanner.models import (
+from apkscanner.core.db import Database
+from apkscanner.core.evidence import EvidenceRecorder
+from apkscanner.core.models import (
     DynamicExperimentCapsule,
     DynamicExperimentReceipt,
     Evidence,
     RuntimeObservation,
     Scan,
 )
-from apkscanner.schemas import DynamicExperimentCreate
-from apkscanner.tools import CommandResult, ToolRunner
+from apkscanner.core.schemas import DynamicExperimentCreate
+from apkscanner.platform.artifacts import ArtifactStore
+from apkscanner.platform.tools import CommandResult, ToolRunner
+from apkscanner.runtime.dynamic_experiments import DynamicExperimentService
 from sqlalchemy import select
 
 
@@ -29,7 +29,7 @@ def test_dynamic_experiment_resumes_only_the_failed_step(settings, monkeypatch) 
     database.create_all()
     store = ArtifactStore(configured)
 
-    from apkscanner.device import AdbDeviceAdapter, AdbDevicePool
+    from apkscanner.runtime.device import AdbDeviceAdapter, AdbDevicePool
 
     adapter = AdbDeviceAdapter(configured, ToolRunner(30), serial="device-1")
     pool = AdbDevicePool([adapter])
@@ -132,7 +132,7 @@ def test_dynamic_experiment_satisfies_only_a_structured_impact_contract(
     database.create_all()
     store = ArtifactStore(configured)
 
-    from apkscanner.device import AdbDeviceAdapter, AdbDevicePool
+    from apkscanner.runtime.device import AdbDeviceAdapter, AdbDevicePool
 
     adapter = AdbDeviceAdapter(configured, ToolRunner(30), serial="device-1")
     service = DynamicExperimentService(

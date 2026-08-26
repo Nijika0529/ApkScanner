@@ -6,8 +6,8 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
 
-from apkscanner.poc import PocBuilder
-from apkscanner.schemas import BenchmarkSpec
+from apkscanner.core.schemas import BenchmarkSpec
+from apkscanner.runtime.poc import PocBuilder
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_ROOT = REPOSITORY_ROOT / "testapk"
@@ -137,7 +137,7 @@ def test_vulntest_source_contains_real_attack_paths_and_safe_control() -> None:
 
 def test_platform_proof_harness_supports_binder_transactions() -> None:
     source = PocBuilder._platform_proof_source(
-        package_name="io.apkscanner.poc.proof_fixture",
+        package_name="io.apkscanner.runtime.poc.proof_fixture",
         encoded_request="e30=",
     )
 

@@ -7,11 +7,11 @@ import threading
 from dataclasses import replace
 
 import pytest
-from apkscanner.artifacts import ArtifactStore
-from apkscanner.db import Database
-from apkscanner.models import Evidence, InvestigationTask, Scan
-from apkscanner.orchestrator import ScanOrchestrator, _LiveProofContext
-from apkscanner.tools import TimeBudget
+from apkscanner.core.db import Database
+from apkscanner.core.models import Evidence, InvestigationTask, Scan
+from apkscanner.platform.artifacts import ArtifactStore
+from apkscanner.platform.tools import TimeBudget
+from apkscanner.runtime.orchestrator import ScanOrchestrator, _LiveProofContext
 from sqlalchemy import select
 
 

@@ -15,26 +15,26 @@ from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
 import pytest
-from apkscanner.artifacts import ArtifactStore
-from apkscanner.db import Database
-from apkscanner.device import AdbDeviceAdapter
-from apkscanner.models import EntryPoint, InvestigationTask, ProofAttempt, Scan
-from apkscanner.orchestrator import ScanOrchestrator, _LiveProofContext
-from apkscanner.poc import PocBuilder, PocBuildResult
-from apkscanner.schemas import (
+from apkscanner.core.db import Database
+from apkscanner.core.models import EntryPoint, InvestigationTask, ProofAttempt, Scan
+from apkscanner.core.schemas import (
     AgentBinderScriptStep,
     AgentOracleSpec,
     AgentPocSpec,
     AgentProofReplay,
     AgentRequestedTest,
 )
-from apkscanner.tools import CommandResult, TimeBudget, ToolRunner
+from apkscanner.platform.artifacts import ArtifactStore
+from apkscanner.platform.tools import CommandResult, TimeBudget, ToolRunner
+from apkscanner.runtime.device import AdbDeviceAdapter
+from apkscanner.runtime.orchestrator import ScanOrchestrator, _LiveProofContext
+from apkscanner.runtime.poc import PocBuilder, PocBuildResult
 
 
 def poc_spec() -> AgentPocSpec:
     return AgentPocSpec(
         project_path="poc/provider_probe",
-        package_name="io.apkscanner.poc.providerprobe",
+        package_name="io.apkscanner.runtime.poc.providerprobe",
         launch_component=".MainActivity",
         log_tag="APKSCANNER_POC",
         timeout_seconds=30,
@@ -140,7 +140,7 @@ def test_platform_materializes_a_request_scoped_binder_harness(settings, tmp_pat
     encoded = re.search(r'REQUEST_BASE64 = "([A-Za-z0-9+/=]+)"', source)
     assert encoded is not None
     payload = json.loads(base64.b64decode(encoded.group(1)))
-    assert spec.package_name.startswith("io.apkscanner.poc.proof_")
+    assert spec.package_name.startswith("io.apkscanner.runtime.poc.proof_")
     assert spec.harness_mode == "custom"
     assert payload["package"] == "com.example.target"
     assert payload["component"] == "com.example.target.SecretService"
@@ -415,7 +415,7 @@ def write_poc_project(workspace: Path) -> Path:
     source.mkdir(parents=True)
     (project / "AndroidManifest.xml").write_text(
         """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-package="io.apkscanner.poc.providerprobe">
+package="io.apkscanner.runtime.poc.providerprobe">
 <application>
 <activity android:name=".MainActivity" android:exported="true" />
 </application>
@@ -423,7 +423,7 @@ package="io.apkscanner.poc.providerprobe">
         encoding="utf-8",
     )
     (source / "MainActivity.java").write_text(
-        """package io.apkscanner.poc.providerprobe;
+        """package io.apkscanner.runtime.poc.providerprobe;
 public final class MainActivity extends android.app.Activity {}""",
         encoding="utf-8",
     )
@@ -487,7 +487,7 @@ def test_poc_builder_rejects_main_thread_wait_after_bind_service(
     project = write_poc_project(workspace)
     source = next((project / "src").rglob("MainActivity.java"))
     source.write_text(
-        """package io.apkscanner.poc.providerprobe;
+        """package io.apkscanner.runtime.poc.providerprobe;
 public final class MainActivity extends android.app.Activity {
   void test(android.content.Intent intent) throws Exception {
     bindService(intent, null, 0);
@@ -521,7 +521,7 @@ def test_poc_builder_enforces_the_runtime_result_protocol(
         builder._validate_project(workspace, poc_spec(), oracle=oracle)
 
     source.write_text(
-        r"""package io.apkscanner.poc.providerprobe;
+        r"""package io.apkscanner.runtime.poc.providerprobe;
 public final class MainActivity extends android.app.Activity {
   void report(int rows) {
     String requestId = getIntent().getStringExtra("apkscanner_request_id");
@@ -550,7 +550,7 @@ def test_platform_generated_poc_harness_owns_the_result_protocol(
     project = write_poc_project(workspace)
     source_dir = next((project / "src").rglob("MainActivity.java")).parent
     (source_dir / "Exploit.java").write_text(
-        """package io.apkscanner.poc.providerprobe;
+        """package io.apkscanner.runtime.poc.providerprobe;
 public final class Exploit {
   public static Object runAttack(android.app.Activity activity,
       android.content.Intent launch) {
@@ -564,11 +564,11 @@ public final class Exploit {
     )
     requested = AgentPocSpec(
         project_path="poc/provider_probe",
-        package_name="io.apkscanner.poc.providerprobe",
+        package_name="io.apkscanner.runtime.poc.providerprobe",
         launch_component=".ApkScannerHarnessActivity",
         log_tag="APKSCANNER_POC",
         harness_mode="platform_generated",
-        attack_class="io.apkscanner.poc.providerprobe.Exploit",
+        attack_class="io.apkscanner.runtime.poc.providerprobe.Exploit",
     )
     oracle = AgentOracleSpec(
         kind="provider_rows",
@@ -599,7 +599,7 @@ public final class Exploit {
         item
         for item in activities
         if item.get("{http://schemas.android.com/apk/res/android}name")
-        == "io.apkscanner.poc.providerprobe.ApkScannerHarnessActivity"
+        == "io.apkscanner.runtime.poc.providerprobe.ApkScannerHarnessActivity"
     )
     assert generated.get("{http://schemas.android.com/apk/res/android}exported") == "true"
     assert generated.find("intent-filter/action") is not None
@@ -640,7 +640,7 @@ def test_poc_builder_rejects_lambdas_for_dx_toolchain(
     project = write_poc_project(workspace)
     source = next((project / "src").rglob("MainActivity.java"))
     source.write_text(
-        """package io.apkscanner.poc.providerprobe;
+        """package io.apkscanner.runtime.poc.providerprobe;
 public final class MainActivity extends android.app.Activity {
   void test() { new Thread(() -> {}).start(); }
 }""",
@@ -673,7 +673,7 @@ def test_poc_builder_recovers_a_unique_project_path_by_package(
     assert validated == project
     assert manifest == project / "AndroidManifest.xml"
     assert [item.name for item in sources] == ["MainActivity.java"]
-    assert effective.package_name == "io.apkscanner.poc.providerprobe"
+    assert effective.package_name == "io.apkscanner.runtime.poc.providerprobe"
 
 
 def test_poc_builder_uses_safe_manifest_package_as_source_of_truth(
@@ -684,14 +684,14 @@ def test_poc_builder_uses_safe_manifest_package_as_source_of_truth(
     workspace.mkdir()
     write_poc_project(workspace)
     builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
-    mismatched = poc_spec().model_copy(update={"package_name": "io.apkscanner.poc.modelguess"})
+    mismatched = poc_spec().model_copy(update={"package_name": "io.apkscanner.runtime.poc.modelguess"})
 
     _project, _sources, _manifest, effective = builder._validate_project(
         workspace,
         mismatched,
     )
 
-    assert effective.package_name == "io.apkscanner.poc.providerprobe"
+    assert effective.package_name == "io.apkscanner.runtime.poc.providerprobe"
 
 
 def test_poc_builder_uses_unique_manifest_launcher_as_source_of_truth(
@@ -704,7 +704,7 @@ def test_poc_builder_uses_unique_manifest_launcher_as_source_of_truth(
     manifest = project / "AndroidManifest.xml"
     manifest.write_text(
         """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-package="io.apkscanner.poc.providerprobe">
+package="io.apkscanner.runtime.poc.providerprobe">
 <application>
 <activity android:name=".MainActivity" android:exported="true">
 <intent-filter>
@@ -724,7 +724,7 @@ package="io.apkscanner.poc.providerprobe">
         mismatched,
     )
 
-    assert effective.launch_component == "io.apkscanner.poc.providerprobe.MainActivity"
+    assert effective.launch_component == "io.apkscanner.runtime.poc.providerprobe.MainActivity"
 
 
 def test_poc_builder_repairs_manifest_launcher_to_match_java_activity(
@@ -736,7 +736,7 @@ def test_poc_builder_repairs_manifest_launcher_to_match_java_activity(
     project = write_poc_project(workspace)
     source = next((project / "src").rglob("MainActivity.java"))
     source.write_text(
-        """package io.apkscanner.poc.actual;
+        """package io.apkscanner.runtime.poc.actual;
 public final class MainActivity extends android.app.Activity {}""",
         encoding="utf-8",
     )
@@ -756,11 +756,11 @@ public final class MainActivity extends android.app.Activity {}""",
     )
     activity = ElementTree.parse(built_manifest).getroot().find("application/activity")
 
-    assert effective.launch_component == "io.apkscanner.poc.actual.MainActivity"
+    assert effective.launch_component == "io.apkscanner.runtime.poc.actual.MainActivity"
     assert activity is not None
     assert (
         activity.get("{http://schemas.android.com/apk/res/android}name")
-        == "io.apkscanner.poc.actual.MainActivity"
+        == "io.apkscanner.runtime.poc.actual.MainActivity"
     )
 
 
@@ -774,9 +774,9 @@ def test_poc_builder_allows_launcher_in_a_sibling_controlled_poc_package(
     manifest = project / "AndroidManifest.xml"
     manifest.write_text(
         """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-package="io.apkscanner.poc.commandservice">
+package="io.apkscanner.runtime.poc.commandservice">
 <application>
-<activity android:name="io.apkscanner.poc.providerprobe.MainActivity"
+<activity android:name="io.apkscanner.runtime.poc.providerprobe.MainActivity"
 android:exported="true">
 <intent-filter>
 <action android:name="android.intent.action.MAIN" />
@@ -794,8 +794,8 @@ android:exported="true">
         poc_spec(),
     )
 
-    assert effective.package_name == "io.apkscanner.poc.commandservice"
-    assert effective.launch_component == "io.apkscanner.poc.providerprobe.MainActivity"
+    assert effective.package_name == "io.apkscanner.runtime.poc.commandservice"
+    assert effective.launch_component == "io.apkscanner.runtime.poc.providerprobe.MainActivity"
 
 
 def test_poc_builder_uses_unique_java_log_tag_as_source_of_truth(
@@ -807,7 +807,7 @@ def test_poc_builder_uses_unique_java_log_tag_as_source_of_truth(
     project = write_poc_project(workspace)
     source = next((project / "src").rglob("MainActivity.java"))
     source.write_text(
-        """package io.apkscanner.poc.providerprobe;
+        """package io.apkscanner.runtime.poc.providerprobe;
 public final class MainActivity extends android.app.Activity {
 private static final String TAG = "PROVIDER_RESULT";
 }""",
@@ -844,7 +844,7 @@ def test_source_build_preserves_package_visibility_queries_with_legacy_android_j
     source = tmp_path / "source.xml"
     source.write_text(
         """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-package="io.apkscanner.poc.providerprobe">
+package="io.apkscanner.runtime.poc.providerprobe">
 <queries><package android:name="io.apkscanner.vulntest" /></queries>
 <application><activity android:name=".MainActivity" /></application>
 </manifest>""",
@@ -867,7 +867,7 @@ def test_source_build_keeps_queries_and_exports_launcher_on_modern_android(
     source = tmp_path / "source.xml"
     source.write_text(
         """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-package="io.apkscanner.poc.providerprobe">
+package="io.apkscanner.runtime.poc.providerprobe">
 <queries><package android:name="io.apkscanner.vulntest" /></queries>
 <application><activity android:name=".MainActivity" android:exported="false" /></application>
 </manifest>""",
@@ -879,7 +879,7 @@ package="io.apkscanner.poc.providerprobe">
     normalized = PocBuilder._build_manifest(
         source,
         output,
-        package_name="io.apkscanner.poc.providerprobe",
+        package_name="io.apkscanner.runtime.poc.providerprobe",
         launch_component=".MainActivity",
     )
 
@@ -896,7 +896,7 @@ def test_source_build_adds_target_visibility_without_overwriting_agent_queries(
     source = tmp_path / "source.xml"
     source.write_text(
         """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-package="io.apkscanner.poc.providerprobe">
+package="io.apkscanner.runtime.poc.providerprobe">
 <queries><package android:name="io.existing.visible" /></queries>
 <application><activity android:name=".MainActivity" /></application>
 </manifest>""",
@@ -929,7 +929,7 @@ def test_source_build_normalizes_manifest_sdk_values(tmp_path) -> None:
     source = tmp_path / "source.xml"
     source.write_text(
         """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-package="io.apkscanner.poc.providerprobe">
+package="io.apkscanner.runtime.poc.providerprobe">
 <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
 <application><activity android:name=".MainActivity" /></application>
 </manifest>""",
@@ -1243,10 +1243,10 @@ def test_personal_lab_ingests_an_agent_built_prebuilt_apk(
         @staticmethod
         def run(argv, **_kwargs):  # noqa: ANN001, ANN205
             stdout = (
-                "package: name='io.apkscanner.poc.providerprobe'\n"
+                "package: name='io.apkscanner.runtime.poc.providerprobe'\n"
                 "sdkVersion:'26'\n"
                 "targetSdkVersion:'36'\n"
-                "launchable-activity: name='io.apkscanner.poc.providerprobe.MainActivity'\n"
+                "launchable-activity: name='io.apkscanner.runtime.poc.providerprobe.MainActivity'\n"
                 if "badging" in argv
                 else "Verified"
             )
@@ -1543,7 +1543,7 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
         "secret-token",
         replay.model_copy(
             update={
-                "poc": replay.poc.model_copy(update={"package_name": "io.apkscanner.poc.renamed"})
+                "poc": replay.poc.model_copy(update={"package_name": "io.apkscanner.runtime.poc.renamed"})
             }
         ),
     )
@@ -1572,7 +1572,7 @@ def test_live_proof_replay_requires_harm_hypothesis_and_deduplicates(
             update={
                 "hypothesis_id": unrelated_hypothesis_id,
                 "poc": working_replay.poc.model_copy(
-                    update={"package_name": "io.apkscanner.poc.anotherrename"}
+                    update={"package_name": "io.apkscanner.runtime.poc.anotherrename"}
                 ),
             }
         ),

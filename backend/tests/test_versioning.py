@@ -6,9 +6,8 @@ import zipfile
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
-from apkscanner.artifacts import ArtifactStore
-from apkscanner.db import Database
-from apkscanner.models import (
+from apkscanner.core.db import Database
+from apkscanner.core.models import (
     ApplicationRecord,
     ApplicationRelease,
     EntryPoint,
@@ -21,11 +20,12 @@ from apkscanner.models import (
     VulnerabilityCase,
     VulnerabilityOccurrence,
 )
-from apkscanner.orchestrator import ScanOrchestrator
-from apkscanner.proof_recipes import plan_with_proof_recipe
-from apkscanner.schemas import AgentOracleSpec, AgentRequestedTest
-from apkscanner.tools import TimeBudget
-from apkscanner.versioning import SecurityEvolutionService
+from apkscanner.core.schemas import AgentOracleSpec, AgentRequestedTest
+from apkscanner.platform.artifacts import ArtifactStore
+from apkscanner.platform.tools import TimeBudget
+from apkscanner.platform.versioning import SecurityEvolutionService
+from apkscanner.runtime.orchestrator import ScanOrchestrator
+from apkscanner.runtime.proof_recipes import plan_with_proof_recipe
 from sqlalchemy import select
 
 
@@ -88,7 +88,7 @@ def test_snapshot_diff_migrates_only_proven_poc(settings, tmp_path) -> None:  # 
     with zipfile.ZipFile(source_zip, "w") as archive:
         archive.writestr(
             "AndroidManifest.xml",
-            '<manifest package="io.apkscanner.poc.replay"/>',
+            '<manifest package="io.apkscanner.runtime.poc.replay"/>',
         )
         archive.writestr("src/io/apkscanner/poc/replay/Main.java", "class Main {}")
     source_sha = hashlib.sha256(source_zip.read_bytes()).hexdigest()
@@ -139,7 +139,7 @@ def test_snapshot_diff_migrates_only_proven_poc(settings, tmp_path) -> None:  # 
                 "rationale": "Read one secret row.",
                 "poc": {
                     "project_path": "poc/old",
-                    "package_name": "io.apkscanner.poc.replay",
+                    "package_name": "io.apkscanner.runtime.poc.replay",
                     "launch_component": ".MainActivity",
                     "log_tag": "APKSCANNER_POC",
                     "timeout_seconds": 60,

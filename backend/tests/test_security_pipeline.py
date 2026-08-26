@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import pytest
-from apkscanner.db import Database
-from apkscanner.models import (
+from apkscanner.core.db import Database
+from apkscanner.core.models import (
     EntryPoint,
     Finding,
     HypothesisArgument,
@@ -11,8 +11,8 @@ from apkscanner.models import (
     Scan,
     SecurityHypothesis,
 )
-from apkscanner.schemas import AgentRequestedTest
-from apkscanner.security_pipeline import HypothesisLedger
+from apkscanner.core.schemas import AgentRequestedTest
+from apkscanner.runtime.security_pipeline import HypothesisLedger
 from sqlalchemy import select
 
 

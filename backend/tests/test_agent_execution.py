@@ -4,7 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from apkscanner.agent_execution import (
+from apkscanner.runtime.agent_execution import (
     PHASE_NAMES,
     AgentExecutionProfile,
     PhaseRoute,

@@ -4,10 +4,10 @@ import hashlib
 import shutil
 
 import pytest
-from apkscanner.capabilities import CapabilityManifest, CapabilityRegistry
+from apkscanner.core.models import Scan
+from apkscanner.core.repository import add_event
 from apkscanner.main import create_app
-from apkscanner.models import Scan
-from apkscanner.repository import add_event
+from apkscanner.platform.capabilities import CapabilityManifest, CapabilityRegistry
 from fastapi.testclient import TestClient
 
 

@@ -10,15 +10,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from apkscanner.agent_workspace import AgentWorkspaceManager
-from apkscanner.codex_executor import CodexDockerExecutor, ScanContainer
-from apkscanner.codex_protocol import (
+from apkscanner.runtime.agent_workspace import AgentWorkspaceManager
+from apkscanner.runtime.codex_executor import CodexDockerExecutor, ScanContainer
+from apkscanner.runtime.codex_protocol import (
     PersistentWorkerClient,
     PersistentWorkerError,
     PersistentWorkerTimeout,
 )
-from apkscanner.codex_runner import CodexInvestigator, _ActiveDockerSession
-from apkscanner.codex_worker import WorkerConfiguration
+from apkscanner.runtime.codex_runner import CodexInvestigator, _ActiveDockerSession
+from apkscanner.runtime.codex_worker import WorkerConfiguration
 from pydantic import ValidationError
 
 SCAN_ID = "00000000-0000-0000-0000-000000000101"

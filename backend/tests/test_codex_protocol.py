@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from apkscanner.codex_protocol import (
+from apkscanner.runtime.codex_protocol import (
     PersistentWorkerCancelled,
     PersistentWorkerClient,
     PersistentWorkerError,

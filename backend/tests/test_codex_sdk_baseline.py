@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from apkscanner.codex_runner import codex_config_overrides
-from apkscanner.codex_sdk_baseline import (
+from apkscanner.runtime.codex_runner import codex_config_overrides
+from apkscanner.runtime.codex_sdk_baseline import (
     PINNED_SDK_VERSION,
     VERIFIED_SOURCE_COMMIT,
     collect_sdk_baseline,

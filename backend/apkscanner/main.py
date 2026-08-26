@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -9,16 +10,16 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .api import router
-from .artifacts import ArtifactStore
-from .capabilities import CapabilityRegistry
-from .config import Settings
-from .db import Database
-from .enums import ScanStatus
-from .models import Scan
-from .operator_service import PlatformOperatorService
-from .orchestrator import ScanOrchestrator
-from .supervisor import SupervisorService
+from .core.config import Settings
+from .core.db import Database
+from .core.enums import ScanStatus
+from .core.models import Scan
+from .platform.api import router
+from .platform.artifacts import ArtifactStore
+from .platform.capabilities import CapabilityRegistry
+from .platform.operator_service import PlatformOperatorService
+from .runtime.orchestrator import ScanOrchestrator
+from .runtime.supervisor import SupervisorService
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -111,7 +112,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.background_tasks = set()
     app.add_middleware(
         TrustedHostMiddleware,
-        allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"],
+        allowed_hosts=os.environ.get(
+            "APKSCANNER_ALLOWED_HOSTS",
+            "127.0.0.1,localhost,[::1],testserver",
+        ).split(","),
     )
 
     @app.middleware("http")

@@ -1,8 +1,8 @@
 from types import SimpleNamespace
 
-from apkscanner.db import Database
-from apkscanner.models import CampaignRun, Scan
-from apkscanner.supervisor import CampaignPlan, SupervisorService
+from apkscanner.core.db import Database
+from apkscanner.core.models import CampaignRun, Scan
+from apkscanner.runtime.supervisor import CampaignPlan, SupervisorService
 
 
 class _Registry:

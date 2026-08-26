@@ -50,21 +50,10 @@ RUN if [ -n "${DEBIAN_MIRROR}" ]; then \
         zip \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /usr/lib/android-sdk/platforms /usr/lib/android-sdk/build-tools \
-    && curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
-        "https://dl.google.com/android/repository/${ANDROID_PLATFORM_ARCHIVE}" \
-        -o /tmp/android-platform.zip \
-    && echo "${ANDROID_PLATFORM_SHA1}  /tmp/android-platform.zip" | sha1sum -c - \
-    && unzip -q /tmp/android-platform.zip -d /tmp/android-platform \
-    && mv /tmp/android-platform/android-* /usr/lib/android-sdk/platforms/android-36 \
-    && curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
-        "https://dl.google.com/android/repository/${ANDROID_BUILD_TOOLS_ARCHIVE}" \
-        -o /tmp/android-build-tools.zip \
-    && echo "${ANDROID_BUILD_TOOLS_SHA1}  /tmp/android-build-tools.zip" | sha1sum -c - \
-    && unzip -q /tmp/android-build-tools.zip -d /tmp/android-build-tools \
-    && mv /tmp/android-build-tools/android-* /usr/lib/android-sdk/build-tools/36.1.0 \
-    && rm -rf /tmp/android-platform /tmp/android-platform.zip \
-        /tmp/android-build-tools /tmp/android-build-tools.zip
+RUN mkdir -p /usr/lib/android-sdk/platforms /usr/lib/android-sdk/build-tools
+
+COPY docker/vendor/android-sdk/platforms/android-36 /usr/lib/android-sdk/platforms/android-36
+COPY docker/vendor/android-sdk/build-tools/36.1.0 /usr/lib/android-sdk/build-tools/36.1.0
 
 COPY docker/vendor/jadx /opt/jadx
 COPY docker/vendor/apktool/apktool.jar /opt/apktool/apktool.jar

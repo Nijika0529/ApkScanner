@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 
 import pytest
-from apkscanner.artifacts import ArtifactStore
+from apkscanner.platform.artifacts import ArtifactStore
 
 
 def test_evidence_store_rejects_symlinked_digest_directory(settings, tmp_path) -> None:  # noqa: ANN001

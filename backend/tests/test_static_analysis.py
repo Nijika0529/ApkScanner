@@ -8,18 +8,18 @@ import zipfile
 from pathlib import Path
 
 import pytest
-from apkscanner import native_analysis as native_analysis_module
-from apkscanner import rules as rules_module
-from apkscanner.manifest import parse_manifest
-from apkscanner.native_analysis import NativeArtifactAnalyzer
-from apkscanner.rules import BuiltinRuleEngine
-from apkscanner.static_analysis import (
+from apkscanner.analysis import native_analysis as native_analysis_module
+from apkscanner.analysis import rules as rules_module
+from apkscanner.analysis.manifest import parse_manifest
+from apkscanner.analysis.native_analysis import NativeArtifactAnalyzer
+from apkscanner.analysis.rules import BuiltinRuleEngine
+from apkscanner.analysis.static_analysis import (
     ApkInspector,
     InvalidApkError,
     StaticAnalysisResult,
 )
-from apkscanner.target_profiles import target_review_surfaces
-from apkscanner.tools import CommandResult, ToolRunner
+from apkscanner.analysis.target_profiles import target_review_surfaces
+from apkscanner.platform.tools import CommandResult, ToolRunner
 
 from .conftest import MANIFEST
 
@@ -582,7 +582,7 @@ def test_inspector_keeps_smali_and_uses_aapt2_manifest_when_oem_resources_fail(
 
     inspector = ApkInspector(settings, runner=OemFallbackRunner())
     monkeypatch.setattr(
-        "apkscanner.static_analysis.discover_tools",
+        "apkscanner.analysis.static_analysis.discover_tools",
         lambda _runner: {"apktool": "test", "aapt2": "test"},
     )
     result = inspector.inspect(fixture_apk, "scan-oem-fallback")

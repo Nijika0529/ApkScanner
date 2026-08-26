@@ -1,9 +1,9 @@
 from pathlib import Path
 
-from apkscanner.android_chains import AndroidAttackChainAnalyzer
-from apkscanner.manifest import parse_manifest
-from apkscanner.rules import BuiltinRuleEngine
-from apkscanner.static_analysis import StaticAnalysisResult
+from apkscanner.analysis.android_chains import AndroidAttackChainAnalyzer
+from apkscanner.analysis.manifest import parse_manifest
+from apkscanner.analysis.rules import BuiltinRuleEngine
+from apkscanner.analysis.static_analysis import StaticAnalysisResult
 
 
 def _write(root: Path, relative: str, content: str) -> None:
@@ -539,3 +539,225 @@ def test_binder_claimed_package_authorization_requires_calling_uid_binding(tmp_p
 
     assert any(item.rule_id == "CHAIN-ANDROID-RUNTIME-IPC" for item in findings)
     assert [item.family for item in surfaces].count("runtime_ipc_boundary") == 1
+
+
+def test_service_manager_identity_bypass_detects_multi_service_no_auth(tmp_path) -> None:
+    """ServiceManager.getService + self-reported caller identity + no getCallingUid."""
+    root = tmp_path / "jadx"
+    _write(
+        root,
+        "sources/com/example/target/ExportBinder.java",
+        """
+        package com.example.target;
+        import android.os.ServiceManager;
+        class ExportBinder extends IExportService.Stub {
+          boolean authorize(String callerPackage) {
+            IBinder peer = ServiceManager.getService("another_service");
+            return allowedPackages.contains(callerPackage);
+          }
+        }
+        """,
+    )
+
+    manifest = _manifest()
+    chains = AndroidAttackChainAnalyzer().analyze(manifest, [root])
+    by_kind = {item["chain_kind"]: item for item in chains}
+
+    assert "service_manager_identity_bypass" in by_kind
+    chain = by_kind["service_manager_identity_bypass"]
+    assert chain["family"] == "runtime_ipc_boundary"
+    assert "caller_supplied_identity" in chain["sink_markers"]
+    assert "caller_identity_authorization" in chain["risk_markers"]
+    assert "calling_uid_binding_not_observed_in_bounded_path" in chain["inferred_risks"]
+
+    result = StaticAnalysisResult(
+        manifest=manifest,
+        workspace=tmp_path,
+        tool_versions={},
+        tool_results={},
+        signing={},
+        file_inventory={},
+        searchable_roots=[root],
+        decompilation={"status": "complete_success", "output_usable": True},
+        attack_chains=chains,
+    )
+    engine = BuiltinRuleEngine()
+    findings, _coverage = engine.evaluate(result)
+    surfaces = engine.static_review_surfaces(manifest, findings)
+    assert any(item.rule_id == "CHAIN-ANDROID-RUNTIME-IPC" for item in findings)
+    assert any(
+        s.family == "runtime_ipc_boundary"
+        for s in surfaces
+    ), "runtime_ipc_boundary surface should appear in static review"
+
+
+def test_self_reported_identity_from_extras_flagged_as_risk(tmp_path) -> None:
+    """Identity from Intent extras ('pkg' key) without callingUid check."""
+    root = tmp_path / "jadx"
+    _write(
+        root,
+        "sources/com/example/target/IntentIdentityService.java",
+        """
+        package com.example.target;
+        import android.os.Binder;
+        class IntentIdentityService extends IAuthService.Stub {
+          boolean onTransact(int code, Parcel data, Parcel reply, int flags) {
+            Intent intent = (Intent) data.readParcelable(null);
+            String callerIdentity = intent.getStringExtra("pkg");
+            return allowedPackages.contains(callerIdentity);
+          }
+        }
+        """,
+    )
+
+    manifest = _manifest()
+    chains = AndroidAttackChainAnalyzer().analyze(manifest, [root])
+    by_kind = {item["chain_kind"]: item for item in chains}
+
+    assert "binder_claimed_identity_authorization" in by_kind
+    chain = by_kind["binder_claimed_identity_authorization"]
+    assert "self_reported_identity" in chain["sink_markers"], (
+        "self_reported_identity marker should be detected from getStringExtra('pkg')"
+    )
+    assert "calling_uid_binding_not_observed_in_bounded_path" in chain["inferred_risks"]
+
+
+def test_plugin_archive_trust_without_signature_check(tmp_path) -> None:
+    """Plugin loaded via getPackageArchiveInfo without signature verification."""
+    root = tmp_path / "jadx"
+    _write(
+        root,
+        "sources/com/example/target/ExportBinder.java",
+        """
+        package com.example.target;
+        class ExportBinder extends IExportService.Stub {
+          boolean authorize(String callerPackage) {
+            android.content.pm.PackageInfo info =
+                pm.getPackageArchiveInfo(apkPath, 0);
+            return allowedPackages.contains(callerPackage);
+          }
+        }
+        """,
+    )
+
+    manifest = _manifest()
+    chains = AndroidAttackChainAnalyzer().analyze(manifest, [root])
+    by_kind = {item["chain_kind"]: item for item in chains}
+
+    assert "binder_claimed_identity_authorization" in by_kind
+    chain = by_kind["binder_claimed_identity_authorization"]
+    assert "plugin_archive_trust" in chain["risk_markers"], (
+        "plugin_archive_trust should be detected from getPackageArchiveInfo without signature flags"
+    )
+    assert "caller_identity_authorization" in chain["risk_markers"]
+
+
+def test_reverse_search_finds_path_missed_by_forward(tmp_path) -> None:
+    """Reverse (sink→source) search on reversed adjacency catches paths forward missed."""
+    root = tmp_path / "jadx"
+    _write(
+        root,
+        "sources/com/example/target/ExportBinder.java",
+        """
+        package com.example.target;
+        class ExportBinder extends IExportService.Stub {
+          void onTransact(int code, Parcel data, Parcel reply, int flags) {
+            // no reference to helper — forward search from here won't find the sink
+          }
+        }
+        """,
+    )
+    _write(
+        root,
+        "sources/com/example/target/IdentityHelper.java",
+        """
+        package com.example.target;
+        class IdentityHelper {
+          void checkCaller() {
+            String callerPackage = getCallingPackage();
+            // references ExportBinder → reverse edge B→A makes this reachable
+            com.example.target.ExportBinder svc = null;
+          }
+        }
+        """,
+    )
+
+    manifest = _manifest()
+    chains = AndroidAttackChainAnalyzer().analyze(manifest, [root])
+    by_kind = {item["chain_kind"]: item for item in chains}
+
+    assert "binder_claimed_identity_authorization" in by_kind
+    chain = by_kind["binder_claimed_identity_authorization"]
+    assert chain["search_direction"] == "reverse", (
+        "reverse search should find this path that forward search missed"
+    )
+    assert "caller_supplied_identity" in chain["sink_markers"]
+    assert "binder_entrypoint" in chain["source_markers"]
+
+
+def test_bidirectional_confluence_boosts_priority(tmp_path) -> None:
+    """When both forward and reverse find the same path, mark bidirectional + boost."""
+    root = tmp_path / "jadx"
+    _write(
+        root,
+        "sources/com/example/target/ExportBinder.java",
+        """
+        package com.example.target;
+        class ExportBinder extends IExportService.Stub {
+          boolean authorize(String callerPackage) {
+            com.example.target.IdentityHelper helper = new com.example.target.IdentityHelper();
+            return allowedPackages.contains(callerPackage);
+          }
+        }
+        """,
+    )
+    _write(
+        root,
+        "sources/com/example/target/IdentityHelper.java",
+        """
+        package com.example.target;
+        class IdentityHelper {
+          // references ExportBinder → reverse edge
+          com.example.target.ExportBinder parent;
+        }
+        """,
+    )
+
+    manifest = _manifest()
+    chains = AndroidAttackChainAnalyzer().analyze(manifest, [root])
+    by_kind = {item["chain_kind"]: item for item in chains}
+
+    assert "binder_claimed_identity_authorization" in by_kind
+    chain = by_kind["binder_claimed_identity_authorization"]
+    assert chain["search_direction"] == "bidirectional", (
+        "same path found by forward and reverse should be bidirectional"
+    )
+    assert chain["priority"] >= 100, (
+        "bidirectional confluence should boost priority to at least 100"
+    )
+
+
+def test_forward_search_direction_tagged_on_all_chains(tmp_path) -> None:
+    """Every forward-discovered chain should have search_direction set."""
+    root = tmp_path / "jadx"
+    _write(
+        root,
+        "sources/com/example/target/RedirectActivity.java",
+        """
+        package com.example.target;
+        class RedirectActivity {
+          void relay(Intent intent) {
+            Intent nested = intent.getParcelableExtra(Intent.EXTRA_INTENT);
+            startActivity(nested);
+          }
+        }
+        """,
+    )
+
+    manifest = _manifest()
+    chains = AndroidAttackChainAnalyzer().analyze(manifest, [root])
+    for chain in chains:
+        assert "search_direction" in chain, (
+            f"chain {chain['chain_kind']} should have search_direction"
+        )
+        assert chain["search_direction"] in {"forward", "reverse", "bidirectional"}

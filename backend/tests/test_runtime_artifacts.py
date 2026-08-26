@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import json
 
-from apkscanner.artifacts import ArtifactStore
-from apkscanner.db import Database
-from apkscanner.device import AdbDevicePool
-from apkscanner.evidence import EvidenceRecorder
-from apkscanner.models import RuntimeArtifact, Scan
-from apkscanner.runtime_artifacts import RuntimeArtifactService
-from apkscanner.schemas import RuntimeArtifactCaptureRequest
-from apkscanner.static_analysis import ApkInspector
+from apkscanner.analysis.static_analysis import ApkInspector
+from apkscanner.core.db import Database
+from apkscanner.core.evidence import EvidenceRecorder
+from apkscanner.core.models import RuntimeArtifact, Scan
+from apkscanner.core.schemas import RuntimeArtifactCaptureRequest
+from apkscanner.platform.artifacts import ArtifactStore
+from apkscanner.runtime.device import AdbDevicePool
+from apkscanner.runtime.runtime_artifacts import RuntimeArtifactService
 
 
 def test_runtime_artifact_reuses_analysis_and_only_adds_a_new_loader_edge(

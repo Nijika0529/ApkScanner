@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import pytest
-from apkscanner.adb_gateway import (
+from apkscanner.platform.tools import CommandResult
+from apkscanner.runtime.adb_gateway import (
     AdbGatewayRequest,
     AdbGatewayResponse,
     validate_adaptive_adb_args,
     validate_adb_args,
 )
-from apkscanner.tools import CommandResult
 from pydantic import ValidationError
 
 
@@ -54,7 +54,7 @@ def test_gateway_response_bounds_command_output() -> None:
     "args",
     [
         ["install", "/agent-workspaces/verifier/workspace/poc.apk"],
-        ["uninstall", "io.apkscanner.poc.verify"],
+        ["uninstall", "io.apkscanner.runtime.poc.verify"],
         ["push", "/agent-workspaces/verifier/workspace/page.html", "/data/local/tmp/page.html"],
         ["shell", "sh", "-c", "am start -a android.intent.action.VIEW"],
         ["forward", "tcp:8080", "tcp:8080"],

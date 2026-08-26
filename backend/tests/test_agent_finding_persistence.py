@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from apkscanner.artifacts import ArtifactStore
-from apkscanner.db import Database
-from apkscanner.finding_policy import partition_findings
-from apkscanner.models import (
+from apkscanner.core.db import Database
+from apkscanner.core.models import (
     EntryPoint,
     Evidence,
     Finding,
@@ -12,7 +10,9 @@ from apkscanner.models import (
     Scan,
     SecurityHypothesis,
 )
-from apkscanner.orchestrator import ScanOrchestrator
+from apkscanner.platform.artifacts import ArtifactStore
+from apkscanner.runtime.finding_policy import partition_findings
+from apkscanner.runtime.orchestrator import ScanOrchestrator
 from sqlalchemy import select
 
 

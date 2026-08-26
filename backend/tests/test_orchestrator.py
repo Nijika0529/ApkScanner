@@ -11,14 +11,8 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from apkscanner.adb_gateway import AdbGatewayRequest
-from apkscanner.agent_audit import build_agent_audits
-from apkscanner.agent_events import AgentCancelledError, AgentRuntimeEvent
-from apkscanner.artifacts import ArtifactStore
-from apkscanner.db import Database
-from apkscanner.device import AdbDeviceAdapter
-from apkscanner.finding_policy import partition_findings
-from apkscanner.models import (
+from apkscanner.core.db import Database
+from apkscanner.core.models import (
     AdaptiveVerificationCheckpoint,
     AgentRuntimeEventRecord,
     CoverageItem,
@@ -33,16 +27,22 @@ from apkscanner.models import (
     ScanEvent,
     SecurityHypothesis,
 )
-from apkscanner.orchestrator import ScanOrchestrator, _LiveProofContext
-from apkscanner.planner import StaticEntryClosure
-from apkscanner.reports import ReportBuilder
-from apkscanner.schemas import (
+from apkscanner.core.schemas import (
     AdaptiveVerificationResult,
     AdbDeviceOut,
     AgentInvestigationResult,
     AgentRuntimeObservation,
 )
-from apkscanner.tools import CommandResult, TimeBudget, ToolRunner
+from apkscanner.platform.artifacts import ArtifactStore
+from apkscanner.platform.reports import ReportBuilder
+from apkscanner.platform.tools import CommandResult, TimeBudget, ToolRunner
+from apkscanner.runtime.adb_gateway import AdbGatewayRequest
+from apkscanner.runtime.agent_audit import build_agent_audits
+from apkscanner.runtime.agent_events import AgentCancelledError, AgentRuntimeEvent
+from apkscanner.runtime.device import AdbDeviceAdapter
+from apkscanner.runtime.finding_policy import partition_findings
+from apkscanner.runtime.orchestrator import ScanOrchestrator, _LiveProofContext
+from apkscanner.runtime.planner import StaticEntryClosure
 from sqlalchemy import select
 
 
@@ -70,7 +70,7 @@ def test_preserve_policy_allows_target_launch_and_poc_cleanup() -> None:
         package_name="com.example.target",
     )
     assert not ScanOrchestrator._adb_command_destroys_target_data(
-        ["uninstall", "io.apkscanner.poc.zipprobe"],
+        ["uninstall", "io.apkscanner.runtime.poc.zipprobe"],
         package_name="com.example.target",
     )
 
@@ -133,7 +133,7 @@ def test_adaptive_gateway_replaces_only_a_stale_apkscanner_poc(
                     "Performing Streamed Install",
                     (
                         "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package "
-                        "io.apkscanner.poc.compat signatures do not match newer version]"
+                        "io.apkscanner.runtime.poc.compat signatures do not match newer version]"
                     ),
                 )
             return CommandResult(["adb", *args], 0, "Success\n", "")
@@ -179,7 +179,7 @@ def test_adaptive_gateway_replaces_only_a_stale_apkscanner_poc(
     assert response["exit_code"] == 0
     assert RetryDevice.calls == [
         ["install", "-r", str(workspace / "poc.apk")],
-        ["uninstall", "io.apkscanner.poc.compat"],
+        ["uninstall", "io.apkscanner.runtime.poc.compat"],
         ["install", "-r", str(workspace / "poc.apk")],
     ]
     assert [kind for kind, _result, _metadata in recorded] == [
@@ -193,12 +193,12 @@ def test_adaptive_gateway_treats_textual_am_start_error_as_failure() -> None:
     raw = CommandResult(
         ["adb", "shell", "am", "start"],
         0,
-        "Starting: Intent { cmp=io.apkscanner.poc.compat/.MainActivity }",
+        "Starting: Intent { cmp=io.apkscanner.runtime.poc.compat/.MainActivity }",
         "Error type 3\nError: Activity class does not exist.\n",
     )
 
     normalized = ScanOrchestrator._normalize_adaptive_adb_result(
-        ["shell", "am", "start", "-n", "io.apkscanner.poc.compat/.MainActivity"],
+        ["shell", "am", "start", "-n", "io.apkscanner.runtime.poc.compat/.MainActivity"],
         raw,
     )
 
@@ -2446,7 +2446,7 @@ def test_agent_generated_poc_is_built_from_the_docker_session_workspace(
                         "rationale": "Use the PoC generated in the writable session.",
                         "poc": {
                             "project_path": "poc/generated",
-                            "package_name": "io.apkscanner.poc.runtime",
+                            "package_name": "io.apkscanner.runtime.poc.runtime",
                             "launch_component": ".MainActivity",
                             "log_tag": "APKSCANNER_POC",
                             "timeout_seconds": 30,

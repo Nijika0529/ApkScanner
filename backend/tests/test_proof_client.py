@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 from urllib.request import Request
 
-from apkscanner import proof_client
+from apkscanner.runtime import proof_client
 
 
 class _Response:

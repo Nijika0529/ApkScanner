@@ -10,15 +10,15 @@ from pathlib import Path
 import yaml
 from sqlalchemy import select
 
-from .artifacts import ArtifactStore
-from .benchmark import BenchmarkEvaluator
-from .config import Settings
-from .db import Database
-from .models import EntryPoint, InvestigationTask, Scan
-from .orchestrator import ScanOrchestrator
-from .reports import ReportBuilder
-from .schemas import BenchmarkSpec
-from .tools import discover_tools
+from .core.config import Settings
+from .core.db import Database
+from .core.models import EntryPoint, InvestigationTask, Scan
+from .core.schemas import BenchmarkSpec
+from .platform.artifacts import ArtifactStore
+from .platform.reports import ReportBuilder
+from .platform.tools import discover_tools
+from .runtime.benchmark import BenchmarkEvaluator
+from .runtime.orchestrator import ScanOrchestrator
 
 
 def _runtime() -> tuple[Settings, Database, ArtifactStore, ScanOrchestrator]:
@@ -215,7 +215,7 @@ def context_command(args: argparse.Namespace) -> int:
 def serve_command(args: argparse.Namespace) -> int:
     import uvicorn
 
-    uvicorn.run("apkscanner.main:app", host="127.0.0.1", port=args.port, reload=args.reload)
+    uvicorn.run("apkscanner.main:app", host="0.0.0.0", port=args.port, reload=args.reload)
     return 0
 
 

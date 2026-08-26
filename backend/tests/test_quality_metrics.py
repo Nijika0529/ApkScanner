@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from apkscanner.db import Database
-from apkscanner.models import (
+from apkscanner.core.db import Database
+from apkscanner.core.models import (
     AgentSessionRecord,
     AgentTurnRecord,
     EntryPoint,
@@ -15,7 +15,7 @@ from apkscanner.models import (
     ScanEvent,
     SecurityHypothesis,
 )
-from apkscanner.quality_metrics import _classify_failure, build_scan_quality_summary
+from apkscanner.runtime.quality_metrics import _classify_failure, build_scan_quality_summary
 
 
 def test_failure_classifier_distinguishes_planning_and_runtime_receipt_gaps() -> None:

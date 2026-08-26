@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from apkscanner.manifest import aapt2_xmltree_to_xml, parse_manifest
+from apkscanner.analysis.manifest import aapt2_xmltree_to_xml, parse_manifest
 
 
 def test_aapt2_xmltree_manifest_preserves_permissions_and_components() -> None:

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import pytest
-from apkscanner.models import EntryPoint
-from apkscanner.orchestrator import ScanOrchestrator
-from apkscanner.schemas import AgentRequestedTest
+from apkscanner.core.models import EntryPoint
+from apkscanner.core.schemas import AgentRequestedTest
+from apkscanner.runtime.orchestrator import ScanOrchestrator
 
 
 def _payload(result: str, evidence_ids: list[str]) -> dict:  # noqa: ANN401

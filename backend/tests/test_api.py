@@ -7,11 +7,10 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-import apkscanner.api as api_module
+import apkscanner.platform.api as api_module
 import pytest
-from apkscanner.enums import TaskStatus
-from apkscanner.main import create_app
-from apkscanner.models import (
+from apkscanner.core.enums import TaskStatus
+from apkscanner.core.models import (
     EntryPoint,
     Evidence,
     Finding,
@@ -20,7 +19,8 @@ from apkscanner.models import (
     Scan,
     SecurityHypothesis,
 )
-from apkscanner.schemas import AgentInvestigationResult
+from apkscanner.core.schemas import AgentInvestigationResult
+from apkscanner.main import create_app
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 

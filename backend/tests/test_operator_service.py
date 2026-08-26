@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from apkscanner.artifacts import ArtifactStore
-from apkscanner.db import Database
-from apkscanner.finding_reports import build_finding_report, render_finding_description
-from apkscanner.models import Finding, InvestigationTask, Scan, SecurityHypothesis
-from apkscanner.operator_schemas import OPERATOR_RECEIPT_JSON_SCHEMA, OperatorSessionCreate
-from apkscanner.operator_service import PlatformOperatorService
-from apkscanner.orchestrator import ScanOrchestrator
+from apkscanner.core.db import Database
+from apkscanner.core.models import Finding, InvestigationTask, Scan, SecurityHypothesis
+from apkscanner.platform.artifacts import ArtifactStore
+from apkscanner.platform.operator_schemas import OPERATOR_RECEIPT_JSON_SCHEMA, OperatorSessionCreate
+from apkscanner.platform.operator_service import PlatformOperatorService
+from apkscanner.runtime.finding_reports import build_finding_report, render_finding_description
+from apkscanner.runtime.orchestrator import ScanOrchestrator
 
 
 def test_finding_report_is_hypothesis_scoped_and_compact(settings) -> None:  # noqa: ANN001

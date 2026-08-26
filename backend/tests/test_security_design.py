@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from apkscanner.models import EntryPoint, Scan
-from apkscanner.security_design import build_android_threat_model, finding_identity
+from apkscanner.analysis.security_design import build_android_threat_model, finding_identity
+from apkscanner.core.models import EntryPoint, Scan
 
 
 def _scan(scan_id: str, artifact: str, version: str) -> Scan:
