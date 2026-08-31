@@ -14,6 +14,7 @@
 | 2026-08-26 | 方向三 · 身份混淆 | 新增 3 markers（`service_manager_access`、`self_reported_identity`、`plugin_archive_trust`）+ 新链 `service_manager_identity_bypass` + 扩展现有 `binder_claimed_identity_authorization` + 推断风险分支 | 3 新测试，android_chains 19/19 | ✅ |
 | 2026-08-26 | 方向二 · 反向搜索 | `_reverse_chains_for_spec` sink→source BFS + `analyze()` 集成 + 双向汇合提权 + `search_direction` 字段 | 3 新测试，android_chains 19/19 | ✅ |
 | 2026-08-26 | 方向四 · 能力一等化 | `CapabilityObject` schema + `capability_objects.py` 提取模块（PendingIntent / URI Grant 生命周期追踪） | 5 新测试，capability_objects 5/5 | ✅ |
+| 2026-08-26 | 方向一 · 入口 disposition | `EntryDisposition` 枚举（10 态）+ `disposition.py` 解析器 + `EntryPoint.disposition` 字段 + 覆盖率指标 | 16 新测试，disposition 16/16 | ✅ |
 
 ---
 
@@ -63,9 +64,9 @@ sinks / risks / guards / max_hops / endpoint_discovery`）+ 正则 `MARKERS` / �
 
 ### 2.4 关键缺口（与本 Spec 方向一一对应）
 
-- 没有逐入口的 **10 态 disposition** 状态机（方向一）；
-- 只有正向 source→sink，没有 **sink-first 反向搜索**（方向二）；
-- 能力对象仍是 marker，不是 **一等实体**（方向四）；
+
+
+
 - 没有 coroutine/ViewModel/WorkManager/Handler/EventBus 等 **异步与生命周期边**（方向五）；
 - Native 只有静态资产级覆盖，没有 **动态原生验证**（Frida/ASan/fuzzer，方向六）；
 - 没有显式的 **安全断言 → 反证实验** 产物（方向七）；

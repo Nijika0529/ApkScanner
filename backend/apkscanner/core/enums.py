@@ -98,3 +98,22 @@ class CoverageStatus(StrEnum):
     NOT_APPLICABLE = "not_applicable"
     TOOL_FAILED = "tool_failed"
     DEGRADED = "degraded"
+
+
+class EntryDisposition(StrEnum):
+    """Mandatory per-entry disposition after scan completion.
+
+    Every entry point must resolve to exactly one of these states,
+    replacing the previous ad-hoc "was it investigated?" ambiguity.
+    """
+
+    UNINVESTIGATED = "uninvestigated"
+    STATICALLY_UNREACHABLE = "statically_unreachable"
+    PERMISSION_PROTECTED = "permission_protected"
+    CALLER_IDENTITY_PROTECTED = "caller_identity_protected"
+    ATTACK_CHAIN_CANDIDATE = "attack_chain_candidate"
+    STATICALLY_SUPPORTED = "statically_supported"
+    DYNAMICALLY_NOT_REPRODUCED = "dynamically_not_reproduced"
+    DYNAMICALLY_REFUTED = "dynamically_refuted"
+    REPRODUCED_BLACKBOX = "reproduced_blackbox"
+    CAPABILITY_GAP = "capability_gap"

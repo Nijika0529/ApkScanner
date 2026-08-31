@@ -206,6 +206,7 @@ class EntryPoint(Base):
     deep_links: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     code_anchors: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    disposition: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     scan: Mapped[Scan] = relationship(back_populates="entries")

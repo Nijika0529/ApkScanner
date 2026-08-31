@@ -95,6 +95,7 @@ class EntryPointOut(ApiModel):
     deep_links: list[dict[str, Any]]
     code_anchors: list[dict[str, Any]]
     metadata_json: dict[str, Any]
+    disposition: str | None = None
 
 
 class FindingOut(ApiModel):
