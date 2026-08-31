@@ -54,7 +54,7 @@ def test_gateway_response_bounds_command_output() -> None:
     "args",
     [
         ["install", "/agent-workspaces/verifier/workspace/poc.apk"],
-        ["uninstall", "io.apkscanner.runtime.poc.verify"],
+        ["uninstall", "io.apkscanner.poc.verify"],
         ["push", "/agent-workspaces/verifier/workspace/page.html", "/data/local/tmp/page.html"],
         ["shell", "sh", "-c", "am start -a android.intent.action.VIEW"],
         ["forward", "tcp:8080", "tcp:8080"],

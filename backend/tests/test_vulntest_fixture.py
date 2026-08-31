@@ -137,7 +137,7 @@ def test_vulntest_source_contains_real_attack_paths_and_safe_control() -> None:
 
 def test_platform_proof_harness_supports_binder_transactions() -> None:
     source = PocBuilder._platform_proof_source(
-        package_name="io.apkscanner.runtime.poc.proof_fixture",
+        package_name="io.apkscanner.poc.proof_fixture",
         encoded_request="e30=",
     )
 

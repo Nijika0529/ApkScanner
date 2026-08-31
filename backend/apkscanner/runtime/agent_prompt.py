@@ -469,7 +469,7 @@ def investigation_prompt(
             "do not use Java lambdas; use anonymous callback or Runnable classes so dx-based and "
             "older-device validation remains deterministic. Use prebuilt_apk_path only when "
             "source_build_available is false. "
-            "The PoC package must start with io.apkscanner.runtime.poc. Prefer poc.harness_mode="
+            "The PoC package must start with io.apkscanner.poc. Prefer poc.harness_mode="
             "platform_generated: provide attack_class with a public static runAttack(Activity, "
             "Intent) method and set launch_component to .ApkScannerHarnessActivity. The method may "
             "return Boolean, String, or a Bundle containing success, result_summary, and an optional "
@@ -799,9 +799,9 @@ def investigation_prompt(
         "Binder fields for a platform-generated proof Harness; extras/reset are optional. Copy both IDs exactly from the supplied task "
         'context. Use this shape: {"hypothesis_id":"<exact-id>","entry_point_id":'
         '"<exact-seed-id>","poc":{"project_path":"poc/name","package_name":'
-        '"io.apkscanner.runtime.poc.name","launch_component":".ApkScannerHarnessActivity",'
+        '"io.apkscanner.poc.name","launch_component":".ApkScannerHarnessActivity",'
         '"log_tag":"APKSCANNER_POC","harness_mode":"platform_generated",'
-        '"attack_class":"io.apkscanner.runtime.poc.name.Exploit"},"oracle":'
+        '"attack_class":"io.apkscanner.poc.name.Exploit"},"oracle":'
         '{"kind":"provider_rows","minimum_rows":1,'
         '"impact":"unauthorized_data_access"},"rationale":'
         '"final ordinary-app replay"}. '

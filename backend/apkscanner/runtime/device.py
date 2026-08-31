@@ -1008,7 +1008,7 @@ class AdbDeviceAdapter:
                 commands.append(("blackbox.target_uid", target_uid_result, dict(common)))
                 # A prior worker may have been interrupted before its cleanup, or a
                 # fresh data directory may use a different signing key. Removing
-                # only the validated io.apkscanner.runtime.poc.* package makes the next
+                # only the validated io.apkscanner.poc.* package makes the next
                 # install deterministic without touching the target application.
                 stale_uninstall = self._adb_budget(
                     ["uninstall", spec.package_name],
@@ -1582,7 +1582,7 @@ class AdbDeviceAdapter:
     ) -> tuple[CommandResult, dict[str, Any] | None, dict[str, Any]]:
         """Read a temporary platform PoC's request-bound private receipt.
 
-        The receipt is intentionally scoped to the generated ``io.apkscanner.runtime.poc``
+        The receipt is intentionally scoped to the generated ``io.apkscanner.poc``
         package and is not an observation of target-app private data. A nonterminal
         ``started`` receipt proves only entry into the PoC; callers must still use a
         terminal receipt or an independent target Oracle before treating execution as

@@ -1015,7 +1015,7 @@ def test_android13_device_is_local_verdict_but_not_release_gate_eligible(
     apk.write_bytes(b"APK")
     spec = AgentPocSpec(
         project_path="poc/test",
-        package_name="io.apkscanner.runtime.poc.legacysmoke",
+        package_name="io.apkscanner.poc.legacysmoke",
         launch_component=".MainActivity",
         log_tag="APKSCANNER_POC",
         timeout_seconds=5,
@@ -1114,7 +1114,7 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
     apk.write_bytes(b"APK")
     spec = AgentPocSpec(
         project_path="poc/test",
-        package_name="io.apkscanner.runtime.poc.test",
+        package_name="io.apkscanner.poc.test",
         launch_component=".MainActivity",
         log_tag="APKSCANNER_POC",
     )
@@ -1294,7 +1294,7 @@ def test_poc_durable_receipt_is_a_terminal_request_bound_observation(settings) -
     )
 
     result, payload, metadata = adapter._poll_poc_durable_receipt(
-        package_name="io.apkscanner.runtime.poc.receipt",
+        package_name="io.apkscanner.poc.receipt",
         request_id="request-receipt",
         timeout_seconds=5,
         budget=None,
@@ -1328,10 +1328,10 @@ def test_poc_runtime_diagnostics_classify_install_launch_and_dex_failures() -> N
     runtime = AdbDeviceAdapter._poc_runtime_diagnostics(
         (
             "FATAL EXCEPTION: main\n"
-            "Process: io.apkscanner.runtime.poc.compat, PID: 123\n"
+            "Process: io.apkscanner.poc.compat, PID: 123\n"
             "java.lang.VerifyError: rejected class"
         ),
-        "io.apkscanner.runtime.poc.compat",
+        "io.apkscanner.poc.compat",
     )
 
     assert install == {
@@ -1476,7 +1476,7 @@ def test_poc_owned_ui_cannot_forge_a_target_security_impact() -> None:
 
     metadata = AdbDeviceAdapter._evaluate_ui_oracle(
         oracle,
-        ('<hierarchy><node package="io.apkscanner.runtime.poc.test" text="Imported secret" /></hierarchy>'),
+        ('<hierarchy><node package="io.apkscanner.poc.test" text="Imported secret" /></hierarchy>'),
         package_name="com.example.target",
         baseline_output=('<hierarchy><node package="com.example.target" text="" /></hierarchy>'),
         baseline_valid=True,
@@ -1629,7 +1629,7 @@ def test_process_crash_oracle_requires_the_target_process() -> None:
         (
             "Process: com.example.target, PID: 99\n"
             "FATAL EXCEPTION: main\n"
-            "Process: io.apkscanner.runtime.poc.test, PID: 123\n"
+            "Process: io.apkscanner.poc.test, PID: 123\n"
             "noise mentioning com.example.target"
         ),
         "com.example.target",

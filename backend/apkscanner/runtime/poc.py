@@ -213,7 +213,7 @@ class PocBuilder:
             separators=(",", ":"),
         ).encode("utf-8")
         digest = hashlib.sha256(serialized).hexdigest()[:16]
-        package_name = f"io.apkscanner.runtime.poc.proof_{digest}"
+        package_name = f"io.apkscanner.poc.proof_{digest}"
         relative_project = Path("poc") / f"platform-proof-{digest}"
         root = workspace.resolve()
         project = (root / relative_project).resolve()
@@ -1037,7 +1037,7 @@ class PocBuilder:
                 if len(normalized_declared) == 1
                 else []
             )
-            if len(candidates) != 1 or not candidates[0].startswith("io.apkscanner.runtime.poc."):
+            if len(candidates) != 1 or not candidates[0].startswith("io.apkscanner.poc."):
                 raise ValueError("launch_component is not declared as an activity")
             effective_spec = AgentPocSpec.model_validate(
                 {
@@ -1096,7 +1096,7 @@ class PocBuilder:
                 )
             )
         if component not in java_activities:
-            candidates = [item for item in java_activities if item.startswith("io.apkscanner.runtime.poc.")]
+            candidates = [item for item in java_activities if item.startswith("io.apkscanner.poc.")]
             if len(candidates) != 1:
                 raise ValueError("PoC launcher activity must match exactly one Java Activity class")
             effective_spec = AgentPocSpec.model_validate(
@@ -1169,12 +1169,12 @@ class PocBuilder:
         package_name = manifest_root.get("package")
         if manifest_root.tag != "manifest" or not package_name:
             raise ValueError("PoC manifest requires a package")
-        if not package_name.startswith("io.apkscanner.runtime.poc"):
-            raise ValueError("platform-generated PoC package must start with io.apkscanner.runtime.poc")
+        if not package_name.startswith("io.apkscanner.poc"):
+            raise ValueError("platform-generated PoC package must start with io.apkscanner.poc")
         application = manifest_root.find("application")
         if application is None:
             raise ValueError("PoC manifest requires an application")
-        # The platform owns this short-lived io.apkscanner.runtime.poc.* package. Mark it
+        # The platform owns this short-lived io.apkscanner.poc.* package. Mark it
         # debuggable solely so the host can read its private, request-bound proof
         # receipt with `run-as` before it is uninstalled.
         application.set(f"{{{ANDROID_NAMESPACE}}}debuggable", "true")

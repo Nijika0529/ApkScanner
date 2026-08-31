@@ -14,6 +14,7 @@ import pytest
 from apkscanner.core.db import Database
 from apkscanner.core.models import (
     AdaptiveVerificationCheckpoint,
+    AdbDeviceRecord,
     AgentRuntimeEventRecord,
     CoverageItem,
     EntryPoint,
@@ -70,7 +71,7 @@ def test_preserve_policy_allows_target_launch_and_poc_cleanup() -> None:
         package_name="com.example.target",
     )
     assert not ScanOrchestrator._adb_command_destroys_target_data(
-        ["uninstall", "io.apkscanner.runtime.poc.zipprobe"],
+        ["uninstall", "io.apkscanner.poc.zipprobe"],
         package_name="com.example.target",
     )
 
@@ -133,7 +134,7 @@ def test_adaptive_gateway_replaces_only_a_stale_apkscanner_poc(
                     "Performing Streamed Install",
                     (
                         "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package "
-                        "io.apkscanner.runtime.poc.compat signatures do not match newer version]"
+                        "io.apkscanner.poc.compat signatures do not match newer version]"
                     ),
                 )
             return CommandResult(["adb", *args], 0, "Success\n", "")
@@ -179,7 +180,7 @@ def test_adaptive_gateway_replaces_only_a_stale_apkscanner_poc(
     assert response["exit_code"] == 0
     assert RetryDevice.calls == [
         ["install", "-r", str(workspace / "poc.apk")],
-        ["uninstall", "io.apkscanner.runtime.poc.compat"],
+        ["uninstall", "io.apkscanner.poc.compat"],
         ["install", "-r", str(workspace / "poc.apk")],
     ]
     assert [kind for kind, _result, _metadata in recorded] == [
@@ -193,12 +194,12 @@ def test_adaptive_gateway_treats_textual_am_start_error_as_failure() -> None:
     raw = CommandResult(
         ["adb", "shell", "am", "start"],
         0,
-        "Starting: Intent { cmp=io.apkscanner.runtime.poc.compat/.MainActivity }",
+        "Starting: Intent { cmp=io.apkscanner.poc.compat/.MainActivity }",
         "Error type 3\nError: Activity class does not exist.\n",
     )
 
     normalized = ScanOrchestrator._normalize_adaptive_adb_result(
-        ["shell", "am", "start", "-n", "io.apkscanner.runtime.poc.compat/.MainActivity"],
+        ["shell", "am", "start", "-n", "io.apkscanner.poc.compat/.MainActivity"],
         raw,
     )
 
@@ -237,6 +238,54 @@ def test_device_listing_fills_verdict_contract_for_partial_capability(
     assert validated.android16_verdict_eligible is False
     assert validated.dynamic_verdict_eligible is False
     assert validated.verdict_scope == "unavailable"
+
+
+def test_remove_device_deletes_orphaned_db_record_not_in_runtime_pool(
+    settings,
+) -> None:  # noqa: ANN001
+    """A device persisted from a previous bootstrap must still be removable."""
+    configured = replace(settings, adb_serial="device-a:5555")
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    orchestrator = ScanOrchestrator(
+        configured,
+        database,
+        ArtifactStore(configured),
+    )
+
+    # Simulate an orphaned record: persisted in DB but absent from the runtime pool.
+    with database.session_factory() as session:
+        session.add(AdbDeviceRecord(serial="device-b:5555", state="ready"))
+        session.commit()
+
+    assert len(orchestrator.list_adb_devices()) == 2
+
+    orchestrator.remove_adb_device("device-b:5555")
+
+    remaining = orchestrator.list_adb_devices()
+    assert [d["serial"] for d in remaining] == ["device-a:5555"]
+    with database.session_factory() as session:
+        record = session.scalar(
+            select(AdbDeviceRecord).where(AdbDeviceRecord.serial == "device-b:5555")
+        )
+        assert record is None
+
+
+def test_remove_device_rejects_active_device(settings) -> None:  # noqa: ANN001
+    configured = replace(settings, adb_serial="device-a:5555")
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    orchestrator = ScanOrchestrator(
+        configured,
+        database,
+        ArtifactStore(configured),
+    )
+
+    with pytest.raises(RuntimeError, match="active"):
+        orchestrator.device_pool.scheduler._active_by_serial["device-a:5555"] = "task-1"
+        orchestrator.remove_adb_device("device-a:5555")
 
 
 def test_adaptive_verifier_batches_high_value_static_findings_once(
@@ -2446,7 +2495,7 @@ def test_agent_generated_poc_is_built_from_the_docker_session_workspace(
                         "rationale": "Use the PoC generated in the writable session.",
                         "poc": {
                             "project_path": "poc/generated",
-                            "package_name": "io.apkscanner.runtime.poc.runtime",
+                            "package_name": "io.apkscanner.poc.runtime",
                             "launch_component": ".MainActivity",
                             "log_tag": "APKSCANNER_POC",
                             "timeout_seconds": 30,

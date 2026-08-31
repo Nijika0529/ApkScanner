@@ -471,11 +471,11 @@ def test_single_critic_turn_can_report_every_material_objection() -> None:
 def test_poc_base_package_remains_inside_the_controlled_namespace() -> None:
     spec = AgentPocSpec(
         project_path="poc/base",
-        package_name="io.apkscanner.runtime.poc",
-        launch_component="io.apkscanner.runtime.poc.MainActivity",
+        package_name="io.apkscanner.poc",
+        launch_component="io.apkscanner.poc.MainActivity",
     )
 
-    assert spec.package_name == "io.apkscanner.runtime.poc"
+    assert spec.package_name == "io.apkscanner.poc"
 
 
 def test_invalid_optional_requested_test_does_not_discard_static_verdict() -> None:
@@ -550,8 +550,8 @@ def test_poc_log_oracle_recovers_an_omitted_expected_text() -> None:
                 },
                 "poc": {
                     "project_path": "poc/deep_link",
-                    "package_name": "io.apkscanner.runtime.poc.deep_link",
-                    "launch_component": ("io.apkscanner.runtime.poc.deep_link.MainActivity"),
+                    "package_name": "io.apkscanner.poc.deep_link",
+                    "launch_component": ("io.apkscanner.poc.deep_link.MainActivity"),
                 },
                 "rationale": "用独立 PoC 应用验证目标入口。",
             }
@@ -593,10 +593,10 @@ def test_agent_result_repairs_fields_from_the_wrong_execution_mode() -> None:
                 },
                 "poc": {
                     "project_path": "poc/custom_harness",
-                    "package_name": "io.apkscanner.runtime.poc.custom_harness",
-                    "launch_component": "io.apkscanner.runtime.poc.custom_harness.MainActivity",
+                    "package_name": "io.apkscanner.poc.custom_harness",
+                    "launch_component": "io.apkscanner.poc.custom_harness.MainActivity",
                     "harness_mode": "custom",
-                    "attack_class": "io.apkscanner.runtime.poc.custom_harness.Attack",
+                    "attack_class": "io.apkscanner.poc.custom_harness.Attack",
                 },
                 "rationale": "自定义 Activity 执行攻击并观察目标 UI。",
             }
@@ -626,7 +626,7 @@ def test_agent_result_repairs_fields_from_the_wrong_execution_mode() -> None:
         {
             "location": "requested_tests.0.poc.attack_class",
             "repair": "removed_platform_harness_only_field",
-            "original_value": "io.apkscanner.runtime.poc.custom_harness.Attack",
+            "original_value": "io.apkscanner.poc.custom_harness.Attack",
         },
     ]
 

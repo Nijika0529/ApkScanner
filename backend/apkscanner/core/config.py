@@ -99,7 +99,7 @@ class Settings:
     def from_env(cls) -> Settings:
         data_dir = Path(os.getenv("APKSCANNER_DATA_DIR", ".data")).resolve()
         database_url = os.getenv(
-            "APKSCANNER_DATABASE_URL", f"sqlite:///{data_dir / 'apkscanner.core.db'}"
+            "APKSCANNER_DATABASE_URL", f"sqlite:///{data_dir / 'apkscanner.db'}"
         )
         frontend = os.getenv("APKSCANNER_FRONTEND_DIST")
         configured_serials = tuple(

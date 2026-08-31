@@ -403,8 +403,12 @@ class ScanOrchestrator:
         serial = self._validate_adb_serial(serial)
         if self.device_pool.is_active(serial):
             raise RuntimeError("Device is active; drain it and wait for the task to release it")
-        if not self.device_pool.remove(serial):
-            raise KeyError(serial)
+        # Best-effort removal from the runtime pool: a device may be persisted in
+        # the database from a previous bootstrap but absent from the current
+        # runtime pool (e.g. the server was restarted with different
+        # APKSCANNER_ADB_SERIALS).  The database record is the source of truth,
+        # so deleting it below is what actually removes the device.
+        self.device_pool.remove(serial)
         with self.database.session_factory() as session:
             record = session.scalar(select(AdbDeviceRecord).where(AdbDeviceRecord.serial == serial))
             if record is None:
@@ -716,7 +720,7 @@ class ScanOrchestrator:
         if match is None:
             return None
         package_name = match.group(1)
-        if package_name == target_package or not package_name.startswith("io.apkscanner.runtime.poc."):
+        if package_name == target_package or not package_name.startswith("io.apkscanner.poc."):
             return None
         return package_name
 

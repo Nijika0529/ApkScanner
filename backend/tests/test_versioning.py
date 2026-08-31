@@ -88,7 +88,7 @@ def test_snapshot_diff_migrates_only_proven_poc(settings, tmp_path) -> None:  # 
     with zipfile.ZipFile(source_zip, "w") as archive:
         archive.writestr(
             "AndroidManifest.xml",
-            '<manifest package="io.apkscanner.runtime.poc.replay"/>',
+            '<manifest package="io.apkscanner.poc.replay"/>',
         )
         archive.writestr("src/io/apkscanner/poc/replay/Main.java", "class Main {}")
     source_sha = hashlib.sha256(source_zip.read_bytes()).hexdigest()
@@ -139,7 +139,7 @@ def test_snapshot_diff_migrates_only_proven_poc(settings, tmp_path) -> None:  # 
                 "rationale": "Read one secret row.",
                 "poc": {
                     "project_path": "poc/old",
-                    "package_name": "io.apkscanner.runtime.poc.replay",
+                    "package_name": "io.apkscanner.poc.replay",
                     "launch_component": ".MainActivity",
                     "log_tag": "APKSCANNER_POC",
                     "timeout_seconds": 60,
