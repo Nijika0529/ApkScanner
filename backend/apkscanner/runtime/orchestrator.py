@@ -36,9 +36,11 @@ from ..analysis.target_profiles import (
 from ..core.config import Settings
 from ..core.db import Database
 from ..core.enums import (
+    FINDING_STATUS_RANK,
     CoverageStatus,
     EntryPointKind,
     FindingStatus,
+    HypothesisStatus,
     ScanStatus,
     TaskStatus,
     TaskType,
@@ -56,6 +58,7 @@ from ..core.models import (
     EntryPoint,
     Evidence,
     Finding,
+    IndexedArtifact,
     InvestigationTask,
     ProofAttempt,
     RuntimeObservation,
@@ -64,7 +67,12 @@ from ..core.models import (
     SecurityHypothesis,
     ValidationFixture,
 )
-from ..core.repository import add_event, now
+from ..core.proof_receipts import (
+    attributable_harm_attempts,
+    attributable_refutation_attempts,
+    evidence_backed_harm_attempts,
+)
+from ..core.repository import add_event, invalidate_scan_materialized_summary, now
 from ..core.schemas import (
     ADAPTIVE_VERIFIER_RESULT_JSON_SCHEMA,
     AGENT_RESULT_JSON_SCHEMA,
@@ -80,7 +88,11 @@ from ..platform.artifacts import ArtifactStore
 from ..platform.attacker_templates import attacker_template_catalog, materialize_attacker_templates
 from ..platform.tools import CommandResult, TimeBudget, ToolRunner
 from ..platform.versioning import SecurityEvolutionService
-from .adb_gateway import AdbGatewayRequest, AdbGatewayResponse
+from .adb_gateway import (
+    AdbGatewayRequest,
+    AdbGatewayResponse,
+    validate_dynamic_experiment_adb_template,
+)
 from .agent_events import AgentCancelledError, AgentRuntimeEvent
 from .agent_prompt import (
     adaptive_verification_prompt,
@@ -90,8 +102,19 @@ from .agent_prompt import (
 )
 from .codex_runner import CodexInvestigator, CodexRunResult
 from .device import AdbDeviceAdapter, AdbDevicePool, DeviceLeaseCancelledError
+from .disposition import (
+    disposition_coverage_rate,
+    disposition_summary,
+    resolve_entry_dispositions,
+)
 from .dynamic_experiments import DynamicExperimentService
-from .finding_policy import partition_findings
+from .finding_policy import (
+    build_static_refutation_gate,
+    evidence_backed_signal_tier,
+    partition_findings,
+    static_evidence_is_usable,
+    static_refutation_is_evidence_backed,
+)
 from .finding_reports import (
     FindingReport,
     build_finding_report,
@@ -104,6 +127,11 @@ from .proof_recipes import ProofRecipe, bind_proof_recipe, proof_recipe_from_pla
 from .runtime_artifacts import RuntimeArtifactService
 from .runtime_contracts import task_gateway_environment
 from .security_pipeline import HypothesisLedger
+from .signal_projection import (
+    evidence_supports_runtime_observation,
+    project_runtime_observation_gap,
+)
+from .signal_tiers import valid_static_support_gate
 
 REACHABILITY_ONLY_HYPOTHESIS_CLAIMS = frozenset(
     {
@@ -1264,19 +1292,71 @@ class ScanOrchestrator:
                 )
             )
             if existing is not None:
+                existing_evidence_ids = (
+                    [
+                        evidence_id
+                        for evidence_id in existing.evidence_ids
+                        if isinstance(evidence_id, str) and evidence_id
+                    ]
+                    if isinstance(existing.evidence_ids, list)
+                    else []
+                )
+                finding = (
+                    session.get(Finding, existing.finding_id)
+                    if existing.finding_id is not None
+                    else None
+                )
+                existing_source_evidence = list(
+                    session.scalars(
+                        select(Evidence).where(
+                            Evidence.scan_id == context.scan_id,
+                            Evidence.id.in_(existing_evidence_ids),
+                        )
+                    )
+                )
+                if finding is not None and any(
+                    evidence_supports_runtime_observation(item)
+                    for item in existing_source_evidence
+                ):
+                    projected = self._project_runtime_observation_gap(
+                        finding,
+                        observation_id=existing.id,
+                        evidence_ids=existing_evidence_ids,
+                        task_id=task_id,
+                        observation_kind=existing.kind,
+                    )
+                    if projected:
+                        invalidate_scan_materialized_summary(
+                            session,
+                            context.scan_id,
+                            reason="runtime_observation_projection",
+                        )
+                    session.commit()
                 return {
                     "schema_version": "1.0",
                     "id": existing.id,
                     "observation_key": existing.observation_key,
                     "deduplicated": True,
                 }
+            finding: Finding | None = None
             if observation.finding_id is not None:
                 finding = session.get(Finding, observation.finding_id)
                 if finding is None or finding.scan_id != context.scan_id:
                     raise ValueError("runtime observation finding is outside this scan")
-            known_evidence_ids = set(
-                session.scalars(select(Evidence.id).where(Evidence.scan_id == context.scan_id))
+            known_evidence = (
+                list(
+                    session.scalars(
+                        select(Evidence).where(
+                            Evidence.scan_id == context.scan_id,
+                            Evidence.id.in_(observation.evidence_ids),
+                        )
+                    )
+                )
+                if observation.evidence_ids
+                else []
             )
+            known_evidence_by_id = {item.id: item for item in known_evidence}
+            known_evidence_ids = set(known_evidence_by_id)
             if not set(observation.evidence_ids) <= known_evidence_ids:
                 raise ValueError("runtime observation references unknown evidence")
             evidence = self.evidence.json(
@@ -1294,6 +1374,13 @@ class ScanOrchestrator:
                     "source": observation.source,
                     "kind": observation.kind,
                     "finding_id": observation.finding_id,
+                    "platform_runtime_receipt_ids": [
+                        evidence_id
+                        for evidence_id in observation.evidence_ids
+                        if evidence_supports_runtime_observation(
+                            known_evidence_by_id[evidence_id]
+                        )
+                    ],
                 },
             )
             record = RuntimeObservation(
@@ -1312,6 +1399,26 @@ class ScanOrchestrator:
                 },
             )
             session.add(record)
+            session.flush()
+            if finding is not None and any(
+                evidence_supports_runtime_observation(
+                    known_evidence_by_id[evidence_id]
+                )
+                for evidence_id in observation.evidence_ids
+            ):
+                projected = self._project_runtime_observation_gap(
+                    finding,
+                    observation_id=record.id,
+                    evidence_ids=list(record.evidence_ids),
+                    task_id=task_id,
+                    observation_kind=record.kind,
+                )
+                if projected:
+                    invalidate_scan_materialized_summary(
+                        session,
+                        context.scan_id,
+                        reason="runtime_observation_projection",
+                    )
             add_event(
                 session,
                 context.scan_id,
@@ -1335,6 +1442,24 @@ class ScanOrchestrator:
                 "evidence_id": evidence.id,
                 "deduplicated": False,
             }
+
+    @staticmethod
+    def _project_runtime_observation_gap(
+        finding: Finding,
+        *,
+        observation_id: str,
+        evidence_ids: list[str],
+        task_id: str,
+        observation_kind: str,
+    ) -> bool:
+        """Project a durable runtime fact without turning it into a proven vulnerability."""
+        return project_runtime_observation_gap(
+            finding,
+            observation_id=observation_id,
+            evidence_ids=evidence_ids,
+            task_id=task_id,
+            observation_kind=observation_kind,
+        )
 
     def resolve_investigator(self, requested: str = "configured") -> str:
         backend = (
@@ -2106,15 +2231,38 @@ class ScanOrchestrator:
                 session.add(coverage_item)
                 entry_coverage[entry.id] = coverage_item
             for tool, payload in result.tool_results.items():
-                metadata = (
+                decompilation = (
                     {
                         key: value
                         for key, value in dict(payload.get("decompilation") or {}).items()
                         if key != "failed_classes"
                     }
                     if tool == "jadx"
-                    else None
+                    else {}
                 )
+                timed_out = payload.get("timed_out") is True
+                exit_code = payload.get("exit_code")
+                output_usable = (
+                    decompilation.get("output_usable") is True
+                    if tool == "jadx"
+                    else exit_code == 0 and not timed_out
+                )
+                tool_status = (
+                    str(decompilation.get("status") or "unknown")
+                    if tool == "jadx"
+                    else "timed_out"
+                    if timed_out
+                    else "succeeded"
+                    if exit_code == 0
+                    else "tool_failed"
+                )
+                metadata = {
+                    **decompilation,
+                    "static_output_usable": output_usable,
+                    "static_tool_status": tool_status,
+                    "static_tool_timed_out": timed_out,
+                    "static_tool_exit_code": exit_code,
+                }
                 self.evidence.json(
                     session,
                     scan_id=scan.id,
@@ -2456,9 +2604,18 @@ class ScanOrchestrator:
                 for finding in session.scalars(
                     select(Finding).where(
                         Finding.scan_id == scan_id,
-                        Finding.status == FindingStatus.SUPPORTED_STATIC.value,
+                        Finding.status.in_(
+                            [
+                                FindingStatus.SUPPORTED_STATIC.value,
+                                FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value,
+                                "static_path_supported",
+                                "oracle_gap",
+                            ]
+                        ),
                     )
                 )
+                if evidence_backed_signal_tier(session, finding)
+                in {"static_chain", "runtime_oracle_gap"}
                 if severity_rank.get(finding.severity, 0) >= minimum_rank
             ]
             candidates.sort(
@@ -2796,7 +2953,8 @@ class ScanOrchestrator:
 
     @staticmethod
     def _finding_semantic_identity(finding: Finding) -> str | None:
-        identity = (finding.metadata_json or {}).get("identity")
+        metadata = finding.metadata_json if isinstance(finding.metadata_json, dict) else {}
+        identity = metadata.get("identity")
         if not isinstance(identity, dict):
             return None
         for key in ("semantic_fingerprint", "finding_id"):
@@ -2834,13 +2992,44 @@ class ScanOrchestrator:
                 .order_by(Finding.created_at, Finding.id)
             )
         )
+
+        def finding_metadata(finding: Finding) -> dict[str, Any]:
+            return (
+                dict(finding.metadata_json)
+                if isinstance(finding.metadata_json, dict)
+                else {}
+            )
+
+        def finding_string_list(value: Any) -> list[str]:
+            return (
+                [item for item in value if isinstance(item, str) and item]
+                if isinstance(value, list)
+                else []
+            )
+
         active = [
             finding
             for finding in findings
-            if not isinstance((finding.metadata_json or {}).get("merged_into_finding_id"), str)
+            if not isinstance(finding_metadata(finding).get("merged_into_finding_id"), str)
         ]
         by_id = {finding.id: finding for finding in active}
         adjacency: dict[str, set[str]] = {finding.id: set() for finding in active}
+        harm_attempts_by_finding = {
+            finding.id: attributable_harm_attempts(session, finding)
+            for finding in active
+            if finding.status
+            in {
+                FindingStatus.REPRODUCED_BLACKBOX.value,
+                FindingStatus.ACCEPTED.value,
+            }
+            or finding_metadata(finding).get("harm_demonstrated") is True
+        }
+        refuting_attempts_by_finding = {
+            finding.id: attributable_refutation_attempts(session, finding)
+            for finding in active
+            if finding.status == FindingStatus.NOT_REPRODUCED.value
+            or bool(finding_metadata(finding).get("refutation_attempt_ids"))
+        }
         proof_signature_by_finding: dict[str, set[str]] = defaultdict(set)
         identity_groups: dict[str, list[str]] = defaultdict(list)
         for finding in active:
@@ -2855,38 +3044,18 @@ class ScanOrchestrator:
                 adjacency[first].add(duplicate_id)
                 adjacency[duplicate_id].add(first)
 
-        proof_attempt_ids = {
-            proof_id
-            for finding in active
-            if (finding.metadata_json or {}).get("harm_demonstrated") is True
-            for proof_id in (finding.metadata_json or {}).get("proof_attempt_ids", [])
-            if isinstance(proof_id, str) and proof_id
-        }
-        proof_attempt_by_id = {
-            attempt.id: attempt
-            for attempt in (
-                session.scalars(select(ProofAttempt).where(ProofAttempt.id.in_(proof_attempt_ids)))
-                if proof_attempt_ids
-                else []
-            )
-        }
         proof_signature_groups: dict[str, list[str]] = defaultdict(list)
         for finding in active:
-            metadata = dict(finding.metadata_json or {})
-            task_id = metadata.get("task_id")
-            if metadata.get("harm_demonstrated") is not True or not isinstance(task_id, str):
-                continue
-            for proof_id in metadata.get("proof_attempt_ids", []):
-                attempt = proof_attempt_by_id.get(proof_id)
-                if attempt is None or not attempt.harm_demonstrated:
-                    continue
+            for attempt in harm_attempts_by_finding.get(finding.id, []):
                 plan = attempt.plan if isinstance(attempt.plan, dict) else {}
                 oracle = plan.get("oracle") if isinstance(plan.get("oracle"), dict) else {}
                 poc = plan.get("poc") if isinstance(plan.get("poc"), dict) else {}
                 signature = json.dumps(
                     {
-                        "task_id": task_id,
-                        "entry_point_ids": sorted(set(finding.entry_point_ids or [])),
+                        "task_id": attempt.task_id,
+                        "entry_point_ids": sorted(
+                            set(finding_string_list(finding.entry_point_ids))
+                        ),
                         "operation": plan.get("operation"),
                         "binder_transaction_code": plan.get("binder_transaction_code"),
                         "binder_interface_descriptor": plan.get("binder_interface_descriptor"),
@@ -2933,25 +3102,71 @@ class ScanOrchestrator:
             adjacency[duplicate_id].add(canonical_id)
             adjacency[canonical_id].add(duplicate_id)
 
-        status_rank = {
-            FindingStatus.FALSE_POSITIVE.value: 0,
-            FindingStatus.REFUTED_STATIC.value: 1,
-            FindingStatus.NOT_REPRODUCED.value: 2,
-            FindingStatus.INCONCLUSIVE.value: 3,
-            FindingStatus.CANDIDATE.value: 4,
-            FindingStatus.SUPPORTED_STATIC.value: 5,
-            FindingStatus.ACCEPTED.value: 6,
-            FindingStatus.REPRODUCED_BLACKBOX.value: 7,
-        }
+        status_rank = FINDING_STATUS_RANK
         severity_rank = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
         confidence_rank = {"low": 0, "medium": 1, "high": 2}
+        valid_scan_evidence_ids = set(
+            session.scalars(
+                select(Evidence.id).where(Evidence.scan_id == scan_id)
+            )
+        )
+
+        def effective_status_rank(item: Finding) -> int:
+            if (
+                item.status
+                in {
+                    FindingStatus.FALSE_POSITIVE.value,
+                    FindingStatus.ACCEPTED.value,
+                }
+                and isinstance(item.review_note, str)
+                and item.review_note.strip()
+            ):
+                return max(FINDING_STATUS_RANK.values()) + 1
+            if (
+                item.status
+                in {
+                    FindingStatus.REPRODUCED_BLACKBOX.value,
+                    FindingStatus.ACCEPTED.value,
+                }
+                and not harm_attempts_by_finding.get(item.id)
+            ):
+                tier = evidence_backed_signal_tier(session, item)
+                return {
+                    "raw_candidate": FINDING_STATUS_RANK[FindingStatus.CANDIDATE.value],
+                    "static_chain": FINDING_STATUS_RANK[
+                        FindingStatus.SUPPORTED_STATIC.value
+                    ],
+                    "runtime_oracle_gap": FINDING_STATUS_RANK[
+                        FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value
+                    ],
+                }[tier]
+            if item.status == FindingStatus.NOT_REPRODUCED.value:
+                return (
+                    FINDING_STATUS_RANK[FindingStatus.FALSE_POSITIVE.value]
+                    if refuting_attempts_by_finding.get(item.id)
+                    else FINDING_STATUS_RANK[FindingStatus.CANDIDATE.value]
+                )
+            if item.status == FindingStatus.REFUTED_STATIC.value:
+                return (
+                    FINDING_STATUS_RANK[FindingStatus.REFUTED_STATIC.value]
+                    if static_refutation_is_evidence_backed(session, item)
+                    else FINDING_STATUS_RANK[FindingStatus.CANDIDATE.value]
+                )
+            if item.status in {
+                FindingStatus.SUPPORTED_STATIC.value,
+                FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value,
+                "static_path_supported",
+                "oracle_gap",
+            } and evidence_backed_signal_tier(session, item) == "raw_candidate":
+                return FINDING_STATUS_RANK[FindingStatus.CANDIDATE.value]
+            return status_rank.get(item.status, -1)
         merged_map: dict[str, str] = {}
         visited: set[str] = set()
 
         hypothesis_ids = {
             hypothesis_id
             for finding in active
-            if isinstance(hypothesis_id := (finding.metadata_json or {}).get("hypothesis_id"), str)
+            if isinstance(hypothesis_id := finding_metadata(finding).get("hypothesis_id"), str)
         }
         hypothesis_claim_length = {
             hypothesis.id: len(" ".join(hypothesis.claim.split()))
@@ -3007,11 +3222,19 @@ class ScanOrchestrator:
             representative = max(
                 component,
                 key=lambda item: (
-                    status_rank.get(item.status, -1),
+                    effective_status_rank(item),
+                    int(
+                        item.status
+                        in {
+                            FindingStatus.FALSE_POSITIVE.value,
+                            FindingStatus.ACCEPTED.value,
+                        }
+                        and bool(item.review_note)
+                    ),
                     severity_rank.get(item.severity, -1),
                     confidence_rank.get(item.confidence, -1),
                     hypothesis_claim_length.get(
-                        str((item.metadata_json or {}).get("hypothesis_id")), 0
+                        str(finding_metadata(item).get("hypothesis_id")), 0
                     ),
                     -component.index(item),
                 ),
@@ -3031,6 +3254,7 @@ class ScanOrchestrator:
             canonical.rule_id = representative.rule_id
             canonical.source = representative.source
             canonical.status = representative.status
+            canonical.review_note = representative.review_note
             canonical.severity = max(
                 (item.severity for item in component),
                 key=lambda value: severity_rank.get(value, -1),
@@ -3040,11 +3264,20 @@ class ScanOrchestrator:
                 key=lambda value: confidence_rank.get(value, -1),
             )
             canonical.entry_point_ids = self._ordered_union(
-                *(list(item.entry_point_ids or []) for item in component)
+                *(finding_string_list(item.entry_point_ids) for item in component)
             )
-            canonical.evidence_ids = self._ordered_union(
-                *(list(item.evidence_ids or []) for item in component)
-            )
+            canonical.evidence_ids = [
+                evidence_id
+                for evidence_id in self._ordered_union(
+                    *(
+                        list(item.evidence_ids)
+                        if isinstance(item.evidence_ids, list)
+                        else []
+                        for item in component
+                    )
+                )
+                if evidence_id in valid_scan_evidence_ids
+            ]
             location_keys: set[str] = set()
             merged_locations: list[dict[str, Any]] = []
             for item in component:
@@ -3058,18 +3291,38 @@ class ScanOrchestrator:
                     merged_locations.append(location)
             canonical.locations = merged_locations
 
-            all_metadata = [dict(item.metadata_json or {}) for item in component]
+            all_metadata = [finding_metadata(item) for item in component]
+
+            def metadata_list(metadata: dict[str, Any], key: str) -> list[Any]:
+                value = metadata.get(key)
+                return list(value) if isinstance(value, list) else []
+
             histories = [
                 history_item
                 for metadata in all_metadata
-                for history_item in metadata.get("adaptive_verification_history", [])
+                for history_item in metadata_list(
+                    metadata, "adaptive_verification_history"
+                )
                 if isinstance(history_item, dict)
             ]
+            component_harm_attempts = [
+                attempt
+                for item in component
+                for attempt in harm_attempts_by_finding.get(item.id, [])
+            ]
+            component_refuting_attempts = [
+                attempt
+                for item in component
+                for attempt in refuting_attempts_by_finding.get(item.id, [])
+            ]
             proof_attempt_ids = self._ordered_union(
-                *[list(metadata.get("proof_attempt_ids") or []) for metadata in all_metadata]
+                [attempt.id for attempt in component_harm_attempts]
+            )
+            refutation_attempt_ids = self._ordered_union(
+                [attempt.id for attempt in component_refuting_attempts]
             )
             coverage_gaps = self._ordered_union(
-                *[list(metadata.get("coverage_gaps") or []) for metadata in all_metadata]
+                *[metadata_list(metadata, "coverage_gaps") for metadata in all_metadata]
             )
             identities = [
                 identity
@@ -3077,7 +3330,7 @@ class ScanOrchestrator:
                 if isinstance((identity := metadata.get("identity")), dict)
             ]
             occurrence_history = list(
-                (canonical.metadata_json or {}).get("merged_occurrences") or []
+                finding_metadata(canonical).get("merged_occurrences") or []
             )
             occurrence_history.extend(
                 {
@@ -3085,20 +3338,41 @@ class ScanOrchestrator:
                     "dedupe_key": duplicate.dedupe_key,
                     "title": duplicate.title,
                     "status": duplicate.status,
-                    "task_id": (duplicate.metadata_json or {}).get("task_id"),
-                    "hypothesis_id": (duplicate.metadata_json or {}).get("hypothesis_id"),
-                    "entry_point_ids": list(duplicate.entry_point_ids or []),
-                    "evidence_ids": list(duplicate.evidence_ids or []),
+                    "task_id": finding_metadata(duplicate).get("task_id"),
+                    "hypothesis_id": finding_metadata(duplicate).get("hypothesis_id"),
+                    "entry_point_ids": finding_string_list(duplicate.entry_point_ids),
+                    "evidence_ids": finding_string_list(duplicate.evidence_ids),
                     "merge_basis": merge_basis(duplicate, canonical),
                 }
                 for duplicate in duplicates
             )
-            canonical_metadata = dict(canonical.metadata_json or {})
+            canonical_metadata = finding_metadata(canonical)
+            representative_metadata = finding_metadata(representative)
+            representative_tier = evidence_backed_signal_tier(session, representative)
+            receipt_keys = (
+                "signal_tier",
+                "platform_static_support_gate",
+                "platform_static_refutation_gate",
+                "chain_receipt",
+                "security_impact",
+                "missing_control",
+                "oracle_gap",
+                "proof_gap_code",
+                "proof_backlog",
+                "adaptive_verification",
+                "verification_mode",
+                "release_gate_eligible",
+                "dynamic_verdict_eligible",
+                "android16_verdict_eligible",
+                "verdict_scope",
+            )
+            for key in receipt_keys:
+                canonical_metadata.pop(key, None)
+                if key in representative_metadata:
+                    canonical_metadata[key] = deepcopy(representative_metadata[key])
             canonical_metadata.update(
                 {
-                    "harm_demonstrated": any(
-                        metadata.get("harm_demonstrated") is True for metadata in all_metadata
-                    ),
+                    "harm_demonstrated": bool(component_harm_attempts),
                     "merged_finding_ids": self._ordered_union(
                         list(canonical_metadata.get("merged_finding_ids") or []),
                         [item.id for item in duplicates],
@@ -3107,23 +3381,85 @@ class ScanOrchestrator:
                     "equivalent_identities": identities,
                     "coverage_gaps": coverage_gaps,
                     "proof_attempt_ids": proof_attempt_ids,
+                    "refutation_attempt_ids": refutation_attempt_ids,
                 }
             )
+            if representative_tier == "runtime_oracle_gap":
+                canonical_metadata["signal_tier"] = "runtime_oracle_gap"
+                canonical_metadata["proof_gap_code"] = "missing_platform_harm_oracle"
+                canonical_metadata["oracle_gap"] = {
+                    **dict(canonical_metadata.get("oracle_gap") or {}),
+                    "schema_version": "1.0",
+                    "status": "open",
+                    "runtime_observed": True,
+                }
+                canonical_metadata.pop("platform_static_support_gate", None)
+                canonical_metadata.pop("chain_receipt", None)
+            elif representative_tier == "static_chain" and valid_static_support_gate(
+                representative_metadata
+            ):
+                canonical_metadata["signal_tier"] = "static_chain"
+                canonical_metadata.pop("oracle_gap", None)
+                canonical_metadata.pop("proof_gap_code", None)
+            else:
+                canonical_metadata.pop("signal_tier", None)
+                canonical_metadata.pop("oracle_gap", None)
+                canonical_metadata.pop("proof_gap_code", None)
+                if representative.status != FindingStatus.SUPPORTED_STATIC.value:
+                    canonical_metadata.pop("platform_static_support_gate", None)
+                    canonical_metadata.pop("chain_receipt", None)
+            if canonical.status != FindingStatus.REFUTED_STATIC.value:
+                canonical_metadata.pop("platform_static_refutation_gate", None)
             if histories:
                 canonical_metadata["adaptive_verification_history"] = histories[-10:]
-                canonical_metadata["adaptive_verification"] = histories[-1]
+            representative_adaptive = representative_metadata.get(
+                "adaptive_verification"
+            )
+            if isinstance(representative_adaptive, dict):
+                canonical_metadata["adaptive_verification"] = deepcopy(
+                    representative_adaptive
+                )
+            else:
+                canonical_metadata.pop("adaptive_verification", None)
             if canonical_metadata["harm_demonstrated"]:
                 canonical_metadata["proof_backlog"] = {
                     **dict(canonical_metadata.get("proof_backlog") or {}),
                     "status": "verified",
                 }
+            elif isinstance(canonical_metadata.get("proof_backlog"), dict):
+                canonical_metadata["proof_backlog"] = {
+                    **dict(canonical_metadata["proof_backlog"]),
+                    "status": (
+                        "oracle_gap"
+                        if representative_tier == "runtime_oracle_gap"
+                        else "proof_required"
+                    ),
+                }
             canonical.metadata_json = canonical_metadata
+            if (
+                canonical.status == FindingStatus.REFUTED_STATIC.value
+                and not static_refutation_is_evidence_backed(session, canonical)
+            ):
+                reported_gate = canonical_metadata.pop(
+                    "platform_static_refutation_gate", None
+                )
+                canonical.status = FindingStatus.INCONCLUSIVE.value
+                canonical_metadata["static_refutation_reconciliation"] = {
+                    "previous_status": FindingStatus.REFUTED_STATIC.value,
+                    "reason": (
+                        "merged static refutation lacked a same-scan usable evidence receipt "
+                        "with concrete counterevidence and blocked edge"
+                    ),
+                    "reported_gate": reported_gate,
+                }
+                canonical.metadata_json = canonical_metadata
 
             for duplicate in duplicates:
-                original_metadata = dict(duplicate.metadata_json or {})
+                original_metadata = finding_metadata(duplicate)
                 duplicate.status = FindingStatus.INCONCLUSIVE.value
                 duplicate.metadata_json = {
                     **original_metadata,
+                    "previous_review_note": duplicate.review_note,
                     "harm_demonstrated": False,
                     "merged_duplicate": True,
                     "merged_into_finding_id": canonical.id,
@@ -3141,6 +3477,16 @@ class ScanOrchestrator:
                     .where(SecurityHypothesis.final_finding_id == duplicate.id)
                     .values(final_finding_id=canonical.id)
                 )
+                for model in (
+                    RuntimeObservation,
+                    DynamicExperimentCapsule,
+                    IndexedArtifact,
+                ):
+                    session.execute(
+                        update(model)
+                        .where(model.finding_id == duplicate.id)
+                        .values(finding_id=canonical.id)
+                    )
                 merged_map[duplicate.id] = canonical.id
 
         return merged_map
@@ -4206,22 +4552,14 @@ class ScanOrchestrator:
     @staticmethod
     def _proven_attempts_for_finding(session, finding: Finding) -> list[ProofAttempt]:  # noqa: ANN001
         """Resolve only platform-owned harm receipts attributable to one finding."""
+        return attributable_harm_attempts(session, finding)
 
-        metadata = dict(finding.metadata_json or {})
-        declared_ids = [
-            value for value in metadata.get("proof_attempt_ids", []) if isinstance(value, str)
-        ]
-        statement = select(ProofAttempt).where(
-            ProofAttempt.scan_id == finding.scan_id,
-            ProofAttempt.harm_demonstrated.is_(True),
-        )
-        if declared_ids:
-            statement = statement.where(ProofAttempt.id.in_(declared_ids))
-        elif isinstance(metadata.get("hypothesis_id"), str):
-            statement = statement.where(ProofAttempt.hypothesis_id == metadata["hypothesis_id"])
-        else:
-            return []
-        return list(session.scalars(statement.order_by(ProofAttempt.created_at)))
+    @staticmethod
+    def _refuting_attempts_for_finding(
+        session, finding: Finding  # noqa: ANN001
+    ) -> list[ProofAttempt]:
+        """Resolve attributable platform Oracle receipts that disproved an attempt."""
+        return attributable_refutation_attempts(session, finding)
 
     def _apply_adaptive_verifier_result(
         self,
@@ -4274,9 +4612,10 @@ class ScanOrchestrator:
             task = session.get(InvestigationTask, task_id)
             if scan is None or task is None:
                 raise LookupError("Adaptive Verifier result target disappeared")
-            known_evidence_ids = set(
-                session.scalars(select(Evidence.id).where(Evidence.scan_id == scan_id))
+            evidence_records = list(
+                session.scalars(select(Evidence).where(Evidence.scan_id == scan_id))
             )
+            evidence_by_id = {item.id: item for item in evidence_records}
             verdict_counts: Counter[str] = Counter()
             model_verdict_counts: Counter[str] = Counter()
             verdict_overrides: list[dict[str, str]] = []
@@ -4285,13 +4624,102 @@ class ScanOrchestrator:
                 assessment = assessments.get(finding_id)
                 if finding is None or assessment is None:
                     continue
+                existing_status = finding.status
+                preserve_human_closure = (
+                    existing_status
+                    in {
+                        FindingStatus.FALSE_POSITIVE.value,
+                        FindingStatus.ACCEPTED.value,
+                    }
+                    and isinstance(finding.review_note, str)
+                    and bool(finding.review_note.strip())
+                )
+                existing_signal_tier = evidence_backed_signal_tier(session, finding)
                 proven_attempts = self._proven_attempts_for_finding(session, finding)
                 proven_attempt_ids = [attempt.id for attempt in proven_attempts]
                 proven_evidence_ids = self._ordered_union(
                     *(list(attempt.evidence_ids or []) for attempt in proven_attempts)
                 )
+                refuting_attempts = self._refuting_attempts_for_finding(session, finding)
+                refuting_attempt_ids = [attempt.id for attempt in refuting_attempts]
+                refuting_evidence_ids = self._ordered_union(
+                    *(list(attempt.evidence_ids or []) for attempt in refuting_attempts)
+                )
                 model_verdict = assessment.verdict
                 model_verdict_counts[model_verdict] += 1
+                raw_finding_evidence_ids = (
+                    finding.evidence_ids if isinstance(finding.evidence_ids, list) else []
+                )
+                finding_evidence_ids = {
+                    value
+                    for value in raw_finding_evidence_ids
+                    if isinstance(value, str) and value
+                }
+                linked_runtime_observations = list(
+                    session.scalars(
+                        select(RuntimeObservation).where(
+                            RuntimeObservation.scan_id == finding.scan_id,
+                            RuntimeObservation.finding_id == finding.id,
+                        )
+                    )
+                )
+                linked_runtime_evidence_ids = {
+                    evidence_id
+                    for observation in linked_runtime_observations
+                    for evidence_id in (
+                        observation.evidence_ids
+                        if isinstance(observation.evidence_ids, list)
+                        else []
+                    )
+                    if isinstance(evidence_id, str) and evidence_id
+                }
+
+                def evidence_is_bound_to_finding(
+                    evidence: Evidence,
+                    *,
+                    current_finding_id: str = finding.id,
+                    current_finding_evidence_ids: set[str] = finding_evidence_ids,
+                    current_runtime_evidence_ids: set[str] = linked_runtime_evidence_ids,
+                ) -> bool:
+                    metadata = (
+                        evidence.metadata_json
+                        if isinstance(evidence.metadata_json, dict)
+                        else {}
+                    )
+                    candidate_finding_ids = metadata.get("candidate_finding_ids")
+                    return (
+                        evidence.id in current_finding_evidence_ids
+                        or metadata.get("finding_id") == current_finding_id
+                        or (
+                            isinstance(candidate_finding_ids, list)
+                            and current_finding_id in candidate_finding_ids
+                        )
+                        or evidence.id in current_runtime_evidence_ids
+                    )
+
+                accepted_assessment_evidence = [
+                    evidence_by_id[evidence_id]
+                    for evidence_id in assessment.evidence_ids
+                    if evidence_id in evidence_by_id
+                    and evidence_is_bound_to_finding(evidence_by_id[evidence_id])
+                ]
+                accepted_evidence_ids = [
+                    evidence.id for evidence in accepted_assessment_evidence
+                ]
+                platform_runtime_observed = any(
+                    evidence_supports_runtime_observation(evidence)
+                    for evidence in evidence_records
+                    if evidence.id in linked_runtime_evidence_ids
+                )
+                static_refutation_gate = build_static_refutation_gate(
+                    evidence_by_id={
+                        evidence.id: evidence
+                        for evidence in accepted_assessment_evidence
+                    },
+                    evidence_ids=assessment.evidence_ids,
+                    counterevidence=assessment.counterevidence,
+                    blocked_edge=assessment.attack_chain,
+                )
                 candidate_execution = batch_execution_by_finding.get(finding_id, {})
                 candidate_android16_eligible = bool(
                     candidate_execution.get(
@@ -4316,19 +4744,20 @@ class ScanOrchestrator:
                 )
                 verdict = model_verdict
                 verdict_override_reason: str | None = None
-                if model_verdict == FindingStatus.REPRODUCED_BLACKBOX.value and not proven_attempts:
-                    verdict = FindingStatus.SUPPORTED_STATIC.value
+                negative_verdict = model_verdict in {
+                    FindingStatus.REFUTED_STATIC.value,
+                    FindingStatus.NOT_REPRODUCED.value,
+                }
+                runtime_context = (
+                    platform_runtime_observed
+                    or existing_signal_tier == "runtime_oracle_gap"
+                )
+                if preserve_human_closure:
+                    verdict = existing_status
                     verdict_override_reason = (
-                        "Adaptive semantic assessment did not reference a platform ProofAttempt "
-                        "with harm_demonstrated=true and cannot issue a reproduced verdict."
-                    )
-                    verdict_overrides.append(
-                        {
-                            "finding_id": finding_id,
-                            "model_verdict": model_verdict,
-                            "applied_verdict": verdict,
-                            "reason": verdict_override_reason,
-                        }
+                        "The finding was explicitly dispositioned by a human while adaptive "
+                        "verification was running; the late Agent result is retained for audit "
+                        "and requires an explicit human review to replace."
                     )
                 elif proven_attempts:
                     verdict = FindingStatus.REPRODUCED_BLACKBOX.value
@@ -4337,21 +4766,82 @@ class ScanOrchestrator:
                             "An existing platform ProofAttempt demonstrated harm; the adaptive "
                             "model verdict cannot downgrade that immutable receipt."
                         )
-                        verdict_overrides.append(
-                            {
-                                "finding_id": finding_id,
-                                "model_verdict": model_verdict,
-                                "applied_verdict": verdict,
-                                "reason": verdict_override_reason,
-                            }
+                elif negative_verdict and refuting_attempts:
+                    verdict = FindingStatus.NOT_REPRODUCED.value
+                    if model_verdict != verdict:
+                        verdict_override_reason = (
+                            "An attributable platform Oracle receipt refuted the runtime attempt; "
+                            "the applied verdict is dynamic, not a model-only static refutation."
                         )
+                elif negative_verdict and runtime_context and not refuting_attempts:
+                    verdict = FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value
+                    verdict_override_reason = (
+                        "A runtime observation cannot be closed by a model-only negative verdict; "
+                        "an attributable platform Oracle refutation receipt is required."
+                    )
+                elif (
+                    model_verdict == FindingStatus.NOT_REPRODUCED.value
+                    and not refuting_attempts
+                ):
+                    verdict = FindingStatus.INCONCLUSIVE.value
+                    verdict_override_reason = (
+                        "The adaptive model cannot claim a negative runtime result without an "
+                        "attributable platform Oracle refutation receipt."
+                    )
+                elif (
+                    model_verdict == FindingStatus.REFUTED_STATIC.value
+                    and static_refutation_gate["eligible"] is not True
+                ):
+                    verdict = FindingStatus.INCONCLUSIVE.value
+                    verdict_override_reason = (
+                        "A static refutation requires usable static platform evidence attributable "
+                        "to this finding and concrete counterevidence naming the guard or blocked "
+                        "edge."
+                    )
+                elif (
+                    existing_signal_tier == "runtime_oracle_gap"
+                    and not refuting_attempts
+                    and model_verdict
+                    not in {
+                        FindingStatus.REFUTED_STATIC.value,
+                        FindingStatus.NOT_REPRODUCED.value,
+                    }
+                ):
+                    verdict = FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value
+                    verdict_override_reason = (
+                        "A later model-only assessment cannot erase an existing runtime Oracle "
+                        "gap; platform proof or refutation is still required."
+                    )
+                elif platform_runtime_observed:
+                    verdict = FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value
+                    verdict_override_reason = (
+                        "A linked platform runtime observation exists, but no attributable "
+                        "harm-demonstrating ProofAttempt exists; the observation remains an "
+                        "Oracle gap."
+                    )
+                elif model_verdict == FindingStatus.REPRODUCED_BLACKBOX.value:
+                    verdict = FindingStatus.INCONCLUSIVE.value
+                    verdict_override_reason = (
+                        "The adaptive assessment claimed reproduction without a linked platform "
+                        "runtime observation or an attributable harm-demonstrating ProofAttempt."
+                    )
+                elif assessment.runtime_observed:
+                    verdict_override_reason = (
+                        "The model-reported runtime observation was retained only as a claim "
+                        "because no finding-linked platform runtime receipt supports it."
+                    )
+                if verdict_override_reason is not None:
+                    verdict_overrides.append(
+                        {
+                            "finding_id": finding_id,
+                            "model_verdict": model_verdict,
+                            "applied_verdict": verdict,
+                            "reason": verdict_override_reason,
+                        }
+                    )
                 verdict_counts[verdict] += 1
-                accepted_evidence_ids = [
-                    evidence_id
-                    for evidence_id in assessment.evidence_ids
-                    if evidence_id in known_evidence_ids
-                ]
                 accepted_evidence_ids.extend(proven_evidence_ids)
+                accepted_evidence_ids.extend(refuting_evidence_ids)
                 candidate_response_evidence_id = response_evidence_ids_by_finding.get(
                     finding_id,
                     response_evidence_id,
@@ -4359,9 +4849,14 @@ class ScanOrchestrator:
                 candidate_thread_id = str(candidate_execution.get("thread_id") or thread_id)
                 candidate_turn_id = str(candidate_execution.get("turn_id") or turn_id)
                 accepted_evidence_ids.append(candidate_response_evidence_id)
-                history = list(
-                    (finding.metadata_json or {}).get("adaptive_verification_history") or []
+                raw_history = (finding.metadata_json or {}).get(
+                    "adaptive_verification_history"
                 )
+                history = [
+                    dict(item)
+                    for item in raw_history
+                    if isinstance(item, dict)
+                ] if isinstance(raw_history, list) else []
                 history_entry = {
                     "schema_version": "1.0",
                     "task_id": task_id,
@@ -4377,7 +4872,12 @@ class ScanOrchestrator:
                     "compatibility_smoke_only": not candidate_dynamic_eligible,
                     "verdict_scope": candidate_verdict_scope,
                     "confidence": assessment.confidence,
-                    "runtime_observed": assessment.runtime_observed,
+                    "runtime_observed": bool(
+                        platform_runtime_observed
+                        or existing_signal_tier == "runtime_oracle_gap"
+                    ),
+                    "model_runtime_observed": assessment.runtime_observed,
+                    "runtime_claim_accepted": platform_runtime_observed,
                     "duplicate_of_finding_id": assessment.duplicate_of_finding_id,
                     "summary": assessment.summary,
                     "attack_chain": assessment.attack_chain,
@@ -4388,8 +4888,14 @@ class ScanOrchestrator:
                         experiment.model_dump(mode="json") for experiment in assessment.experiments
                     ],
                     "proof_attempt_ids": proven_attempt_ids,
+                    "refutation_attempt_ids": refuting_attempt_ids,
                     "response_evidence_id": candidate_response_evidence_id,
+                    "previous_status": existing_status,
                 }
+                if model_verdict == FindingStatus.REFUTED_STATIC.value:
+                    history_entry["platform_static_refutation_gate"] = (
+                        static_refutation_gate
+                    )
                 if (
                     history
                     and history[-1].get("task_id") == task_id
@@ -4398,20 +4904,22 @@ class ScanOrchestrator:
                     history[-1] = history_entry
                 else:
                     history.append(history_entry)
-                finding.status = verdict
-                finding.confidence = assessment.confidence
-                finding.review_note = (
-                    f"{assessment.summary}\n兼容性烟测限制：{verdict_override_reason}"
-                    if verdict_override_reason
-                    else assessment.summary
-                )
+                if not preserve_human_closure:
+                    finding.status = verdict
+                    finding.confidence = assessment.confidence
+                    finding.review_note = (
+                        f"{assessment.summary}\n平台判定限制：{verdict_override_reason}"
+                        if verdict_override_reason
+                        else assessment.summary
+                    )
                 finding.evidence_ids = list(
-                    dict.fromkeys([*finding.evidence_ids, *accepted_evidence_ids])
+                    dict.fromkeys([*raw_finding_evidence_ids, *accepted_evidence_ids])
                 )
                 finding_metadata = {
                     **dict(finding.metadata_json or {}),
                     "harm_demonstrated": bool(proven_attempts),
                     "proof_attempt_ids": proven_attempt_ids,
+                    "refutation_attempt_ids": refuting_attempt_ids,
                     "android16_verdict_eligible": candidate_android16_eligible,
                     "dynamic_verdict_eligible": candidate_dynamic_eligible,
                     "release_gate_eligible": bool(
@@ -4429,7 +4937,11 @@ class ScanOrchestrator:
                         **dict((finding.metadata_json or {}).get("proof_backlog") or {}),
                         "status": (
                             "verified"
-                            if verdict == FindingStatus.REPRODUCED_BLACKBOX.value
+                            if proven_attempts
+                            else "closed"
+                            if preserve_human_closure
+                            else "oracle_gap"
+                            if verdict == FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value
                             else "closed"
                             if verdict
                             in {
@@ -4442,8 +4954,44 @@ class ScanOrchestrator:
                         "verifier_task_id": task_id,
                     },
                 }
+                if preserve_human_closure:
+                    finding_metadata["latest_agent_reanalysis"] = {
+                        **history_entry,
+                        "human_closure_preserved": True,
+                    }
+                if verdict == FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value:
+                    finding_metadata["signal_tier"] = "runtime_oracle_gap"
+                    finding_metadata["proof_gap_code"] = "missing_platform_harm_oracle"
+                    finding_metadata["oracle_gap"] = {
+                        "schema_version": "1.0",
+                        "status": "open",
+                        "reason": "missing_harm_demonstrated_proof_attempt",
+                        "runtime_observed": bool(
+                            platform_runtime_observed
+                            or existing_signal_tier == "runtime_oracle_gap"
+                        ),
+                        "proof_attempt_ids": proven_attempt_ids,
+                        "verifier_task_id": task_id,
+                    }
+                elif verdict == FindingStatus.SUPPORTED_STATIC.value:
+                    finding_metadata["signal_tier"] = "static_chain"
+                    finding_metadata.pop("oracle_gap", None)
+                    finding_metadata.pop("proof_gap_code", None)
+                else:
+                    finding_metadata.pop("signal_tier", None)
+                    finding_metadata.pop("oracle_gap", None)
+                    finding_metadata.pop("proof_gap_code", None)
+                if (
+                    verdict == FindingStatus.REFUTED_STATIC.value
+                    and static_refutation_gate["eligible"] is True
+                ):
+                    finding_metadata["platform_static_refutation_gate"] = (
+                        static_refutation_gate
+                    )
+                elif not preserve_human_closure:
+                    finding_metadata.pop("platform_static_refutation_gate", None)
                 report_payload = finding_metadata.get("report")
-                if isinstance(report_payload, dict):
+                if isinstance(report_payload, dict) and not preserve_human_closure:
                     report = FindingReport.model_validate(report_payload)
                     report.conclusion = (assessment.security_impact or assessment.summary)[:600]
                     if assessment.attack_chain:
@@ -4482,7 +5030,10 @@ class ScanOrchestrator:
                     report.verification.evidence_ids = list(dict.fromkeys(accepted_evidence_ids))[
                         :64
                     ]
-                    report.verification.proof_attempt_ids = proven_attempt_ids[:64]
+                    report.verification.proof_attempt_ids = self._ordered_union(
+                        proven_attempt_ids,
+                        refuting_attempt_ids,
+                    )[:64]
                     report.kind = (
                         "finding"
                         if verdict == FindingStatus.REPRODUCED_BLACKBOX.value
@@ -4572,6 +5123,10 @@ class ScanOrchestrator:
                     "assessment_verdict_counts": dict(verdict_counts),
                     "model_verdict_counts": dict(model_verdict_counts),
                     "compatibility_override_count": len(verdict_overrides),
+                    "oracle_gap_count": effective_verdict_counts.get(
+                        FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value,
+                        0,
+                    ),
                     "resume_count": len(resume_history),
                     "verdict_scope": verdict_scope,
                     "release_gate_eligible": release_gate_eligible,
@@ -4597,6 +5152,10 @@ class ScanOrchestrator:
                     "assessment_verdict_counts": dict(verdict_counts),
                     "model_verdict_counts": dict(model_verdict_counts),
                     "compatibility_override_count": len(verdict_overrides),
+                    "oracle_gap_count": effective_verdict_counts.get(
+                        FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value,
+                        0,
+                    ),
                     "merged_duplicate_count": len(merged_findings),
                     "android16_verdict_eligible": android16_verdict_eligible,
                     "dynamic_verdict_eligible": dynamic_verdict_eligible,
@@ -4794,6 +5353,8 @@ class ScanOrchestrator:
                 "sink": assessment.sink,
                 "reachable_path": assessment.reachable_path,
                 "boundary": assessment.boundary,
+                "security_impact": assessment.security_impact,
+                "missing_control": assessment.missing_control,
                 "has_counterevidence": bool(assessment.counterevidence),
                 "has_proof_gaps": bool(assessment.proof_gaps),
             }
@@ -5014,7 +5575,7 @@ class ScanOrchestrator:
         self,
         capsule: DynamicExperimentCapsule,
     ) -> None:
-        if capsule.status not in {"completed", "canceled"}:
+        if capsule.status not in {"completed", "canceled", "failed"}:
             return
         proof_attempt_id = (capsule.impact_contract or {}).get("proof_attempt_id")
         if not isinstance(proof_attempt_id, str):
@@ -5032,16 +5593,12 @@ class ScanOrchestrator:
             )
             evidence_ids = list(
                 dict.fromkeys(
-                    evidence_id
-                    for receipt in receipts
-                    for evidence_id in receipt.evidence_ids
+                    evidence_id for receipt in receipts for evidence_id in receipt.evidence_ids
                 )
             )
             evidence_by_id = {
                 item.id: item
-                for item in session.scalars(
-                    select(Evidence).where(Evidence.id.in_(evidence_ids))
-                )
+                for item in session.scalars(select(Evidence).where(Evidence.id.in_(evidence_ids)))
             }
             summaries = [
                 self._evidence_summary(evidence_by_id[evidence_id])
@@ -5051,7 +5608,7 @@ class ScanOrchestrator:
         self.hypothesis_ledger.complete_proof(
             proof_attempt_id,
             summaries,
-            error=(capsule.error if capsule.status == "canceled" else None),
+            error=(capsule.error if capsule.status in {"canceled", "failed"} else None),
         )
 
     def stop_scan_tasks(self, scan_id: str) -> dict[str, int]:
@@ -5763,6 +6320,7 @@ class ScanOrchestrator:
 
         agent_result = None
         agent_error = None
+        agent_capability_gap = False
         agent_failures: list[dict[str, str]] = []
         executed_agent_tests: list[dict[str, Any]] = []
         agent_round_history: list[dict[str, Any]] = []
@@ -5814,7 +6372,7 @@ class ScanOrchestrator:
             round_index: int = 0,
             blind_rescue: bool = False,
         ):  # noqa: ANN202
-            nonlocal last_progress_signature, agent_no_progress_rounds
+            nonlocal agent_capability_gap, last_progress_signature, agent_no_progress_rounds
             audit_id: str | None = None
             runtime_events: list[dict[str, Any]] = []
             phase_bucket, phase_limit_seconds = phase_budget(phase)
@@ -5845,6 +6403,7 @@ class ScanOrchestrator:
                 return None, f"{phase} is limited to one run per task"
             phase_counts[phase] = phase_counts.get(phase, 0) + 1
             if investigator is None:
+                agent_capability_gap = True
                 self._set_task_stage(
                     scan_id,
                     task_id,
@@ -5855,6 +6414,7 @@ class ScanOrchestrator:
                 )
                 return None, "AI investigation is disabled for this scan"
             if not agent_enabled:
+                agent_capability_gap = True
                 self._set_task_stage(
                     scan_id,
                     task_id,
@@ -5890,6 +6450,7 @@ class ScanOrchestrator:
             capability = investigator.capability(deep=True)
             self._raise_if_cancelled(cancel_event)
             if not capability.get("available"):
+                agent_capability_gap = True
                 self._set_task_stage(
                     scan_id,
                     task_id,
@@ -6309,6 +6870,11 @@ class ScanOrchestrator:
                     backend=agent_backend,
                     model=self.settings.codex_model,
                     payload=argument_payload,
+                    allowed_evidence_ids={
+                        str(item["id"])
+                        for item in dispatch_evidence
+                        if isinstance(item.get("id"), str)
+                    },
                 )
                 self._record_agent_runtime_events(
                     scan_id=scan_id,
@@ -7297,13 +7863,31 @@ class ScanOrchestrator:
             )
         if agent_result:
             raw_payload = agent_result.result.model_dump(mode="json")
+            validation_input = deepcopy(raw_payload)
+            critic_payload = (
+                debate_context.get("critic")
+                if isinstance(debate_context, dict)
+                else None
+            )
+            if isinstance(critic_payload, dict):
+                critic_objections = critic_payload.get("review_objections", [])
+                validation_input["review_objections"] = (
+                    [
+                        dict(item)
+                        for item in critic_objections
+                        if isinstance(item, dict)
+                    ]
+                    if isinstance(critic_objections, list)
+                    else []
+                )
             validated_payload, validated_result_value = self._validated_agent_payload(
-                deepcopy(raw_payload), evidence_summaries
+                validation_input, evidence_summaries
             )
             validated_payload = self._validated_hypothesis_payload(
                 validated_payload,
                 hypothesis_context,
             )
+            validated_result_value = str(validated_payload["result"])
             validated_payload["coverage_gaps"] = list(
                 dict.fromkeys(
                     [
@@ -7456,7 +8040,12 @@ class ScanOrchestrator:
                                 ),
                             ],
                             "agent_backend": agent_backend,
-                            "failure_category": "evidence_inconclusive",
+                            "failure_category": (
+                                "agent_unavailable"
+                                if agent_capability_gap
+                                else "evidence_inconclusive"
+                            ),
+                            "capability_gap": agent_capability_gap,
                             "negative_closure_rescue": deepcopy(rescue_gate),
                             "debate_policy": deepcopy(debate_policy),
                             "hypothesis_progress": (
@@ -8873,6 +9462,13 @@ class ScanOrchestrator:
             error = "Dynamic experiment could not be bound to a platform ProofAttempt."
             self.hypothesis_ledger.complete_proof(proof_attempt_id, [], error=error)
             return None, error
+        try:
+            for step in [*plan.steps, *plan.cleanup_steps]:
+                validate_dynamic_experiment_adb_template(step.adb_args)
+        except ValueError as exc:
+            error = f"Dynamic experiment command is outside platform policy: {exc}"
+            self.hypothesis_ledger.complete_proof(proof_attempt_id, [], error=error)
+            return None, error
         contract = {
             **plan.proof.model_dump(mode="json"),
             "proof_attempt_id": proof_attempt_id,
@@ -8891,9 +9487,7 @@ class ScanOrchestrator:
                 preconditions=list(plan.preconditions),
                 impact_contract=contract,
                 steps=[item.model_dump(mode="json") for item in plan.steps],
-                cleanup_steps=[
-                    item.model_dump(mode="json") for item in plan.cleanup_steps
-                ],
+                cleanup_steps=[item.model_dump(mode="json") for item in plan.cleanup_steps],
                 state_json={
                     "scan_id": scan_id,
                     "task_id": task_id,
@@ -8939,25 +9533,19 @@ class ScanOrchestrator:
             )
             evidence_ids = list(
                 dict.fromkeys(
-                    evidence_id
-                    for receipt in receipts
-                    for evidence_id in receipt.evidence_ids
+                    evidence_id for receipt in receipts for evidence_id in receipt.evidence_ids
                 )
             )
             evidence_by_id = {
                 item.id: item
-                for item in session.scalars(
-                    select(Evidence).where(Evidence.id.in_(evidence_ids))
-                )
+                for item in session.scalars(select(Evidence).where(Evidence.id.in_(evidence_ids)))
             }
             proof_evidence = [
                 self._evidence_summary(evidence_by_id[evidence_id])
                 for evidence_id in evidence_ids
                 if evidence_id in evidence_by_id
             ]
-        known_evidence_ids = {
-            str(item.get("id")) for item in evidence_summaries if item.get("id")
-        }
+        known_evidence_ids = {str(item.get("id")) for item in evidence_summaries if item.get("id")}
         evidence_summaries.extend(
             item for item in proof_evidence if item["id"] not in known_evidence_ids
         )
@@ -10318,6 +10906,29 @@ class ScanOrchestrator:
                     ]
                 )
             )
+        if (
+            payload.get("result") == FindingStatus.SUPPORTED_STATIC.value
+            and not any(
+                item.get("verdict")
+                in {
+                    FindingStatus.SUPPORTED_STATIC.value,
+                    "needs_dynamic_proof",
+                }
+                for item in assessments
+            )
+        ):
+            payload["result"] = FindingStatus.INCONCLUSIVE.value
+            payload["coverage_gaps"] = list(
+                dict.fromkeys(
+                    [
+                        *payload.get("coverage_gaps", []),
+                        (
+                            "No task-owned hypothesis assessment passed the platform "
+                            "static-support gate; the task remains inconclusive."
+                        ),
+                    ]
+                )
+            )
         return payload
 
     @staticmethod
@@ -10481,13 +11092,265 @@ class ScanOrchestrator:
         return payload
 
     @staticmethod
+    def _unresolved_static_objection_ids(
+        payload: dict[str, Any],
+        hypothesis_id: str | None,
+        evidence_by_id: dict[str, dict[str, Any]],
+    ) -> list[str]:
+        """Return Critic objections that lack an evidence-backed overruling receipt."""
+
+        raw_resolutions = payload.get("objection_resolutions", [])
+        raw_resolutions = raw_resolutions if isinstance(raw_resolutions, list) else []
+        resolutions = {
+            str(item.get("objection_id")): item
+            for item in raw_resolutions
+            if isinstance(item, dict) and isinstance(item.get("objection_id"), str)
+        }
+        unresolved: list[str] = []
+        raw_objections = payload.get("review_objections", [])
+        raw_objections = raw_objections if isinstance(raw_objections, list) else []
+        for objection in raw_objections:
+            if not isinstance(objection, dict):
+                continue
+            objection_id = objection.get("objection_id")
+            if not isinstance(objection_id, str):
+                continue
+            objection_hypothesis_id = objection.get("hypothesis_id")
+            if objection_hypothesis_id not in {None, hypothesis_id}:
+                continue
+            resolution = resolutions.get(objection_id, {})
+            resolution_evidence_ids = resolution.get("evidence_ids", [])
+            evidence_backed = isinstance(resolution_evidence_ids, list) and any(
+                isinstance(evidence_id, str) and evidence_id in evidence_by_id
+                for evidence_id in resolution_evidence_ids
+            )
+            if (
+                resolution.get("disposition") != "overruled"
+                or not str(resolution.get("rationale") or "").strip()
+                or not evidence_backed
+            ):
+                unresolved.append(objection_id)
+        return list(dict.fromkeys(unresolved))
+
+    @staticmethod
+    def _static_support_gate(
+        assessment: dict[str, Any],
+        evidence_by_id: dict[str, dict[str, Any]],
+        *,
+        evidence_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Apply deterministic minimum evidence requirements to a static conclusion."""
+
+        placeholder_values = {
+            "",
+            "n/a",
+            "na",
+            "none",
+            "null",
+            "unknown",
+            "unknown/none",
+            "not applicable",
+            "not established",
+            "tbd",
+            "待确认",
+            "待验证",
+            "未知",
+            "无",
+        }
+
+        minimum_lengths = {
+            "source": 8,
+            "control": 12,
+            "sink": 4,
+            "reachable_path": 16,
+            "boundary": 8,
+            "security_impact": 20,
+            "missing_control": 16,
+        }
+
+        def normalized_text(field: str) -> str:
+            value = assessment.get(field)
+            return " ".join(value.strip().split()) if isinstance(value, str) else ""
+
+        def is_substantive(field: str) -> bool:
+            value = normalized_text(field)
+            normalized = value.lower()
+            alphanumeric = {character.lower() for character in value if character.isalnum()}
+            return (
+                normalized not in placeholder_values
+                and len(value) >= minimum_lengths[field]
+                and len(alphanumeric) >= 3
+            )
+
+        def anchor_tokens(field: str) -> set[str]:
+            value = normalized_text(field)
+            expanded = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", value)
+            tokens = {
+                token.lower()
+                for token in re.findall(r"[A-Za-z_$][A-Za-z0-9_$]{2,}", expanded)
+                if token.lower()
+                not in {
+                    "the",
+                    "and",
+                    "from",
+                    "into",
+                    "without",
+                    "caller",
+                    "controlled",
+                    "target",
+                    "application",
+                    "process",
+                }
+            }
+            for run in re.findall(r"[\u3400-\u9fff]+", value):
+                # Chinese descriptions do not have whitespace-delimited words. 3–6 character
+                # shingles preserve meaningful anchors such as “外部应用” without treating a
+                # generic single character as proof that source/sink appears in the path.
+                for width in range(3, min(6, len(run)) + 1):
+                    tokens.update(
+                        run[index : index + width]
+                        for index in range(0, len(run) - width + 1)
+                    )
+            return tokens
+
+        required_fields = (
+            "source",
+            "control",
+            "sink",
+            "reachable_path",
+            "boundary",
+        )
+        suppression_reasons = [
+            f"missing_{field}" for field in required_fields if not is_substantive(field)
+        ]
+        if not is_substantive("security_impact"):
+            suppression_reasons.append("missing_concrete_security_impact")
+        if not is_substantive("missing_control"):
+            suppression_reasons.append("missing_guard_or_control_gap")
+        reachable_path = normalized_text("reachable_path")
+        boundary = normalized_text("boundary")
+        if "->" not in reachable_path and "→" not in reachable_path:
+            suppression_reasons.append("unstructured_reachable_path")
+        if (
+            "->" not in boundary
+            and "→" not in boundary
+            and "boundary" not in boundary.lower()
+            and "_uid" not in boundary.lower()
+        ):
+            suppression_reasons.append("unstructured_trust_boundary")
+        path_tokens = anchor_tokens("reachable_path")
+        if is_substantive("source") and not (anchor_tokens("source") & path_tokens):
+            suppression_reasons.append("source_not_anchored_in_path")
+        if is_substantive("sink") and not (anchor_tokens("sink") & path_tokens):
+            suppression_reasons.append("sink_not_anchored_in_path")
+        counterevidence = assessment.get("counterevidence", [])
+        if isinstance(counterevidence, list) and any(
+            isinstance(value, str) and value.strip() for value in counterevidence
+        ):
+            suppression_reasons.append("unresolved_counterevidence")
+        unresolved_objection_ids = assessment.get("unresolved_objection_ids", [])
+        unresolved_objection_ids = (
+            [value for value in unresolved_objection_ids if isinstance(value, str)]
+            if isinstance(unresolved_objection_ids, list)
+            else []
+        )
+        if unresolved_objection_ids:
+            suppression_reasons.append("unresolved_critic_objection")
+
+        cited_ids = evidence_ids if evidence_ids is not None else assessment.get("evidence_ids", [])
+        static_evidence_ids = list(
+            dict.fromkeys(
+                evidence_id
+                for evidence_id in cited_ids
+                if isinstance(evidence_id, str)
+                and static_evidence_is_usable(
+                    kind=evidence_by_id.get(evidence_id, {}).get("kind"),
+                    metadata=evidence_by_id.get(evidence_id, {}).get("metadata"),
+                    exit_code=evidence_by_id.get(evidence_id, {}).get("exit_code"),
+                )
+            )
+        )
+        if not static_evidence_ids:
+            suppression_reasons.append("missing_explicit_static_evidence")
+        return {
+            "schema_version": "1.0",
+            "eligible": not suppression_reasons,
+            "required_fields": [
+                *required_fields,
+                "security_impact",
+                "missing_control",
+            ],
+            "static_evidence_ids": static_evidence_ids,
+            "unresolved_objection_ids": unresolved_objection_ids,
+            "suppression_reasons": suppression_reasons,
+        }
+
+    @staticmethod
+    def _static_refutation_gate(
+        assessment: dict[str, Any],
+        evidence_by_id: dict[str, dict[str, Any]],
+        *,
+        evidence_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Require a concrete guard/blocked edge and usable static evidence before closure."""
+
+        cited_ids = (
+            evidence_ids
+            if evidence_ids is not None
+            else assessment.get("evidence_ids", [])
+        )
+        blocked_edge = next(
+            (
+                value
+                for value in (
+                    assessment.get("control"),
+                    assessment.get("reachable_path"),
+                )
+                if isinstance(value, str) and len(" ".join(value.strip().split())) >= 12
+            ),
+            "",
+        )
+        return build_static_refutation_gate(
+            evidence_by_id=evidence_by_id,
+            evidence_ids=cited_ids,
+            counterevidence=assessment.get("counterevidence"),
+            blocked_edge=blocked_edge,
+        )
+
+    @staticmethod
     def _validated_agent_payload(
-        payload: dict[str, Any], evidence_summaries: list[dict[str, Any]]
+        payload: dict[str, Any],
+        evidence_summaries: list[dict[str, Any]],
+        *,
+        require_structured_static_assessment: bool = True,
     ) -> tuple[dict[str, Any], str]:
         evidence_by_id = {
             item["id"]: item for item in evidence_summaries if isinstance(item.get("id"), str)
         }
         unknown: list[str] = []
+
+        def dynamic_verdict_eligible(item: dict[str, Any]) -> bool:
+            metadata = item.get("metadata", {})
+            return (
+                metadata.get(
+                    "dynamic_verdict_eligible",
+                    metadata.get("android16_verdict_eligible", True),
+                )
+                is not False
+            )
+
+        def oracle_verdict_eligible(item: dict[str, Any]) -> bool:
+            return dynamic_verdict_eligible(item) and (
+                item.get("kind") != "dynamic_experiment.adb"
+                or item.get("metadata", {}).get("platform_oracle_validated") is True
+            )
+
+        def usable_static_summary(item: dict[str, Any]) -> bool:
+            return static_evidence_is_usable(
+                kind=item.get("kind"),
+                metadata=item.get("metadata"),
+                exit_code=item.get("exit_code"),
+            )
 
         def resolve_ids(values: Any) -> list[str]:
             resolved: list[str] = []
@@ -10532,12 +11395,13 @@ class ScanOrchestrator:
             FindingStatus.REPRODUCED_BLACKBOX.value,
             FindingStatus.NOT_REPRODUCED.value,
         } and not any(
-            evidence_by_id[evidence_id]["kind"].startswith("static.") for evidence_id in valid_ids
+            usable_static_summary(evidence_by_id[evidence_id])
+            for evidence_id in valid_ids
         ):
             static_ids = [
                 evidence_id
                 for evidence_id, item in evidence_by_id.items()
-                if item["kind"].startswith("static.")
+                if usable_static_summary(item)
             ]
             if static_ids:
                 valid_ids = list(dict.fromkeys([*valid_ids, *static_ids]))
@@ -10580,6 +11444,19 @@ class ScanOrchestrator:
         if static_evidence_attached:
             gaps.append("Platform attached the issued static Evidence omitted by the model.")
         cited = [evidence_by_id[value] for value in valid_ids]
+        non_verdict_dynamic_cited = any(
+            str(item.get("kind") or "").startswith(("blackbox.", "dynamic_experiment."))
+            and not dynamic_verdict_eligible(item)
+            for item in cited
+        )
+        if non_verdict_dynamic_cited and result_value in {
+            FindingStatus.REPRODUCED_BLACKBOX.value,
+            FindingStatus.NOT_REPRODUCED.value,
+        }:
+            gaps.append(
+                "Dynamic Evidence from a non-verdict compatibility scope was retained "
+                "for diagnostics but cannot confirm or refute the finding."
+            )
         probe_request_tests = {
             (
                 item.get("metadata", {}).get("request_id"),
@@ -10589,6 +11466,7 @@ class ScanOrchestrator:
             if item["kind"] == "blackbox.probe_app"
             and item.get("exit_code") == 0
             and item.get("metadata", {}).get("caller_identity") == "probe_app"
+            and dynamic_verdict_eligible(item)
         }
         log_request_tests = {
             (
@@ -10598,6 +11476,7 @@ class ScanOrchestrator:
             for item in cited
             if item["kind"] == "blackbox.logcat"
             and item.get("metadata", {}).get("request_observed")
+            and dynamic_verdict_eligible(item)
         }
         probe_correlated_tests = {
             (request_id, test_case_id)
@@ -10614,6 +11493,7 @@ class ScanOrchestrator:
             and item.get("exit_code") == 0
             and item.get("metadata", {}).get("caller_identity")
             in {"agent_poc_app", "platform_generated_poc"}
+            and dynamic_verdict_eligible(item)
         }
         poc_observation_kinds = {
             "blackbox.poc_logcat",
@@ -10627,6 +11507,7 @@ class ScanOrchestrator:
             for item in cited
             if item["kind"] in poc_observation_kinds
             and item.get("metadata", {}).get("request_observed")
+            and dynamic_verdict_eligible(item)
         }
         poc_correlated_tests = {
             (request_id, test_case_id)
@@ -10637,10 +11518,8 @@ class ScanOrchestrator:
             item.get("metadata", {}).get("test_case_id")
             for item in cited
             if item["kind"] == "dynamic_experiment.adb"
-            and item.get("metadata", {}).get(
-                "dynamic_experiment_execution_demonstrated"
-            )
-            is True
+            and item.get("metadata", {}).get("dynamic_experiment_execution_demonstrated") is True
+            and dynamic_verdict_eligible(item)
         } - {None}
         correlated_request_tests = probe_correlated_tests | poc_correlated_tests
         correlated_blackbox = bool(correlated_request_tests or dynamic_experiment_test_ids)
@@ -10652,39 +11531,47 @@ class ScanOrchestrator:
             for item in cited
             if item["kind"] == "blackbox.poc_ui_dump"
             and item.get("metadata", {}).get("impact_contract_satisfied") is True
+            and oracle_verdict_eligible(item)
             and (
                 item.get("metadata", {}).get("request_id"),
                 item.get("metadata", {}).get("test_case_id"),
             )
             in poc_correlated_tests
         } - {None}
-        successful_blackbox = bool(dynamic_experiment_test_ids) or (
-            correlated_blackbox and any(
-                (
-                    item["kind"] == "blackbox.logcat"
-                    and item.get("metadata", {}).get("probe_success")
-                    and (
-                        item.get("metadata", {}).get("request_id"),
-                        item.get("metadata", {}).get("test_case_id"),
+        successful_blackbox = (
+            bool(dynamic_experiment_test_ids)
+            or (
+                correlated_blackbox
+                and any(
+                    (
+                        item["kind"] == "blackbox.logcat"
+                        and item.get("metadata", {}).get("probe_success")
+                        and dynamic_verdict_eligible(item)
+                        and (
+                            item.get("metadata", {}).get("request_id"),
+                            item.get("metadata", {}).get("test_case_id"),
+                        )
+                        in probe_correlated_tests
                     )
-                    in probe_correlated_tests
+                    or (
+                        item["kind"] in poc_observation_kinds
+                        and item.get("metadata", {}).get("poc_success")
+                        and dynamic_verdict_eligible(item)
+                        and (
+                            item["kind"] != "blackbox.poc_durable_receipt"
+                            or item.get("metadata", {}).get("receipt_terminal") is True
+                        )
+                        and (
+                            item.get("metadata", {}).get("request_id"),
+                            item.get("metadata", {}).get("test_case_id"),
+                        )
+                        in poc_correlated_tests
+                    )
+                    for item in cited
                 )
-                or (
-                    item["kind"] in poc_observation_kinds
-                    and item.get("metadata", {}).get("poc_success")
-                    and (
-                        item["kind"] != "blackbox.poc_durable_receipt"
-                        or item.get("metadata", {}).get("receipt_terminal") is True
-                    )
-                    and (
-                        item.get("metadata", {}).get("request_id"),
-                        item.get("metadata", {}).get("test_case_id"),
-                    )
-                    in poc_correlated_tests
-                )
-                for item in cited
             )
-        ) or bool(independent_poc_effect_test_ids)
+            or bool(independent_poc_effect_test_ids)
+        )
         successful_blackbox_test_ids = {
             item.get("metadata", {}).get("test_case_id")
             for item in cited
@@ -10692,6 +11579,7 @@ class ScanOrchestrator:
                 (
                     item["kind"] == "blackbox.logcat"
                     and item.get("metadata", {}).get("probe_success")
+                    and dynamic_verdict_eligible(item)
                     and (
                         item.get("metadata", {}).get("request_id"),
                         item.get("metadata", {}).get("test_case_id"),
@@ -10701,6 +11589,7 @@ class ScanOrchestrator:
                 or (
                     item["kind"] in poc_observation_kinds
                     and item.get("metadata", {}).get("poc_success")
+                    and dynamic_verdict_eligible(item)
                     and (
                         item["kind"] != "blackbox.poc_durable_receipt"
                         or item.get("metadata", {}).get("receipt_terminal") is True
@@ -10713,16 +11602,20 @@ class ScanOrchestrator:
                 )
             )
         } - {None}
-        successful_blackbox_test_ids |= dynamic_experiment_test_ids | independent_poc_effect_test_ids
+        successful_blackbox_test_ids |= (
+            dynamic_experiment_test_ids | independent_poc_effect_test_ids
+        )
         impact_test_ids = {
             item.get("metadata", {}).get("test_case_id")
             for item in cited
             if item.get("metadata", {}).get("impact_contract_satisfied") is True
+            and oracle_verdict_eligible(item)
         } - {None}
         refuted_test_ids = {
             item.get("metadata", {}).get("test_case_id")
             for item in cited
             if item.get("metadata", {}).get("oracle_refuted") is True
+            and oracle_verdict_eligible(item)
         } - {None}
         harmful_blackbox = successful_blackbox and bool(
             successful_blackbox_test_ids & impact_test_ids
@@ -10733,13 +11626,13 @@ class ScanOrchestrator:
             FindingStatus.SUPPORTED_STATIC.value,
             FindingStatus.REFUTED_STATIC.value,
         }:
-            evidence_valid = any(item["kind"].startswith("static.") for item in cited)
+            evidence_valid = any(usable_static_summary(item) for item in cited)
         elif result_value == FindingStatus.REPRODUCED_BLACKBOX.value:
             evidence_valid = harmful_blackbox
         elif result_value == FindingStatus.NOT_REPRODUCED.value:
             evidence_valid = explicitly_refuted
         if not evidence_valid:
-            static_cited = any(item["kind"].startswith("static.") for item in cited)
+            static_cited = any(usable_static_summary(item) for item in cited)
             if static_cited and result_value == FindingStatus.REPRODUCED_BLACKBOX.value:
                 result_value = FindingStatus.SUPPORTED_STATIC.value
                 gaps.append(
@@ -10763,6 +11656,11 @@ class ScanOrchestrator:
             if not isinstance(assessment, dict):
                 continue
             claimed_assessment = str(assessment.get("verdict") or "")
+            explicitly_cited_assessment_evidence_ids = list(
+                assessment.get("evidence_ids", [])
+                if isinstance(assessment.get("evidence_ids"), list)
+                else []
+            )
             validation_verdict = (
                 FindingStatus.SUPPORTED_STATIC.value
                 if claimed_assessment == "needs_dynamic_proof"
@@ -10776,6 +11674,7 @@ class ScanOrchestrator:
                     "hypothesis_assessments": [],
                 },
                 evidence_summaries,
+                require_structured_static_assessment=False,
             )
             assessment["verdict"] = (
                 "needs_dynamic_proof"
@@ -10795,6 +11694,104 @@ class ScanOrchestrator:
                         *assessment_payload.get("coverage_gaps", []),
                     ]
                 )
+            )
+            if assessment["verdict"] in {
+                FindingStatus.SUPPORTED_STATIC.value,
+                "needs_dynamic_proof",
+            }:
+                assessment["unresolved_objection_ids"] = (
+                    ScanOrchestrator._unresolved_static_objection_ids(
+                        payload,
+                        (
+                            str(assessment.get("hypothesis_id"))
+                            if assessment.get("hypothesis_id") is not None
+                            else None
+                        ),
+                        evidence_by_id,
+                    )
+                )
+                gate = ScanOrchestrator._static_support_gate(
+                    assessment,
+                    evidence_by_id,
+                    evidence_ids=explicitly_cited_assessment_evidence_ids,
+                )
+                assessment["platform_static_support_gate"] = gate
+                if not gate["eligible"]:
+                    assessment["model_verdict"] = claimed_assessment
+                    assessment["verdict"] = FindingStatus.CANDIDATE.value
+                    assessment["suppression_reason"] = "static_support_gate_failed"
+                    assessment["suppression_reasons"] = gate["suppression_reasons"]
+                    assessment["proof_gaps"] = list(
+                        dict.fromkeys(
+                            [
+                                *assessment["proof_gaps"],
+                                (
+                                    "Static-support gate suppressed this assessment: "
+                                    + ", ".join(gate["suppression_reasons"])
+                                    + "."
+                                ),
+                            ]
+                        )
+                    )
+            elif assessment["verdict"] == FindingStatus.REFUTED_STATIC.value:
+                gate = ScanOrchestrator._static_refutation_gate(
+                    assessment,
+                    evidence_by_id,
+                    evidence_ids=explicitly_cited_assessment_evidence_ids,
+                )
+                assessment["platform_static_refutation_gate"] = gate
+                if not gate["eligible"]:
+                    assessment["model_verdict"] = claimed_assessment
+                    assessment["verdict"] = FindingStatus.CANDIDATE.value
+                    assessment["suppression_reason"] = "static_refutation_gate_failed"
+                    assessment["suppression_reasons"] = gate["suppression_reasons"]
+                    assessment["proof_gaps"] = list(
+                        dict.fromkeys(
+                            [
+                                *assessment["proof_gaps"],
+                                (
+                                    "Static-refutation gate suppressed this assessment: "
+                                    + ", ".join(gate["suppression_reasons"])
+                                    + "."
+                                ),
+                            ]
+                        )
+                    )
+        assessments = [
+            item
+            for item in payload.get("hypothesis_assessments", [])
+            if isinstance(item, dict)
+        ]
+        if (
+            require_structured_static_assessment
+            and result_value == FindingStatus.SUPPORTED_STATIC.value
+            and not any(
+                assessment.get("verdict")
+                in {
+                    FindingStatus.SUPPORTED_STATIC.value,
+                    "needs_dynamic_proof",
+                }
+                for assessment in assessments
+            )
+        ):
+            result_value = FindingStatus.INCONCLUSIVE.value
+            gaps.append(
+                "No structured hypothesis assessment passed the platform static-support gate; "
+                "the task remains an inconclusive candidate rather than a statically "
+                "supported finding."
+            )
+        if (
+            require_structured_static_assessment
+            and result_value == FindingStatus.REFUTED_STATIC.value
+            and not any(
+                assessment.get("verdict") == FindingStatus.REFUTED_STATIC.value
+                for assessment in assessments
+            )
+        ):
+            result_value = FindingStatus.INCONCLUSIVE.value
+            gaps.append(
+                "No hypothesis passed the platform static-refutation gate; the task remains "
+                "inconclusive instead of being closed by a model-only negative claim."
             )
         payload["coverage_gaps"] = gaps
         payload["result"] = result_value
@@ -10825,11 +11822,40 @@ class ScanOrchestrator:
             )
         )
         for finding in findings:
-            if bool((finding.metadata_json or {}).get("harm_demonstrated")):
+            metadata = dict(finding.metadata_json or {})
+            if (
+                finding.status
+                in {
+                    FindingStatus.FALSE_POSITIVE.value,
+                    FindingStatus.ACCEPTED.value,
+                }
+                and isinstance(finding.review_note, str)
+                and finding.review_note.strip()
+            ):
+                # Automated reruns may append evidence, but only another explicit human review
+                # may replace a human disposition.
+                continue
+            if bool(metadata.get("harm_demonstrated")):
+                continue
+            if evidence_backed_signal_tier(session, finding) == "runtime_oracle_gap":
+                finding.status = FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value
+                metadata["signal_tier"] = "runtime_oracle_gap"
+                metadata["proof_gap_code"] = "missing_platform_harm_oracle"
+                metadata["oracle_gap"] = {
+                    **(
+                        dict(metadata.get("oracle_gap"))
+                        if isinstance(metadata.get("oracle_gap"), dict)
+                        else {}
+                    ),
+                    "schema_version": "1.0",
+                    "status": "open",
+                    "runtime_observed": True,
+                }
+                finding.metadata_json = metadata
                 continue
             finding.status = FindingStatus.INCONCLUSIVE.value
             finding.metadata_json = {
-                **finding.metadata_json,
+                **metadata,
                 "superseded_by_turn": task.turn_id,
                 "superseded_result": result_value,
                 "superseded_by_backend": agent_backend,
@@ -10863,20 +11889,19 @@ class ScanOrchestrator:
             entry.id: entry.name
             for entry in session.scalars(select(EntryPoint).where(EntryPoint.scan_id == scan.id))
         }
-        proven_hypotheses: list[tuple[SecurityHypothesis, list[ProofAttempt]]] = []
-        for hypothesis in hypotheses:
-            attempts = list(
-                session.scalars(
-                    select(ProofAttempt)
-                    .where(
-                        ProofAttempt.hypothesis_id == hypothesis.id,
-                        ProofAttempt.harm_demonstrated.is_(True),
-                    )
-                    .order_by(ProofAttempt.created_at)
-                )
-            )
-            if attempts:
-                proven_hypotheses.append((hypothesis, attempts))
+        attempts_by_hypothesis: dict[str, list[ProofAttempt]] = defaultdict(list)
+        for attempt in evidence_backed_harm_attempts(
+            session,
+            scan_id=scan.id,
+            task_id=task.id,
+            hypothesis_ids={hypothesis.id for hypothesis in hypotheses},
+        ):
+            attempts_by_hypothesis[attempt.hypothesis_id].append(attempt)
+        proven_hypotheses = [
+            (hypothesis, attempts_by_hypothesis[hypothesis.id])
+            for hypothesis in hypotheses
+            if hypothesis.id in attempts_by_hypothesis
+        ]
         proven_hypothesis_ids = {hypothesis.id for hypothesis, _attempts in proven_hypotheses}
 
         if proven_hypotheses:
@@ -10900,7 +11925,14 @@ class ScanOrchestrator:
                 proof_status = FindingStatus.REPRODUCED_BLACKBOX.value
                 proof_evidence_ids = list(
                     dict.fromkeys(
-                        evidence_id for attempt in attempts for evidence_id in attempt.evidence_ids
+                        evidence_id
+                        for attempt in attempts
+                        for evidence_id in (
+                            attempt.evidence_ids
+                            if isinstance(attempt.evidence_ids, list)
+                            else []
+                        )
+                        if isinstance(evidence_id, str) and evidence_id
                     )
                 )
                 proof_rationales = list(
@@ -10994,28 +12026,60 @@ class ScanOrchestrator:
                     session.flush()
                 else:
                     previous_metadata = dict(finding.metadata_json or {})
+                    preserve_human_closure = (
+                        finding.status
+                        in {
+                            FindingStatus.FALSE_POSITIVE.value,
+                            FindingStatus.ACCEPTED.value,
+                        }
+                        and isinstance(finding.review_note, str)
+                        and bool(finding.review_note.strip())
+                    )
                     for merge_key in (
                         "merged_duplicate",
                         "merged_into_finding_id",
                         "merge_basis",
                     ):
                         previous_metadata.pop(merge_key, None)
-                    finding.source = agent_backend
-                    finding.title = report.title
-                    finding.description = render_finding_description(report)
-                    finding.remediation = render_finding_remediation(report)
-                    finding.severity = payload.get("platform_severity") or payload.get(
-                        "severity_proposal", "medium"
-                    )
-                    finding.confidence = payload.get("confidence", "medium")
-                    finding.status = proof_status
-                    finding.review_note = None
+                    if not preserve_human_closure:
+                        finding.source = agent_backend
+                        finding.title = report.title
+                        finding.description = render_finding_description(report)
+                        finding.remediation = render_finding_remediation(report)
+                        finding.severity = payload.get("platform_severity") or payload.get(
+                            "severity_proposal", "medium"
+                        )
+                        finding.confidence = payload.get("confidence", "medium")
+                        finding.status = proof_status
+                        finding.review_note = None
                     finding.entry_point_ids = chain_entry_ids
-                    finding.evidence_ids = proof_evidence_ids
-                    finding.metadata_json = {
+                    finding.evidence_ids = (
+                        list(
+                            dict.fromkeys(
+                                [*finding.evidence_ids, *proof_evidence_ids]
+                            )
+                        )
+                        if preserve_human_closure
+                        else proof_evidence_ids
+                    )
+                    if preserve_human_closure:
+                        metadata["latest_agent_reanalysis"] = {
+                            "task_id": task.id,
+                            "result": proof_status,
+                            "evidence_ids": proof_evidence_ids,
+                            "human_closure_preserved": True,
+                            "report": metadata.get("report"),
+                        }
+                    updated_metadata = {
                         **previous_metadata,
                         **metadata,
                     }
+                    if preserve_human_closure:
+                        if "report" in previous_metadata:
+                            updated_metadata["report"] = previous_metadata["report"]
+                        else:
+                            updated_metadata.pop("report", None)
+                    finding.metadata_json = updated_metadata
                 hypothesis.final_finding_id = finding.id
                 pattern = (
                     self.security_evolution.create_pattern_from_finding(
@@ -11041,13 +12105,125 @@ class ScanOrchestrator:
                         matches=new_matches,
                     )
 
-        supported_assessments = [
-            assessment
-            for assessment in payload.get("hypothesis_assessments", [])
-            if isinstance(assessment, dict)
-            and assessment.get("verdict") == FindingStatus.SUPPORTED_STATIC.value
-            and assessment.get("hypothesis_id") not in proven_hypothesis_ids
+        assessment_records = [
+            item
+            for item in payload.get("hypothesis_assessments", [])
+            if isinstance(item, dict)
         ]
+        assessment_evidence_ids = {
+            evidence_id
+            for assessment in assessment_records
+            for evidence_id in assessment.get("evidence_ids", [])
+            if isinstance(evidence_id, str) and evidence_id
+        }
+        assessment_evidence_ids.update(
+            evidence_id
+            for resolution in payload.get("objection_resolutions", [])
+            if isinstance(resolution, dict)
+            for evidence_id in (
+                resolution.get("evidence_ids", [])
+                if isinstance(resolution.get("evidence_ids"), list)
+                else []
+            )
+            if isinstance(evidence_id, str) and evidence_id
+        )
+        assessment_evidence_by_id = {
+            item.id: self._evidence_summary(item)
+            for item in (
+                session.scalars(
+                    select(Evidence).where(
+                        Evidence.scan_id == scan.id,
+                        Evidence.id.in_(assessment_evidence_ids),
+                    )
+                )
+                if assessment_evidence_ids
+                else []
+            )
+        }
+        supported_assessments: list[dict[str, Any]] = []
+        static_support_suppressions: list[dict[str, Any]] = []
+        for assessment in assessment_records:
+            if (
+                assessment.get("verdict")
+                not in {
+                    FindingStatus.SUPPORTED_STATIC.value,
+                    "needs_dynamic_proof",
+                }
+                or assessment.get("hypothesis_id") in proven_hypothesis_ids
+            ):
+                continue
+            assessment["unresolved_objection_ids"] = (
+                self._unresolved_static_objection_ids(
+                    payload,
+                    (
+                        str(assessment.get("hypothesis_id"))
+                        if assessment.get("hypothesis_id") is not None
+                        else None
+                    ),
+                    assessment_evidence_by_id,
+                )
+            )
+            reported_gate = assessment.get("platform_static_support_gate")
+            gate = self._static_support_gate(assessment, assessment_evidence_by_id)
+            if isinstance(reported_gate, dict) and reported_gate != gate:
+                assessment["reported_static_support_gate"] = reported_gate
+            assessment["platform_static_support_gate"] = gate
+            if gate.get("eligible") is True:
+                supported_assessments.append(assessment)
+                continue
+            suppression = {
+                "hypothesis_id": assessment.get("hypothesis_id"),
+                "reason": "static_support_gate_failed",
+                "reasons": list(gate.get("suppression_reasons") or []),
+            }
+            static_support_suppressions.append(suppression)
+            assessment["model_verdict"] = assessment.get("model_verdict") or assessment.get(
+                "verdict"
+            )
+            assessment["verdict"] = FindingStatus.CANDIDATE.value
+            assessment["suppression_reason"] = suppression["reason"]
+            assessment["suppression_reasons"] = suppression["reasons"]
+        if static_support_suppressions:
+            payload = {
+                **dict(payload),
+                "hypothesis_assessments": assessment_records,
+                "static_support_suppressions": static_support_suppressions,
+            }
+            task.result = payload
+        hypothesis_by_id = {hypothesis.id: hypothesis for hypothesis in hypotheses}
+        for suppression in static_support_suppressions:
+            hypothesis = hypothesis_by_id.get(str(suppression.get("hypothesis_id")))
+            if hypothesis is None or hypothesis.id in proven_hypothesis_ids:
+                continue
+            hypothesis.status = HypothesisStatus.INCONCLUSIVE.value
+            hypothesis.support_evidence_ids = []
+            hypothesis.metadata_json = {
+                **dict(hypothesis.metadata_json or {}),
+                "static_support_suppression": suppression,
+            }
+        if (
+            result_value == FindingStatus.SUPPORTED_STATIC.value
+            and not supported_assessments
+            and not proven_hypotheses
+        ):
+            gaps = payload.get("coverage_gaps")
+            gaps = [value for value in gaps if isinstance(value, str)] if isinstance(
+                gaps, list
+            ) else []
+            message = (
+                "No hypothesis passed the platform static-support gate; the task remains "
+                "inconclusive and no supported Finding was emitted."
+            )
+            payload = {
+                **dict(payload),
+                "result": FindingStatus.INCONCLUSIVE.value,
+                "platform_severity": None,
+                "severity_disposition": "not_applicable_inconclusive",
+                "coverage_gaps": list(dict.fromkeys([*gaps, message])),
+            }
+            task.result = payload
+            task.status = TaskStatus.INCONCLUSIVE.value
+            return
         if (
             result_value
             in {
@@ -11078,18 +12254,6 @@ class ScanOrchestrator:
         else:
             automation_state = "manual_or_poc_required"
             proof_reason = "agent_did_not_produce_an_automatable_proof"
-        hypothesis_by_id = {hypothesis.id: hypothesis for hypothesis in hypotheses}
-        if not supported_assessments and result_value == FindingStatus.SUPPORTED_STATIC.value:
-            supported_assessments = [
-                {
-                    "hypothesis_id": hypothesis.id,
-                    "verdict": FindingStatus.SUPPORTED_STATIC.value,
-                    "evidence_ids": evidence_ids,
-                    "proof_gaps": payload.get("coverage_gaps", []),
-                }
-                for hypothesis in hypotheses[:1]
-                if hypothesis.id not in proven_hypothesis_ids
-            ]
 
         for assessment in supported_assessments:
             hypothesis = hypothesis_by_id.get(str(assessment.get("hypothesis_id")))
@@ -11159,6 +12323,24 @@ class ScanOrchestrator:
                 "coverage_gaps": payload.get("coverage_gaps", []),
                 "harm_demonstrated": False,
                 "excluded_proven_hypothesis_ids": sorted(proven_hypothesis_ids),
+                "signal_tier": "static_chain",
+                "platform_static_support_gate": assessment.get(
+                    "platform_static_support_gate"
+                ),
+                "chain_receipt": {
+                    key: assessment.get(key)
+                    for key in (
+                        "source",
+                        "control",
+                        "sink",
+                        "reachable_path",
+                        "boundary",
+                        "security_impact",
+                        "missing_control",
+                    )
+                },
+                "security_impact": assessment.get("security_impact"),
+                "missing_control": assessment.get("missing_control"),
                 "proof_backlog": proof_backlog,
                 "identity": signal_identity,
                 "report": report.model_dump(mode="json"),
@@ -11189,21 +12371,101 @@ class ScanOrchestrator:
                 )
                 session.add(finding)
             else:
-                finding.source = agent_backend
-                finding.title = report.title
-                finding.description = render_finding_description(report)
-                finding.remediation = render_finding_remediation(report)
-                finding.severity = payload.get("platform_severity") or payload.get(
-                    "severity_proposal", "medium"
+                previous_metadata = dict(finding.metadata_json or {})
+                preserve_human_closure = (
+                    finding.status
+                    in {
+                        FindingStatus.FALSE_POSITIVE.value,
+                        FindingStatus.ACCEPTED.value,
+                    }
+                    and isinstance(finding.review_note, str)
+                    and bool(finding.review_note.strip())
                 )
-                finding.confidence = assessment.get("confidence") or payload.get(
-                    "confidence", "medium"
+                preserve_runtime_observation = (
+                    not preserve_human_closure
+                    and evidence_backed_signal_tier(session, finding)
+                    == "runtime_oracle_gap"
                 )
-                finding.status = FindingStatus.SUPPORTED_STATIC.value
-                finding.review_note = None
-                finding.entry_point_ids = signal_entry_ids
-                finding.evidence_ids = signal_evidence_ids
-                finding.metadata_json = {**(finding.metadata_json or {}), **metadata}
+                preserved_runtime_metadata = {
+                    key: previous_metadata[key]
+                    for key in (
+                        "signal_tier",
+                        "proof_backlog",
+                        "proof_gap_code",
+                        "oracle_gap",
+                        "adaptive_verification",
+                        "adaptive_verification_history",
+                        "report",
+                    )
+                    if key in previous_metadata
+                }
+                if preserve_runtime_observation:
+                    preserved_runtime_metadata["signal_tier"] = "runtime_oracle_gap"
+                    preserved_runtime_metadata["proof_gap_code"] = (
+                        "missing_platform_harm_oracle"
+                    )
+                    preserved_runtime_metadata["oracle_gap"] = {
+                        **(
+                            dict(previous_metadata.get("oracle_gap"))
+                            if isinstance(previous_metadata.get("oracle_gap"), dict)
+                            else {}
+                        ),
+                        "schema_version": "1.0",
+                        "status": "open",
+                        "runtime_observed": True,
+                    }
+                if not preserve_human_closure:
+                    finding.source = agent_backend
+                    finding.title = report.title
+                    finding.description = render_finding_description(report)
+                    finding.remediation = render_finding_remediation(report)
+                    finding.severity = payload.get("platform_severity") or payload.get(
+                        "severity_proposal", "medium"
+                    )
+                    finding.confidence = assessment.get("confidence") or payload.get(
+                        "confidence", "medium"
+                    )
+                    finding.status = (
+                        FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value
+                        if preserve_runtime_observation
+                        else FindingStatus.SUPPORTED_STATIC.value
+                    )
+                    finding.review_note = None
+                finding.entry_point_ids = list(
+                    dict.fromkeys([*finding.entry_point_ids, *signal_entry_ids])
+                )
+                finding.evidence_ids = list(
+                    dict.fromkeys([*finding.evidence_ids, *signal_evidence_ids])
+                )
+                if preserve_human_closure:
+                    finding.metadata_json = {
+                        **previous_metadata,
+                        "latest_agent_reanalysis": {
+                            "task_id": task.id,
+                            "result": FindingStatus.SUPPORTED_STATIC.value,
+                            "evidence_ids": signal_evidence_ids,
+                            "human_closure_preserved": True,
+                            "report": metadata["report"],
+                            "platform_static_support_gate": metadata.get(
+                                "platform_static_support_gate"
+                            ),
+                        },
+                    }
+                else:
+                    finding.metadata_json = {
+                        **previous_metadata,
+                        **metadata,
+                        **(
+                            preserved_runtime_metadata
+                            if preserve_runtime_observation
+                            else {}
+                        ),
+                        **(
+                            {"latest_static_support_report": metadata["report"]}
+                            if preserve_runtime_observation
+                            else {}
+                        ),
+                    }
             session.flush()
             hypothesis.final_finding_id = finding.id
 
@@ -11269,6 +12531,11 @@ class ScanOrchestrator:
                 .order_by(CoverageItem.control_id, CoverageItem.id)
             )
         )
+        entry_records = list(
+            session.scalars(
+                select(EntryPoint).where(EntryPoint.scan_id == scan.id).order_by(EntryPoint.id)
+            )
+        )
         seal_payload = {
             "schema_version": "1.0",
             "scan_id": scan.id,
@@ -11321,6 +12588,13 @@ class ScanOrchestrator:
                 }
                 for item in coverage_records
             ],
+            "entry_dispositions": [
+                {
+                    "entry_point_id": item.id,
+                    "disposition": item.disposition,
+                }
+                for item in entry_records
+            ],
         }
         return self.evidence.json(
             session,
@@ -11338,6 +12612,140 @@ class ScanOrchestrator:
             },
         )
 
+    def _assign_entry_dispositions(
+        self,
+        session,  # noqa: ANN001
+        scan: Scan,
+        finding_records: list[Finding],
+        confirmed_finding_ids: set[str],
+    ) -> dict[str, str]:
+        scan_id = scan.id
+        entries = list(
+            session.scalars(
+                select(EntryPoint).where(EntryPoint.scan_id == scan_id).order_by(EntryPoint.id)
+            )
+        )
+        tasks = list(
+            session.scalars(
+                select(InvestigationTask)
+                .where(InvestigationTask.scan_id == scan_id)
+                .order_by(InvestigationTask.id)
+            )
+        )
+        entry_payloads = [
+            {
+                "id": entry.id,
+                "kind": entry.kind,
+                "name": entry.name,
+                "owner_component": entry.owner_component,
+                "exported": entry.exported,
+                "permission": entry.permission,
+                "permission_protection": entry.permission_protection,
+                "metadata_json": entry.metadata_json,
+                "static_closure_evaluated": True,
+                "static_closure": (
+                    closure.as_dict()
+                    if (closure := InvestigationPlanner._static_closure(entry)) is not None
+                    else None
+                ),
+            }
+            for entry in entries
+        ]
+        task_payloads = [
+            {
+                "id": task.id,
+                "target_entry_ids": task.target_entry_ids,
+                "status": task.status,
+                "task_type": task.task_type,
+                "attempts": task.attempts,
+                "recency": (task.completed_at or task.started_at or task.created_at).timestamp(),
+                "agent_enabled": (
+                    (backend := self.resolve_task_investigator(scan, task)) != "none"
+                    and self.settings.investigator_enabled(backend)
+                ),
+                "capability_gap": bool((task.result or {}).get("capability_gap"))
+                or (task.result or {}).get("failure_category")
+                in {"agent_unavailable", "device_unavailable"},
+            }
+            for task in tasks
+        ]
+        finding_payloads = [
+            {
+                "id": finding.id,
+                "entry_point_ids": finding.entry_point_ids,
+                "status": finding.status,
+                "task_id": (finding.metadata_json or {}).get("task_id"),
+                "proof_backed": finding.id in confirmed_finding_ids,
+                "signal_tier": evidence_backed_signal_tier(session, finding),
+                "active": not isinstance(
+                    (finding.metadata_json or {}).get("merged_into_finding_id"), str
+                ),
+            }
+            for finding in finding_records
+        ]
+        attack_chains: list[dict[str, Any]] = []
+        for finding in finding_records:
+            finding_metadata = finding.metadata_json or {}
+            if (
+                isinstance(finding_metadata.get("merged_into_finding_id"), str)
+                or finding.status
+                not in {
+                    FindingStatus.CANDIDATE.value,
+                    FindingStatus.SUPPORTED_STATIC.value,
+                    FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value,
+                    FindingStatus.ACCEPTED.value,
+                    FindingStatus.REPRODUCED_BLACKBOX.value,
+                }
+                or (
+                    finding.status == FindingStatus.REPRODUCED_BLACKBOX.value
+                    and finding.id not in confirmed_finding_ids
+                )
+            ):
+                continue
+            for chain in (finding.metadata_json or {}).get("attack_chains", []) or []:
+                if not isinstance(chain, dict):
+                    continue
+                attack_chains.append(
+                    {
+                        **chain,
+                        "entry_point_ids": list(
+                            dict.fromkeys(
+                                [
+                                    *(chain.get("entry_point_ids", []) or []),
+                                    *(finding.entry_point_ids or []),
+                                ]
+                            )
+                        ),
+                        "task_id": finding_metadata.get("task_id"),
+                    }
+                )
+        for entry in entries:
+            for chain in (entry.metadata_json or {}).get("static_review_attack_chains", []) or []:
+                if not isinstance(chain, dict):
+                    continue
+                attack_chains.append(
+                    {
+                        **chain,
+                        "entry_point_ids": list(
+                            dict.fromkeys([*(chain.get("entry_point_ids", []) or []), entry.id])
+                        ),
+                    }
+                )
+
+        dispositions = resolve_entry_dispositions(
+            entry_payloads,
+            task_payloads,
+            finding_payloads,
+            attack_chains,
+            codex_enabled=any(
+                task_payload.get("agent_enabled") is True for task_payload in task_payloads
+            ),
+            device_available=self.device_pool.configured,
+        )
+        for entry in entries:
+            entry.disposition = dispositions[entry.id]
+        return dispositions
+
     def _finish(self, scan_id: str) -> None:
         with self.database.session_factory() as session:
             scan = session.get(Scan, scan_id)
@@ -11353,6 +12761,14 @@ class ScanOrchestrator:
             confirmed_findings, signals = partition_findings(session, finding_records)
             finding_count = len(confirmed_findings)
             signal_count = len(signals)
+            entry_dispositions = self._assign_entry_dispositions(
+                session,
+                scan,
+                finding_records,
+                {finding.id for finding in confirmed_findings},
+            )
+            entry_disposition_counts = disposition_summary(entry_dispositions)
+            entry_disposition_rate = disposition_coverage_rate(entry_dispositions)
             # Re-analysis emits a fresh receipt; older seals remain as audit history.
             seal = self._create_scan_seal(session, scan, finding_records)
             execution_control = dict((scan.stats or {}).get("execution_control") or {})
@@ -11370,11 +12786,22 @@ class ScanOrchestrator:
                 "task_status_counts": dict(counts),
                 "finding_count": finding_count,
                 "signal_count": signal_count,
+                "entry_disposition_counts": entry_disposition_counts,
+                "entry_disposition_coverage_rate": entry_disposition_rate,
+                "unresolved_entry_disposition_count": entry_disposition_counts.get(
+                    "uninvestigated", 0
+                ),
                 **({"execution_control": execution_control} if execution_control else {}),
                 "seal": {
                     "schema_version": "1.0",
                     "evidence_id": seal.id,
                     "sha256": seal.sha256,
+                    "current": True,
+                },
+                "materialized_summary": {
+                    "schema_version": "1.0",
+                    "current": True,
+                    "generated_at": now().isoformat(),
                 },
             }
             add_event(
@@ -11386,6 +12813,8 @@ class ScanOrchestrator:
                     "task_status_counts": dict(counts),
                     "findings": finding_count,
                     "signals": signal_count,
+                    "entry_disposition_counts": entry_disposition_counts,
+                    "entry_disposition_coverage_rate": entry_disposition_rate,
                     "seal_evidence_id": seal.id,
                     "seal_sha256": seal.sha256,
                     "stopped_by_user": stopped_by_user,

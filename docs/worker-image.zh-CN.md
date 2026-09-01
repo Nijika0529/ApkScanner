@@ -50,6 +50,10 @@ docker/vendor/apktool/apktool.jar
 
 不要取消摘要校验，也不要把未经确认的新版本直接覆盖到固定目录。
 
+Android Platform 与 Build Tools 不依赖本机 `docker/vendor/android-sdk`：Docker 构建会从
+Google Android Repository 下载固定归档，并使用 Dockerfile 中锁定的 SHA-256 摘要校验后再
+解包。因此，干净仓库只需按上文准备 JADX 和 Apktool 两类离线资产。
+
 ## 构建与检查
 
 ```bash
@@ -64,8 +68,9 @@ docker image inspect apk-scanner-codex-worker:0.2.0 \
 ```
 
 当前镜像约 650 MB，首次构建还需要下载 Android Platform 与 Build Tools。仅修改宿主控制面或
-前端时通常不需要重建 Worker；修改 `Dockerfile.worker`、`pyproject.toml`、`codex_worker.py`、
-容器包装器或固定工具版本后应重建并运行 Docker 契约测试。
+前端时通常不需要重建 Worker；修改 `Dockerfile.worker`、`pyproject.toml`、
+`backend/apkscanner/runtime/codex_worker.py`、容器包装器或固定工具版本后应重建并运行 Docker
+契约测试。
 
 ```bash
 APKSCANNER_RUN_DOCKER_TESTS=1 \

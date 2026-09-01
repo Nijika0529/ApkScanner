@@ -214,6 +214,25 @@ def test_dynamic_experiment_api_persists_stateful_steps(settings) -> None:  # no
         assert listed.json()[0]["id"] == capsule_id
         assert listed.json()[0]["steps"][1]["observation_kind"] == "callback.received"
 
+        rejected = client.post(
+            f"/api/v1/scans/{scan_id}/dynamic-experiments",
+            headers=headers,
+            json={
+                "name": "host escape",
+                "objective": "This command must be rejected before persistence.",
+                "steps": [
+                    {
+                        "id": "push",
+                        "title": "Transfer a host file",
+                        "phase": "action",
+                        "adb_args": ["push", "/etc/passwd", "/data/local/tmp/input"],
+                    }
+                ],
+            },
+        )
+        assert rejected.status_code == 422
+        assert "invalid dynamic experiment command" in rejected.json()["detail"]
+
 
 def test_scan_quality_summary_api_returns_empty_funnel(settings) -> None:  # noqa: ANN001
     app = create_app(settings)
@@ -239,6 +258,234 @@ def test_scan_quality_summary_api_returns_empty_funnel(settings) -> None:  # noq
         "count": 0,
     }
     assert payload["cost"]["agent_calls"] == 0
+
+
+@pytest.mark.parametrize("initial_status", ["candidate", "supported_static"])
+def test_finding_review_cannot_accept_an_unproven_signal(
+    settings,  # noqa: ANN001
+    initial_status: str,
+) -> None:
+    app = create_app(settings)
+    with app.state.database.session_factory() as session:
+        scan = Scan(
+            status="final",
+            filename=f"review-{initial_status}.apk",
+            artifact_sha256="a" * 64,
+            artifact_path=f"review-{initial_status}.apk",
+        )
+        finding = Finding(
+            scan=scan,
+            dedupe_key=f"review-{initial_status}",
+            rule_id="STATIC-REVIEW",
+            title="Unproven static signal",
+            description="This signal has no attributable platform harm receipt.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            status=initial_status,
+            review_note="original note",
+            metadata_json={"harm_demonstrated": False},
+        )
+        session.add_all([scan, finding])
+        session.commit()
+        finding_id = finding.id
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/v1/findings/{finding_id}/review",
+            headers={"X-APKScanner-Request": "console"},
+            json={"status": "accepted", "note": "accept without proof"},
+        )
+
+    assert response.status_code == 409
+    assert "proof-backed confirmed finding" in response.json()["detail"]
+    with app.state.database.session_factory() as session:
+        persisted = session.get(Finding, finding_id)
+        assert persisted is not None
+        assert persisted.status == initial_status
+        assert persisted.review_note == "original note"
+
+
+def test_finding_review_can_accept_a_proof_backed_reproduced_finding(settings) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    with app.state.database.session_factory() as session:
+        scan = Scan(
+            status="final",
+            filename="review-proven.apk",
+            artifact_sha256="b" * 64,
+            artifact_path="review-proven.apk",
+            stats={
+                "finding_count": 1,
+                "signal_count": 0,
+                "seal": {
+                    "evidence_id": "prior-seal",
+                    "sha256": "1" * 64,
+                    "current": True,
+                },
+            },
+        )
+        entry = EntryPoint(
+            scan=scan,
+            kind="activity",
+            name="com.example.ReviewActivity",
+            exported=True,
+            disposition="reproduced_blackbox",
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="completed",
+        )
+        session.add_all([scan, entry, task])
+        session.flush()
+        hypothesis = SecurityHypothesis(
+            scan_id=scan.id,
+            task_id=task.id,
+            fingerprint="c" * 64,
+            category="android.exported_component",
+            claim="An ordinary application reaches a harmful target operation.",
+        )
+        evidence = Evidence(
+            scan_id=scan.id,
+            task_id=task.id,
+            kind="blackbox.oracle_result",
+            sha256="d" * 64,
+            path="review-proof.json",
+            summary="The platform Oracle observed the harmful target effect.",
+        )
+        session.add_all([hypothesis, evidence])
+        session.flush()
+        finding = Finding(
+            scan=scan,
+            dedupe_key="review-proven",
+            rule_id="AGENT-ENTRY-INVESTIGATION",
+            source="codex",
+            title="Proof-backed finding",
+            description="An attributable platform receipt demonstrated harm.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            status="reproduced_blackbox",
+            entry_point_ids=[entry.id],
+            evidence_ids=["00000000-0000-0000-0000-000000000099"],
+            metadata_json={
+                "hypothesis_id": hypothesis.id,
+                "harm_demonstrated": True,
+                "signal_tier": "runtime_oracle_gap",
+                "proof_gap_code": "missing_platform_harm_oracle",
+                "oracle_gap": {"status": "open"},
+                "proof_backlog": {"status": "proof_required", "task_id": task.id},
+                "report": {
+                    "kind": "finding",
+                    "conclusion": "平台原始结论为已证明。",
+                    "verification": {
+                        "status": "confirmed",
+                        "missing_proof": None,
+                        "next_step": None,
+                    },
+                },
+            },
+        )
+        session.add(finding)
+        session.flush()
+        proof = ProofAttempt(
+            scan_id=scan.id,
+            task_id=task.id,
+            hypothesis_id=hypothesis.id,
+            test_case_id="review-proven",
+            status="proven",
+            oracle={"release_gate_eligible": True},
+            evidence_ids=[evidence.id],
+            harm_demonstrated=True,
+        )
+        session.add(proof)
+        session.flush()
+        hypothesis.final_finding_id = finding.id
+        finding.metadata_json = {
+            **dict(finding.metadata_json or {}),
+            "proof_attempt_ids": ["00000000-0000-0000-0000-000000000098", proof.id],
+        }
+        session.commit()
+        finding_id = finding.id
+        scan_id = scan.id
+        evidence_id = evidence.id
+        proof_id = proof.id
+        entry_id = entry.id
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/v1/findings/{finding_id}/review",
+            headers={"X-APKScanner-Request": "console"},
+            json={"status": "accepted", "note": "receipt manually reviewed"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "accepted"
+    assert response.json()["review_note"] == "receipt manually reviewed"
+    with TestClient(app) as client:
+        rejected_downgrade = client.post(
+            f"/api/v1/findings/{finding_id}/review",
+            headers={"X-APKScanner-Request": "console"},
+            json={"status": "candidate", "note": "silently reopen proven receipt"},
+        )
+    assert rejected_downgrade.status_code == 409
+    assert "cannot be downgraded" in rejected_downgrade.json()["detail"]
+
+    with TestClient(app) as client:
+        false_positive = client.post(
+            f"/api/v1/findings/{finding_id}/review",
+            headers={"X-APKScanner-Request": "console"},
+            json={"status": "false_positive", "note": "human override after reviewing context"},
+        )
+        signals = client.get(f"/api/v1/scans/{scan_id}/signals")
+        restored = client.post(
+            f"/api/v1/findings/{finding_id}/review",
+            headers={"X-APKScanner-Request": "console"},
+            json={"status": "accepted", "note": "restore after rechecking the receipt"},
+        )
+
+    assert false_positive.status_code == 200
+    assert false_positive.json()["status"] == "false_positive"
+    assert false_positive.json()["metadata_json"]["report"]["kind"] == "pending_risk"
+    assert false_positive.json()["metadata_json"]["report"]["verification"][
+        "status"
+    ] == "refuted"
+    assert signals.status_code == 200
+    reviewed_signal = next(item for item in signals.json() if item["id"] == finding_id)
+    assert reviewed_signal["can_accept"] is True
+    assert restored.status_code == 200
+    assert restored.json()["status"] == "accepted"
+    assert restored.json()["review_note"] == "restore after rechecking the receipt"
+    assert restored.json()["metadata_json"]["report"]["kind"] == "finding"
+    assert restored.json()["metadata_json"]["report"]["verification"][
+        "status"
+    ] == "confirmed"
+    assert "误报" not in restored.json()["metadata_json"]["report"]["conclusion"]
+    assert restored.json()["metadata_json"]["report"]["verification"][
+        "evidence_ids"
+    ] == [evidence_id]
+    assert restored.json()["metadata_json"]["report"]["verification"][
+        "proof_attempt_ids"
+    ] == [proof_id]
+    with app.state.database.session_factory() as session:
+        persisted = session.get(Finding, finding_id)
+        assert persisted is not None
+        assert persisted.status == "accepted"
+        assert persisted.review_note == "restore after rechecking the receipt"
+        assert persisted.evidence_ids == [evidence_id]
+        assert persisted.metadata_json["harm_demonstrated"] is True
+        assert persisted.metadata_json["proof_attempt_ids"] == [proof_id]
+        assert persisted.metadata_json["release_gate_eligible"] is True
+        assert persisted.metadata_json["proof_backlog"]["status"] == "verified"
+        assert "signal_tier" not in persisted.metadata_json
+        assert "proof_gap_code" not in persisted.metadata_json
+        assert "oracle_gap" not in persisted.metadata_json
+        persisted_scan = session.get(Scan, scan_id)
+        persisted_entry = session.get(EntryPoint, entry_id)
+        assert persisted_scan is not None
+        assert persisted_scan.stats["seal"]["current"] is False
+        assert persisted_scan.stats["materialized_summary"]["current"] is False
+        assert "finding_count" not in persisted_scan.stats
+        assert "signal_count" not in persisted_scan.stats
+        assert persisted_entry is not None and persisted_entry.disposition is None
 
 
 def test_artifact_graph_api_returns_native_relationships(settings) -> None:  # noqa: ANN001
@@ -308,9 +555,7 @@ def test_health_reports_a_leased_adb_pool_as_busy_not_unavailable(
 
     assert response.status_code == 200
     device = next(
-        item
-        for item in response.json()["capabilities"]
-        if item["name"] == "remote_android_device"
+        item for item in response.json()["capabilities"] if item["name"] == "remote_android_device"
     )
     assert device["available"] is True
     assert device["busy"] is True
@@ -520,9 +765,7 @@ def test_scan_child_collections_return_not_found_for_unknown_scan(
 ) -> None:  # noqa: ANN001
     app = create_app(settings)
     with TestClient(app) as client:
-        response = client.get(
-            f"/api/v1/scans/00000000-0000-0000-0000-000000000099/{suffix}"
-        )
+        response = client.get(f"/api/v1/scans/00000000-0000-0000-0000-000000000099/{suffix}")
     assert response.status_code == 404
 
 
@@ -601,7 +844,14 @@ def test_findings_require_platform_harm_and_valid_evidence(settings) -> None:  #
                 path=str(settings.data_dir / "evidence.json"),
                 summary="Platform Oracle observed unauthorized impact",
             )
-            session.add(evidence)
+            static_evidence = Evidence(
+                scan_id=scan.id,
+                kind="static.jadx",
+                sha256="b" * 64,
+                path=str(settings.data_dir / "static-evidence.json"),
+                summary="Static source-to-sink path",
+            )
+            session.add_all([evidence, static_evidence])
             session.flush()
             proof = ProofAttempt(
                 scan_id=scan.id,
@@ -636,8 +886,26 @@ def test_findings_require_platform_harm_and_valid_evidence(settings) -> None:  #
                     masvs="MASVS-PLATFORM",
                     severity="high",
                     status="supported_static",
-                    evidence_ids=[evidence.id],
-                    metadata_json={"harm_demonstrated": False},
+                    evidence_ids=[static_evidence.id],
+                    metadata_json={
+                        "harm_demonstrated": False,
+                        "signal_tier": "static_chain",
+                        "platform_static_support_gate": {
+                            "schema_version": "1.0",
+                            "eligible": True,
+                            "required_fields": [
+                                "source",
+                                "control",
+                                "sink",
+                                "reachable_path",
+                                "boundary",
+                                "security_impact",
+                                "missing_control",
+                            ],
+                            "static_evidence_ids": [static_evidence.id],
+                            "suppression_reasons": [],
+                        },
+                    },
                 ),
                 Finding(
                     scan_id=scan.id,
@@ -686,11 +954,29 @@ def test_findings_require_platform_harm_and_valid_evidence(settings) -> None:  #
         "Static support",
         "Invalid proof reference",
     }
+    assert {item["title"]: item["signal_tier"] for item in signals.json()} == {
+        "Static candidate": "raw_candidate",
+        "Static support": "static_chain",
+        "Invalid proof reference": "raw_candidate",
+    }
+    assert {item["title"]: item["can_accept"] for item in signals.json()} == {
+        "Static candidate": False,
+        "Static support": False,
+        "Invalid proof reference": False,
+    }
     assert [item["title"] for item in report.json()["findings"]] == ["Proven impact"]
     assert {item["title"] for item in report.json()["signals"]} == {
         "Static candidate",
         "Static support",
         "Invalid proof reference",
+    }
+    signal_tiers = {
+        item["title"]: item["signal_tier"] for item in report.json()["signals"]
+    }
+    assert signal_tiers == {
+        "Static candidate": "raw_candidate",
+        "Static support": "static_chain",
+        "Invalid proof reference": "raw_candidate",
     }
 
 
@@ -763,9 +1049,7 @@ def test_event_history_is_bounded_and_supports_incremental_cursors(settings) -> 
         latest_items = latest.json()
         assert [item["data"]["index"] for item in latest_items] == [7, 8, 9, 10, 11]
         cursor = latest_items[1]["id"]
-        incremental = client.get(
-            f"/api/v1/scans/{scan_id}/events?after={cursor}&limit=3"
-        )
+        incremental = client.get(f"/api/v1/scans/{scan_id}/events?after={cursor}&limit=3")
         assert incremental.status_code == 200
         assert [item["data"]["index"] for item in incremental.json()] == [9, 10, 11]
 
@@ -814,9 +1098,7 @@ def test_event_history_summary_excludes_high_rate_runtime_telemetry(settings) ->
         scan_id = scan.id
 
     with TestClient(app) as client:
-        response = client.get(
-            f"/api/v1/scans/{scan_id}/events?detail=summary&limit=20"
-        )
+        response = client.get(f"/api/v1/scans/{scan_id}/events?detail=summary&limit=20")
 
     assert response.status_code == 200
     assert [item["event_type"] for item in response.json()] == [
@@ -870,9 +1152,7 @@ def test_completed_scan_can_be_deleted_with_its_unshared_files(settings) -> None
     assert not workspace.exists()
     with app.state.database.session_factory() as session:
         assert session.get(Scan, scan.id) is None
-        assert not list(
-            session.scalars(select(Evidence).where(Evidence.scan_id == scan.id))
-        )
+        assert not list(session.scalars(select(Evidence).where(Evidence.scan_id == scan.id)))
 
 
 def test_running_scan_cannot_be_deleted(settings) -> None:  # noqa: ANN001
@@ -940,9 +1220,7 @@ def test_terminal_task_can_be_deleted_while_ai_audit_is_preserved(settings) -> N
     with app.state.database.session_factory() as session:
         persisted_task = session.get(InvestigationTask, task.id)
         assert persisted_task is not None
-        app.state.orchestrator.hypothesis_ledger.ensure_task_hypotheses(
-            persisted_task
-        )
+        app.state.orchestrator.hypothesis_ledger.ensure_task_hypotheses(persisted_task)
 
     with TestClient(app) as client:
         blocked = client.delete(f"/api/v1/tasks/{task.id}")
@@ -1330,9 +1608,7 @@ def test_worker_completion_wins_a_race_with_task_cancellation(
 
 def test_deleting_one_scan_preserves_a_shared_apk(settings) -> None:  # noqa: ANN001
     app = create_app(settings)
-    sha256, artifact_path = app.state.store.put_bytes(
-        "artifacts", b"shared-apk", suffix=".apk"
-    )
+    sha256, artifact_path = app.state.store.put_bytes("artifacts", b"shared-apk", suffix=".apk")
     scan_ids = [
         "00000000-0000-0000-0000-000000000030",
         "00000000-0000-0000-0000-000000000031",
@@ -1449,15 +1725,10 @@ def test_ai_calls_are_exposed_as_integrity_checked_audit_records(settings) -> No
         assert payload[0]["thread_id"] == "thread-audit"
         assert payload[0]["artifacts"]["request"]["content"]["model"]
         assert (
-            payload[0]["artifacts"]["response"]["content"]["structured_output"][
-                "result"
-            ]
-                == "refuted_static"
+            payload[0]["artifacts"]["response"]["content"]["structured_output"]["result"]
+            == "refuted_static"
         )
-        assert (
-            payload[0]["artifacts"]["validation"]["content"]["downgraded"]
-            is False
-        )
+        assert payload[0]["artifacts"]["validation"]["content"]["downgraded"] is False
         report = client.get(f"/api/v1/scans/{scan.id}/report/json").json()
         assert report["agent_audits"][0]["id"] == audit_id
         html_report = client.get(f"/api/v1/scans/{scan.id}/report/html").text
@@ -1477,9 +1748,7 @@ def test_ai_calls_are_exposed_as_integrity_checked_audit_records(settings) -> No
         assert tampered[0]["status"] == "completed"
         assert tampered[0]["integrity"] == "failed"
         assert tampered[0]["artifacts"]["request"]["content"] is None
-        download = client.get(
-            f"/api/v1/evidence/{request_evidence.id}/download"
-        )
+        download = client.get(f"/api/v1/evidence/{request_evidence.id}/download")
         assert download.status_code == 409
 
 
@@ -1587,7 +1856,9 @@ def test_codex_audit_records_frozen_execution_and_provider_profiles(settings) ->
         assert request["runtime_options"]["execution_profile"]["sandbox"] == "full_access"
         assert request["runtime_options"]["execution_profile"]["container_scope"] == "scan"
         assert request["runtime_options"]["provider_profile"]["wire_api"] == "responses"
-        assert request["runtime_options"]["provider_profile"]["credential_env"] == "DEEPSEEK_API_KEY"
+        assert (
+            request["runtime_options"]["provider_profile"]["credential_env"] == "DEEPSEEK_API_KEY"
+        )
         assert request["runtime_options"]["schema_validator"] == "pydantic@2"
         assert request["runtime_options"]["semantic_validator"] == "apkscanner@1.0"
         assert request["runtime_options"]["max_agent_steps"] is None
@@ -1612,9 +1883,7 @@ def test_codex_audit_records_frozen_execution_and_provider_profiles(settings) ->
         assert request["tool_boundary"]["structured_output_tool_enabled"] is False
         assert "DEEPSEEK_THINKING_OUTPUT_ADAPTER" not in request["prompt"]
         assert "explorer_prompt" not in request
-        recorded_transport = audit["artifacts"]["response"]["content"][
-            "output_transport"
-        ]
+        recorded_transport = audit["artifacts"]["response"]["content"]["output_transport"]
         assert recorded_transport == transport
         summary = client.get(
             f"/api/v1/scans/{scan.id}/agent-audits?include_artifacts=false"
@@ -1679,9 +1948,7 @@ def test_scan_and_task_agent_controls_are_persisted(settings) -> None:  # noqa: 
             persisted_task = session.get(InvestigationTask, task.id)
             assert persisted_scan is not None and persisted_task is not None
             assert (
-                app.state.orchestrator.resolve_task_investigator(
-                    persisted_scan, persisted_task
-                )
+                app.state.orchestrator.resolve_task_investigator(persisted_scan, persisted_task)
                 == "none"
             )
 
@@ -1751,9 +2018,7 @@ def test_scan_execution_control_pauses_resumes_and_stops_all_tasks(
         with app.state.database.session_factory() as session:
             statuses = list(
                 session.scalars(
-                    select(InvestigationTask.status).where(
-                        InvestigationTask.scan_id == scan_id
-                    )
+                    select(InvestigationTask.status).where(InvestigationTask.scan_id == scan_id)
                 )
             )
             event_types = set(
@@ -1927,24 +2192,20 @@ def test_fresh_scan_run_reuses_only_the_verified_apk(
             fresh = session.get(Scan, fresh_id)
             assert fresh is not None
             assert fresh.artifact_path == str(apk_path)
-            assert list(
-                session.scalars(
-                    select(EntryPoint).where(EntryPoint.scan_id == fresh_id)
-                )
-            ) == []
-            assert list(
-                session.scalars(
-                    select(InvestigationTask).where(
-                        InvestigationTask.scan_id == fresh_id
+            assert (
+                list(session.scalars(select(EntryPoint).where(EntryPoint.scan_id == fresh_id)))
+                == []
+            )
+            assert (
+                list(
+                    session.scalars(
+                        select(InvestigationTask).where(InvestigationTask.scan_id == fresh_id)
                     )
                 )
-            ) == []
-            assert list(
-                session.scalars(select(Finding).where(Finding.scan_id == fresh_id))
-            ) == []
-            assert list(
-                session.scalars(select(Evidence).where(Evidence.scan_id == fresh_id))
-            ) == []
+                == []
+            )
+            assert list(session.scalars(select(Finding).where(Finding.scan_id == fresh_id))) == []
+            assert list(session.scalars(select(Evidence).where(Evidence.scan_id == fresh_id))) == []
         assert submitted == [fresh_id]
 
 

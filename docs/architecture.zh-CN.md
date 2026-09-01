@@ -141,14 +141,22 @@ Supervisor 生命周期由服务内第一方循环推进，不依赖浏览器保
 
 | 结论 | 平台最低条件 |
 | --- | --- |
-| `supported_static` | 引用了本 scan 的 `static.*` Evidence ID |
-| `refuted_static` | 静态证据表明攻击路径受保护、不可达或无实际危害 |
+| `candidate` | 原始规则/API 命中或未形成完整攻击链的调查线索 |
+| `supported_static` | 同一 Hypothesis 的 source、control、sink、reachable path、boundary、security impact、missing control 均完整，并由该 assessment 显式引用本 scan/task 中实际存在的 `static.*` Evidence ID |
+| `runtime_observed_unverified` | 运行行为已观察，但缺少归属于该 Hypothesis 且证明具体危害的平台 ProofAttempt/Oracle |
+| `refuted_static` | 本 scan/task 中可用的静态 Evidence 指出阻断该路径的具体 guard、权限等级、调用者身份校验或不可达条件；抽象的“已有保护”不构成反证 |
 | `reproduced_blackbox` | 同一 request/test-case ID 的 Harness/专用 PoC，或绑定 ProofAttempt 的 Dynamic Experiment，由平台 Oracle/语义 ImpactContract 独立观察到具体危害；`adb shell` 成功不等价 |
 | `not_reproduced` | 同一 test-case/request ID 的普通 App UID 尝试与结果日志存在，且平台 Prover 明确产生 `oracle_refuted=true`；它只反驳该已执行用例，不证明全局安全 |
 
-Agent 声称但不属于本 scan/task 的 Evidence ID 会被删除。动态证据不足以支撑复现或负向
-Oracle 时，平台保留由已引用静态证据支撑的明确正向/负向结论；完全未引用所需平台证据的
-输出会被拒绝，而不是制造“信息不足”Finding。
+Agent 声称但不属于本 scan/task 的 Evidence ID 会被删除。运行行为不足以证明危害时进入独立的
+Oracle 缺口层；静态正向结论必须通过完整攻击链硬门槛，缺字段、缺显式静态 Evidence 或仅有 API
+命中时回落为 `candidate`/`inconclusive`。原始 Evidence 仍保留，降级只改变处置层级。
+
+### 降噪与物化一致性契约
+
+- `/signals` 只暴露 `runtime_oracle_gap`、`static_chain`、`raw_candidate` 三种 `signal_tier`；它们分别表示已有运行观察但缺危害 Oracle、完整且有证据的静态链，以及其余原始或已关闭线索。层级从当前数据库 Evidence 计算，不能直接信任历史状态别名或模型元数据。
+- 静态支持必须同时满足完整 source/control/sink/path/boundary/impact/control-gap 链和可用 Evidence；静态反证必须把具体 guard 或阻断条件绑定到同一条路径。模型 confidence 只用于排序和展示，不是平台 Proof；只有证据完整、归因明确的 ProofAttempt 与平台 Oracle 才能证明危害。
+- 扫描进入 `final` 后，人工处置或新增 RuntimeObservation、ProofAttempt 等会改变 Finding 语义的写入，必须将物化统计/报告摘要标为过期，并令 `scan.stats.seal.current=false`；重新汇总和生成 `scan.seal` 后才能把它们视为当前快照。
 
 ## 能力恢复后的增量补扫
 

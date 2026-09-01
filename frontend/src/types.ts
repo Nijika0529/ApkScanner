@@ -90,6 +90,20 @@ export interface EntryPoint {
   metadata_json: Record<string, unknown>
 }
 
+export type FindingStatus =
+  | "candidate"
+  | "supported_static"
+  | "static_path_supported"
+  | "runtime_observed_unverified"
+  | "oracle_gap"
+  | "accepted"
+  | "reproduced_blackbox"
+  | "refuted_static"
+  | "false_positive"
+  | "not_reproduced"
+  | "inconclusive"
+  | (string & {})
+
 export interface Finding {
   id: string
   rule_id: string
@@ -101,7 +115,9 @@ export interface Finding {
   cwe: string | null
   severity: "critical" | "high" | "medium" | "low" | "info"
   confidence: "high" | "medium" | "low"
-  status: string
+  status: FindingStatus
+  signal_tier?: "runtime_oracle_gap" | "static_chain" | "raw_candidate"
+  can_accept?: boolean
   entry_point_ids: string[]
   locations: Array<Record<string, unknown>>
   evidence_ids: string[]

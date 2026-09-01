@@ -9,10 +9,10 @@ from pathlib import Path
 import pytest
 from apkscanner.core import permissions
 from apkscanner.core.db import Database
-from apkscanner.core.models import Finding, Scan
+from apkscanner.core.models import EntryPoint, Finding, Scan
 from apkscanner.platform.artifacts import ArtifactStore
 from fastapi import UploadFile
-from sqlalchemy import select, text
+from sqlalchemy import inspect, select, text
 
 
 def _mode(path: Path) -> int:
@@ -137,6 +137,64 @@ def test_sqlite_read_only_uri_does_not_request_wal(settings) -> None:  # noqa: A
     read_only.engine.dispose()
 
 
+def test_create_all_migrates_the_entry_disposition_column(settings) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="legacy.apk",
+            artifact_sha256="a" * 64,
+            artifact_path="legacy.apk",
+        )
+        session.add(scan)
+        session.flush()
+        session.add(
+            EntryPoint(
+                scan_id=scan.id,
+                kind="activity",
+                name="com.example.LegacyActivity",
+                exported=True,
+            )
+        )
+        session.commit()
+
+    with database.engine.begin() as connection:
+        connection.execute(text("DROP INDEX ix_entry_points_disposition"))
+        connection.execute(text("ALTER TABLE entry_points DROP COLUMN disposition"))
+
+    database.create_all()
+
+    columns = {str(item["name"]) for item in inspect(database.engine).get_columns("entry_points")}
+    indexes = inspect(database.engine).get_indexes("entry_points")
+    assert "disposition" in columns
+    assert any(list(item.get("column_names") or []) == ["disposition"] for item in indexes)
+    with database.session_factory() as session:
+        migrated = session.scalar(select(EntryPoint))
+        assert migrated is not None
+        assert migrated.disposition is None
+
+
+def test_read_only_legacy_schema_requires_a_writable_migration(settings) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    with database.engine.begin() as connection:
+        connection.execute(text("DROP INDEX ix_entry_points_disposition"))
+        connection.execute(text("ALTER TABLE entry_points DROP COLUMN disposition"))
+    database.engine.dispose()
+
+    database_path = settings.data_dir / "test.db"
+    read_only = Database(
+        replace(
+            settings,
+            database_url=f"sqlite:///file:{database_path}?mode=ro&uri=true",
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="reopen it writable"):
+        read_only.create_all()
+    read_only.engine.dispose()
+
+
 def test_database_reopens_only_legacy_auto_closed_findings(settings) -> None:  # noqa: ANN001
     settings.ensure_directories()
     database = Database(settings)
@@ -194,10 +252,7 @@ def test_database_reopens_only_legacy_auto_closed_findings(settings) -> None:  #
     database.create_all()
 
     with database.session_factory() as session:
-        findings = {
-            finding.dedupe_key: finding
-            for finding in session.scalars(select(Finding))
-        }
+        findings = {finding.dedupe_key: finding for finding in session.scalars(select(Finding))}
     reopened = findings["auto-closed"]
     reviewed = findings["user-reviewed"]
     assert reopened.status == "candidate"

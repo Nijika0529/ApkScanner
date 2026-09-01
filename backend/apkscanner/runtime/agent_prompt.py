@@ -235,7 +235,9 @@ or a combination. The platform will preserve your structured response and tool t
 not reinterpret returned values with a fixed Oracle. Use reproduced_blackbox only after an actual
 runtime observation establishes the claimed impact. Use not_reproduced only when a relevant
 runtime attempt produced meaningful counterevidence. Keep supported_static when the static chain
-remains credible but execution is blocked or inconclusive.
+remains credible but execution is blocked or inconclusive. Use refuted_static only when usable
+static Evidence proves a specific guard or unreachable call edge: put that exact blocked edge in
+attack_chain, repeat the concrete observation in counterevidence, and cite the Evidence ID.
 
 The same root vulnerability can be supplied more than once because component, deep-link, and
 static-surface tasks describe different ingress paths. When two candidates reach the same concrete
@@ -774,7 +776,9 @@ def investigation_prompt(
         "ID. In the final structured result, hypotheses_tested must contain exact hypothesis IDs, "
         "not claim text. Emit one hypothesis_assessments item for every tested hypothesis. Each "
         "assessment must state its own verdict and the source, control, sink, reachable_path, "
-        "trust boundary, counterevidence, proof gaps, and supporting Evidence IDs; do not apply one "
+        "trust boundary, concrete security_impact, missing_control, counterevidence, proof gaps, "
+        "and supporting Evidence IDs. Write reachable_path as an ordered `source -> ... -> sink` "
+        "chain and boundary as `attacker_context -> target_context`; do not apply one "
         "task-wide verdict to unrelated hypotheses. Copy every Evidence ID exactly and in full from "
         "the supplied context; never abbreviate "
         f"an ID. A vulnerability is not proven merely because an entry is exported or a dangerous API "
@@ -783,7 +787,9 @@ def investigation_prompt(
         "is concrete but still needs an ordinary-app or impact replay, use assessment verdict "
         "needs_dynamic_proof; absence of a replay, an empty PoC directory, or an unexecuted test is "
         "never not_reproduced or refuted_static. not_reproduced requires a platform-correlated "
-        "negative Oracle, while refuted_static requires a concrete static guard or unreachable edge. "
+        "negative Oracle, while refuted_static requires a concrete static guard or unreachable "
+        "edge recorded in counterevidence and tied to usable static Evidence. Put the exact guard "
+        "or blocked edge in control/reachable_path, not only in the task summary. "
         f"{claim_instruction} Describe adb-shell-only "
         "observations strictly as shell-identity "
         "reachability, never as ordinary-app exploitation or demonstrated harm. Lower confidence "
@@ -809,8 +815,10 @@ def investigation_prompt(
         "load, or other ordered runtime chain, set experiment instead of poc and keep operation=auto, "
         "oracle.kind=reachability, oracle.impact=none, reset=preserve, and all legacy URI/extra/Binder "
         "fields empty. experiment.steps must contain at least one action and one assert step. Its "
-        "proof.assertion_step_ids must name assert steps that emit one of proof.observation_kinds; "
-        "only those platform-recorded receipts may satisfy the semantic impact contract. Assertions must "
+        "proof.assertion_step_ids must name assert steps that emit one of proof.observation_kinds. "
+        "Generic Dynamic Experiment stdout/regex assertions are diagnostic execution receipts, not an "
+        "independent platform Oracle, so they cannot by themselves confirm or refute a vulnerability; "
+        "use a typed ordinary-app PoC Oracle when the result must close the verdict. Assertions must "
         "read an independently produced target, callback, network, file, UI, or process observation; never "
         "manufacture the expected value with echo, printf, a PoC self-log, or another self-authored receipt. "
         "Use cleanup_steps "

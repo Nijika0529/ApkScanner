@@ -819,63 +819,117 @@ class AdbDeviceAdapter:
 
         When an ordinary-app PoC harness launches the *target* app's Activity,
         Vivo's ``com.vivo.appfilter`` shows a prompt ("X 想要打开 Y") with
-        buttons "始终打开" / "仅打开一次" / "取消".  This method taps "始终打开"
-        so that the (jumper → target) permission is permanently granted and the
-        target Activity can open without manual intervention.
+        buttons "始终打开" / "仅打开一次" / "取消".  This method accepts only a
+        one-time/open action so one experiment cannot permanently alter later tests.
         """
-        ui_dump = self._adb_budget(
-            ["shell", "uiautomator", "dump", "/sdcard/oem_jump.dump"],
-            budget,
-            15,
-        )
-        if ui_dump.exit_code != 0:
-            return {"detected": False, "reason": "dump_failed"}
-
-        cat = self._adb_budget(
-            ["shell", "cat", "/sdcard/oem_jump.dump"],
-            budget,
-            15,
-        )
-        if "com.vivo.appfilter" not in cat.stdout:
-            return {"detected": False, "reason": "appfilter_not_in_dump"}
-
-        # Find a known button ("始终打开" is preferred because it grants
-        # permanently; any other known label is accepted as a fallback).
-        bounds: list[int] | None = None
-        button_text: str | None = None
-        for candidate in ("始终打开", "仅打开一次", "打开"):
-            match = re.search(
-                r'text="' + candidate + r'"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',
-                cat.stdout,
+        dump_path = "/data/local/tmp/apkscanner_oem_jump.dump"
+        try:
+            ui_dump = self._adb_budget(
+                ["shell", "uiautomator", "dump", dump_path],
+                budget,
+                15,
             )
-            if match:
-                bounds = [
-                    int(match.group(1)),
-                    int(match.group(2)),
-                    int(match.group(3)),
-                    int(match.group(4)),
-                ]
-                button_text = candidate
-                break
+            if ui_dump.exit_code != 0:
+                return {"detected": False, "reason": "dump_failed"}
 
-        if bounds is None:
-            return {"detected": True, "dismissed": False, "reason": "no_known_button"}
+            cat = self._adb_budget(
+                ["shell", "cat", dump_path],
+                budget,
+                15,
+            )
+            if cat.exit_code != 0:
+                return {"detected": False, "reason": "dump_read_failed"}
 
-        center_x = (bounds[0] + bounds[2]) // 2
-        center_y = (bounds[1] + bounds[3]) // 2
-        tap = self._adb_budget(
-            ["shell", "input", "tap", str(center_x), str(center_y)],
-            budget,
-            15,
+            prompt = self._parse_vivo_jump_prompt(cat.stdout)
+            if not prompt["detected"]:
+                return {"detected": False, "reason": "appfilter_not_in_dump"}
+            bounds = prompt.get("bounds")
+            button_text = prompt.get("button")
+            if not isinstance(bounds, list) or not isinstance(button_text, str):
+                return {"detected": True, "dismissed": False, "reason": "no_known_button"}
+
+            center_x = (bounds[0] + bounds[2]) // 2
+            center_y = (bounds[1] + bounds[3]) // 2
+            tap = self._adb_budget(
+                ["shell", "input", "tap", str(center_x), str(center_y)],
+                budget,
+                15,
+            )
+            dismissed = False
+            reason = "tap_failed"
+            if tap.exit_code == 0:
+                confirm_dump = self._adb_budget(
+                    ["shell", "uiautomator", "dump", dump_path],
+                    budget,
+                    15,
+                )
+                confirm_cat = self._adb_budget(
+                    ["shell", "cat", dump_path],
+                    budget,
+                    15,
+                )
+                if confirm_dump.exit_code != 0 or confirm_cat.exit_code != 0:
+                    reason = "dismissal_confirmation_failed"
+                elif self._parse_vivo_jump_prompt(confirm_cat.stdout)["detected"]:
+                    reason = "prompt_still_present"
+                else:
+                    dismissed = True
+                    reason = "prompt_removed"
+            return {
+                "detected": True,
+                "dismissed": dismissed,
+                "reason": reason,
+                "button": button_text,
+                "bounds": bounds,
+                "tap_center": [center_x, center_y],
+                "result": tap,
+            }
+        finally:
+            self._adb(
+                ["shell", "rm", "-f", dump_path],
+                timeout=15,
+                respect_cancellation=False,
+            )
+
+    @staticmethod
+    def _parse_vivo_jump_prompt(value: str) -> dict[str, Any]:
+        """Return only a clickable button owned by Vivo's prompt package."""
+
+        try:
+            root = ElementTree.fromstring(value)
+        except ElementTree.ParseError:
+            return {"detected": False}
+        nodes = list(root.iter())
+        detected = any(
+            node.attrib.get("package") == "com.vivo.appfilter" for node in nodes
         )
-        return {
-            "detected": True,
-            "dismissed": tap.exit_code == 0,
-            "button": button_text,
-            "bounds": bounds,
-            "tap_center": [center_x, center_y],
-            "result": tap,
-        }
+        if not detected:
+            return {"detected": False}
+        for candidate in ("仅打开一次", "打开"):
+            for node in nodes:
+                resource_id = node.attrib.get("resource-id", "")
+                if (
+                    node.attrib.get("package") != "com.vivo.appfilter"
+                    or node.attrib.get("text") != candidate
+                    or node.attrib.get("clickable") != "true"
+                    or (
+                        resource_id
+                        and not resource_id.startswith("com.vivo.appfilter:")
+                    )
+                ):
+                    continue
+                match = re.fullmatch(
+                    r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]",
+                    node.attrib.get("bounds", ""),
+                )
+                if match is None:
+                    continue
+                return {
+                    "detected": True,
+                    "button": candidate,
+                    "bounds": [int(value) for value in match.groups()],
+                }
+        return {"detected": True}
 
     def execute_poc(
         self,
@@ -895,6 +949,8 @@ class AdbDeviceAdapter:
             raise RuntimeError("remote ADB device is not configured")
         self._validate_package(spec.package_name)
         self._validate_package(target_package_name)
+        if spec.package_name == target_package_name:
+            raise ValueError("PoC package must differ from the target package")
         if not apk_path.is_file():
             raise ValueError("platform-built PoC APK is unavailable")
         component = (
@@ -1178,8 +1234,10 @@ class AdbDeviceAdapter:
                     )
                     oem_dismiss = self._dismiss_oem_jump_prompt(budget=budget)
                     if oem_dismiss.get("detected"):
-                        common["oem_jump_prompt_auto_allowed"] = True
-                        common["oem_jump_prompt_dismissed"] = oem_dismiss.get("dismissed")
+                        oem_prompt_dismissed = oem_dismiss.get("dismissed") is True
+                        common["oem_jump_prompt_detected"] = True
+                        common["oem_jump_prompt_auto_allowed"] = oem_prompt_dismissed
+                        common["oem_jump_prompt_dismissed"] = oem_prompt_dismissed
                         commands.append(
                             (
                                 "blackbox.oem_jump_prompt_dismissed",
@@ -1187,7 +1245,7 @@ class AdbDeviceAdapter:
                                 {
                                     **common,
                                     "oem_prompt_detected": True,
-                                    "oem_prompt_dismissed": oem_dismiss.get("dismissed"),
+                                    "oem_prompt_dismissed": oem_prompt_dismissed,
                                     "oem_button_tapped": oem_dismiss.get("button"),
                                 },
                             )

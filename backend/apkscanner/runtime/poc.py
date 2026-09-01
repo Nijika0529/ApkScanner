@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import io
 import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import threading
 import zipfile
@@ -58,6 +60,10 @@ class PocBuilder:
         self._keystore_lock = threading.Lock()
         self._aapt2_flag_cache: dict[tuple[Path, str], bool] = {}
         self._aapt2_flag_lock = threading.Lock()
+        self._platform_proof_sources: dict[
+            tuple[str, str, str], tuple[bytes, tuple[tuple[Path, bytes], ...]]
+        ] = {}
+        self._platform_proof_sources_lock = threading.Lock()
 
     def capability(self) -> dict[str, object]:
         if not self.settings.poc_enabled:
@@ -215,31 +221,33 @@ class PocBuilder:
         digest = hashlib.sha256(serialized).hexdigest()[:16]
         package_name = f"io.apkscanner.poc.proof_{digest}"
         relative_project = Path("poc") / f"platform-proof-{digest}"
-        root = workspace.resolve()
-        project = (root / relative_project).resolve()
-        poc_root = (root / "poc").resolve()
-        if not project.is_relative_to(poc_root):
-            raise ValueError("platform proof project escaped the task PoC workspace")
-        source_dir = project / "src" / Path(*package_name.split("."))
-        source_dir.mkdir(parents=True, exist_ok=True)
-        manifest = project / "AndroidManifest.xml"
-        manifest.write_text(
-            f'''<?xml version="1.0" encoding="utf-8"?>
+        if not workspace.resolve().is_dir():
+            raise ValueError("task workspace is unavailable")
+        manifest_bytes = f'''<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="{ANDROID_NAMESPACE}" package="{package_name}">
   <application android:label="APKScanner Proof" android:debuggable="true" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
     <activity android:name=".PlatformProofActivity" android:exported="true" />
   </application>
 </manifest>
-''',
-            encoding="utf-8",
+'''.encode()
+        source_bytes = self._platform_proof_source(
+            package_name=package_name,
+            encoded_request=base64.b64encode(serialized).decode("ascii"),
+        ).encode()
+        relative_source = (
+            Path("src") / Path(*package_name.split(".")) / "PlatformProofActivity.java"
         )
-        (source_dir / "PlatformProofActivity.java").write_text(
-            self._platform_proof_source(
-                package_name=package_name,
-                encoded_request=base64.b64encode(serialized).decode("ascii"),
-            ),
-            encoding="utf-8",
-        )
+        source_key = (str(workspace.resolve()), str(relative_project), package_name)
+        with self._platform_proof_sources_lock:
+            if (
+                source_key not in self._platform_proof_sources
+                and len(self._platform_proof_sources) >= 256
+            ):
+                self._platform_proof_sources.pop(next(iter(self._platform_proof_sources)))
+            self._platform_proof_sources[source_key] = (
+                manifest_bytes,
+                ((relative_source, source_bytes),),
+            )
         return AgentPocSpec(
             project_path=str(relative_project),
             package_name=package_name,
@@ -276,35 +284,43 @@ class PocBuilder:
                     + ", ".join(str(item) for item in capability.get("source_build_missing", []))
                 ),
             )
-        try:
-            if spec.harness_mode == "platform_generated":
-                spec = self._materialize_platform_harness(workspace, spec)
-            project, sources, manifest, effective_spec = self._validate_project(
-                workspace,
-                spec,
-                oracle=oracle,
-            )
-            durable_receipt_supported = any(
-                PROOF_RECEIPT_FILENAME
-                in source.read_text(encoding="utf-8", errors="replace")
-                for source in sources
-            )
-            effective_project_path = str(project.relative_to(workspace.resolve()))
-            effective_spec = effective_spec.model_copy(
-                update={"project_path": effective_project_path}
-            )
-            source_bytes = self._source_archive(project, sources, manifest)
-            source_sha256, source_path = self.store.put_bytes(
-                "poc_sources", source_bytes, suffix=".zip"
-            )
-        except (OSError, ValueError, ElementTree.ParseError) as exc:
-            return PocBuildResult(ok=False, error=f"PoC source validation failed: {exc}")
-
         commands: list[tuple[str, CommandResult, dict[str, object]]] = []
         build_root = self.settings.data_dir / "poc-build"
         build_root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="build-", dir=build_root) as temporary:
             output = Path(temporary)
+            snapshot_workspace = output / "workspace"
+            try:
+                snapshot_spec = self._snapshot_project(
+                    workspace,
+                    spec,
+                    snapshot_workspace,
+                )
+                if snapshot_spec.harness_mode == "platform_generated":
+                    snapshot_spec = self._materialize_platform_harness(
+                        snapshot_workspace,
+                        snapshot_spec,
+                    )
+                project, sources, manifest, effective_spec = self._validate_project(
+                    snapshot_workspace,
+                    snapshot_spec,
+                    oracle=oracle,
+                )
+                durable_receipt_supported = any(
+                    PROOF_RECEIPT_FILENAME in source.read_text(encoding="utf-8", errors="replace")
+                    for source in sources
+                )
+                effective_project_path = str(project.relative_to(snapshot_workspace.resolve()))
+                effective_spec = effective_spec.model_copy(
+                    update={"project_path": effective_project_path}
+                )
+                source_bytes = self._source_archive(project, sources, manifest)
+                source_sha256, source_path = self.store.put_bytes(
+                    "poc_sources", source_bytes, suffix=".zip"
+                )
+            except (OSError, ValueError, ElementTree.ParseError) as exc:
+                return PocBuildResult(ok=False, error=f"PoC source validation failed: {exc}")
+
             classes = output / "classes"
             dex = output / "dex"
             classes.mkdir()
@@ -791,11 +807,14 @@ class PocBuilder:
         cancel_event: threading.Event | None,
     ) -> PocBuildResult:
         root = workspace.resolve()
-        candidate = (root / str(spec.prebuilt_apk_path)).resolve()
-        poc_root = (root / "poc").resolve()
+        requested = root / str(spec.prebuilt_apk_path)
+        candidate = requested.resolve()
+        poc_path = root / "poc"
+        poc_root = poc_path.resolve()
         if (
-            not candidate.is_relative_to(poc_root)
-            or candidate.is_symlink()
+            poc_path.is_symlink()
+            or not candidate.is_relative_to(poc_root)
+            or requested.is_symlink()
             or not candidate.is_file()
             or candidate.suffix.lower() != ".apk"
         ):
@@ -803,7 +822,32 @@ class PocBuilder:
                 ok=False,
                 error="prebuilt_apk_path must resolve to a regular APK under poc/",
             )
-        size = candidate.stat().st_size
+        directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            parent_descriptor = os.open(candidate.parent, directory_flags)
+        except OSError as exc:
+            return PocBuildResult(ok=False, error=f"prebuilt APK could not be opened safely: {exc}")
+        try:
+            opened_parent = Path(f"/proc/self/fd/{parent_descriptor}").resolve()
+            if not opened_parent.is_relative_to(poc_root):
+                return PocBuildResult(
+                    ok=False,
+                    error="prebuilt APK escaped the task PoC workspace while opening",
+                )
+            try:
+                candidate_bytes = self._read_regular_input_at(
+                    parent_descriptor,
+                    candidate.name,
+                    maximum_bytes=self.settings.poc_max_apk_bytes,
+                    label="prebuilt Agent APK",
+                )
+            except ValueError as exc:
+                return PocBuildResult(ok=False, error=str(exc))
+        finally:
+            os.close(parent_descriptor)
+        size = len(candidate_bytes)
         if size < 1 or size > self.settings.poc_max_apk_bytes:
             return PocBuildResult(
                 ok=False,
@@ -812,6 +856,11 @@ class PocBuilder:
                     f"{self.settings.poc_max_apk_bytes} bytes"
                 ),
             )
+        apk_sha256, apk_path = self.store.put_bytes(
+            "poc_artifacts",
+            candidate_bytes,
+            suffix=".apk",
+        )
         metadata = {
             "poc_package": spec.package_name,
             "poc_project_path": spec.project_path,
@@ -822,14 +871,14 @@ class PocBuilder:
         checks = [
             (
                 "poc.prebuilt.verify_signature",
-                [self._required_tool("apksigner"), "verify", "--verbose", str(candidate)],
+                [self._required_tool("apksigner"), "verify", "--verbose", str(apk_path)],
             ),
         ]
         inspection: CommandResult | None = None
         for kind, argv in checks:
             result = self.runner.run(
                 argv,
-                cwd=poc_root,
+                cwd=apk_path.parent,
                 timeout=self.settings.poc_build_timeout_seconds,
                 cancel_event=cancel_event,
             )
@@ -845,8 +894,8 @@ class PocBuilder:
         for attempt, aapt2 in enumerate(self._tool_candidates("aapt2"), start=1):
             kind = "poc.prebuilt.inspect_manifest"
             result = self.runner.run(
-                [str(aapt2), "dump", "badging", str(candidate)],
-                cwd=poc_root,
+                [str(aapt2), "dump", "badging", str(apk_path)],
+                cwd=apk_path.parent,
                 timeout=self.settings.poc_build_timeout_seconds,
                 cancel_event=cancel_event,
             )
@@ -914,11 +963,6 @@ class PocBuilder:
                 commands=commands,
                 error="prebuilt Agent APK launch component does not match its manifest",
             )
-        apk_sha256, apk_path = self.store.put_bytes(
-            "poc_artifacts",
-            candidate.read_bytes(),
-            suffix=".apk",
-        )
         provenance = {
             "schema_version": "1.0",
             "spec": spec.model_dump(mode="json"),
@@ -948,6 +992,168 @@ class PocBuilder:
             },
         )
 
+    def _snapshot_project(
+        self,
+        workspace: Path,
+        spec: AgentPocSpec,
+        snapshot_workspace: Path,
+    ) -> AgentPocSpec:
+        """Copy the exact source-build inputs into a platform-private snapshot."""
+
+        source_key = (str(workspace.resolve()), spec.project_path, spec.package_name)
+        with self._platform_proof_sources_lock:
+            platform_source = self._platform_proof_sources.pop(source_key, None)
+        if platform_source is not None:
+            relative_project = Path(spec.project_path)
+            if (
+                relative_project.is_absolute()
+                or not relative_project.parts
+                or relative_project.parts[0] != "poc"
+                or ".." in relative_project.parts
+            ):
+                raise ValueError("platform proof project path is invalid")
+            snapshot_project = snapshot_workspace.resolve() / relative_project
+            snapshot_project.mkdir(parents=True, exist_ok=False)
+            manifest_bytes, source_records = platform_source
+            (snapshot_project / "AndroidManifest.xml").write_bytes(manifest_bytes)
+            for relative_source, source_bytes in source_records:
+                target = snapshot_project / relative_source
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(source_bytes)
+            return spec
+
+        root = workspace.resolve()
+        poc_path = root / "poc"
+        if poc_path.is_symlink():
+            raise ValueError("task PoC workspace must not be a symbolic link")
+        poc_root = poc_path.resolve()
+        if not poc_root.is_relative_to(root):
+            raise ValueError("task PoC workspace escaped the Agent workspace")
+        project = self._resolve_source_project(root, poc_root, spec)
+        if not project.is_relative_to(poc_root) or not project.is_dir():
+            raise ValueError("project_path must resolve to a regular directory under poc/")
+
+        directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            project_descriptor = os.open(project, directory_flags)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ValueError("PoC project must not be a symbolic link") from exc
+            raise ValueError(f"PoC project could not be opened safely: {exc}") from exc
+
+        manifest_bytes: bytes
+        source_records: list[tuple[Path, bytes]] = []
+        total_bytes = 0
+        try:
+            project_stat = os.fstat(project_descriptor)
+            if not stat.S_ISDIR(project_stat.st_mode):
+                raise ValueError("PoC project must be a regular directory")
+            opened_project = Path(f"/proc/self/fd/{project_descriptor}").resolve()
+            if not opened_project.is_relative_to(poc_root):
+                raise ValueError("PoC project escaped the task PoC workspace while opening")
+
+            manifest_bytes = self._read_regular_input_at(
+                project_descriptor,
+                "AndroidManifest.xml",
+                maximum_bytes=self.settings.poc_max_source_bytes,
+                label="PoC manifest",
+            )
+            total_bytes += len(manifest_bytes)
+            try:
+                source_descriptor = os.open("src", directory_flags, dir_fd=project_descriptor)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise ValueError("PoC src directory must not be a symbolic link") from exc
+                raise ValueError(f"PoC src directory could not be opened safely: {exc}") from exc
+            try:
+                for directory, child_directories, filenames, directory_descriptor in os.fwalk(
+                    ".",
+                    topdown=True,
+                    follow_symlinks=False,
+                    dir_fd=source_descriptor,
+                ):
+                    child_directories.sort()
+                    for filename in sorted(filenames):
+                        if not filename.endswith(".java"):
+                            continue
+                        if len(source_records) >= 63:
+                            raise ValueError(
+                                "PoC project must contain at most 64 build input files"
+                            )
+                        relative_source = Path(directory) / filename
+                        remaining = self.settings.poc_max_source_bytes - total_bytes
+                        source_bytes = self._read_regular_input_at(
+                            directory_descriptor,
+                            filename,
+                            maximum_bytes=max(0, remaining),
+                            label=f"PoC source {relative_source}",
+                        )
+                        total_bytes += len(source_bytes)
+                        source_records.append((relative_source, source_bytes))
+            finally:
+                os.close(source_descriptor)
+        finally:
+            os.close(project_descriptor)
+
+        if not source_records:
+            raise ValueError("PoC project requires AndroidManifest.xml and src/**/*.java")
+        if total_bytes > self.settings.poc_max_source_bytes:
+            raise ValueError(f"PoC source exceeds {self.settings.poc_max_source_bytes} bytes")
+
+        relative_project = project.relative_to(root)
+        snapshot_root = snapshot_workspace.resolve()
+        snapshot_project = snapshot_root / relative_project
+        snapshot_project.mkdir(parents=True, exist_ok=False)
+        (snapshot_project / "AndroidManifest.xml").write_bytes(manifest_bytes)
+        snapshot_sources = snapshot_project / "src"
+        for relative_source, source_bytes in source_records:
+            target = snapshot_sources / relative_source
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source_bytes)
+        return spec.model_copy(update={"project_path": str(relative_project)})
+
+    @staticmethod
+    def _read_regular_input_at(
+        directory_descriptor: int,
+        name: str,
+        *,
+        maximum_bytes: int,
+        label: str,
+    ) -> bytes:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        try:
+            descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ValueError(f"{label} must not be a symbolic link") from exc
+            raise ValueError(f"{label} could not be opened safely: {exc}") from exc
+        try:
+            item_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(item_stat.st_mode):
+                raise ValueError(f"{label} is not a regular file")
+            if item_stat.st_nlink != 1:
+                raise ValueError(f"{label} must not be hard-linked")
+            if item_stat.st_size > maximum_bytes:
+                raise ValueError(f"PoC source exceeds {maximum_bytes} remaining bytes")
+            chunks: list[bytes] = []
+            remaining = maximum_bytes + 1
+            while remaining > 0:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            payload = b"".join(chunks)
+            if len(payload) > maximum_bytes:
+                raise ValueError(f"PoC source exceeds {maximum_bytes} remaining bytes")
+            return payload
+        finally:
+            os.close(descriptor)
+
     def _validate_project(
         self,
         workspace: Path,
@@ -956,7 +1162,12 @@ class PocBuilder:
         oracle: AgentOracleSpec | None = None,
     ) -> tuple[Path, list[Path], Path, AgentPocSpec]:
         root = workspace.resolve()
-        poc_root = (root / "poc").resolve()
+        poc_path = root / "poc"
+        if poc_path.is_symlink():
+            raise ValueError("task PoC workspace must not be a symbolic link")
+        poc_root = poc_path.resolve()
+        if not poc_root.is_relative_to(root):
+            raise ValueError("task PoC workspace escaped the Agent workspace")
         project = self._resolve_source_project(root, poc_root, spec)
         if not project.is_relative_to(poc_root) or not project.is_dir() or project.is_symlink():
             raise ValueError("project_path must resolve to a regular directory under poc/")
@@ -971,9 +1182,14 @@ class PocBuilder:
         for item in build_inputs:
             if item.is_symlink() or not item.resolve().is_relative_to(project):
                 raise ValueError("PoC project contains a symbolic link or escaped path")
+            item_stat = item.lstat()
+            if not stat.S_ISREG(item_stat.st_mode):
+                raise ValueError("PoC build input is not a regular file")
+            if item_stat.st_nlink != 1:
+                raise ValueError("PoC build input must not be hard-linked")
             if item.suffix.lower() not in ALLOWED_SOURCE_SUFFIXES:
                 raise ValueError(f"unsupported PoC source file: {item.relative_to(project)}")
-            total += item.stat().st_size
+            total += item_stat.st_size
         if total > self.settings.poc_max_source_bytes:
             raise ValueError(f"PoC source exceeds {self.settings.poc_max_source_bytes} bytes")
         tree = ElementTree.parse(manifest)
@@ -1151,13 +1367,18 @@ class PocBuilder:
 
     def _materialize_platform_harness(
         self,
-        workspace: Path,
+        snapshot_workspace: Path,
         spec: AgentPocSpec,
     ) -> AgentPocSpec:
-        """Generate the launcher and result protocol around Agent exploit logic."""
+        """Generate the launcher inside a platform-private source snapshot."""
 
-        root = workspace.resolve()
-        poc_root = (root / "poc").resolve()
+        root = snapshot_workspace.resolve()
+        poc_path = root / "poc"
+        if poc_path.is_symlink():
+            raise ValueError("task PoC workspace must not be a symbolic link")
+        poc_root = poc_path.resolve()
+        if not poc_root.is_relative_to(root):
+            raise ValueError("task PoC workspace escaped the Agent workspace")
         project = self._resolve_source_project(root, poc_root, spec)
         if not project.is_relative_to(poc_root) or not project.is_dir() or project.is_symlink():
             raise ValueError("project_path must resolve to a regular directory under poc/")
@@ -1169,8 +1390,15 @@ class PocBuilder:
         package_name = manifest_root.get("package")
         if manifest_root.tag != "manifest" or not package_name:
             raise ValueError("PoC manifest requires a package")
-        if not package_name.startswith("io.apkscanner.poc"):
-            raise ValueError("platform-generated PoC package must start with io.apkscanner.poc")
+        if not re.fullmatch(
+            r"io\.apkscanner\.poc(?:\.[a-z][a-z0-9_]*)*",
+            package_name,
+        ):
+            raise ValueError("platform-generated PoC manifest package is invalid")
+        if package_name != spec.package_name:
+            raise ValueError(
+                "platform-generated PoC manifest package must match the validated specification"
+            )
         application = manifest_root.find("application")
         if application is None:
             raise ValueError("PoC manifest requires an application")
@@ -1201,8 +1429,12 @@ class PocBuilder:
         tree.write(manifest, encoding="utf-8", xml_declaration=True)
 
         source_dir = project / "src" / Path(*package_name.split("."))
+        if not source_dir.resolve().is_relative_to(project):
+            raise ValueError("platform-generated PoC source directory escaped its project")
         source_dir.mkdir(parents=True, exist_ok=True)
         harness_source = source_dir / "ApkScannerHarnessActivity.java"
+        if harness_source.is_symlink() or not harness_source.resolve().is_relative_to(project):
+            raise ValueError("platform-generated PoC harness must remain inside its project")
         harness_source.write_text(
             self._platform_harness_source(
                 package_name=package_name,
@@ -1326,7 +1558,7 @@ public final class ApkScannerHarnessActivity extends Activity {{
     def _platform_proof_source(*, package_name: str, encoded_request: str) -> str:
         """Return the platform-owned one-shot Activity used for deterministic proofs."""
 
-        template = r'''package __PACKAGE__;
+        template = r"""package __PACKAGE__;
 
 import android.app.Activity;
 import android.content.ComponentName;
@@ -1751,15 +1983,15 @@ public final class PlatformProofActivity extends Activity {
     return result.toString();
   }
 }
-'''
+"""
         return (
             template.replace("__PACKAGE__", package_name)
             .replace("__REQUEST_BASE64__", encoded_request)
             .replace("__RECEIPT_FILENAME__", PROOF_RECEIPT_FILENAME)
         )
 
-    @staticmethod
     def _resolve_source_project(
+        self,
         root: Path,
         poc_root: Path,
         spec: AgentPocSpec,
@@ -1780,9 +2012,25 @@ public final class PlatformProofActivity extends Activity {
                 or not any((project / "src").rglob("*.java"))
             ):
                 continue
+            directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            directory_flags |= getattr(os, "O_DIRECTORY", 0)
+            directory_flags |= getattr(os, "O_NOFOLLOW", 0)
             try:
-                manifest_root = ElementTree.parse(manifest).getroot()
-            except (OSError, ElementTree.ParseError):
+                project_descriptor = os.open(project.resolve(), directory_flags)
+                try:
+                    opened_project = Path(f"/proc/self/fd/{project_descriptor}").resolve()
+                    if not opened_project.is_relative_to(poc_root):
+                        continue
+                    manifest_bytes = self._read_regular_input_at(
+                        project_descriptor,
+                        "AndroidManifest.xml",
+                        maximum_bytes=self.settings.poc_max_source_bytes,
+                        label="PoC manifest candidate",
+                    )
+                finally:
+                    os.close(project_descriptor)
+                manifest_root = ElementTree.fromstring(manifest_bytes)
+            except (OSError, ValueError, ElementTree.ParseError):
                 continue
             if (
                 manifest_root.tag == "manifest"

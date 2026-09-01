@@ -19,6 +19,8 @@ from ..core.models import (
     ScanEvent,
     SecurityHypothesis,
 )
+from ..core.proof_receipts import evidence_backed_harm_attempts
+from .finding_policy import evidence_backed_signal_tiers, partition_findings
 
 _DYNAMIC_EVIDENCE_PREFIXES = ("blackbox.", "dynamic_experiment.")
 
@@ -48,9 +50,10 @@ def build_scan_quality_summary(session: Session, scan_id: str) -> dict[str, Any]
     attempts = list(
         session.scalars(select(ProofAttempt).where(ProofAttempt.scan_id == scan_id))
     )
+    proven_attempts = evidence_backed_harm_attempts(session, scan_id=scan_id)
     findings = list(
-        session.execute(
-            select(Finding.id, Finding.status).where(Finding.scan_id == scan_id)
+        session.scalars(
+            select(Finding).where(Finding.scan_id == scan_id)
         )
     )
     evidence = list(
@@ -106,17 +109,29 @@ def build_scan_quality_summary(session: Session, scan_id: str) -> dict[str, Any]
     for attempt in attempts:
         attempts_by_hypothesis[attempt.hypothesis_id].append(attempt)
 
-    finding_by_id = {item.id: item.status for item in findings}
+    active_findings = [
+        item
+        for item in findings
+        if not isinstance(
+            (item.metadata_json or {}).get("merged_into_finding_id"),
+            str,
+        )
+    ]
+    confirmed_findings, _signals = partition_findings(session, active_findings)
+    confirmed_finding_ids = {item.id for item in confirmed_findings}
+    finding_tier_by_id = evidence_backed_signal_tiers(session, active_findings)
     statically_supported = {
         item.id
         for item in hypotheses
-        if item.support_evidence_ids
-        or (
-            item.final_finding_id
-            and finding_by_id.get(item.final_finding_id) is not None
-            and finding_by_id[item.final_finding_id]
-            in {"supported_static", "reproduced_blackbox", "accepted"}
+        if (
+            item.final_finding_id in confirmed_finding_ids
+            or finding_tier_by_id.get(item.final_finding_id) == "static_chain"
         )
+    }
+    runtime_observed_unverified = {
+        item.id
+        for item in active_findings
+        if finding_tier_by_id[item.id] == "runtime_oracle_gap"
     }
     proof_planned = set(attempts_by_hypothesis)
     device_executed = {
@@ -125,14 +140,18 @@ def build_scan_quality_summary(session: Session, scan_id: str) -> dict[str, Any]
         if any(
             (kind := evidence_by_id.get(evidence_id)) is not None
             and kind.startswith(_DYNAMIC_EVIDENCE_PREFIXES)
-            for evidence_id in attempt.evidence_ids
+            for evidence_id in (
+                attempt.evidence_ids if isinstance(attempt.evidence_ids, list) else []
+            )
         )
     }
     harm_proven = {
-        attempt.hypothesis_id for attempt in attempts if attempt.harm_demonstrated
+        attempt.hypothesis_id for attempt in proven_attempts
     }
     reproduced_findings = {
-        item.id for item in findings if item.status == "reproduced_blackbox"
+        item.id
+        for item in confirmed_findings
+        if item.status == "reproduced_blackbox"
     }
 
     funnel = [
@@ -142,6 +161,11 @@ def build_scan_quality_summary(session: Session, scan_id: str) -> dict[str, Any]
         _stage("static_supported", "静态支持", len(statically_supported)),
         _stage("proof_planned", "已规划 Proof", len(proof_planned)),
         _stage("device_executed", "真机已执行", len(device_executed)),
+        _stage(
+            "runtime_observed_unverified",
+            "运行已观察 / Oracle 缺口",
+            len(runtime_observed_unverified),
+        ),
         _stage("harm_proven", "危害已证明", len(harm_proven)),
         _stage("reproduced_findings", "动态 Finding", len(reproduced_findings)),
     ]

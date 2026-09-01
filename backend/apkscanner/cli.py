@@ -215,7 +215,7 @@ def context_command(args: argparse.Namespace) -> int:
 def serve_command(args: argparse.Namespace) -> int:
     import uvicorn
 
-    uvicorn.run("apkscanner.main:app", host="0.0.0.0", port=args.port, reload=args.reload)
+    uvicorn.run("apkscanner.main:app", host="127.0.0.1", port=args.port, reload=args.reload)
     return 0
 
 

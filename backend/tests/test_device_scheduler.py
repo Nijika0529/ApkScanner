@@ -988,6 +988,256 @@ def test_initial_probe_uses_only_shell_reachability(settings) -> None:  # noqa: 
     assert not any("broadcast" in argv for argv in calls)
 
 
+def test_execute_poc_rejects_target_package_collision_before_adb(
+    settings,
+    tmp_path: Path,
+) -> None:  # noqa: ANN001
+    calls: list[list[str]] = []
+
+    class NoCallRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @staticmethod
+        def run(argv, **_kwargs):  # noqa: ANN001, ANN205
+            calls.append(argv)
+            raise AssertionError("package collision must fail before ADB is invoked")
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        NoCallRunner(),  # type: ignore[arg-type]
+    )
+    apk = tmp_path / "colliding-poc.apk"
+    apk.write_bytes(b"APK")
+    spec = AgentPocSpec(
+        project_path="poc/collision",
+        package_name="io.apkscanner.poc.collision",
+        launch_component=".MainActivity",
+    )
+
+    with pytest.raises(ValueError, match="must differ from the target package"):
+        adapter.execute_poc(
+            apk,
+            spec,
+            target_package_name=spec.package_name,
+            state="guest",
+        )
+
+    assert calls == []
+
+
+def test_oem_jump_prompt_prefers_one_time_open_and_removes_dump(settings) -> None:  # noqa: ANN001
+    dump_path = "/data/local/tmp/apkscanner_oem_jump.dump"
+
+    class PromptRunner:
+        calls: list[list[str]] = []
+        tapped = False
+
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @classmethod
+        def run(cls, argv, **_kwargs):  # noqa: ANN001, ANN206
+            cls.calls.append(argv)
+            if argv[-4:-3] == ["input"] and argv[-3] == "tap":
+                cls.tapped = True
+                return CommandResult(argv, 0, "", "")
+            if "uiautomator" in argv:
+                return CommandResult(argv, 0, "UI hierarchy dumped", "")
+            if argv[-2:] == ["cat", dump_path]:
+                if cls.tapped:
+                    return CommandResult(
+                        argv,
+                        0,
+                        '<hierarchy><node package="com.example.target" /></hierarchy>',
+                        "",
+                    )
+                return CommandResult(
+                    argv,
+                    0,
+                    (
+                        "<hierarchy>"
+                        '<node package="com.vivo.appfilter" text="始终打开" '
+                        'clickable="true" bounds="[0,0][100,100]" />'
+                        '<node package="com.vivo.appfilter" text="仅打开一次" '
+                        'resource-id="com.vivo.appfilter:id/once" clickable="true" '
+                        'bounds="[200,20][400,120]" />'
+                        "</hierarchy>"
+                    ),
+                    "",
+                )
+            return CommandResult(argv, 0, "", "")
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        PromptRunner(),  # type: ignore[arg-type]
+    )
+
+    result = adapter._dismiss_oem_jump_prompt()
+
+    assert result["detected"] is True
+    assert result["dismissed"] is True
+    assert result["button"] == "仅打开一次"
+    assert result["tap_center"] == [300, 70]
+    assert any(argv[-4:] == ["input", "tap", "300", "70"] for argv in PromptRunner.calls)
+    assert PromptRunner.calls[-1][-3:] == ["rm", "-f", dump_path]
+    assert all("/sdcard/oem_jump.dump" not in argv for argv in PromptRunner.calls)
+
+
+def test_oem_jump_prompt_removes_dump_when_capture_fails(settings) -> None:  # noqa: ANN001
+    dump_path = "/data/local/tmp/apkscanner_oem_jump.dump"
+
+    class FailedDumpRunner:
+        calls: list[list[str]] = []
+
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @classmethod
+        def run(cls, argv, **_kwargs):  # noqa: ANN001, ANN206
+            cls.calls.append(argv)
+            if "uiautomator" in argv:
+                return CommandResult(argv, 1, "", "dump failed")
+            return CommandResult(argv, 0, "", "")
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        FailedDumpRunner(),  # type: ignore[arg-type]
+    )
+
+    result = adapter._dismiss_oem_jump_prompt()
+
+    assert result == {"detected": False, "reason": "dump_failed"}
+    assert FailedDumpRunner.calls[-1][-3:] == ["rm", "-f", dump_path]
+
+
+def test_oem_jump_prompt_does_not_accept_permanent_only_button(settings) -> None:  # noqa: ANN001
+    dump_path = "/data/local/tmp/apkscanner_oem_jump.dump"
+
+    class PermanentOnlyRunner:
+        calls: list[list[str]] = []
+
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @classmethod
+        def run(cls, argv, **_kwargs):  # noqa: ANN001, ANN206
+            cls.calls.append(argv)
+            if "uiautomator" in argv:
+                return CommandResult(argv, 0, "UI hierarchy dumped", "")
+            if argv[-2:] == ["cat", dump_path]:
+                return CommandResult(
+                    argv,
+                    0,
+                    (
+                        "<hierarchy>"
+                        '<node package="com.vivo.appfilter" text="始终打开" '
+                        'clickable="true" bounds="[0,0][100,100]" />'
+                        "</hierarchy>"
+                    ),
+                    "",
+                )
+            return CommandResult(argv, 0, "", "")
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        PermanentOnlyRunner(),  # type: ignore[arg-type]
+    )
+
+    result = adapter._dismiss_oem_jump_prompt()
+
+    assert result == {"detected": True, "dismissed": False, "reason": "no_known_button"}
+    assert not any("tap" in argv for argv in PermanentOnlyRunner.calls)
+    assert PermanentOnlyRunner.calls[-1][-3:] == ["rm", "-f", dump_path]
+
+
+def test_oem_jump_prompt_requires_disappearance_after_a_successful_tap(settings) -> None:  # noqa: ANN001
+    dump_path = "/data/local/tmp/apkscanner_oem_jump.dump"
+
+    class StalePromptRunner:
+        calls: list[list[str]] = []
+
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @classmethod
+        def run(cls, argv, **_kwargs):  # noqa: ANN001, ANN206
+            cls.calls.append(argv)
+            if "uiautomator" in argv:
+                return CommandResult(argv, 0, "UI hierarchy dumped", "")
+            if argv[-2:] == ["cat", dump_path]:
+                return CommandResult(
+                    argv,
+                    0,
+                    (
+                        "<hierarchy>"
+                        '<node package="com.vivo.appfilter" text="仅打开一次" '
+                        'clickable="true" bounds="[20,20][220,120]" />'
+                        "</hierarchy>"
+                    ),
+                    "",
+                )
+            return CommandResult(argv, 0, "", "")
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        StalePromptRunner(),  # type: ignore[arg-type]
+    )
+
+    result = adapter._dismiss_oem_jump_prompt()
+
+    assert result["detected"] is True
+    assert result["dismissed"] is False
+    assert result["reason"] == "prompt_still_present"
+    assert StalePromptRunner.calls[-1][-3:] == ["rm", "-f", dump_path]
+
+
+def test_oem_jump_prompt_ignores_button_text_owned_by_another_package(settings) -> None:  # noqa: ANN001
+    dump_path = "/data/local/tmp/apkscanner_oem_jump.dump"
+
+    class ForeignButtonRunner:
+        calls: list[list[str]] = []
+
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @classmethod
+        def run(cls, argv, **_kwargs):  # noqa: ANN001, ANN206
+            cls.calls.append(argv)
+            if "uiautomator" in argv:
+                return CommandResult(argv, 0, "UI hierarchy dumped", "")
+            if argv[-2:] == ["cat", dump_path]:
+                return CommandResult(
+                    argv,
+                    0,
+                    (
+                        "<hierarchy>"
+                        '<node package="com.vivo.appfilter" text="提示" />'
+                        '<node package="com.example.target" text="打开" '
+                        'clickable="true" bounds="[0,0][100,100]" />'
+                        "</hierarchy>"
+                    ),
+                    "",
+                )
+            return CommandResult(argv, 0, "", "")
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        ForeignButtonRunner(),  # type: ignore[arg-type]
+    )
+
+    result = adapter._dismiss_oem_jump_prompt()
+
+    assert result == {"detected": True, "dismissed": False, "reason": "no_known_button"}
+    assert not any("tap" in argv for argv in ForeignButtonRunner.calls)
+
+
 def test_android13_device_is_local_verdict_but_not_release_gate_eligible(
     settings,
     tmp_path,

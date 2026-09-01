@@ -127,15 +127,15 @@ Dynamic Experiment Capsule，把前置状态、多条 ADB 动作、中间观察�
 
 Agent 可在 `requested_tests[].experiment` 中提交同一结构。平台先校验步骤 ID、action/assert 组成、
 assertion 与 observation kind 的绑定，再创建 Capsule，并将其关联到当前 Hypothesis 的
-`ProofAttempt(platform_dynamic_experiment)`。assert 步骤只有在全部声明断言通过、语义
-ImpactContract 完整且设备满足当前 validation profile 时，才会形成 `harm_demonstrated=true`；普通
-action 成功只证明执行发生。暂停的 Capsule 保留正在执行的 Proof，人工或平台再次 `run` 后只执行失败或
-未执行步骤，进入 completed/canceled 终态时再统一闭合 Proof。
+`ProofAttempt(platform_dynamic_experiment)`。通用 Capsule 的 stdout/regex 断言属于诊断性执行回执，
+不是独立的平台 Oracle，因此不会单独形成 `harm_demonstrated=true` 或动态反证；需要闭合漏洞结论时，
+应改用具备类型化平台观察器的普通应用 PoC。普通 action 成功只证明执行发生。暂停的 Capsule 保留正在
+执行的 Proof，人工或平台再次 `run` 后只执行失败或未执行步骤，进入 completed/canceled 终态时再统一闭合 Proof。
 
 ## 3.3 扫描质量漏斗
 
-`GET /scans/{scan_id}/quality-summary` 从结构化台账实时聚合入口、任务、Hypothesis、静态支持、
-Proof 规划、设备执行、危害证明和动态 Finding 八个阶段，并按 schema/provider/构建/安装/运行时/设备/
+`GET /scans/{scan_id}/quality-summary` 从结构化台账实时聚合入口、任务、Hypothesis、完整静态支持、
+Proof 规划、设备执行、危害证明和动态 Finding 八个主阶段，并将“运行已观察但缺 Oracle”作为旁路指标；按 schema/provider/构建/安装/运行时/设备/
 Oracle/超时/取消分类失败。总览同时展示 Agent 调用与 token、缓存输入比例、各 phase 耗时、设备等待与
 持有时间、PoC 构建数和 Dynamic Experiment 数。接口不读取大型 artifact 正文，且在没有新事件时返回
 稳定的 `generated_at`，避免事件轮询制造无意义重渲染。

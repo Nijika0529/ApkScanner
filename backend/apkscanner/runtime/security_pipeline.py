@@ -8,16 +8,19 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from ..core.db import Database
-from ..core.enums import FindingStatus, HypothesisStatus, ProofAttemptStatus
+from ..core.enums import FindingStatus, HypothesisStatus, ProofAttemptStatus, ScanStatus
 from ..core.models import (
     EntryPoint,
+    Evidence,
     Finding,
     HypothesisArgument,
     InvestigationTask,
     ProofAttempt,
+    Scan,
     SecurityHypothesis,
 )
-from ..core.repository import now
+from ..core.proof_receipts import evidence_backed_harm_attempts
+from ..core.repository import invalidate_scan_materialized_summary, now
 from ..core.schemas import AgentRequestedTest
 from .proof_recipes import plan_with_proof_recipe
 
@@ -137,10 +140,24 @@ class HypothesisLedger:
         backend: str,
         model: str | None,
         payload: dict[str, Any],
+        allowed_evidence_ids: set[str] | None = None,
     ) -> None:
-        evidence_ids = [
-            value for value in payload.get("evidence_ids", []) if isinstance(value, str)
-        ]
+        evidence_ids: list[str] = []
+        for value in payload.get("evidence_ids", []):
+            if not isinstance(value, str):
+                continue
+            resolved = value
+            if allowed_evidence_ids is not None and value not in allowed_evidence_ids:
+                prefix_matches = [
+                    evidence_id
+                    for evidence_id in allowed_evidence_ids
+                    if len(value) >= 8 and evidence_id.startswith(value)
+                ]
+                if len(prefix_matches) != 1:
+                    continue
+                resolved = prefix_matches[0]
+            if resolved not in evidence_ids:
+                evidence_ids.append(resolved)
         position = {
             "hunter": "support",
             "advocate": "support",
@@ -154,14 +171,19 @@ class HypothesisLedger:
                     select(SecurityHypothesis).where(SecurityHypothesis.task_id == task_id)
                 )
             )
-            proven_hypothesis_ids = set(
-                session.scalars(
-                    select(ProofAttempt.hypothesis_id).where(
-                        ProofAttempt.task_id == task_id,
-                        ProofAttempt.harm_demonstrated.is_(True),
+            task = session.get(InvestigationTask, task_id)
+            proven_hypothesis_ids = {
+                attempt.hypothesis_id
+                for attempt in (
+                    evidence_backed_harm_attempts(
+                        session,
+                        scan_id=task.scan_id,
+                        task_id=task_id,
                     )
+                    if task is not None
+                    else []
                 )
-            )
+            }
             hypothesis_ids = {hypothesis.id for hypothesis in hypotheses}
             scoped_ids = {
                 value
@@ -390,8 +412,31 @@ class HypothesisLedger:
             and item.get("metadata", {}).get("impact_contract_satisfied") is True
             for item in evidence
         )
+
+        def platform_oracle_eligible(item: dict[str, Any]) -> bool:
+            return (
+                item.get("kind") != "dynamic_experiment.adb"
+                or item.get("metadata", {}).get("platform_oracle_validated") is True
+            )
+
+        unvalidated_agent_assertion_ids = [
+            str(item["id"])
+            for item in evidence
+            if item.get("kind") == "dynamic_experiment.adb"
+            and not platform_oracle_eligible(item)
+            and isinstance(item.get("id"), str)
+        ]
+        dynamic_experiment_executed = any(
+            item.get("kind") == "dynamic_experiment.adb"
+            and item.get("metadata", {}).get(
+                "dynamic_experiment_execution_demonstrated"
+            )
+            is True
+            for item in evidence
+        )
         dynamic_experiment_succeeded = any(
             item.get("kind") == "dynamic_experiment.adb"
+            and platform_oracle_eligible(item)
             and item.get("metadata", {}).get(
                 "dynamic_experiment_execution_demonstrated"
             )
@@ -402,10 +447,12 @@ class HypothesisLedger:
             probe_succeeded
             or poc_succeeded
             or platform_observed_poc_effect
-            or dynamic_experiment_succeeded
+            or dynamic_experiment_executed
         )
         observed_facts: list[dict[str, Any]] = []
         for item in evidence:
+            if not platform_oracle_eligible(item):
+                continue
             metadata = item.get("metadata", {})
             oracle_metadata = metadata.get("oracle")
             if not isinstance(oracle_metadata, dict):
@@ -420,10 +467,14 @@ class HypothesisLedger:
                 }
             )
         impact_observed = any(
-            item.get("metadata", {}).get("impact_contract_satisfied") is True for item in evidence
+            item.get("metadata", {}).get("impact_contract_satisfied") is True
+            and platform_oracle_eligible(item)
+            for item in evidence
         )
         oracle_refuted = any(
-            item.get("metadata", {}).get("oracle_refuted") is True for item in evidence
+            item.get("metadata", {}).get("oracle_refuted") is True
+            and platform_oracle_eligible(item)
+            for item in evidence
         )
         android16_verdict_eligible = not any(
             item.get("metadata", {}).get("android16_verdict_eligible") is False for item in evidence
@@ -483,6 +534,33 @@ class HypothesisLedger:
                 ProofAttemptStatus.EXECUTING.value,
             }:
                 return
+            unique_evidence_ids = list(dict.fromkeys(evidence_ids))
+            persisted_evidence_ids = set(
+                session.scalars(
+                    select(Evidence.id).where(
+                        Evidence.scan_id == attempt.scan_id,
+                        Evidence.id.in_(unique_evidence_ids),
+                    )
+                )
+            ) if unique_evidence_ids else set()
+            evidence_receipt_valid = (
+                bool(evidence)
+                and len(evidence_ids) == len(evidence)
+                and persisted_evidence_ids == set(unique_evidence_ids)
+            )
+            missing_evidence_ids = [
+                evidence_id
+                for evidence_id in unique_evidence_ids
+                if evidence_id not in persisted_evidence_ids
+            ]
+            if not evidence_receipt_valid:
+                harm_demonstrated = False
+                release_gate_eligible = False
+                if status in {
+                    ProofAttemptStatus.PROVEN.value,
+                    ProofAttemptStatus.REFUTED.value,
+                }:
+                    status = ProofAttemptStatus.INCONCLUSIVE.value
             oracle = {
                 "schema_version": "1.0",
                 "correlated_probe_result": correlated,
@@ -491,13 +569,16 @@ class HypothesisLedger:
                 "poc_succeeded": poc_succeeded,
                 "poc_claimed_security_impact": poc_claimed_impact,
                 "platform_observed_poc_effect": platform_observed_poc_effect,
+                "dynamic_experiment_executed": dynamic_experiment_executed,
                 "dynamic_experiment_succeeded": dynamic_experiment_succeeded,
+                "unvalidated_agent_assertion_ids": unvalidated_agent_assertion_ids,
                 "execution_demonstrated": execution_demonstrated,
                 "security_impact_observed": impact_observed,
                 "impact_contract_ids": list(
                     dict.fromkeys(
                         str(contract_id)
                         for item in evidence
+                        if platform_oracle_eligible(item)
                         if (contract_id := item.get("metadata", {}).get("impact_contract_id"))
                     )
                 ),
@@ -509,6 +590,8 @@ class HypothesisLedger:
                 "compatibility_smoke_only": compatibility_smoke_only,
                 "verdict_scope": verdict_scope,
                 "harm_demonstrated": harm_demonstrated,
+                "evidence_receipt_valid": evidence_receipt_valid,
+                "missing_evidence_ids": missing_evidence_ids,
                 "oem_consent_gated": any(
                     item.get("metadata", {}).get("oem_jump_prompt_auto_allowed")
                     for item in evidence
@@ -565,6 +648,13 @@ class HypothesisLedger:
                     )
                 elif hypothesis.status != HypothesisStatus.PROVEN.value:
                     hypothesis.status = HypothesisStatus.INCONCLUSIVE.value
+            scan = session.get(Scan, attempt.scan_id)
+            if scan is not None and scan.status == ScanStatus.FINAL.value:
+                invalidate_scan_materialized_summary(
+                    session,
+                    attempt.scan_id,
+                    reason="proof_attempt_completed",
+                )
             session.commit()
 
     def finalize(
@@ -615,6 +705,19 @@ class HypothesisLedger:
             session.scalars(select(SecurityHypothesis).where(SecurityHypothesis.task_id == task_id))
         )
         hypothesis_ids = {hypothesis.id for hypothesis in hypotheses}
+        scan_id = hypotheses[0].scan_id if hypotheses else ""
+        proven_attempts_by_hypothesis: dict[str, list[ProofAttempt]] = {}
+        if scan_id:
+            for attempt in evidence_backed_harm_attempts(
+                session,
+                scan_id=scan_id,
+                task_id=task_id,
+                hypothesis_ids=hypothesis_ids,
+            ):
+                proven_attempts_by_hypothesis.setdefault(
+                    attempt.hypothesis_id,
+                    [],
+                ).append(attempt)
         tested_ids = {
             value
             for value in payload.get("hypotheses_tested", [])
@@ -628,7 +731,11 @@ class HypothesisLedger:
             and item["hypothesis_id"] in hypothesis_ids
         }
         tested_ids.update(assessments)
-        legacy_blanket = not assessments and not tested_ids
+        legacy_blanket = (
+            not assessments
+            and not tested_ids
+            and result_value != FindingStatus.SUPPORTED_STATIC.value
+        )
         for hypothesis in hypotheses:
             assessment = assessments.get(hypothesis.id)
             assessment_result = (
@@ -668,14 +775,7 @@ class HypothesisLedger:
                 if hypothesis.id in tested_ids
                 else "not_assessed_by_agent"
             )
-            proven_attempts = list(
-                session.scalars(
-                    select(ProofAttempt).where(
-                        ProofAttempt.hypothesis_id == hypothesis.id,
-                        ProofAttempt.harm_demonstrated.is_(True),
-                    )
-                )
-            )
+            proven_attempts = proven_attempts_by_hypothesis.get(hypothesis.id, [])
             proof_evidence_ids = list(
                 dict.fromkeys(
                     evidence_id
@@ -763,7 +863,9 @@ class HypothesisLedger:
                     hypothesis.support_evidence_ids,
                     effective_evidence_ids,
                 )
-            elif effective_status == HypothesisStatus.REFUTED.value:
+            else:
+                hypothesis.support_evidence_ids = []
+            if effective_status == HypothesisStatus.REFUTED.value:
                 hypothesis.refute_evidence_ids = HypothesisLedger._merge_ids(
                     hypothesis.refute_evidence_ids,
                     effective_evidence_ids,
@@ -781,30 +883,28 @@ class HypothesisLedger:
 
     def task_harm_demonstrated(self, task_id: str) -> bool:
         with self.database.session_factory() as session:
-            return (
-                session.scalar(
-                    select(ProofAttempt.id)
-                    .where(
-                        ProofAttempt.task_id == task_id,
-                        ProofAttempt.harm_demonstrated.is_(True),
-                    )
-                    .limit(1)
+            task = session.get(InvestigationTask, task_id)
+            return bool(
+                task
+                and evidence_backed_harm_attempts(
+                    session,
+                    scan_id=task.scan_id,
+                    task_id=task_id,
                 )
-                is not None
             )
 
     def task_proof_result(self, task_id: str) -> tuple[str, list[str]] | None:
         """Return the strongest platform proof independently of the model's conclusion."""
         with self.database.session_factory() as session:
-            attempts = list(
-                session.scalars(
-                    select(ProofAttempt)
-                    .where(
-                        ProofAttempt.task_id == task_id,
-                        ProofAttempt.harm_demonstrated.is_(True),
-                    )
-                    .order_by(ProofAttempt.created_at)
+            task = session.get(InvestigationTask, task_id)
+            attempts = (
+                evidence_backed_harm_attempts(
+                    session,
+                    scan_id=task.scan_id,
+                    task_id=task_id,
                 )
+                if task is not None
+                else []
             )
             if not attempts:
                 return None
@@ -819,15 +919,15 @@ class HypothesisLedger:
         """Return immutable platform harm receipts grouped by hypothesis."""
 
         with self.database.session_factory() as session:
-            attempts = list(
-                session.scalars(
-                    select(ProofAttempt)
-                    .where(
-                        ProofAttempt.task_id == task_id,
-                        ProofAttempt.harm_demonstrated.is_(True),
-                    )
-                    .order_by(ProofAttempt.created_at)
+            task = session.get(InvestigationTask, task_id)
+            attempts = (
+                evidence_backed_harm_attempts(
+                    session,
+                    scan_id=task.scan_id,
+                    task_id=task_id,
                 )
+                if task is not None
+                else []
             )
             receipts: dict[str, list[str]] = {}
             for attempt in attempts:
@@ -860,8 +960,18 @@ class HypothesisLedger:
                     .order_by(ProofAttempt.created_at)
                 )
             )
+            task = session.get(InvestigationTask, task_id)
+            proven_attempts = (
+                evidence_backed_harm_attempts(
+                    session,
+                    scan_id=task.scan_id,
+                    task_id=task_id,
+                )
+                if task is not None
+                else []
+            )
         hypothesis_ids = [item.id for item in hypotheses]
-        proven_ids = {item.hypothesis_id for item in attempts if item.harm_demonstrated}
+        proven_ids = {item.hypothesis_id for item in proven_attempts}
         attempts_by_hypothesis: dict[str, list[ProofAttempt]] = {}
         for attempt in attempts:
             attempts_by_hypothesis.setdefault(attempt.hypothesis_id, []).append(attempt)
@@ -925,6 +1035,17 @@ class HypothesisLedger:
             "critical": 4,
         }
         with self.database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            attempts = (
+                evidence_backed_harm_attempts(
+                    session,
+                    scan_id=task.scan_id,
+                    task_id=task_id,
+                )
+                if task is not None
+                else []
+            )
+            proven_hypothesis_ids = {attempt.hypothesis_id for attempt in attempts}
             severities = list(
                 session.scalars(
                     select(Finding.severity)
@@ -932,17 +1053,12 @@ class HypothesisLedger:
                         SecurityHypothesis,
                         SecurityHypothesis.final_finding_id == Finding.id,
                     )
-                    .join(
-                        ProofAttempt,
-                        ProofAttempt.hypothesis_id == SecurityHypothesis.id,
-                    )
                     .where(
                         SecurityHypothesis.task_id == task_id,
-                        ProofAttempt.task_id == task_id,
-                        ProofAttempt.harm_demonstrated.is_(True),
+                        SecurityHypothesis.id.in_(proven_hypothesis_ids),
                     )
                 )
-            )
+            ) if proven_hypothesis_ids else []
         valid = [value for value in severities if value in severity_rank]
         if not valid:
             return None

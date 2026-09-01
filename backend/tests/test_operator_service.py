@@ -1,9 +1,20 @@
 from __future__ import annotations
 
 from apkscanner.core.db import Database
-from apkscanner.core.models import Finding, InvestigationTask, Scan, SecurityHypothesis
+from apkscanner.core.models import (
+    Evidence,
+    Finding,
+    InvestigationTask,
+    ProofAttempt,
+    Scan,
+    SecurityHypothesis,
+)
 from apkscanner.platform.artifacts import ArtifactStore
-from apkscanner.platform.operator_schemas import OPERATOR_RECEIPT_JSON_SCHEMA, OperatorSessionCreate
+from apkscanner.platform.operator_schemas import (
+    OPERATOR_RECEIPT_JSON_SCHEMA,
+    OperatorReceipt,
+    OperatorSessionCreate,
+)
 from apkscanner.platform.operator_service import PlatformOperatorService
 from apkscanner.runtime.finding_reports import build_finding_report, render_finding_description
 from apkscanner.runtime.orchestrator import ScanOrchestrator
@@ -231,3 +242,395 @@ def test_operator_receipt_uses_strict_responses_object_schema() -> None:
             assert_strict(item)
 
     assert_strict(OPERATOR_RECEIPT_JSON_SCHEMA)
+
+
+def test_operator_cannot_confirm_harm_without_an_attributable_proof_attempt(
+    settings,  # noqa: ANN001
+) -> None:
+    database = Database(settings)
+    database.create_all()
+    store = ArtifactStore(settings)
+    orchestrator = ScanOrchestrator(settings, database, store)
+    service = PlatformOperatorService(database, store, orchestrator)
+    with database.session_factory() as db:
+        scan = Scan(
+            filename="operator-proof-policy.apk",
+            artifact_sha256="c" * 64,
+            artifact_path="operator-proof-policy.apk",
+        )
+        task = InvestigationTask(scan=scan, task_type="component", status="completed")
+        db.add_all([scan, task])
+        db.flush()
+        hypothesis = SecurityHypothesis(
+            scan_id=scan.id,
+            task_id=task.id,
+            fingerprint="d" * 64,
+            category="component",
+            claim="A candidate requires platform proof.",
+        )
+        db.add(hypothesis)
+        db.flush()
+        finding = Finding(
+            scan=scan,
+            dedupe_key="operator-proof-policy",
+            rule_id="AGENT",
+            title="Unproven candidate",
+            description="Static evidence alone is not runtime harm proof.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            status="supported_static",
+            metadata_json={"hypothesis_id": hypothesis.id},
+        )
+        static_evidence = Evidence(
+            scan_id=scan.id,
+            task_id=task.id,
+            kind="static.jadx",
+            sha256="e" * 64,
+            path="operator-static.json",
+        )
+        receipt_evidence = Evidence(
+            scan_id=scan.id,
+            task_id=task.id,
+            kind="operator.receipt",
+            sha256="f" * 64,
+            path="operator-receipt.json",
+        )
+        db.add_all([finding, static_evidence, receipt_evidence])
+        db.flush()
+        hypothesis.final_finding_id = finding.id
+        db.commit()
+        finding_id = finding.id
+        static_evidence_id = static_evidence.id
+        receipt_evidence_id = receipt_evidence.id
+
+    session_id, _turn_id = service.create_session(
+        OperatorSessionCreate(
+            instruction="复核该候选是否已经证明危害",
+            finding_ids=[finding_id],
+            device_mode="none",
+        )
+    )
+    service._apply_finding_updates(
+        session_id,
+        OperatorReceipt.model_validate(
+            {
+                "result": "reproduced",
+                "summary": "模型声称已复现，但只有静态证据。",
+                "finding_updates": [
+                    {
+                        "finding_id": finding_id,
+                        "verdict": "reproduced_blackbox",
+                        "conclusion": "静态代码显示该路径可能存在。",
+                        "evidence_ids": [static_evidence_id],
+                    }
+                ],
+            }
+        ),
+        receipt_evidence_id,
+    )
+
+    with database.session_factory() as db:
+        finding = db.get(Finding, finding_id)
+        assert finding is not None
+        assert finding.status == "inconclusive"
+        assert finding.metadata_json["harm_demonstrated"] is False
+        history = finding.metadata_json["operator_history"][-1]
+        assert history["requested_verdict"] == "reproduced_blackbox"
+        assert history["verdict"] == "inconclusive"
+        assert "ProofAttempt" in history["verdict_override_reason"]
+
+
+def test_operator_static_refutation_requires_a_complete_platform_gate(settings) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    store = ArtifactStore(settings)
+    service = PlatformOperatorService(
+        database,
+        store,
+        ScanOrchestrator(settings, database, store),
+    )
+    with database.session_factory() as db:
+        scan = Scan(
+            filename="operator-static-refutation.apk",
+            artifact_sha256="0" * 64,
+            artifact_path="operator-static-refutation.apk",
+        )
+        task = InvestigationTask(scan=scan, task_type="component", status="completed")
+        db.add_all([scan, task])
+        db.flush()
+        static_evidence = Evidence(
+            scan_id=scan.id,
+            task_id=task.id,
+            kind="static.jadx",
+            sha256="1" * 64,
+            path="operator-static-refutation.json",
+            metadata_json={"static_output_usable": True},
+        )
+        receipt_evidence = Evidence(
+            scan_id=scan.id,
+            task_id=task.id,
+            kind="operator.receipt",
+            sha256="2" * 64,
+            path="operator-static-refutation-receipt.json",
+        )
+        generic = Finding(
+            scan=scan,
+            dedupe_key="operator-generic-refutation",
+            rule_id="AGENT",
+            title="Generic model closure",
+            description="A vague conclusion must not close this candidate.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            status="supported_static",
+        )
+        concrete = Finding(
+            scan=scan,
+            dedupe_key="operator-concrete-refutation",
+            rule_id="AGENT",
+            title="Concrete static closure",
+            description="A specific caller check blocks this path.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            status="supported_static",
+        )
+        db.add_all([static_evidence, receipt_evidence, generic, concrete])
+        db.flush()
+        generic.evidence_ids = [static_evidence.id]
+        concrete.evidence_ids = [static_evidence.id]
+        db.commit()
+        finding_ids = [generic.id, concrete.id]
+        static_evidence_id = static_evidence.id
+        receipt_evidence_id = receipt_evidence.id
+
+    session_id, _turn_id = service.create_session(
+        OperatorSessionCreate(
+            instruction="用静态证据复核两个候选。",
+            finding_ids=finding_ids,
+            device_mode="none",
+        )
+    )
+    service._apply_finding_updates(
+        session_id,
+        OperatorReceipt.model_validate(
+            {
+                "result": "refuted",
+                "summary": "一个结论泛泛，另一个有具体调用者校验。",
+                "finding_updates": [
+                    {
+                        "finding_id": finding_ids[0],
+                        "verdict": "refuted_static",
+                        "conclusion": "代码看起来没有问题。",
+                        "evidence_ids": [static_evidence_id],
+                    },
+                    {
+                        "finding_id": finding_ids[1],
+                        "verdict": "refuted_static",
+                        "conclusion": "Binder 入口在敏感调用前强制校验调用 UID。",
+                        "evidence_ids": [static_evidence_id],
+                        "counterevidence": [
+                            "静态分支显示 Binder.getCallingUid() 不匹配时立即抛出 SecurityException。"
+                        ],
+                        "blocked_edge": (
+                            "untrusted Binder caller -> UID equality guard -> privileged sink blocked"
+                        ),
+                    },
+                ],
+            }
+        ),
+        receipt_evidence_id,
+    )
+
+    with database.session_factory() as db:
+        generic = db.get(Finding, finding_ids[0])
+        concrete = db.get(Finding, finding_ids[1])
+        assert generic is not None and generic.status == "inconclusive"
+        assert "platform_static_refutation_gate" not in generic.metadata_json
+        generic_gate = generic.metadata_json["operator_history"][-1][
+            "platform_static_refutation_gate"
+        ]
+        assert generic_gate["eligible"] is False
+        assert "missing_concrete_counterevidence" in generic_gate[
+            "suppression_reasons"
+        ]
+        assert concrete is not None and concrete.status == "refuted_static"
+        concrete_gate = concrete.metadata_json["platform_static_refutation_gate"]
+        assert concrete_gate["eligible"] is True
+        assert concrete_gate["static_evidence_ids"] == [static_evidence_id]
+        assert "UID equality guard" in concrete_gate["blocked_edge"]
+
+
+def test_operator_unchanged_promotes_an_attributable_harm_receipt(settings) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    store = ArtifactStore(settings)
+    service = PlatformOperatorService(
+        database,
+        store,
+        ScanOrchestrator(settings, database, store),
+    )
+    with database.session_factory() as db:
+        scan = Scan(
+            filename="operator-existing-proof.apk",
+            artifact_sha256="1" * 64,
+            artifact_path="operator-existing-proof.apk",
+        )
+        task = InvestigationTask(scan=scan, task_type="component", status="completed")
+        db.add_all([scan, task])
+        db.flush()
+        hypothesis = SecurityHypothesis(
+            scan_id=scan.id,
+            task_id=task.id,
+            fingerprint="2" * 64,
+            category="component",
+            claim="A platform receipt already proves this hypothesis.",
+        )
+        evidence = Evidence(
+            scan_id=scan.id,
+            task_id=task.id,
+            kind="blackbox.oracle_result",
+            sha256="3" * 64,
+            path="operator-proof.json",
+        )
+        receipt_evidence = Evidence(
+            scan_id=scan.id,
+            task_id=task.id,
+            kind="operator.receipt",
+            sha256="4" * 64,
+            path="operator-existing-proof-receipt.json",
+        )
+        db.add_all([hypothesis, evidence, receipt_evidence])
+        db.flush()
+        proof = ProofAttempt(
+            scan_id=scan.id,
+            task_id=task.id,
+            hypothesis_id=hypothesis.id,
+            test_case_id="operator-existing-proof",
+            status="proven",
+            evidence_ids=[evidence.id],
+            harm_demonstrated=True,
+        )
+        finding = Finding(
+            scan=scan,
+            dedupe_key="operator-existing-proof",
+            rule_id="AGENT",
+            title="Existing proof",
+            description="The finding write lagged behind its proof receipt.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            status="supported_static",
+            evidence_ids=[evidence.id],
+            metadata_json={"hypothesis_id": hypothesis.id},
+        )
+        db.add_all([proof, finding])
+        db.flush()
+        hypothesis.final_finding_id = finding.id
+        db.commit()
+        finding_id = finding.id
+        receipt_evidence_id = receipt_evidence.id
+
+    session_id, _turn_id = service.create_session(
+        OperatorSessionCreate(
+            instruction="保留现状并检查现有平台证明",
+            finding_ids=[finding_id],
+            device_mode="none",
+        )
+    )
+    service._apply_finding_updates(
+        session_id,
+        OperatorReceipt.model_validate(
+            {
+                "result": "completed",
+                "summary": "平台证明已存在。",
+                "finding_updates": [
+                    {
+                        "finding_id": finding_id,
+                        "verdict": "unchanged",
+                        "conclusion": "沿用平台证明。",
+                        "evidence_ids": [],
+                    }
+                ],
+            }
+        ),
+        receipt_evidence_id,
+    )
+
+    with database.session_factory() as db:
+        finding = db.get(Finding, finding_id)
+        assert finding is not None
+        assert finding.status == "reproduced_blackbox"
+        assert finding.metadata_json["harm_demonstrated"] is True
+
+
+def test_operator_cannot_reopen_a_human_false_positive_closure(settings) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    store = ArtifactStore(settings)
+    service = PlatformOperatorService(
+        database,
+        store,
+        ScanOrchestrator(settings, database, store),
+    )
+    with database.session_factory() as db:
+        scan = Scan(
+            filename="operator-human-closure.apk",
+            artifact_sha256="5" * 64,
+            artifact_path="operator-human-closure.apk",
+        )
+        db.add(scan)
+        db.flush()
+        finding = Finding(
+            scan=scan,
+            dedupe_key="operator-human-closure",
+            rule_id="AGENT",
+            title="Human-reviewed false positive",
+            description="Only an explicit human review may reopen this record.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            status="false_positive",
+            review_note="业务约束已人工确认，保持关闭。",
+        )
+        receipt_evidence = Evidence(
+            scan_id=scan.id,
+            kind="operator.receipt",
+            sha256="6" * 64,
+            path="operator-human-closure.json",
+        )
+        db.add_all([finding, receipt_evidence])
+        db.commit()
+        finding_id = finding.id
+        receipt_evidence_id = receipt_evidence.id
+
+    session_id, _turn_id = service.create_session(
+        OperatorSessionCreate(
+            instruction="重新分析人工关闭项，但不要覆盖人工结论",
+            finding_ids=[finding_id],
+            device_mode="none",
+        )
+    )
+    service._apply_finding_updates(
+        session_id,
+        OperatorReceipt.model_validate(
+            {
+                "result": "completed",
+                "summary": "模型建议重新打开，但没有平台危害证明。",
+                "finding_updates": [
+                    {
+                        "finding_id": finding_id,
+                        "verdict": "reproduced_blackbox",
+                        "conclusion": "模型认为静态路径可利用。",
+                        "evidence_ids": [],
+                    }
+                ],
+            }
+        ),
+        receipt_evidence_id,
+    )
+
+    with database.session_factory() as db:
+        finding = db.get(Finding, finding_id)
+        assert finding is not None
+        assert finding.status == "false_positive"
+        assert finding.review_note == "业务约束已人工确认，保持关闭。"
+        history = finding.metadata_json["operator_history"][-1]
+        assert history["verdict"] == "false_positive"
+        assert "human disposition" in history["verdict_override_reason"]

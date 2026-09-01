@@ -14,17 +14,28 @@ from ..core.evidence import EvidenceRecorder
 from ..core.models import (
     DynamicExperimentCapsule,
     DynamicExperimentReceipt,
+    Finding,
     RuntimeObservation,
 )
-from ..core.repository import add_event
+from ..core.repository import add_event, invalidate_scan_materialized_summary
 from ..core.schemas import DynamicExperimentStepSpec
+from .adb_gateway import (
+    quote_dynamic_experiment_adb_args,
+    validate_dynamic_experiment_adb_args,
+    validate_dynamic_experiment_adb_template,
+)
 from .device import AdbDeviceAdapter, AdbDevicePool, DeviceLeaseCancelledError
+from .signal_projection import project_runtime_observation_gap
 
 _STATE_REFERENCE = re.compile(r"\$\{([A-Za-z][A-Za-z0-9_.-]{0,127})\}")
 
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+class DynamicExperimentPolicyError(ValueError):
+    """A persisted Capsule violates the platform-owned command policy."""
 
 
 class DynamicExperimentService:
@@ -94,7 +105,11 @@ class DynamicExperimentService:
                 raise RuntimeError("dynamic experiment is already running")
             self._cancellations[capsule_id] = cancel_event
         try:
-            capsule = self._prepare_run(capsule_id, preferred_serial)
+            try:
+                capsule = self._prepare_run(capsule_id, preferred_serial)
+            except DynamicExperimentPolicyError as exc:
+                self._mark_preparation_error(capsule_id, str(exc))
+                return self.get(capsule_id)
             try:
                 with self.device_pool.task_lease(
                     f"dynamic:{capsule_id}",
@@ -134,7 +149,11 @@ class DynamicExperimentService:
                 raise RuntimeError("dynamic experiment is already running")
             self._cancellations[capsule_id] = cancel_event
         try:
-            self._prepare_run(capsule_id, adapter.serial)
+            try:
+                self._prepare_run(capsule_id, adapter.serial)
+            except DynamicExperimentPolicyError as exc:
+                self._mark_preparation_error(capsule_id, str(exc))
+                return self.get(capsule_id)
             self._record_acquired(capsule_id, 0.0, adapter)
             try:
                 self._execute_pending_steps(capsule_id, adapter, cancel_event)
@@ -181,6 +200,15 @@ class DynamicExperimentService:
                 raise LookupError(capsule_id)
             if capsule.status == "completed":
                 raise ValueError("dynamic experiment is already complete")
+            try:
+                all_steps = [
+                    DynamicExperimentStepSpec.model_validate(item)
+                    for item in [*capsule.steps, *capsule.cleanup_steps]
+                ]
+                for step in all_steps:
+                    validate_dynamic_experiment_adb_template(step.adb_args)
+            except ValueError as exc:
+                raise DynamicExperimentPolicyError(str(exc)) from exc
             if preferred_serial is not None:
                 capsule.preferred_serial = preferred_serial
             capsule.status = "running"
@@ -256,6 +284,7 @@ class DynamicExperimentService:
             assert capsule is not None
             state = dict(capsule.state_json or {})
             args = [self._render_argument(value, state) for value in step.adb_args]
+            validate_dynamic_experiment_adb_args(args)
             prior_attempts = list(
                 session.scalars(
                     select(DynamicExperimentReceipt).where(
@@ -277,7 +306,7 @@ class DynamicExperimentService:
             receipt_id = receipt.id
 
         result = adapter.execute_gateway(
-            args,
+            quote_dynamic_experiment_adb_args(args),
             timeout=step.timeout_seconds,
             policy="adaptive",
         )
@@ -287,9 +316,7 @@ class DynamicExperimentService:
                 "actual": result.exit_code,
                 "matched": result.exit_code == step.expected_exit_code,
             },
-            "stdout_contains": {
-                value: value in result.stdout for value in step.stdout_contains
-            },
+            "stdout_contains": {value: value in result.stdout for value in step.stdout_contains},
         }
         if step.stdout_regex is not None:
             checks["stdout_regex"] = {
@@ -321,7 +348,7 @@ class DynamicExperimentService:
                 other_id == step.id or self._step_passed(capsule_id, other_id)
                 for other_id in assertion_step_ids
             )
-            contract_satisfied = bool(
+            agent_assertion_matched = bool(
                 passed
                 and required_assertion
                 and step.phase == "assert"
@@ -331,10 +358,8 @@ class DynamicExperimentService:
                 and contract.get("impact")
                 and contract.get("observed_fact")
             )
-            oracle_refuted = bool(
-                not passed
-                and required_assertion
-                and contract.get("refute_on_failure") is True
+            agent_assertion_failed = bool(
+                not passed and required_assertion and contract.get("refute_on_failure") is True
             )
             runtime_metadata = {
                 key: value
@@ -363,9 +388,15 @@ class DynamicExperimentService:
                     passed and step.phase in {"action", "observe", "assert"}
                 ),
                 "impact_contract_id": contract.get("contract_id"),
-                "impact_contract_satisfied": contract_satisfied,
-                "oracle_refuted": oracle_refuted,
-                "oracle": (
+                # Generic Agent-authored stdout predicates are useful runtime
+                # observations, but they are not an independent platform Oracle.
+                # A typed platform observer must mint verdict-bearing metadata.
+                "agent_assertion_contract_matched": agent_assertion_matched,
+                "agent_assertion_failed": agent_assertion_failed,
+                "platform_oracle_validated": False,
+                "impact_contract_satisfied": False,
+                "oracle_refuted": False,
+                "agent_claimed_oracle": (
                     {
                         "observed_fact": {
                             "kind": step.observation_kind,
@@ -375,7 +406,7 @@ class DynamicExperimentService:
                             "step_id": step.id,
                         }
                     }
-                    if contract_satisfied
+                    if agent_assertion_matched
                     else {}
                 ),
                 **runtime_metadata,
@@ -423,6 +454,25 @@ class DynamicExperimentService:
                 session.add(observation)
                 session.flush()
                 observation_ids.append(observation.id)
+                finding = (
+                    session.get(Finding, capsule.finding_id)
+                    if capsule.finding_id is not None
+                    else None
+                )
+                if finding is not None and passed:
+                    projected = project_runtime_observation_gap(
+                        finding,
+                        observation_id=observation.id,
+                        evidence_ids=[evidence.id],
+                        task_id=str(capsule.task_id or "dynamic_experiment"),
+                        observation_kind=observation.kind,
+                    )
+                    if projected:
+                        invalidate_scan_materialized_summary(
+                            session,
+                            capsule.scan_id,
+                            reason="dynamic_experiment_runtime_observation",
+                        )
             if step.capture_stdout_as is not None:
                 capsule.state_json = {
                     **dict(capsule.state_json or {}),
@@ -519,21 +569,21 @@ class DynamicExperimentService:
             session.commit()
 
     def _mark_completed(self, capsule_id: str, cleanup_failures: list[str]) -> None:
-        contract_satisfied = self._contract_satisfied(capsule_id)
+        agent_assertion_matched = self._contract_satisfied(capsule_id)
         with self.database.session_factory() as session:
             capsule = session.get(DynamicExperimentCapsule, capsule_id)
             assert capsule is not None
             capsule.status = "completed"
             capsule.completed_at = _now()
             capsule.error = (
-                f"cleanup incomplete: {', '.join(cleanup_failures)}"
-                if cleanup_failures
-                else None
+                f"cleanup incomplete: {', '.join(cleanup_failures)}" if cleanup_failures else None
             )
             capsule.result_json = {
                 **dict(capsule.result_json or {}),
                 "verdict": "passed",
-                "harm_demonstrated": contract_satisfied,
+                "agent_assertion_contract_matched": agent_assertion_matched,
+                "platform_oracle_validated": False,
+                "harm_demonstrated": False,
                 "cleanup_complete": not cleanup_failures,
                 "cleanup_failed_step_ids": cleanup_failures,
             }
@@ -624,6 +674,30 @@ class DynamicExperimentService:
                 capsule.scan_id,
                 "dynamic_experiment.paused",
                 "动态实验因执行错误暂停，已保留断点",
+                {"capsule_id": capsule.id, "error": error},
+            )
+            session.commit()
+
+    def _mark_preparation_error(self, capsule_id: str, error: str) -> None:
+        with self.database.session_factory() as session:
+            capsule = session.get(DynamicExperimentCapsule, capsule_id)
+            if capsule is None:
+                return
+            capsule.status = "failed"
+            capsule.completed_at = _now()
+            capsule.error = error
+            capsule.result_json = {
+                **dict(capsule.result_json or {}),
+                "verdict": "inconclusive",
+                "resumable": False,
+                "failure_stage": "policy_validation",
+                "platform_error": error,
+            }
+            add_event(
+                session,
+                capsule.scan_id,
+                "dynamic_experiment.failed",
+                "动态实验未通过平台命令策略校验",
                 {"capsule_id": capsule.id, "error": error},
             )
             session.commit()

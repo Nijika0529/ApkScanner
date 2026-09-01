@@ -53,7 +53,8 @@ sinks / risks / guards / max_hops / endpoint_discovery`）+ 正则 `MARKERS` / �
 
 ### 2.2 证据与判定模型
 
-`supported_static` → `refuted_static` → `reproduced_blackbox` → `not_reproduced` 四级，配合
+当前采用分层状态：原始 `candidate`、完整静态链 `supported_static`、运行已观察但缺 Oracle 的
+`runtime_observed_unverified`，以及 `refuted_static` / `reproduced_blackbox` / `not_reproduced`，配合
 `CoverageItem`（每入口 × 每阶段 × gap）、`HypothesisArgument`（Hunter/Advocate/Critic/Arbiter）、
 `ImpactContract` / `DynamicExperimentCapsule` / `ProofRecipe` / Oracle。
 
@@ -103,7 +104,8 @@ sinks / risks / guards / max_hops / endpoint_discovery`）+ 正则 `MARKERS` / �
 | 受权限保护 | 存在有效权限检查 |
 | 受调用者身份保护 | 调用者身份被校验 |
 | 存在候选攻击链 | 已识别潜在攻击链，待验证 |
-| 静态支持 | 有静态证据支撑 |
+| 静态支持 | 已通过完整静态攻击链硬门槛 |
+| 运行已观察 / Oracle 缺口 | 已观察目标行为，但尚未证明具体危害 |
 | 动态未复现 | 动态实验未复现危害 |
 | 动态已反证 | 动态实验明确反证 |
 | 普通 UID 已复现 | 普通 App UID 下已复现危害 |

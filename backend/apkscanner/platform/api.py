@@ -56,7 +56,11 @@ from ..core.models import (
     VulnerabilityOccurrence,
     VulnerabilityPattern,
 )
-from ..core.repository import add_event, now
+from ..core.proof_receipts import (
+    attributable_harm_attempts,
+    attributable_harm_attempts_by_finding,
+)
+from ..core.repository import add_event, invalidate_scan_materialized_summary, now
 from ..core.schemas import (
     AdbDeviceConnectRequest,
     AdbDeviceOut,
@@ -75,6 +79,7 @@ from ..core.schemas import (
     EvidenceOut,
     FindingOut,
     FindingReview,
+    FindingSignalOut,
     HealthResponse,
     InvestigationBriefCreate,
     InvestigationBriefEvaluation,
@@ -103,9 +108,14 @@ from ..core.schemas import (
     VulnerabilityOccurrenceOut,
     VulnerabilityPatternOut,
 )
+from ..runtime.adb_gateway import validate_dynamic_experiment_adb_template
 from ..runtime.agent_audit import AGENT_AUDIT_KINDS, build_agent_audits
 from ..runtime.benchmark import BenchmarkEvaluator
-from ..runtime.finding_policy import partition_findings
+from ..runtime.finding_policy import (
+    evidence_backed_signal_tier,
+    evidence_backed_signal_tiers,
+    partition_findings,
+)
 from ..runtime.orchestrator import ScanOrchestrator
 from ..runtime.quality_metrics import build_scan_quality_summary
 from ..runtime.supervisor import CampaignAppendRequest, CampaignPlan, SupervisorService
@@ -717,6 +727,11 @@ def create_dynamic_experiment(
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     require_scan(session, scan_id)
+    try:
+        for step in [*payload.steps, *payload.cleanup_steps]:
+            validate_dynamic_experiment_adb_template(step.adb_args)
+    except ValueError as exc:
+        raise HTTPException(422, f"invalid dynamic experiment command: {exc}") from exc
     if payload.task_id is not None:
         task = session.get(InvestigationTask, payload.task_id)
         if task is None or task.scan_id != scan_id:
@@ -812,7 +827,7 @@ async def run_dynamic_experiment(
     capsule = session.get(DynamicExperimentCapsule, capsule_id)
     if capsule is None:
         raise HTTPException(404, "dynamic experiment not found")
-    if capsule.status in {"running", "completed", "canceled"}:
+    if capsule.status in {"running", "completed", "canceled", "failed"}:
         raise HTTPException(409, f"dynamic experiment cannot run from status={capsule.status}")
     task = asyncio.create_task(
         asyncio.to_thread(
@@ -900,9 +915,7 @@ async def capture_runtime_artifact(
         if (
             payload.schedule_investigations
             and completed.investigation_task_ids
-            and not completed.result_json.get(
-                "analysis_reused_from_runtime_artifact_id"
-            )
+            and not completed.result_json.get("analysis_reused_from_runtime_artifact_id")
         ):
             await orchestrator.submit(scan_id)
 
@@ -1075,14 +1088,12 @@ def evaluate_investigation_brief(
     submitted = {item.criterion: item for item in payload.criteria}
     if set(submitted) != expected_criteria:
         raise HTTPException(422, "Every success criterion must be evaluated exactly once")
-    evidence_ids = {
-        evidence_id
-        for item in payload.criteria
-        for evidence_id in item.evidence_ids
-    }
-    evidence = list(
-        session.scalars(select(Evidence).where(Evidence.id.in_(evidence_ids)))
-    ) if evidence_ids else []
+    evidence_ids = {evidence_id for item in payload.criteria for evidence_id in item.evidence_ids}
+    evidence = (
+        list(session.scalars(select(Evidence).where(Evidence.id.in_(evidence_ids))))
+        if evidence_ids
+        else []
+    )
     if len(evidence) != len(evidence_ids):
         raise HTTPException(422, "Evaluation references unknown Evidence IDs")
     launch = dict((brief.result or {}).get("launch") or {})
@@ -1233,11 +1244,7 @@ def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> Health
         for name, version in tool_versions.items()
     ]
     elf_tool = next(
-        (
-            name
-            for name in ("llvm-readelf", "readelf")
-            if orchestrator.runner.available(name)
-        ),
+        (name for name in ("llvm-readelf", "readelf") if orchestrator.runner.available(name)),
         None,
     )
     capabilities.append(
@@ -1284,9 +1291,7 @@ def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> Health
         max_upload_bytes=orchestrator.settings.max_upload_bytes,
         default_investigator=orchestrator.resolve_investigator(),
         enabled_investigators=[
-            name
-            for name in ("codex",)
-            if orchestrator.settings.investigator_enabled(name)
+            name for name in ("codex",) if orchestrator.settings.investigator_enabled(name)
         ],
         capabilities=capabilities,
     )
@@ -1367,7 +1372,9 @@ async def create_fresh_scan_run(
 ) -> Scan:
     source = require_scan(session, scan_id)
     if source.status not in {ScanStatus.FINAL.value, ScanStatus.FAILED.value}:
-        raise HTTPException(409, "Wait for the current scan run to finish before starting a fresh run")
+        raise HTTPException(
+            409, "Wait for the current scan run to finish before starting a fresh run"
+        )
     try:
         artifact_path = store.verify_content_addressed(
             "artifacts",
@@ -1382,9 +1389,7 @@ async def create_fresh_scan_run(
     if not isinstance(source_control, dict):
         source_control = {}
     requested_backend = str(
-        source_control.get("backend")
-        or source_stats.get("investigator")
-        or "configured"
+        source_control.get("backend") or source_stats.get("investigator") or "configured"
     )
     try:
         resolved_backend = orchestrator.resolve_investigator(requested_backend)
@@ -1511,9 +1516,7 @@ def delete_scan(
 
     artifact = (scan.artifact_path, scan.artifact_sha256)
     evidence = list(
-        session.execute(
-            select(Evidence.path, Evidence.sha256).where(Evidence.scan_id == scan_id)
-        )
+        session.execute(select(Evidence.path, Evidence.sha256).where(Evidence.scan_id == scan_id))
     )
     evidence_by_path = {str(path): str(sha256) for path, sha256 in evidence}
     shared_evidence_paths: set[str] = set()
@@ -1548,9 +1551,7 @@ def delete_scan(
     warnings: list[str] = []
     if not artifact_is_shared:
         try:
-            removed += int(
-                store.delete_content_addressed("artifacts", artifact[0], artifact[1])
-            )
+            removed += int(store.delete_content_addressed("artifacts", artifact[0], artifact[1]))
         except (OSError, ValueError) as exc:
             warnings.append(f"APK artifact cleanup failed: {exc}")
     for path, sha256 in evidence_by_path.items():
@@ -1592,9 +1593,7 @@ def get_security_snapshot(
     session: Session = Depends(get_session),
 ) -> SecuritySnapshot:
     require_scan(session, scan_id)
-    snapshot = session.scalar(
-        select(SecuritySnapshot).where(SecuritySnapshot.scan_id == scan_id)
-    )
+    snapshot = session.scalar(select(SecuritySnapshot).where(SecuritySnapshot.scan_id == scan_id))
     if snapshot is None:
         raise HTTPException(404, "Security snapshot is not available")
     return snapshot
@@ -1659,9 +1658,7 @@ def create_regression_case(
         "rule_id": finding.rule_id,
         "cwe": finding.cwe,
         "entry_stable_keys": sorted(
-            stable_by_entry[item]
-            for item in finding.entry_point_ids
-            if item in stable_by_entry
+            stable_by_entry[item] for item in finding.entry_point_ids if item in stable_by_entry
         ),
         "title": " ".join(finding.title.lower().split()),
     }
@@ -1703,11 +1700,12 @@ def create_regression_case(
     )
     session.add(case_record)
     session.flush()
+    confirmed_source, _source_signals = partition_findings(session, [finding])
     proof_level = (
         "dynamic"
-        if finding.status == FindingStatus.REPRODUCED_BLACKBOX.value
+        if confirmed_source
         else "static"
-        if finding.status == FindingStatus.SUPPORTED_STATIC.value
+        if evidence_backed_signal_tier(session, finding) == "static_chain"
         else "none"
     )
     session.add(
@@ -1798,9 +1796,7 @@ def list_vulnerability_patterns(
 ) -> list[VulnerabilityPattern]:
     return list(
         session.scalars(
-            select(VulnerabilityPattern).order_by(
-                VulnerabilityPattern.updated_at.desc()
-            )
+            select(VulnerabilityPattern).order_by(VulnerabilityPattern.updated_at.desc())
         )
     )
 
@@ -1842,11 +1838,11 @@ def list_findings(scan_id: str, session: Session = Depends(get_session)) -> list
     return confirmed
 
 
-@router.get("/scans/{scan_id}/signals", response_model=list[FindingOut])
+@router.get("/scans/{scan_id}/signals", response_model=list[FindingSignalOut])
 def list_finding_signals(
     scan_id: str,
     session: Session = Depends(get_session),
-) -> list[Finding]:
+) -> list[FindingSignalOut]:
     require_scan(session, scan_id)
     findings = list(
         session.scalars(
@@ -1865,7 +1861,16 @@ def list_finding_signals(
         )
     )
     _confirmed, signals = partition_findings(session, findings)
-    return signals
+    signal_tiers = evidence_backed_signal_tiers(session, signals)
+    harm_attempts = attributable_harm_attempts_by_finding(session, signals)
+    return [
+        FindingSignalOut(
+            **FindingOut.model_validate(finding).model_dump(),
+            signal_tier=signal_tiers[finding.id],
+            can_accept=bool(harm_attempts.get(finding.id)),
+        )
+        for finding in signals
+    ]
 
 
 @router.get("/scans/{scan_id}/tasks", response_model=list[InvestigationTaskOut])
@@ -1994,14 +1999,10 @@ def list_events(
     if after:
         return list(
             session.scalars(
-                statement.where(ScanEvent.id > after)
-                .order_by(ScanEvent.id)
-                .limit(limit)
+                statement.where(ScanEvent.id > after).order_by(ScanEvent.id).limit(limit)
             )
         )
-    latest = list(
-        session.scalars(statement.order_by(ScanEvent.id.desc()).limit(limit))
-    )
+    latest = list(session.scalars(statement.order_by(ScanEvent.id.desc()).limit(limit)))
     latest.reverse()
     return latest
 
@@ -2019,11 +2020,7 @@ async def stream_events(
             raise HTTPException(404, "Scan not found")
     last_event_id = request.headers.get("last-event-id", "")
     initial_cursor = (
-        int(last_event_id)
-        if last_event_id.isdigit()
-        else after
-        if isinstance(after, int)
-        else 0
+        int(last_event_id) if last_event_id.isdigit() else after if isinstance(after, int) else 0
     )
 
     async def generate():  # noqa: ANN202
@@ -2036,11 +2033,7 @@ async def stream_events(
                 )
                 if detail == "summary":
                     statement = statement.where(_console_summary_event_filter())
-                events = list(
-                    session.scalars(
-                        statement.order_by(ScanEvent.id).limit(200)
-                    )
-                )
+                events = list(session.scalars(statement.order_by(ScanEvent.id).limit(200)))
                 scan = session.get(Scan, scan_id)
             for event in events:
                 cursor = event.id
@@ -2052,8 +2045,7 @@ async def stream_events(
                 )
                 yield f"id: {event.id}\nevent: {stream_event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
             if scan is None or (
-                scan.status in {ScanStatus.FINAL.value, ScanStatus.FAILED.value}
-                and not events
+                scan.status in {ScanStatus.FINAL.value, ScanStatus.FAILED.value} and not events
             ):
                 yield "event: end\ndata: {}\n\n"
                 break
@@ -2073,13 +2065,10 @@ _SUMMARY_MODEL_EVENTS = {
 
 def _console_summary_event_filter():  # noqa: ANN202
     """Exclude high-rate runtime telemetry from the interactive console stream."""
-    return (
-        or_(
-            ~ScanEvent.event_type.like("exploration.model.%"),
-            ScanEvent.event_type.in_(_SUMMARY_MODEL_EVENTS),
-        )
-        & (ScanEvent.event_type != "exploration.evidence.created")
-    )
+    return or_(
+        ~ScanEvent.event_type.like("exploration.model.%"),
+        ScanEvent.event_type.in_(_SUMMARY_MODEL_EVENTS),
+    ) & (ScanEvent.event_type != "exploration.evidence.created")
 
 
 @router.post("/findings/{finding_id}/review", response_model=FindingOut)
@@ -2091,8 +2080,114 @@ def review_finding(
     finding = session.get(Finding, finding_id)
     if finding is None:
         raise HTTPException(404, "Finding not found")
+    harm_attempts = attributable_harm_attempts(session, finding)
+    if review.status == FindingStatus.ACCEPTED.value:
+        if not harm_attempts:
+            raise HTTPException(
+                409,
+                (
+                    "Only a proof-backed confirmed finding can be accepted; "
+                    "static candidates and unverified signals must remain pending or be "
+                    "marked false positive."
+                ),
+            )
+        proof_attempt_ids = list(dict.fromkeys(attempt.id for attempt in harm_attempts))
+        proof_evidence_ids = list(
+            dict.fromkeys(
+                evidence_id
+                for attempt in harm_attempts
+                for evidence_id in attempt.evidence_ids
+                if isinstance(evidence_id, str) and evidence_id
+            )
+        )
+        current_evidence_ids = (
+            finding.evidence_ids if isinstance(finding.evidence_ids, list) else []
+        )
+        candidate_evidence_ids = list(
+            dict.fromkeys(
+                evidence_id
+                for evidence_id in [*current_evidence_ids, *proof_evidence_ids]
+                if isinstance(evidence_id, str) and evidence_id
+            )
+        )
+        valid_evidence_ids = set(
+            session.scalars(
+                select(Evidence.id).where(
+                    Evidence.scan_id == finding.scan_id,
+                    Evidence.id.in_(candidate_evidence_ids),
+                )
+            )
+        )
+        finding.evidence_ids = [
+            evidence_id
+            for evidence_id in candidate_evidence_ids
+            if evidence_id in valid_evidence_ids
+        ]
+        metadata = dict(finding.metadata_json) if isinstance(finding.metadata_json, dict) else {}
+        metadata["harm_demonstrated"] = True
+        metadata["proof_attempt_ids"] = proof_attempt_ids
+        metadata["release_gate_eligible"] = any(
+            isinstance(attempt.oracle, dict)
+            and attempt.oracle.get("release_gate_eligible") is True
+            for attempt in harm_attempts
+        )
+        metadata["proof_backlog"] = {
+            **(
+                dict(metadata.get("proof_backlog"))
+                if isinstance(metadata.get("proof_backlog"), dict)
+                else {}
+            ),
+            "status": "verified",
+        }
+        metadata.pop("signal_tier", None)
+        metadata.pop("proof_gap_code", None)
+        metadata.pop("oracle_gap", None)
+        finding.metadata_json = metadata
+    if review.status == FindingStatus.CANDIDATE.value and harm_attempts:
+        raise HTTPException(
+            409,
+            (
+                "A platform-proven finding cannot be downgraded to candidate; "
+                "use an explicit false-positive review to override it."
+            ),
+        )
+    metadata = (
+        dict(finding.metadata_json)
+        if isinstance(finding.metadata_json, dict)
+        else {}
+    )
+    report = metadata.get("report")
+    if isinstance(report, dict):
+        report = dict(report)
+        verification = report.get("verification")
+        verification = dict(verification) if isinstance(verification, dict) else {}
+        if review.status == FindingStatus.ACCEPTED.value:
+            report["kind"] = "finding"
+            verification["status"] = "confirmed"
+            verification["missing_proof"] = None
+            verification["next_step"] = None
+            verification["evidence_ids"] = list(finding.evidence_ids or [])
+            verification["proof_attempt_ids"] = list(
+                metadata.get("proof_attempt_ids") or []
+            )
+        elif review.status == FindingStatus.FALSE_POSITIVE.value:
+            report["kind"] = "pending_risk"
+            verification["status"] = "refuted"
+            verification["missing_proof"] = None
+            verification["next_step"] = None
+        else:
+            report["kind"] = "pending_risk"
+            verification["status"] = "pending"
+        report["verification"] = verification
+        metadata["report"] = report
+        finding.metadata_json = metadata
     finding.status = review.status
     finding.review_note = review.note
+    invalidate_scan_materialized_summary(
+        session,
+        finding.scan_id,
+        reason="finding_human_review_changed",
+    )
     session.commit()
     session.refresh(finding)
     return finding
@@ -2165,9 +2260,7 @@ async def update_scan_execution_control(
 
     current = scan.stats.get("execution_control")
     current_state = (
-        str(current.get("state") or "running")
-        if isinstance(current, dict)
-        else "running"
+        str(current.get("state") or "running") if isinstance(current, dict) else "running"
     )
     next_state = {
         "pause": "paused",
@@ -2800,11 +2893,11 @@ def delete_task(
     task.error = None
     task.result = {
         **dict(task.result or {}),
-            "deletion": {
-                "soft_deleted": True,
-                "deleted_at": deleted_at.isoformat(),
-                "runtime_stop_pending": stopping_runtime,
-                "reason": (
+        "deletion": {
+            "soft_deleted": True,
+            "deleted_at": deleted_at.isoformat(),
+            "runtime_stop_pending": stopping_runtime,
+            "reason": (
                 "Execution row hidden while evidence, hypotheses, proof attempts, and AI audit "
                 "lineage remain preserved."
             ),
@@ -2846,9 +2939,7 @@ def download_evidence(
     if evidence is None:
         raise HTTPException(404, "Evidence not found")
     try:
-        path = store.verify_content_addressed(
-            "evidence", evidence.path, evidence.sha256
-        )
+        path = store.verify_content_addressed("evidence", evidence.path, evidence.sha256)
     except (OSError, ValueError) as exc:
         raise HTTPException(409, f"Evidence integrity check failed: {exc}") from exc
     return FileResponse(path, filename=path.name, media_type="application/octet-stream")

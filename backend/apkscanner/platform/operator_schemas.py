@@ -15,6 +15,7 @@ class OperatorFindingUpdate(BaseModel):
     verdict: Literal[
         "reproduced_blackbox",
         "supported_static",
+        "runtime_observed_unverified",
         "refuted_static",
         "not_reproduced",
         "inconclusive",
@@ -22,6 +23,8 @@ class OperatorFindingUpdate(BaseModel):
     ] = "unchanged"
     conclusion: str = Field(min_length=1, max_length=1200)
     evidence_ids: list[str] = Field(default_factory=list, max_length=64)
+    counterevidence: list[str] = Field(default_factory=list, max_length=32)
+    blocked_edge: str | None = Field(default=None, max_length=2000)
     remaining_gap: str | None = Field(default=None, max_length=1200)
 
 

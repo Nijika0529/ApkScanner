@@ -22,13 +22,24 @@ from ..core.models import (
     InvestigationTask,
     OperatorSession,
     OperatorTurn,
+    RuntimeObservation,
     Scan,
     SecurityHypothesis,
 )
 from ..core.permissions import ensure_private_directory
+from ..core.proof_receipts import (
+    attributable_harm_attempts,
+    attributable_refutation_attempts,
+)
+from ..core.repository import invalidate_scan_materialized_summary
+from ..runtime.finding_policy import (
+    build_static_refutation_gate,
+    evidence_backed_signal_tier,
+)
 from ..runtime.finding_reports import FindingReport, render_finding_description
 from ..runtime.orchestrator import ScanOrchestrator, _LiveProofContext
 from ..runtime.runtime_contracts import task_gateway_environment
+from ..runtime.signal_projection import evidence_supports_runtime_observation
 from .artifacts import ArtifactStore
 from .operator_schemas import OperatorReceipt, OperatorSessionCreate
 from .tools import TimeBudget
@@ -457,6 +468,8 @@ class PlatformOperatorService:
             "/scan-input，历史 PoC 的不可变索引见上下文，当前工作区可写。"
             f"当前 Finding: {finding_ids or '未限定'}；ADB: {'可用' if device_available else '本轮不可用'}。\n"
             "若要更新 Finding，必须在 finding_updates 中引用对应 finding_id 和实际 Evidence ID；"
+            "refuted_static 还必须在 counterevidence 写明反证，并在 blocked_edge 写出精确的"
+            "权限/调用者校验或不可达调用边；"
             "动态观察可 POST 到 $APKSCANNER_OBSERVATION_URL，使用头 "
             "X-APKScanner-Proof-Token:$APKSCANNER_OBSERVATION_TOKEN，响应会返回可引用的 evidence_id；"
             "新 APK/报告/脚本放到 poc/ 或 output/，并在 artifact_paths 中列出相对路径。\n"
@@ -606,46 +619,290 @@ class PlatformOperatorService:
             operator_session = db.get(OperatorSession, session_id)
             assert operator_session is not None
             allowed_ids = set((operator_session.scope_json or {}).get("finding_ids") or [])
+            affected_scan_ids: set[str] = set()
             for update in receipt.finding_updates:
                 if update.finding_id not in allowed_ids:
                     continue
                 finding = db.get(Finding, update.finding_id)
                 if finding is None:
                     continue
-                valid_evidence_ids = set(
+                valid_evidence = list(
                     db.scalars(
-                        select(Evidence.id).where(
+                        select(Evidence).where(
                             Evidence.id.in_(update.evidence_ids),
                             Evidence.scan_id == finding.scan_id,
                         )
                     )
                 )
+                valid_evidence_ids = {item.id for item in valid_evidence}
+                raw_finding_evidence_ids = (
+                    finding.evidence_ids if isinstance(finding.evidence_ids, list) else []
+                )
+                finding_evidence_ids = {
+                    value
+                    for value in raw_finding_evidence_ids
+                    if isinstance(value, str) and value
+                }
+                attributable_evidence: list[Evidence] = []
+                for evidence in valid_evidence:
+                    evidence_metadata = (
+                        evidence.metadata_json
+                        if isinstance(evidence.metadata_json, dict)
+                        else {}
+                    )
+                    candidate_finding_ids = evidence_metadata.get(
+                        "candidate_finding_ids"
+                    )
+                    if (
+                        evidence.id in finding_evidence_ids
+                        or evidence_metadata.get("finding_id") == finding.id
+                        or (
+                            isinstance(candidate_finding_ids, list)
+                            and finding.id in candidate_finding_ids
+                        )
+                    ):
+                        attributable_evidence.append(evidence)
+                attributable_evidence_ids = {
+                    item.id for item in attributable_evidence
+                }
+                linked_runtime_observations = list(
+                    db.scalars(
+                        select(RuntimeObservation).where(
+                            RuntimeObservation.scan_id == finding.scan_id,
+                            RuntimeObservation.finding_id == finding.id,
+                        )
+                    )
+                )
+                linked_runtime_evidence_ids = {
+                    evidence_id
+                    for observation in linked_runtime_observations
+                    for evidence_id in observation.evidence_ids
+                    if isinstance(evidence_id, str)
+                }
+                linked_runtime_evidence = (
+                    list(
+                        db.scalars(
+                            select(Evidence).where(
+                                Evidence.scan_id == finding.scan_id,
+                                Evidence.id.in_(linked_runtime_evidence_ids),
+                            )
+                        )
+                    )
+                    if linked_runtime_evidence_ids
+                    else []
+                )
+                runtime_observed = any(
+                    evidence_supports_runtime_observation(item)
+                    for item in linked_runtime_evidence
+                )
+                harm_attempts = attributable_harm_attempts(db, finding)
+                refuting_attempts = attributable_refutation_attempts(db, finding)
+                harm_attempt_ids = [attempt.id for attempt in harm_attempts]
+                refuting_attempt_ids = [attempt.id for attempt in refuting_attempts]
+                attempt_evidence_ids = [
+                    evidence_id
+                    for attempt in [*harm_attempts, *refuting_attempts]
+                    for evidence_id in attempt.evidence_ids
+                    if isinstance(evidence_id, str)
+                ]
+                runtime_observation_evidence_ids = [
+                    evidence_id
+                    for observation in linked_runtime_observations
+                    for evidence_id in observation.evidence_ids
+                    if isinstance(evidence_id, str)
+                ]
                 combined_evidence = list(
-                    dict.fromkeys([*finding.evidence_ids, *valid_evidence_ids, receipt_evidence_id])
+                    dict.fromkeys(
+                        [
+                            *raw_finding_evidence_ids,
+                            *sorted(attributable_evidence_ids),
+                            *attempt_evidence_ids,
+                            *runtime_observation_evidence_ids,
+                            receipt_evidence_id,
+                        ]
+                    )
                 )
                 metadata = dict(finding.metadata_json or {})
+                existing_tier = evidence_backed_signal_tier(db, finding)
+                static_refutation_gate = build_static_refutation_gate(
+                    evidence_by_id={item.id: item for item in attributable_evidence},
+                    evidence_ids=update.evidence_ids,
+                    counterevidence=update.counterevidence,
+                    blocked_edge=update.blocked_edge,
+                )
+                applied_verdict = update.verdict
+                override_reason: str | None = None
+                preserve_human_closure = (
+                    finding.status
+                    in {
+                        FindingStatus.FALSE_POSITIVE.value,
+                        FindingStatus.ACCEPTED.value,
+                    }
+                    and isinstance(finding.review_note, str)
+                    and finding.review_note.strip()
+                )
+                if preserve_human_closure:
+                    applied_verdict = finding.status
+                    override_reason = (
+                        "A human disposition can only be replaced by an explicit human review. "
+                        "The Operator evidence was retained for that review."
+                    )
+                elif (
+                    update.verdict == "unchanged"
+                    and finding.status == FindingStatus.ACCEPTED.value
+                ):
+                    applied_verdict = finding.status
+                elif harm_attempts:
+                    applied_verdict = FindingStatus.REPRODUCED_BLACKBOX.value
+                    if update.verdict != applied_verdict:
+                        override_reason = (
+                            "An attributable platform harm receipt prevents an Operator downgrade."
+                        )
+                elif update.verdict == "unchanged":
+                    applied_verdict = finding.status
+                elif update.verdict == FindingStatus.REPRODUCED_BLACKBOX.value:
+                    if runtime_observed or existing_tier == "runtime_oracle_gap":
+                        applied_verdict = FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value
+                        override_reason = (
+                            "Runtime behavior was observed, but no attributable platform harm "
+                            "ProofAttempt exists."
+                        )
+                    else:
+                        applied_verdict = FindingStatus.INCONCLUSIVE.value
+                        override_reason = (
+                            "Operator evidence did not include an attributable platform harm "
+                            "ProofAttempt or a platform runtime observation."
+                        )
+                elif update.verdict == FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value:
+                    if not runtime_observed and existing_tier != "runtime_oracle_gap":
+                        applied_verdict = FindingStatus.INCONCLUSIVE.value
+                        override_reason = (
+                            "No platform runtime-observation receipt was attributable to the "
+                            "finding."
+                        )
+                elif update.verdict == FindingStatus.NOT_REPRODUCED.value:
+                    if not refuting_attempts:
+                        applied_verdict = (
+                            FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value
+                            if runtime_observed or existing_tier == "runtime_oracle_gap"
+                            else FindingStatus.INCONCLUSIVE.value
+                        )
+                        override_reason = (
+                            "A negative Operator verdict requires an attributable platform Oracle "
+                            "refutation receipt."
+                        )
+                elif update.verdict == FindingStatus.SUPPORTED_STATIC.value:
+                    if existing_tier == "runtime_oracle_gap":
+                        applied_verdict = FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value
+                        override_reason = (
+                            "A static Operator assessment cannot erase an existing runtime "
+                            "Oracle gap."
+                        )
+                    elif evidence_backed_signal_tier(db, finding) != "static_chain":
+                        applied_verdict = finding.status
+                        override_reason = (
+                            "Static support requires the platform's complete static-chain gate "
+                            "receipt."
+                        )
+                elif update.verdict == FindingStatus.REFUTED_STATIC.value:
+                    if runtime_observed or existing_tier == "runtime_oracle_gap":
+                        applied_verdict = FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value
+                        override_reason = (
+                            "A model-only static refutation cannot close an existing runtime "
+                            "observation; an attributable platform Oracle refutation is required."
+                        )
+                    elif static_refutation_gate["eligible"] is not True:
+                        applied_verdict = (
+                            FindingStatus.INCONCLUSIVE.value
+                        )
+                        override_reason = (
+                            "Static refutation requires attributable usable static Evidence, "
+                            "concrete counterevidence, and an exact guard or blocked edge."
+                        )
+                elif (
+                    update.verdict == FindingStatus.INCONCLUSIVE.value
+                    and existing_tier == "runtime_oracle_gap"
+                ):
+                    applied_verdict = FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value
+                    override_reason = (
+                        "An inconclusive Operator turn cannot erase an existing runtime "
+                        "Oracle gap."
+                    )
+                finding.status = applied_verdict
+                metadata["harm_demonstrated"] = bool(harm_attempts) or (
+                    applied_verdict == FindingStatus.ACCEPTED.value
+                    and metadata.get("harm_demonstrated") is True
+                )
+                metadata["proof_attempt_ids"] = harm_attempt_ids
+                metadata["refutation_attempt_ids"] = refuting_attempt_ids
+                if applied_verdict == FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value:
+                    metadata["signal_tier"] = "runtime_oracle_gap"
+                    metadata["proof_gap_code"] = "missing_platform_harm_oracle"
+                    metadata["oracle_gap"] = {
+                        **(
+                            dict(metadata.get("oracle_gap"))
+                            if isinstance(metadata.get("oracle_gap"), dict)
+                            else {}
+                        ),
+                        "schema_version": "1.0",
+                        "status": "open",
+                        "runtime_observed": bool(
+                            runtime_observed or existing_tier == "runtime_oracle_gap"
+                        ),
+                        "operator_session_id": session_id,
+                    }
+                elif applied_verdict == FindingStatus.SUPPORTED_STATIC.value:
+                    metadata["signal_tier"] = "static_chain"
+                    metadata.pop("proof_gap_code", None)
+                    metadata.pop("oracle_gap", None)
+                else:
+                    metadata.pop("signal_tier", None)
+                    metadata.pop("proof_gap_code", None)
+                    metadata.pop("oracle_gap", None)
+                if applied_verdict == FindingStatus.REFUTED_STATIC.value:
+                    metadata["platform_static_refutation_gate"] = static_refutation_gate
+                elif not preserve_human_closure:
+                    metadata.pop("platform_static_refutation_gate", None)
                 report_payload = metadata.get("report")
-                if isinstance(report_payload, dict):
+                if isinstance(report_payload, dict) and not preserve_human_closure:
                     report = FindingReport.model_validate(report_payload)
                     report.conclusion = update.conclusion[:600]
                     report.verification.established_facts = receipt.observations[:3]
-                    report.verification.evidence_ids = list(valid_evidence_ids)[:64]
+                    report.verification.evidence_ids = list(
+                        dict.fromkeys(
+                            [
+                                *sorted(attributable_evidence_ids),
+                                *attempt_evidence_ids,
+                                *runtime_observation_evidence_ids,
+                            ]
+                        )
+                    )[:64]
+                    report.verification.proof_attempt_ids = list(
+                        dict.fromkeys([*harm_attempt_ids, *refuting_attempt_ids])
+                    )[:64]
                     report.verification.missing_proof = update.remaining_gap
                     report.verification.next_step = (
                         None if update.remaining_gap is None else "根据剩余缺口继续补充动态实验。"
                     )
-                    if update.verdict == "reproduced_blackbox" and valid_evidence_ids:
+                    if applied_verdict in {
+                        FindingStatus.ACCEPTED.value,
+                        FindingStatus.REPRODUCED_BLACKBOX.value,
+                    }:
                         report.kind = "finding"
                         report.verification.status = "confirmed"
                         report.title = report.title.replace("待验证：", "已复现：", 1)
-                        finding.status = FindingStatus.REPRODUCED_BLACKBOX.value
-                        metadata["harm_demonstrated"] = True
-                    elif update.verdict == "refuted_static":
+                    elif applied_verdict == FindingStatus.REFUTED_STATIC.value:
+                        report.kind = "pending_risk"
                         report.verification.status = "refuted"
-                        finding.status = FindingStatus.REFUTED_STATIC.value
-                    elif update.verdict in {"not_reproduced", "inconclusive"}:
+                    elif applied_verdict in {
+                        FindingStatus.NOT_REPRODUCED.value,
+                        FindingStatus.INCONCLUSIVE.value,
+                    }:
+                        report.kind = "pending_risk"
                         report.verification.status = "inconclusive"
-                        finding.status = update.verdict
+                    else:
+                        report.kind = "pending_risk"
+                        report.verification.status = "pending"
                     metadata["report"] = report.model_dump(mode="json")
                     finding.title = report.title
                     finding.description = render_finding_description(report)
@@ -653,8 +910,15 @@ class PlatformOperatorService:
                 history.append(
                     {
                         "session_id": session_id,
-                        "verdict": update.verdict,
+                        "requested_verdict": update.verdict,
+                        "verdict": applied_verdict,
+                        "verdict_override_reason": override_reason,
                         "conclusion": update.conclusion,
+                        "platform_static_refutation_gate": (
+                            static_refutation_gate
+                            if update.verdict == FindingStatus.REFUTED_STATIC.value
+                            else None
+                        ),
                         "evidence_ids": list(valid_evidence_ids),
                         "receipt_evidence_id": receipt_evidence_id,
                         "at": _utcnow().isoformat(),
@@ -663,6 +927,13 @@ class PlatformOperatorService:
                 metadata["operator_history"] = history[-20:]
                 finding.metadata_json = metadata
                 finding.evidence_ids = combined_evidence
+                affected_scan_ids.add(finding.scan_id)
+            for scan_id in affected_scan_ids:
+                invalidate_scan_materialized_summary(
+                    db,
+                    scan_id,
+                    reason="operator_finding_update",
+                )
             db.commit()
 
     def get_session(self, session_id: str) -> tuple[OperatorSession, list[OperatorTurn]]:

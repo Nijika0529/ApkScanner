@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session
 
-from .models import ScanEvent
+from .models import EntryPoint, Scan, ScanEvent
 
 
 def add_event(
@@ -29,6 +29,48 @@ def add_event(
 
 def now() -> datetime:
     return datetime.now(UTC)
+
+
+def invalidate_scan_materialized_summary(
+    session: Session,
+    scan_id: str,
+    *,
+    reason: str,
+) -> None:
+    """Mark final-scan derived counts and seal stale after a material Finding mutation."""
+
+    scan = session.get(Scan, scan_id)
+    if scan is None:
+        return
+    stats = dict(scan.stats) if isinstance(scan.stats, dict) else {}
+    for key in (
+        "finding_count",
+        "signal_count",
+        "entry_disposition_counts",
+        "entry_disposition_coverage_rate",
+        "unresolved_entry_disposition_count",
+    ):
+        stats.pop(key, None)
+    invalidated_at = now().isoformat()
+    seal = stats.get("seal")
+    if isinstance(seal, dict):
+        stats["seal"] = {
+            **seal,
+            "current": False,
+            "invalidated_at": invalidated_at,
+            "invalidated_reason": reason,
+        }
+    stats["materialized_summary"] = {
+        "schema_version": "1.0",
+        "current": False,
+        "invalidated_at": invalidated_at,
+        "reason": reason,
+    }
+    scan.stats = stats
+    for entry in session.scalars(
+        select(EntryPoint).where(EntryPoint.scan_id == scan_id)
+    ):
+        entry.disposition = None
 
 
 def scalars(session: Session, statement: Select) -> list[Any]:

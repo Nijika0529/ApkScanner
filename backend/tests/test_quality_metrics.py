@@ -11,11 +11,28 @@ from apkscanner.core.models import (
     Finding,
     InvestigationTask,
     ProofAttempt,
+    RuntimeObservation,
     Scan,
     ScanEvent,
     SecurityHypothesis,
 )
 from apkscanner.runtime.quality_metrics import _classify_failure, build_scan_quality_summary
+
+VALID_STATIC_GATE = {
+    "schema_version": "1.0",
+    "eligible": True,
+    "required_fields": [
+        "source",
+        "control",
+        "sink",
+        "reachable_path",
+        "boundary",
+        "security_impact",
+        "missing_control",
+    ],
+    "static_evidence_ids": ["static-chain"],
+    "suppression_reasons": [],
+}
 
 
 def test_failure_classifier_distinguishes_planning_and_runtime_receipt_gaps() -> None:
@@ -96,6 +113,12 @@ def test_quality_summary_tracks_funnel_cost_and_failures(settings) -> None:  # n
             masvs="MASVS-PLATFORM",
             severity="high",
             status="reproduced_blackbox",
+            evidence_ids=[dynamic_evidence.id],
+            metadata_json={
+                "hypothesis_id": hypothesis.id,
+                "proof_attempt_ids": [attempt.id],
+                "harm_demonstrated": True,
+            },
         )
         session.add(finding)
         session.flush()
@@ -165,3 +188,194 @@ def test_quality_summary_tracks_funnel_cost_and_failures(settings) -> None:  # n
     assert summary["cost"]["device_held_seconds"] == 8.5
     assert summary["efficiency"]["merged_entry_variants"] == 1
     assert summary["failure_reasons"][0]["kind"] == "poc_build"
+
+
+def test_quality_funnel_does_not_count_oracle_gaps_as_static_support(settings) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="noise-tiers.apk",
+            artifact_sha256="d" * 64,
+            artifact_path="noise-tiers.apk",
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            status="completed",
+        )
+        session.add_all([scan, task])
+        session.flush()
+        static_hypothesis = SecurityHypothesis(
+            scan_id=scan.id,
+            task_id=task.id,
+            fingerprint="e" * 64,
+            category="component",
+            claim="A complete static chain reaches a sensitive sink.",
+            status="accepted_for_proof",
+            support_evidence_ids=["static-chain"],
+        )
+        runtime_hypothesis = SecurityHypothesis(
+            scan_id=scan.id,
+            task_id=task.id,
+            fingerprint="f" * 64,
+            category="component",
+            claim="Runtime behavior was observed without a harm Oracle.",
+            status="accepted_for_proof",
+            support_evidence_ids=["runtime-observation"],
+        )
+        session.add_all([static_hypothesis, runtime_hypothesis])
+        session.flush()
+        static_evidence = Evidence(
+            scan_id=scan.id,
+            task_id=task.id,
+            kind="static.jadx",
+            sha256="1" * 64,
+            path="static-chain.json",
+        )
+        runtime_evidence = Evidence(
+            scan_id=scan.id,
+            task_id=task.id,
+            kind="blackbox.logcat",
+            sha256="2" * 64,
+            path="runtime-observation.log",
+            metadata_json={"request_observed": True},
+        )
+        session.add_all([static_evidence, runtime_evidence])
+        session.flush()
+        static_finding = Finding(
+            scan_id=scan.id,
+            dedupe_key="static-chain",
+            rule_id="AGENT",
+            title="Static chain",
+            description="Complete static chain",
+            masvs="MASVS-PLATFORM",
+            severity="medium",
+            status="supported_static",
+            evidence_ids=[static_evidence.id],
+            metadata_json={
+                "platform_static_support_gate": {
+                    **VALID_STATIC_GATE,
+                    "static_evidence_ids": [static_evidence.id],
+                }
+            },
+        )
+        runtime_finding = Finding(
+            scan_id=scan.id,
+            dedupe_key="runtime-gap",
+            rule_id="AGENT",
+            title="Runtime Oracle gap",
+            description="Observed behavior without proven harm",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            status="runtime_observed_unverified",
+            evidence_ids=[runtime_evidence.id],
+            metadata_json={
+                "harm_demonstrated": False,
+                "adaptive_verification": {
+                    "runtime_observed": True,
+                    "model_verdict": "reproduced_blackbox",
+                },
+            },
+        )
+        session.add_all([static_finding, runtime_finding])
+        session.flush()
+        session.add(
+            RuntimeObservation(
+                scan_id=scan.id,
+                task_id=task.id,
+                finding_id=runtime_finding.id,
+                observation_key=f"quality-runtime:{runtime_finding.id}",
+                kind="request.observed",
+                source="adb",
+                evidence_ids=[runtime_evidence.id],
+                payload={"request_observed": True},
+            )
+        )
+        static_hypothesis.final_finding_id = static_finding.id
+        runtime_hypothesis.final_finding_id = runtime_finding.id
+        session.commit()
+        scan_id = scan.id
+
+    with database.session_factory() as session:
+        summary = build_scan_quality_summary(session, scan_id)
+
+    funnel = {item["key"]: item["count"] for item in summary["funnel"]}
+    assert funnel["static_supported"] == 1
+    assert funnel["runtime_observed_unverified"] == 1
+
+
+def test_quality_funnel_ignores_merged_runtime_duplicates(settings) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="merged-quality.apk",
+            artifact_sha256="1" * 64,
+            artifact_path="merged-quality.apk",
+        )
+        canonical = Finding(
+            scan=scan,
+            dedupe_key="canonical-runtime",
+            rule_id="AGENT",
+            title="Canonical runtime gap",
+            description="One active Oracle gap.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            status="runtime_observed_unverified",
+            metadata_json={"signal_tier": "runtime_oracle_gap"},
+        )
+        duplicate = Finding(
+            scan=scan,
+            dedupe_key="merged-runtime",
+            rule_id="AGENT",
+            title="Merged runtime gap",
+            description="Hidden duplicate audit row.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            status="inconclusive",
+            metadata_json={
+                "merged_into_finding_id": "pending-canonical-id",
+                "adaptive_verification": {
+                    "runtime_observed": True,
+                    "model_verdict": "reproduced_blackbox",
+                    "verdict_override_reason": "missing platform Oracle",
+                },
+                "harm_demonstrated": False,
+            },
+        )
+        session.add_all([scan, canonical, duplicate])
+        session.flush()
+        runtime_evidence = Evidence(
+            scan_id=scan.id,
+            kind="blackbox.logcat",
+            sha256="3" * 64,
+            path="merged-runtime.log",
+            metadata_json={"request_observed": True},
+        )
+        session.add(runtime_evidence)
+        session.flush()
+        canonical.evidence_ids = [runtime_evidence.id]
+        session.add(
+            RuntimeObservation(
+                scan_id=scan.id,
+                finding_id=canonical.id,
+                observation_key=f"merged-quality:{canonical.id}",
+                kind="request.observed",
+                source="adb",
+                evidence_ids=[runtime_evidence.id],
+                payload={"request_observed": True},
+            )
+        )
+        duplicate.metadata_json = {
+            **dict(duplicate.metadata_json or {}),
+            "merged_into_finding_id": canonical.id,
+        }
+        session.commit()
+        scan_id = scan.id
+
+    with database.session_factory() as session:
+        summary = build_scan_quality_summary(session, scan_id)
+
+    funnel = {item["key"]: item["count"] for item in summary["funnel"]}
+    assert funnel["runtime_observed_unverified"] == 1

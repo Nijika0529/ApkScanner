@@ -19,7 +19,6 @@ from ..core.models import (
     Finding,
     InvestigationTask,
     PatternMatch,
-    ProofAttempt,
     Scan,
     SecurityHypothesis,
     SecuritySnapshot,
@@ -28,6 +27,7 @@ from ..core.models import (
     VulnerabilityOccurrence,
     VulnerabilityPattern,
 )
+from ..core.proof_receipts import attributable_harm_attempts
 from ..core.repository import add_event
 from ..runtime.proof_recipes import proof_recipe_from_plan
 
@@ -781,16 +781,8 @@ class SecurityEvolutionService:
         )
         candidates: list[dict[str, Any]] = []
         for finding in findings:
-            metadata = dict(finding.metadata_json or {})
-            attempt_ids = list(metadata.get("proof_attempt_ids") or [])
-            attempts = (
-                list(session.scalars(select(ProofAttempt).where(ProofAttempt.id.in_(attempt_ids))))
-                if attempt_ids
-                else []
-            )
+            attempts = attributable_harm_attempts(session, finding)
             for attempt in attempts:
-                if not attempt.harm_demonstrated:
-                    continue
                 source_hypothesis = session.get(
                     SecurityHypothesis,
                     attempt.hypothesis_id,
@@ -1004,6 +996,9 @@ class SecurityEvolutionService:
             FindingStatus.ACCEPTED.value,
         }:
             return None
+        attempts = attributable_harm_attempts(session, finding)
+        if not attempts:
+            return None
         snapshot = session.scalar(
             select(SecuritySnapshot).where(SecuritySnapshot.scan_id == scan.id)
         )
@@ -1017,14 +1012,7 @@ class SecurityEvolutionService:
         ]
         if not facts:
             return None
-        proof_attempt_ids = list((finding.metadata_json or {}).get("proof_attempt_ids") or [])
-        attempts = (
-            list(
-                session.scalars(select(ProofAttempt).where(ProofAttempt.id.in_(proof_attempt_ids)))
-            )
-            if proof_attempt_ids
-            else []
-        )
+        proof_attempt_ids = [attempt.id for attempt in attempts]
         primary = facts[0]
         impact = next(
             (

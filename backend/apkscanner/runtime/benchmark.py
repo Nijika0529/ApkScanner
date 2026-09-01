@@ -15,6 +15,7 @@ from .finding_policy import partition_findings
 _PROOF_RANK = {
     FindingStatus.SUPPORTED_STATIC.value: 1,
     FindingStatus.REPRODUCED_BLACKBOX.value: 2,
+    FindingStatus.ACCEPTED.value: 2,
 }
 _MINIMUM_PROOF_RANK = {"static": 1, "dynamic": 2}
 

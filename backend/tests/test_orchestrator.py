@@ -8,6 +8,7 @@ import threading
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -41,10 +42,29 @@ from apkscanner.runtime.adb_gateway import AdbGatewayRequest
 from apkscanner.runtime.agent_audit import build_agent_audits
 from apkscanner.runtime.agent_events import AgentCancelledError, AgentRuntimeEvent
 from apkscanner.runtime.device import AdbDeviceAdapter
-from apkscanner.runtime.finding_policy import partition_findings
+from apkscanner.runtime.finding_policy import (
+    partition_findings,
+    static_refutation_is_evidence_backed,
+)
 from apkscanner.runtime.orchestrator import ScanOrchestrator, _LiveProofContext
 from apkscanner.runtime.planner import StaticEntryClosure
 from sqlalchemy import select
+
+VALID_STATIC_GATE = {
+    "schema_version": "1.0",
+    "eligible": True,
+    "required_fields": [
+        "source",
+        "control",
+        "sink",
+        "reachable_path",
+        "boundary",
+        "security_impact",
+        "missing_control",
+    ],
+    "static_evidence_ids": ["static-evidence"],
+    "suppression_reasons": [],
+}
 
 
 @pytest.mark.parametrize(
@@ -318,6 +338,14 @@ def test_adaptive_verifier_batches_high_value_static_findings_once(
         )
         session.add_all([scan, entry])
         session.flush()
+        static_evidence = Evidence(
+            scan_id=scan.id,
+            kind="static.jadx",
+            sha256="0" * 64,
+            path="adaptive-static.json",
+        )
+        session.add(static_evidence)
+        session.flush()
         session.add_all(
             [
                 Finding(
@@ -331,6 +359,14 @@ def test_adaptive_verifier_batches_high_value_static_findings_once(
                     confidence="high",
                     status="supported_static",
                     entry_point_ids=[entry.id],
+                    evidence_ids=[static_evidence.id],
+                    metadata_json={
+                        "signal_tier": "static_chain",
+                        "platform_static_support_gate": {
+                            **VALID_STATIC_GATE,
+                            "static_evidence_ids": [static_evidence.id],
+                        },
+                    },
                 ),
                 Finding(
                     scan_id=scan.id,
@@ -343,6 +379,14 @@ def test_adaptive_verifier_batches_high_value_static_findings_once(
                     confidence="medium",
                     status="supported_static",
                     entry_point_ids=[entry.id],
+                    evidence_ids=[static_evidence.id],
+                    metadata_json={
+                        "signal_tier": "static_chain",
+                        "platform_static_support_gate": {
+                            **VALID_STATIC_GATE,
+                            "static_evidence_ids": [static_evidence.id],
+                        },
+                    },
                 ),
             ]
         )
@@ -411,6 +455,14 @@ def test_adaptive_verifier_splits_transport_safe_turns_and_merges_results(
         )
         session.add_all([scan, entry])
         session.flush()
+        static_evidence = Evidence(
+            scan_id=scan.id,
+            kind="static.jadx",
+            sha256="8" * 64,
+            path="adaptive-resume-static.json",
+        )
+        session.add(static_evidence)
+        session.flush()
         findings = [
             Finding(
                 scan=scan,
@@ -423,6 +475,14 @@ def test_adaptive_verifier_splits_transport_safe_turns_and_merges_results(
                 confidence="medium",
                 status="supported_static",
                 entry_point_ids=[entry.id],
+                evidence_ids=[static_evidence.id],
+                metadata_json={
+                    "signal_tier": "static_chain",
+                    "platform_static_support_gate": {
+                        **VALID_STATIC_GATE,
+                        "static_evidence_ids": [static_evidence.id],
+                    },
+                },
             )
             for index in range(6)
         ]
@@ -618,6 +678,14 @@ def test_adaptive_verifier_automatically_resumes_only_missing_candidates(
         )
         session.add_all([scan, entry])
         session.flush()
+        static_evidence = Evidence(
+            scan_id=scan.id,
+            kind="static.jadx",
+            sha256="8" * 64,
+            path="adaptive-resume-static.json",
+        )
+        session.add(static_evidence)
+        session.flush()
         findings = [
             Finding(
                 scan=scan,
@@ -630,6 +698,14 @@ def test_adaptive_verifier_automatically_resumes_only_missing_candidates(
                 confidence="medium",
                 status="supported_static",
                 entry_point_ids=[entry.id],
+                evidence_ids=[static_evidence.id],
+                metadata_json={
+                    "signal_tier": "static_chain",
+                    "platform_static_support_gate": {
+                        **VALID_STATIC_GATE,
+                        "static_evidence_ids": [static_evidence.id],
+                    },
+                },
             )
             for index in range(2)
         ]
@@ -717,17 +793,18 @@ def test_adaptive_verifier_automatically_resumes_only_missing_candidates(
 
 
 @pytest.mark.parametrize(
-    ("android16_eligible", "expected_status", "expected_backlog"),
+    ("android16_eligible", "with_platform_runtime_receipt", "expected_status"),
     [
-        (True, "supported_static", "proof_required"),
-        (False, "supported_static", "proof_required"),
+        (True, False, "inconclusive"),
+        (False, False, "inconclusive"),
+        (True, True, "runtime_observed_unverified"),
     ],
 )
 def test_adaptive_verifier_cannot_promote_without_platform_proof_attempt(
     settings,  # noqa: ANN001
     android16_eligible: bool,
+    with_platform_runtime_receipt: bool,
     expected_status: str,
-    expected_backlog: str,
 ) -> None:
     settings.ensure_directories()
     database = Database(settings)
@@ -769,11 +846,35 @@ def test_adaptive_verifier_cannot_promote_without_platform_proof_attempt(
             value={"observed": "token from target bridge"},
             summary="Adaptive response",
         )
+        runtime_evidence = None
+        if with_platform_runtime_receipt:
+            runtime_evidence = orchestrator.evidence.json(
+                session,
+                scan_id=scan.id,
+                task_id=task.id,
+                kind="blackbox.logcat",
+                value={"request_observed": True},
+                summary="Platform-linked request observation",
+                metadata={"request_observed": True},
+            )
+            session.add(
+                RuntimeObservation(
+                    scan_id=scan.id,
+                    task_id=task.id,
+                    finding_id=finding.id,
+                    observation_key=f"adaptive-runtime:{finding.id}",
+                    kind="request.observed",
+                    source="adb",
+                    evidence_ids=[runtime_evidence.id],
+                    payload={"request_observed": True},
+                )
+            )
         session.commit()
         scan_id = scan.id
         task_id = task.id
         finding_id = finding.id
         response_id = response.id
+        runtime_evidence_id = runtime_evidence.id if runtime_evidence is not None else None
 
     result = AdaptiveVerificationResult.model_validate(
         {
@@ -789,7 +890,9 @@ def test_adaptive_verifier_cannot_promote_without_platform_proof_attempt(
                     "security_impact": "普通第三方应用可诱导泄露当前账号凭据。",
                     "counterevidence": [],
                     "remaining_gaps": [],
-                    "evidence_ids": [],
+                    "evidence_ids": (
+                        [runtime_evidence_id] if runtime_evidence_id is not None else []
+                    ),
                     "experiments": [
                         {
                             "objective": "验证攻击者页面能否取得 Bridge token",
@@ -826,16 +929,27 @@ def test_adaptive_verifier_cannot_promote_without_platform_proof_attempt(
         assert finding.confidence == "high"
         assert response_id in finding.evidence_ids
         assert finding.metadata_json["verification_mode"] == "adaptive_agent"
-        assert finding.metadata_json["proof_backlog"]["status"] == expected_backlog
+        assert finding.metadata_json["proof_backlog"]["status"] == (
+            "oracle_gap" if with_platform_runtime_receipt else "proof_required"
+        )
+        assert (
+            "proof_gap_code" in finding.metadata_json
+        ) is with_platform_runtime_receipt
         assert finding.metadata_json["harm_demonstrated"] is False
         verification = finding.metadata_json["adaptive_verification"]
         assert verification["model_verdict"] == "reproduced_blackbox"
-        assert verification["verdict"] == "supported_static"
-        assert "ProofAttempt" in verification["verdict_override_reason"]
+        assert verification["verdict"] == expected_status
+        assert "platform" in verification["verdict_override_reason"].lower()
+        assert verification["runtime_claim_accepted"] is with_platform_runtime_receipt
         assert verification["android16_verdict_eligible"] is android16_eligible
         assert task.status == "completed"
         assert task.thread_id == "thread-adaptive"
-        assert scan.stats["adaptive_verification"]["verdict_counts"] == {expected_status: 1}
+        assert scan.stats["adaptive_verification"]["verdict_counts"] == {
+            expected_status: 1
+        }
+        assert scan.stats["adaptive_verification"]["oracle_gap_count"] == int(
+            with_platform_runtime_receipt
+        )
         assert scan.stats["adaptive_verification"]["compatibility_override_count"] == 1
 
 
@@ -905,6 +1019,9 @@ def test_adaptive_verifier_preserves_an_existing_platform_proof(settings) -> Non
             "hypothesis_id": hypothesis.id,
             "proof_attempt_ids": [proof.id],
             "harm_demonstrated": True,
+            "signal_tier": "runtime_observed_unverified",
+            "proof_gap_code": "missing_platform_harm_oracle",
+            "oracle_gap": {"status": "open"},
         }
         response = orchestrator.evidence.json(
             session,
@@ -956,10 +1073,426 @@ def test_adaptive_verifier_preserves_an_existing_platform_proof(settings) -> Non
         assert finding.metadata_json["harm_demonstrated"] is True
         assert finding.metadata_json["proof_attempt_ids"] == [proof_id]
         assert proof_evidence_id in finding.evidence_ids
+        assert "signal_tier" not in finding.metadata_json
+        assert "proof_gap_code" not in finding.metadata_json
+        assert "oracle_gap" not in finding.metadata_json
         assert (
             "cannot downgrade"
             in (finding.metadata_json["adaptive_verification"]["verdict_override_reason"])
         )
+
+
+def test_adaptive_proof_attribution_rejects_cross_hypothesis_receipt(settings) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="cross-proof.apk",
+            artifact_sha256="6" * 64,
+            artifact_path=str(settings.data_dir / "cross-proof.apk"),
+        )
+        task = InvestigationTask(scan=scan, task_type="component", status="completed")
+        session.add_all([scan, task])
+        session.flush()
+        target = SecurityHypothesis(
+            scan_id=scan.id,
+            task_id=task.id,
+            fingerprint="7" * 64,
+            category="component",
+            claim="Target hypothesis has no proof.",
+        )
+        other = SecurityHypothesis(
+            scan_id=scan.id,
+            task_id=task.id,
+            fingerprint="8" * 64,
+            category="component",
+            claim="Another hypothesis is proven.",
+        )
+        session.add_all([target, other])
+        session.flush()
+        other_proof = ProofAttempt(
+            scan_id=scan.id,
+            task_id=task.id,
+            hypothesis_id=other.id,
+            test_case_id="other-proof",
+            status="proven",
+            harm_demonstrated=True,
+        )
+        session.add(other_proof)
+        session.flush()
+        finding = Finding(
+            scan=scan,
+            dedupe_key="cross-proof",
+            rule_id="AGENT-ENTRY-INVESTIGATION",
+            title="Unproven target",
+            description="The declared proof belongs to another hypothesis.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            status="supported_static",
+            metadata_json={
+                "hypothesis_id": target.id,
+                "proof_attempt_ids": [other_proof.id],
+            },
+        )
+        session.add(finding)
+        session.flush()
+
+        attempts = ScanOrchestrator._proven_attempts_for_finding(session, finding)
+
+        assert attempts == []
+
+
+@pytest.mark.parametrize(
+    (
+        "initial_status",
+        "model_verdict",
+        "runtime_observed",
+        "receipt_owner",
+        "expected_status",
+    ),
+    [
+        (
+            "supported_static",
+            "not_reproduced",
+            True,
+            None,
+            "inconclusive",
+        ),
+        (
+            "supported_static",
+            "not_reproduced",
+            True,
+            "other",
+            "inconclusive",
+        ),
+        (
+            "supported_static",
+            "not_reproduced",
+            True,
+            "target",
+            "not_reproduced",
+        ),
+        (
+            "runtime_observed_unverified",
+            "supported_static",
+            False,
+            None,
+            "runtime_observed_unverified",
+        ),
+        (
+            "supported_static",
+            "refuted_static",
+            False,
+            None,
+            "inconclusive",
+        ),
+        (
+            "false_positive",
+            "reproduced_blackbox",
+            True,
+            None,
+            "false_positive",
+        ),
+        (
+            "accepted",
+            "refuted_static",
+            False,
+            None,
+            "accepted",
+        ),
+    ],
+)
+def test_adaptive_runtime_gap_requires_an_attributable_platform_receipt_to_close(
+    settings,  # noqa: ANN001
+    initial_status: str,
+    model_verdict: str,
+    runtime_observed: bool,
+    receipt_owner: str | None,
+    expected_status: str,
+) -> None:
+    database = Database(settings)
+    database.create_all()
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="adaptive-negative.apk",
+            package_name="com.example.adaptivenegative",
+            artifact_sha256="9" * 64,
+            artifact_path="adaptive-negative.apk",
+        )
+        source_task = InvestigationTask(scan=scan, task_type="component", status="completed")
+        verifier_task = InvestigationTask(
+            scan=scan,
+            task_type="adaptive_verification",
+            status="running",
+        )
+        session.add_all([scan, source_task, verifier_task])
+        session.flush()
+        target = SecurityHypothesis(
+            scan_id=scan.id,
+            task_id=source_task.id,
+            fingerprint="a" * 64,
+            category="component",
+            claim="The target runtime behavior may expose a privileged operation.",
+        )
+        other = SecurityHypothesis(
+            scan_id=scan.id,
+            task_id=source_task.id,
+            fingerprint="b" * 64,
+            category="component",
+            claim="An unrelated hypothesis.",
+        )
+        session.add_all([target, other])
+        session.flush()
+        finding = Finding(
+            scan=scan,
+            dedupe_key="adaptive-negative",
+            rule_id="AGENT-ENTRY-INVESTIGATION",
+            title="Observed privileged behavior",
+            description="Runtime behavior still needs a harm Oracle.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            status=initial_status,
+            review_note=(
+                "人工在验证任务运行期间确认并保留当前处置。"
+                if initial_status == "false_positive"
+                or initial_status == "accepted"
+                else None
+            ),
+            metadata_json={
+                "hypothesis_id": target.id,
+                **(
+                    {
+                        "signal_tier": "runtime_oracle_gap",
+                        "oracle_gap": {"status": "open", "runtime_observed": True},
+                    }
+                    if initial_status == "runtime_observed_unverified"
+                    else {}
+                ),
+            },
+        )
+        session.add(finding)
+        session.flush()
+        target.final_finding_id = finding.id
+        if initial_status == "runtime_observed_unverified":
+            runtime_evidence = Evidence(
+                scan_id=scan.id,
+                task_id=source_task.id,
+                kind="blackbox.logcat",
+                sha256="d" * 64,
+                path="adaptive-negative-runtime.log",
+                metadata_json={"request_observed": True},
+            )
+            session.add(runtime_evidence)
+            session.flush()
+            finding.evidence_ids = [runtime_evidence.id]
+            session.add(
+                RuntimeObservation(
+                    scan_id=scan.id,
+                    task_id=source_task.id,
+                    finding_id=finding.id,
+                    observation_key=f"adaptive-negative:{finding.id}",
+                    kind="request.observed",
+                    source="adb",
+                    evidence_ids=[runtime_evidence.id],
+                    payload={"request_observed": True},
+                )
+            )
+        if receipt_owner is not None:
+            refutation_evidence = Evidence(
+                scan_id=scan.id,
+                task_id=source_task.id,
+                kind="blackbox.oracle_result",
+                sha256="c" * 64,
+                path="oracle-refutation.json",
+                summary="Platform Oracle refuted the runtime impact contract.",
+            )
+            session.add(refutation_evidence)
+            session.flush()
+            attempt = ProofAttempt(
+                scan_id=scan.id,
+                task_id=source_task.id,
+                hypothesis_id=(target.id if receipt_owner == "target" else other.id),
+                test_case_id=f"negative-{receipt_owner}",
+                status="refuted",
+                evidence_ids=[refutation_evidence.id],
+                harm_demonstrated=False,
+                oracle={
+                    "oracle_refuted": True,
+                    "execution_demonstrated": True,
+                    "dynamic_verdict_eligible": True,
+                },
+            )
+            session.add(attempt)
+            session.flush()
+            finding.metadata_json = {
+                **dict(finding.metadata_json or {}),
+                "refutation_attempt_ids": [attempt.id],
+            }
+        response = orchestrator.evidence.json(
+            session,
+            scan_id=scan.id,
+            task_id=verifier_task.id,
+            kind="agent.adaptive_response",
+            value={"assessment": model_verdict},
+            summary="Adaptive negative response",
+        )
+        session.commit()
+        scan_id = scan.id
+        task_id = verifier_task.id
+        finding_id = finding.id
+        response_id = response.id
+
+    result = AdaptiveVerificationResult.model_validate(
+        {
+            "summary": "高权限验证器重新评估了运行时信号。",
+            "assessments": [
+                {
+                    "finding_id": finding_id,
+                    "verdict": model_verdict,
+                    "confidence": "medium",
+                    "runtime_observed": runtime_observed,
+                    "summary": "模型判断不能替代平台 Oracle 凭据。",
+                    "attack_chain": "Intent -> component -> privileged operation",
+                    "security_impact": "特权操作可能跨越应用安全边界。",
+                }
+            ],
+        }
+    )
+    orchestrator._apply_adaptive_verifier_result(
+        scan_id=scan_id,
+        task_id=task_id,
+        candidate_ids=[finding_id],
+        result=result,
+        thread_id="thread-adaptive-negative",
+        turn_id="turn-adaptive-negative",
+        response_evidence_id=response_id,
+        android16_verdict_eligible=True,
+    )
+
+    with database.session_factory() as session:
+        finding = session.get(Finding, finding_id)
+        assert finding is not None
+        assert finding.status == expected_status
+        if expected_status == "runtime_observed_unverified":
+            assert finding.metadata_json["signal_tier"] == "runtime_oracle_gap"
+            assert finding.metadata_json["oracle_gap"]["status"] == "open"
+        elif expected_status == "not_reproduced":
+            assert finding.metadata_json["refutation_attempt_ids"]
+            assert "signal_tier" not in finding.metadata_json
+            assert "oracle_gap" not in finding.metadata_json
+        else:
+            assert finding.metadata_json["refutation_attempt_ids"] == []
+            assert "signal_tier" not in finding.metadata_json
+        if expected_status in {"false_positive", "accepted"}:
+            assert finding.review_note == "人工在验证任务运行期间确认并保留当前处置。"
+            assert finding.metadata_json["latest_agent_reanalysis"][
+                "human_closure_preserved"
+            ] is True
+
+
+def test_adaptive_static_refutation_persists_a_revalidatable_gate(settings) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="adaptive-static-refutation.apk",
+            package_name="com.example.staticrefutation",
+            artifact_sha256="0" * 64,
+            artifact_path="adaptive-static-refutation.apk",
+        )
+        verifier_task = InvestigationTask(
+            scan=scan,
+            task_type="adaptive_verification",
+            status="running",
+        )
+        session.add_all([scan, verifier_task])
+        session.flush()
+        static_evidence = Evidence(
+            scan_id=scan.id,
+            task_id=verifier_task.id,
+            kind="static.jadx",
+            sha256="1" * 64,
+            path="adaptive-static-refutation.json",
+            metadata_json={"static_output_usable": True},
+        )
+        finding = Finding(
+            scan=scan,
+            dedupe_key="adaptive-static-refutation",
+            rule_id="AGENT",
+            title="Binder privilege candidate",
+            description="The sensitive call may be reachable from an untrusted caller.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            status="supported_static",
+        )
+        session.add_all([static_evidence, finding])
+        session.flush()
+        finding.evidence_ids = [static_evidence.id]
+        response = orchestrator.evidence.json(
+            session,
+            scan_id=scan.id,
+            task_id=verifier_task.id,
+            kind="agent.adaptive_response",
+            value={"assessment": "refuted_static"},
+            summary="Adaptive static refutation response",
+        )
+        session.commit()
+        scan_id = scan.id
+        task_id = verifier_task.id
+        finding_id = finding.id
+        static_evidence_id = static_evidence.id
+        response_id = response.id
+
+    result = AdaptiveVerificationResult.model_validate(
+        {
+            "summary": "静态复核确认敏感调用前存在不可绕过的调用者校验。",
+            "assessments": [
+                {
+                    "finding_id": finding_id,
+                    "verdict": "refuted_static",
+                    "confidence": "high",
+                    "runtime_observed": False,
+                    "summary": "Binder 调用者 UID 不匹配时立即拒绝请求。",
+                    "attack_chain": (
+                        "untrusted Binder caller -> UID equality guard -> privileged sink blocked"
+                    ),
+                    "security_impact": "非目标 UID 无法到达敏感操作。",
+                    "counterevidence": [
+                        "静态控制流显示 Binder.getCallingUid() 不匹配时抛出 SecurityException。"
+                    ],
+                    "evidence_ids": [static_evidence_id],
+                }
+            ],
+        }
+    )
+    orchestrator._apply_adaptive_verifier_result(
+        scan_id=scan_id,
+        task_id=task_id,
+        candidate_ids=[finding_id],
+        result=result,
+        thread_id="thread-adaptive-static-refutation",
+        turn_id="turn-adaptive-static-refutation",
+        response_evidence_id=response_id,
+        android16_verdict_eligible=False,
+    )
+
+    with database.session_factory() as session:
+        finding = session.get(Finding, finding_id)
+        assert finding is not None and finding.status == "refuted_static"
+        gate = finding.metadata_json["platform_static_refutation_gate"]
+        assert gate["eligible"] is True
+        assert gate["static_evidence_ids"] == [static_evidence_id]
+        assert "UID equality guard" in gate["blocked_edge"]
+
+    # Startup reconciliation must be able to revalidate, rather than blindly trust, the closure.
+    database.create_all()
+    with database.session_factory() as session:
+        finding = session.get(Finding, finding_id)
+        assert finding is not None and finding.status == "refuted_static"
 
 
 def test_exact_finding_identity_is_consolidated_across_tasks(settings) -> None:  # noqa: ANN001
@@ -1049,7 +1582,7 @@ def test_exact_finding_identity_is_consolidated_across_tasks(settings) -> None: 
             confidence="medium",
             status="supported_static",
             entry_point_ids=[second_entry.id],
-            evidence_ids=[second_evidence.id],
+            evidence_ids=[second_evidence.id, "missing-duplicate-evidence"],
             metadata_json={
                 "identity": shared_identity,
                 "harm_demonstrated": False,
@@ -1113,6 +1646,256 @@ def test_exact_finding_identity_is_consolidated_across_tasks(settings) -> None: 
         assert signals == []
 
 
+def test_consolidation_keeps_runtime_receipts_when_explicit_canonical_is_weaker(
+    settings,  # noqa: ANN001
+) -> None:
+    database = Database(settings)
+    database.create_all()
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="tier-merge.apk",
+            artifact_sha256="d" * 64,
+            artifact_path="tier-merge.apk",
+        )
+        shared_identity = {
+            "finding_id": "e" * 64,
+            "semantic_fingerprint": "e" * 64,
+        }
+        runtime = Finding(
+            scan=scan,
+            dedupe_key="runtime-representative",
+            rule_id="AGENT",
+            title="Runtime representative",
+            description="Runtime behavior observed without a harm Oracle.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            status="runtime_observed_unverified",
+            metadata_json={
+                "identity": shared_identity,
+                "signal_tier": "runtime_oracle_gap",
+                "oracle_gap": {"status": "open", "runtime_observed": True},
+                "proof_gap_code": "missing_platform_harm_oracle",
+                "refutation_attempt_ids": ["refutation-receipt"],
+                "dynamic_verdict_eligible": True,
+                "android16_verdict_eligible": True,
+                "release_gate_eligible": False,
+                "verdict_scope": "android16_release",
+                "adaptive_verification": {
+                    "verdict": "runtime_observed_unverified",
+                    "runtime_observed": True,
+                },
+                "adaptive_verification_history": [
+                    {
+                        "verdict": "runtime_observed_unverified",
+                        "runtime_observed": True,
+                    }
+                ],
+            },
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        explicit_canonical = Finding(
+            scan=scan,
+            dedupe_key="explicit-canonical",
+            rule_id="AGENT",
+            title="Weaker explicit canonical",
+            description="A stale static candidate.",
+            masvs="MASVS-PLATFORM",
+            severity="medium",
+            status="supported_static",
+            metadata_json={
+                "identity": shared_identity,
+                "signal_tier": "static_chain",
+                "platform_static_support_gate": VALID_STATIC_GATE,
+                "adaptive_verification": {
+                    "verdict": "supported_static",
+                    "runtime_observed": False,
+                },
+                "adaptive_verification_history": [
+                    {"verdict": "supported_static", "runtime_observed": False}
+                ],
+            },
+            created_at=datetime(2026, 1, 2, tzinfo=UTC),
+        )
+        session.add_all([scan, runtime, explicit_canonical])
+        session.flush()
+        runtime_evidence = Evidence(
+            scan_id=scan.id,
+            kind="blackbox.logcat",
+            sha256="f" * 64,
+            path="tier-runtime.log",
+            metadata_json={"request_observed": True},
+        )
+        session.add(runtime_evidence)
+        session.flush()
+        observation = RuntimeObservation(
+            scan_id=scan.id,
+            finding_id=runtime.id,
+            observation_key=f"tier-runtime:{runtime.id}",
+            kind="request.observed",
+            source="adb",
+            evidence_ids=[runtime_evidence.id],
+            payload={"request_observed": True},
+        )
+        session.add(observation)
+        runtime.evidence_ids = [runtime_evidence.id]
+        session.flush()
+
+        merged = orchestrator._consolidate_findings(
+            session,
+            scan_id=scan.id,
+            explicit_duplicates={runtime.id: explicit_canonical.id},
+        )
+        session.flush()
+
+        assert merged == {runtime.id: explicit_canonical.id}
+        assert explicit_canonical.status == "runtime_observed_unverified"
+        metadata = explicit_canonical.metadata_json
+        assert metadata["signal_tier"] == "runtime_oracle_gap"
+        assert metadata["oracle_gap"]["status"] == "open"
+        assert metadata["refutation_attempt_ids"] == []
+        assert metadata["dynamic_verdict_eligible"] is True
+        assert metadata["android16_verdict_eligible"] is True
+        assert metadata["verdict_scope"] == "android16_release"
+        assert metadata["adaptive_verification"]["runtime_observed"] is True
+        assert len(metadata["adaptive_verification_history"]) == 2
+        assert "platform_static_support_gate" not in metadata
+
+
+def test_consolidation_keeps_static_refutation_receipt_on_weaker_explicit_canonical(
+    settings,  # noqa: ANN001
+) -> None:
+    database = Database(settings)
+    database.create_all()
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="static-refutation-merge.apk",
+            artifact_sha256="1" * 64,
+            artifact_path="static-refutation-merge.apk",
+        )
+        session.add(scan)
+        session.flush()
+        static_evidence = Evidence(
+            scan_id=scan.id,
+            kind="static.jadx",
+            sha256="2" * 64,
+            path="static-refutation.json",
+            metadata_json={"static_output_usable": True},
+        )
+        session.add(static_evidence)
+        session.flush()
+        shared_identity = {
+            "finding_id": "3" * 64,
+            "semantic_fingerprint": "3" * 64,
+        }
+        gate = {
+            "schema_version": "1.0",
+            "eligible": True,
+            "static_evidence_ids": [static_evidence.id],
+            "counterevidence": [
+                "Static control flow proves a caller UID guard executes before the sink."
+            ],
+            "blocked_edge": (
+                "untrusted Binder caller -> caller UID guard -> privileged sink blocked"
+            ),
+            "suppression_reasons": [],
+        }
+        refuted = Finding(
+            scan=scan,
+            dedupe_key="refuted-representative",
+            rule_id="AGENT",
+            title="Evidence-backed refutation",
+            description="A concrete caller guard blocks the privileged sink.",
+            masvs="MASVS-PLATFORM",
+            severity="medium",
+            status="refuted_static",
+            evidence_ids=[static_evidence.id],
+            metadata_json={
+                "identity": shared_identity,
+                "platform_static_refutation_gate": gate,
+            },
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        explicit_canonical = Finding(
+            scan=scan,
+            dedupe_key="weaker-explicit-canonical",
+            rule_id="AGENT",
+            title="Weaker candidate",
+            description="An unverified model candidate.",
+            masvs="MASVS-PLATFORM",
+            severity="low",
+            status="candidate",
+            metadata_json={"identity": shared_identity},
+            created_at=datetime(2026, 1, 2, tzinfo=UTC),
+        )
+        session.add_all([refuted, explicit_canonical])
+        session.flush()
+
+        merged = orchestrator._consolidate_findings(
+            session,
+            scan_id=scan.id,
+            explicit_duplicates={refuted.id: explicit_canonical.id},
+        )
+        session.flush()
+
+        assert merged == {refuted.id: explicit_canonical.id}
+        assert explicit_canonical.status == "refuted_static"
+        assert explicit_canonical.metadata_json["platform_static_refutation_gate"] == gate
+        assert static_refutation_is_evidence_backed(session, explicit_canonical)
+
+
+@pytest.mark.parametrize("reviewed_status", ["false_positive", "accepted"])
+def test_consolidation_preserves_a_human_reviewed_disposition(
+    settings,  # noqa: ANN001
+    reviewed_status: str,
+) -> None:
+    database = Database(settings)
+    database.create_all()
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="closed-merge.apk",
+            artifact_sha256="f" * 64,
+            artifact_path="closed-merge.apk",
+        )
+        identity = {"finding_id": "a" * 64, "semantic_fingerprint": "a" * 64}
+        closed = Finding(
+            scan=scan,
+            dedupe_key="closed",
+            rule_id="AGENT",
+            title="Reviewed false positive",
+            description="An operator closed this signal.",
+            masvs="MASVS-PLATFORM",
+            severity="info",
+            status=reviewed_status,
+            review_note="人工确认：安全控制有效。",
+            metadata_json={"identity": identity},
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        candidate = Finding(
+            scan=scan,
+            dedupe_key="new-candidate",
+            rule_id="BUILTIN",
+            title="Unproven reproduced claim",
+            description="A later model claimed reproduction without a proof receipt.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            status="reproduced_blackbox",
+            metadata_json={"identity": identity, "harm_demonstrated": True},
+            created_at=datetime(2026, 1, 2, tzinfo=UTC),
+        )
+        session.add_all([scan, closed, candidate])
+        session.flush()
+
+        merged = orchestrator._consolidate_findings(session, scan_id=scan.id)
+        session.flush()
+
+        assert merged == {candidate.id: closed.id}
+        assert closed.status == reviewed_status
+        assert closed.review_note == "人工确认：安全控制有效。"
+
+
 def test_same_task_hypotheses_sharing_one_platform_oracle_are_consolidated(settings) -> None:  # noqa: ANN001
     settings.ensure_directories()
     database = Database(settings)
@@ -1153,6 +1936,15 @@ def test_same_task_hypotheses_sharing_one_platform_oracle_are_consolidated(setti
         )
         session.add_all([reachability, impact])
         session.flush()
+        proof_evidence = Evidence(
+            scan_id=scan.id,
+            task_id=task.id,
+            kind="blackbox.oracle_result",
+            sha256="5" * 64,
+            path="binder-proof.json",
+        )
+        session.add(proof_evidence)
+        session.flush()
         shared_plan = {
             "entry_point_id": entry.id,
             "operation": "binder_transact",
@@ -1178,6 +1970,7 @@ def test_same_task_hypotheses_sharing_one_platform_oracle_are_consolidated(setti
             test_case_id="binder-reachability",
             status="proven",
             plan={**shared_plan, "hypothesis_id": reachability.id},
+            evidence_ids=[proof_evidence.id],
             harm_demonstrated=True,
         )
         second_proof = ProofAttempt(
@@ -1187,6 +1980,7 @@ def test_same_task_hypotheses_sharing_one_platform_oracle_are_consolidated(setti
             test_case_id="binder-impact",
             status="proven",
             plan={**shared_plan, "hypothesis_id": impact.id},
+            evidence_ids=[proof_evidence.id],
             harm_demonstrated=True,
         )
         session.add_all([first_proof, second_proof])
@@ -1204,6 +1998,7 @@ def test_same_task_hypotheses_sharing_one_platform_oracle_are_consolidated(setti
             confidence="high",
             status="reproduced_blackbox",
             entry_point_ids=[entry.id],
+            evidence_ids=[proof_evidence.id],
             metadata_json={
                 "identity": {"finding_id": "3" * 64},
                 "harm_demonstrated": True,
@@ -1226,6 +2021,7 @@ def test_same_task_hypotheses_sharing_one_platform_oracle_are_consolidated(setti
             confidence="high",
             status="reproduced_blackbox",
             entry_point_ids=[entry.id],
+            evidence_ids=[proof_evidence.id],
             metadata_json={
                 "identity": {"finding_id": "4" * 64},
                 "harm_demonstrated": True,
@@ -1294,6 +2090,33 @@ def test_adaptive_verifier_merges_semantic_duplicate_ingress_findings(settings) 
         task = InvestigationTask(scan=scan, task_type="adaptive_verification", status="running")
         session.add_all([scan, canonical, duplicate, task])
         session.flush()
+        runtime_evidence = Evidence(
+            scan_id=scan.id,
+            task_id=task.id,
+            kind="blackbox.logcat",
+            sha256="7" * 64,
+            path="semantic-duplicate-runtime.log",
+            metadata_json={"request_observed": True},
+        )
+        session.add(runtime_evidence)
+        session.flush()
+        session.add_all(
+            [
+                RuntimeObservation(
+                    scan_id=scan.id,
+                    task_id=task.id,
+                    finding_id=finding.id,
+                    observation_key=f"semantic-duplicate:{finding.id}",
+                    kind="request.observed",
+                    source="adb",
+                    evidence_ids=[runtime_evidence.id],
+                    payload={"request_observed": True},
+                )
+                for finding in (canonical, duplicate)
+            ]
+        )
+        canonical.evidence_ids = [runtime_evidence.id]
+        duplicate.evidence_ids = [runtime_evidence.id]
         response = orchestrator.evidence.json(
             session,
             scan_id=scan.id,
@@ -1321,6 +2144,7 @@ def test_adaptive_verifier_merges_semantic_duplicate_ingress_findings(settings) 
                     "summary": "恶意页面取得同一 token。",
                     "attack_chain": "Intent -> WebView -> AccountBridge.getSessionToken",
                     "security_impact": "会话令牌泄露。",
+                    "evidence_ids": [runtime_evidence.id],
                 },
                 {
                     "finding_id": duplicate_id,
@@ -1331,6 +2155,7 @@ def test_adaptive_verifier_merges_semantic_duplicate_ingress_findings(settings) 
                     "summary": "Deep Link 是同一 sink 的另一入口表述。",
                     "attack_chain": "Deep Link -> WebView -> AccountBridge.getSessionToken",
                     "security_impact": "会话令牌泄露。",
+                    "evidence_ids": [runtime_evidence.id],
                 },
             ],
         }
@@ -1357,11 +2182,14 @@ def test_adaptive_verifier_merges_semantic_duplicate_ingress_findings(settings) 
             and scan is not None
             and task is not None
         )
-        assert canonical.status == "supported_static"
+        assert canonical.status == "runtime_observed_unverified"
         assert canonical.metadata_json["harm_demonstrated"] is False
+        assert canonical.metadata_json["proof_backlog"]["status"] == "oracle_gap"
         assert duplicate.metadata_json["merged_into_finding_id"] == canonical_id
         assert task.result["merged_finding_map"] == {duplicate_id: canonical_id}
-        assert scan.stats["adaptive_verification"]["verdict_counts"] == {"supported_static": 1}
+        assert scan.stats["adaptive_verification"]["verdict_counts"] == {
+            "runtime_observed_unverified": 1
+        }
         records = list(session.scalars(select(Finding).where(Finding.scan_id == scan_id)))
         confirmed, signals = partition_findings(session, records)
         assert confirmed == []
@@ -1374,17 +2202,60 @@ def test_live_runtime_observation_is_persisted_and_deduplicated(settings) -> Non
     database.create_all()
     with database.session_factory() as session:
         scan = Scan(
-            status="investigating",
+            status="final",
             filename="observation.apk",
             package_name="com.example.observation",
             artifact_sha256="e" * 64,
             artifact_path="observation.apk",
+            stats={
+                "finding_count": 1,
+                "signal_count": 1,
+                "seal": {
+                    "evidence_id": "initial-seal",
+                    "sha256": "a" * 64,
+                    "current": True,
+                },
+                "materialized_summary": {"schema_version": "1.0", "current": True},
+            },
         )
         task = InvestigationTask(scan=scan, task_type="component", status="running")
-        session.add_all([scan, task])
+        finding = Finding(
+            scan=scan,
+            dedupe_key="runtime-observation-target",
+            rule_id="AGENT",
+            title="Static candidate",
+            description="A runtime observation may strengthen this signal.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            status="supported_static",
+        )
+        untrusted_finding = Finding(
+            scan=scan,
+            dedupe_key="agent-only-runtime-claim",
+            rule_id="AGENT",
+            title="Agent-only runtime claim",
+            description="No platform execution receipt backs this claim.",
+            masvs="MASVS-PLATFORM",
+            severity="high",
+            status="supported_static",
+        )
+        session.add_all([scan, task, finding, untrusted_finding])
+        session.flush()
+        runtime_evidence = Evidence(
+            scan_id=scan.id,
+            task_id=task.id,
+            kind="blackbox.logcat",
+            sha256="f" * 64,
+            path="runtime-logcat.json",
+            metadata_json={"request_observed": True},
+        )
+        session.add(runtime_evidence)
         session.commit()
         scan_id = scan.id
         task_id = task.id
+        finding_id = finding.id
+        untrusted_finding_id = untrusted_finding.id
+        runtime_evidence_id = runtime_evidence.id
     workspace = settings.data_dir / "observation-context"
     workspace.mkdir()
     (workspace / "context.json").write_text('{"evidence": []}', encoding="utf-8")
@@ -1413,10 +2284,45 @@ def test_live_runtime_observation_is_persisted_and_deduplicated(settings) -> Non
     payload = AgentRuntimeObservation(
         kind="webview.bridge.callback",
         source="webview_callback",
+        finding_id=finding_id,
+        evidence_ids=[runtime_evidence_id],
         payload={"canary": "APKSCANNER-CANARY", "returned_token": "runtime-value"},
     )
     first = orchestrator.record_live_runtime_observation(task_id, token, payload)
+    with database.session_factory() as session:
+        scan = session.get(Scan, scan_id)
+        assert scan is not None
+        assert scan.stats["seal"]["current"] is False
+        assert scan.stats["materialized_summary"]["current"] is False
+        assert scan.stats["materialized_summary"]["reason"] == (
+            "runtime_observation_projection"
+        )
+        assert "finding_count" not in scan.stats
+        assert "signal_count" not in scan.stats
+        # Simulate a summary rebuilt between delivery and an idempotent spool replay.
+        scan.stats = {
+            **dict(scan.stats),
+            "finding_count": 1,
+            "signal_count": 1,
+            "seal": {
+                "evidence_id": "rebuilt-seal",
+                "sha256": "b" * 64,
+                "current": True,
+            },
+            "materialized_summary": {"schema_version": "1.0", "current": True},
+        }
+        session.commit()
     second = orchestrator.record_live_runtime_observation(task_id, token, payload)
+    untrusted = orchestrator.record_live_runtime_observation(
+        task_id,
+        token,
+        AgentRuntimeObservation(
+            kind="agent.runtime.claim",
+            source="agent",
+            finding_id=untrusted_finding_id,
+            payload={"claim": "the callback fired"},
+        ),
+    )
     assert first["deduplicated"] is False
     assert second["deduplicated"] is True
     assert second["id"] == first["id"]
@@ -1424,8 +2330,31 @@ def test_live_runtime_observation_is_persisted_and_deduplicated(settings) -> Non
         observations = list(
             session.scalars(select(RuntimeObservation).where(RuntimeObservation.task_id == task_id))
         )
-        assert len(observations) == 1
-        assert observations[0].environment["validation"]["verdict_scope"] == ("development_legacy")
+        assert len(observations) == 2
+        trusted_observation = next(item for item in observations if item.id == first["id"])
+        assert trusted_observation.environment["validation"]["verdict_scope"] == (
+            "development_legacy"
+        )
+        finding = session.get(Finding, finding_id)
+        assert finding is not None
+        assert finding.status == "runtime_observed_unverified"
+        assert finding.metadata_json["signal_tier"] == "runtime_oracle_gap"
+        assert finding.metadata_json["runtime_observation_ids"] == [trusted_observation.id]
+        assert finding.metadata_json["oracle_gap"]["status"] == "open"
+        assert first["evidence_id"] in finding.evidence_ids
+        untrusted_finding = session.get(Finding, untrusted_finding_id)
+        assert untrusted_finding is not None
+        assert untrusted_finding.status == "supported_static"
+        assert "signal_tier" not in untrusted_finding.metadata_json
+        assert session.get(RuntimeObservation, untrusted["id"]) is not None
+        scan = session.get(Scan, scan_id)
+        assert scan is not None
+        assert scan.stats["seal"]["current"] is False
+        assert scan.stats["seal"]["invalidated_reason"] == (
+            "runtime_observation_projection"
+        )
+        assert "finding_count" not in scan.stats
+        assert "signal_count" not in scan.stats
 
 
 def test_runtime_event_projection_is_idempotent_across_spool_replay(settings) -> None:  # noqa: ANN001
@@ -2616,6 +3545,10 @@ def test_blind_rescue_reopens_a_model_negative_before_closure(
                         "sink": "InternalDispatcher sensitive action",
                         "reachable_path": ("EntryActivity -> RouteHelper -> InternalDispatcher"),
                         "boundary": "android_component_export_boundary",
+                        "security_impact": (
+                            "An ordinary app can trigger the internal sensitive action."
+                        ),
+                        "missing_control": "No caller authorization is enforced.",
                         "counterevidence": (
                             ["Initial analyst did not follow RouteHelper"]
                             if phase == "static_only"
@@ -2953,6 +3886,10 @@ def test_positive_debate_is_single_pass_and_arbitrates_only_real_objections(
                             "sink": "PrivilegedAction",
                             "reachable_path": "EntryActivity -> PrivilegedAction",
                             "boundary": "android_component_export_boundary",
+                            "security_impact": (
+                                "An ordinary app can trigger the privileged action."
+                            ),
+                            "missing_control": "No caller authorization is enforced.",
                             "counterevidence": [],
                             "proof_gaps": [],
                             "evidence_ids": [cited_id],
@@ -3229,6 +4166,18 @@ def test_end_to_end_static_scan_reaches_final_with_explicit_dynamic_gaps(
         entries = list(session.scalars(select(EntryPoint).where(EntryPoint.scan_id == scan_id)))
         assert len(entries) == 9
         assert sum(entry.kind == "static_surface" for entry in entries) == 1
+        assert all(entry.disposition is not None for entry in entries)
+        assert sum(scan.stats["entry_disposition_counts"].values()) == len(entries)
+        assert 0.0 <= scan.stats["entry_disposition_coverage_rate"] <= 1.0
+        assert scan.stats["unresolved_entry_disposition_count"] == scan.stats[
+            "entry_disposition_counts"
+        ].get("uninvestigated", 0)
+        seal_payload = json.loads(Path(seal.path).read_text(encoding="utf-8"))
+        assert len(seal_payload["entry_dispositions"]) == len(entries)
+        assert all(
+            item["disposition"] is not None
+            for item in seal_payload["entry_dispositions"]
+        )
         findings = list(session.scalars(select(Finding).where(Finding.scan_id == scan_id)))
         assert len(findings) >= 5
         assert all(finding.metadata_json["identity"]["finding_id"] for finding in findings)
@@ -3517,6 +4466,12 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(settings, fixtur
         def investigate(**kwargs):  # noqa: ANN003, ANN205
             task = kwargs["task"]
             evidence = kwargs["evidence"]
+            static_evidence_id = next(
+                item["id"]
+                for item in evidence
+                if str(item.get("kind") or "").startswith("static.")
+                and item.get("metadata", {}).get("static_output_usable", True)
+            )
             assert kwargs["platform_context"]["output_language"] == "zh-CN"
             entry_scope = kwargs["platform_context"]["entry_scope"]
             assert entry_scope["policy"] == ("seed_entry_with_scan_wide_chain_exploration")
@@ -3536,6 +4491,10 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(settings, fixtur
             code_context = kwargs["platform_context"]["target_code_context"]
             assert code_context["schema_version"] == "1.0"
             assert code_context["components"]
+            hypothesis_ids = [
+                item["id"]
+                for item in kwargs["platform_context"]["security_hypotheses"]
+            ]
             kwargs["event_callback"](
                 AgentRuntimeEvent(
                     event_type="model.turn.started",
@@ -3550,9 +4509,27 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(settings, fixtur
                 result=AgentInvestigationResult(
                     summary="Manifest 静态证据支持该风险线索。",
                     result="supported_static",
-                    hypotheses_tested=task.hypotheses,
+                    hypotheses_tested=hypothesis_ids,
+                    hypothesis_assessments=[
+                        {
+                            "hypothesis_id": hypothesis_id,
+                            "verdict": "supported_static",
+                            "source": "Assigned exported entry",
+                            "control": "The caller controls the incoming Intent.",
+                            "sink": "Task-specific sensitive sink",
+                            "reachable_path": "Exported entry -> handler -> sensitive sink",
+                            "boundary": "ordinary_app_uid -> target_app_process",
+                            "security_impact": (
+                                "An ordinary app can reach the task-specific sensitive action."
+                            ),
+                            "missing_control": "No caller authorization is enforced.",
+                            "evidence_ids": [static_evidence_id],
+                            "proof_gaps": ["A platform harm Oracle is still required."],
+                        }
+                        for hypothesis_id in hypothesis_ids
+                    ],
                     test_cases=[],
-                    evidence_ids=[evidence[0]["id"]],
+                    evidence_ids=[static_evidence_id],
                     severity_proposal="medium",
                     confidence="medium",
                     coverage_gaps=["No dynamic device"],
@@ -3601,6 +4578,11 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(settings, fixtur
                 )
             )
         )
+        hypotheses = list(
+            session.scalars(
+                select(SecurityHypothesis).where(SecurityHypothesis.scan_id == scan_id)
+            )
+        )
         trusted_service = session.scalar(
             select(EntryPoint).where(
                 EntryPoint.scan_id == scan_id,
@@ -3624,8 +4606,16 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(settings, fixtur
                 )
             )
         )
-    assert tasks
-    assert len(audit_evidence) == len(tasks) * 4
+        assert tasks
+        audited_task_ids = {
+            evidence.task_id for evidence in audit_evidence if evidence.task_id is not None
+        }
+        assert audited_task_ids
+        assert len(audit_evidence) == len(audited_task_ids) * 4
+        assert all(
+            sum(item.task_id == task_id for item in audit_evidence) == 4
+            for task_id in audited_task_ids
+        )
     assert {item.kind for item in audit_evidence} == {
         "agent.request",
         "agent.events",
@@ -3633,7 +4623,14 @@ def test_orchestrator_persists_audit_evidence_for_every_ai_call(settings, fixtur
         "agent.validation",
     }
     assert len(exploration_events) == len(tasks)
-    assert len(proof_backlog) == len(tasks)
+    assert len(proof_backlog) == len(hypotheses)
+    assert {
+        finding.metadata_json["hypothesis_id"] for finding in proof_backlog
+    } == {hypothesis.id for hypothesis in hypotheses}
+    assert all(
+        finding.metadata_json["platform_static_support_gate"]["eligible"] is True
+        for finding in proof_backlog
+    )
     assert all(
         finding.metadata_json["proof_backlog"]["status"] == "proof_required"
         for finding in proof_backlog
@@ -4352,10 +5349,23 @@ def test_restart_recovery_normalizes_transient_device_states(settings) -> None: 
 
 
 def test_refuted_static_agent_result_has_no_platform_risk_severity() -> None:
+    hypothesis_id = "00000000-0000-0000-0000-000000000030"
     payload = AgentInvestigationResult(
         summary="静态证据表明攻击路径受到有效控制。",
         result="refuted_static",
-        hypotheses_tested=["Exported provider may expose data"],
+        hypotheses_tested=[hypothesis_id],
+        hypothesis_assessments=[
+            {
+                "hypothesis_id": hypothesis_id,
+                "verdict": "refuted_static",
+                "control": "A signature permission rejects every ordinary app caller.",
+                "reachable_path": "ordinary_app_uid -> signature permission guard -> blocked",
+                "counterevidence": [
+                    "The manifest and call site enforce the same signature permission."
+                ],
+                "evidence_ids": ["static"],
+            }
+        ],
         test_cases=[],
         evidence_ids=["static"],
         severity_proposal="info",

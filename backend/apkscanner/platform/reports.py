@@ -17,7 +17,8 @@ from ..core.models import (
     Scan,
     SecurityHypothesis,
 )
-from ..runtime.finding_policy import partition_findings
+from ..core.proof_receipts import evidence_backed_harm_attempts
+from ..runtime.finding_policy import evidence_backed_signal_tiers, partition_findings
 
 
 class ReportBuilder:
@@ -52,6 +53,7 @@ class ReportBuilder:
             )
         )
         findings, signals = partition_findings(session, finding_records)
+        signal_tiers = evidence_backed_signal_tiers(session, signals)
         tasks = list(
             session.scalars(
                 select(InvestigationTask)
@@ -97,6 +99,15 @@ class ReportBuilder:
                 .order_by(BenchmarkEvaluation.created_at)
             )
         )
+        hypothesis_ids = {item.id for item in hypotheses}
+        platform_harm_attempt_ids = {
+            attempt.id
+            for attempt in evidence_backed_harm_attempts(
+                session,
+                scan_id=scan.id,
+                hypothesis_ids=hypothesis_ids,
+            )
+        }
         return {
             "schema_version": "1.0",
             "scan": {
@@ -123,9 +134,21 @@ class ReportBuilder:
             },
             "entry_points": [self._entry(item) for item in entries],
             "findings": [self._finding(item) for item in findings],
-            "signals": [self._finding(item) for item in signals],
+            "signals": [
+                self._finding(
+                    item,
+                    signal_tier=signal_tiers[item.id],
+                )
+                for item in signals
+            ],
             "tasks": [self._task(item) for item in tasks],
-            "security_hypotheses": [self._security_hypothesis(item) for item in hypotheses],
+            "security_hypotheses": [
+                self._security_hypothesis(
+                    item,
+                    platform_harm_attempt_ids=platform_harm_attempt_ids,
+                )
+                for item in hypotheses
+            ],
             "benchmark_evaluations": [self._benchmark_evaluation(item) for item in evaluations],
             "agent_audits": agent_audits or [],
             "coverage": [self._coverage(item) for item in coverage],
@@ -150,8 +173,12 @@ class ReportBuilder:
         }
 
     @staticmethod
-    def _finding(item: Finding) -> dict[str, Any]:
-        return {
+    def _finding(
+        item: Finding,
+        *,
+        signal_tier: str | None = None,
+    ) -> dict[str, Any]:
+        payload = {
             "id": item.id,
             "rule_id": item.rule_id,
             "source": item.source,
@@ -169,6 +196,9 @@ class ReportBuilder:
             "metadata": item.metadata_json,
             "review_note": item.review_note,
         }
+        if signal_tier is not None:
+            payload["signal_tier"] = signal_tier
+        return payload
 
     @staticmethod
     def _task(item: InvestigationTask) -> dict[str, Any]:
@@ -187,7 +217,11 @@ class ReportBuilder:
         }
 
     @staticmethod
-    def _security_hypothesis(item: SecurityHypothesis) -> dict[str, Any]:
+    def _security_hypothesis(
+        item: SecurityHypothesis,
+        *,
+        platform_harm_attempt_ids: set[str],
+    ) -> dict[str, Any]:
         return {
             "id": item.id,
             "task_id": item.task_id,
@@ -231,6 +265,7 @@ class ReportBuilder:
                     "oracle": proof.oracle,
                     "evidence_ids": proof.evidence_ids,
                     "harm_demonstrated": proof.harm_demonstrated,
+                    "platform_harm_proven": proof.id in platform_harm_attempt_ids,
                     "error": proof.error,
                     "started_at": (proof.started_at.isoformat() if proof.started_at else None),
                     "completed_at": (
@@ -358,15 +393,46 @@ class ReportBuilder:
             "</tr>"
             for item in report["findings"]
         )
-        signal_rows = "".join(
-            "<tr>"
-            f"<td>{html.escape(item['severity'])}</td>"
-            f"<td>{html.escape(item['status'])}</td>"
-            f"<td>{html.escape(item['title'])}</td>"
-            f"<td>{html.escape(item['source'])}</td>"
-            "</tr>"
-            for item in report["signals"]
-        )
+        signal_sections: list[str] = []
+        for tier, title, description in (
+            (
+                "runtime_oracle_gap",
+                "运行已观察 · 缺 Oracle",
+                "已观察目标行为，但尚无平台 ProofAttempt 证明具体安全影响。",
+            ),
+            (
+                "static_chain",
+                "完整静态攻击链 · 待证明",
+                "已通过 source/control/sink/path/boundary/impact/control-gap 硬门槛。",
+            ),
+            (
+                "raw_candidate",
+                "原始与低证据线索",
+                "规则/API 命中或已关闭记录，不代表漏洞成立。",
+            ),
+        ):
+            tier_items = [
+                item for item in report["signals"] if item.get("signal_tier") == tier
+            ]
+            if not tier_items:
+                continue
+            rows = "".join(
+                "<tr>"
+                f"<td>{html.escape(item['severity'])}</td>"
+                f"<td>{html.escape(item['status'])}</td>"
+                f"<td>{html.escape(item['title'])}</td>"
+                f"<td>{html.escape(item['source'])}</td>"
+                "</tr>"
+                for item in tier_items
+            )
+            signal_sections.append(
+                f"<h3>{html.escape(title)} ({len(tier_items)})</h3>"
+                f"<p>{html.escape(description)}</p>"
+                "<table><thead><tr><th>Severity</th><th>Status</th>"
+                "<th>Title</th><th>Source</th></tr></thead>"
+                f"<tbody>{rows}</tbody></table>"
+            )
+        rendered_signal_sections = "".join(signal_sections) or "<p>没有待验证线索。</p>"
         audit_rows = "".join(
             "<tr>"
             f"<td>{html.escape(item['phase'])}</td>"
@@ -384,7 +450,7 @@ class ReportBuilder:
             f"<td>{html.escape(item['status'])}</td>"
             f"<td>{html.escape(item['claim'])}</td>"
             f"<td>{len(item['proof_attempts'])}</td>"
-            f"<td>{sum(1 for proof in item['proof_attempts'] if proof['harm_demonstrated'])}</td>"
+            f"<td>{sum(1 for proof in item['proof_attempts'] if proof.get('platform_harm_proven') is True)}</td>"
             "</tr>"
             for item in report["security_hypotheses"]
         )
@@ -404,8 +470,7 @@ th{{background:#eef4f7}}code{{background:#eef4f7;padding:2px 5px}}</style></head
  · {html.escape(scan["status"])} · <code>{scan["artifact_sha256"]}</code></p>
 <h2>Finding</h2><table><thead><tr><th>Severity</th><th>Status</th><th>Title</th><th>MASVS</th></tr></thead>
 <tbody>{finding_rows}</tbody></table>
-<h2>静态与待验证线索</h2><table><thead><tr><th>Severity</th><th>Status</th><th>Title</th><th>Source</th></tr></thead>
-<tbody>{signal_rows}</tbody></table>
+<h2>待验证信号分层</h2>{rendered_signal_sections}
 <h2>验证链</h2><table><thead><tr><th>Hypothesis ID</th><th>Status</th><th>Claim</th>
 <th>Proof Attempts</th><th>Harm Proven</th></tr></thead><tbody>{hypothesis_rows}</tbody></table>
 <h2>AI 审计</h2><table><thead><tr><th>Phase</th><th>Backend</th><th>Model</th><th>Status</th>

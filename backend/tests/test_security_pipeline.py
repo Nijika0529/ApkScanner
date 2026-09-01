@@ -4,6 +4,7 @@ import pytest
 from apkscanner.core.db import Database
 from apkscanner.core.models import (
     EntryPoint,
+    Evidence,
     Finding,
     HypothesisArgument,
     InvestigationTask,
@@ -14,6 +15,44 @@ from apkscanner.core.models import (
 from apkscanner.core.schemas import AgentRequestedTest
 from apkscanner.runtime.security_pipeline import HypothesisLedger
 from sqlalchemy import select
+
+
+def _complete_proof_with_persisted_evidence(
+    ledger: HypothesisLedger,
+    database: Database,
+    *,
+    scan_id: str,
+    task_id: str,
+    proof_id: str | None,
+    evidence: list[dict],
+) -> None:
+    with database.session_factory() as session:
+        for item in evidence:
+            evidence_id = item.get("id")
+            if not isinstance(evidence_id, str) or session.get(Evidence, evidence_id):
+                continue
+            session.add(
+                Evidence(
+                    id=evidence_id,
+                    scan_id=scan_id,
+                    task_id=task_id,
+                    kind=str(item.get("kind") or "test.evidence"),
+                    sha256="0" * 64,
+                    path=f"{evidence_id}.json",
+                    exit_code=(
+                        item.get("exit_code")
+                        if isinstance(item.get("exit_code"), int)
+                        else None
+                    ),
+                    metadata_json=(
+                        dict(item.get("metadata"))
+                        if isinstance(item.get("metadata"), dict)
+                        else {}
+                    ),
+                )
+            )
+        session.commit()
+    ledger.complete_proof(proof_id, evidence)
 
 
 def test_hypothesis_ledger_tracks_arguments_and_concrete_proof(settings) -> None:  # noqa: ANN001
@@ -40,13 +79,18 @@ def test_hypothesis_ledger_tracks_arguments_and_concrete_proof(settings) -> None
     hypotheses = ledger.ensure_task_hypotheses(task)
     assert len(hypotheses) == 1
     hypothesis_id = hypotheses[0].id
+    issued_evidence_id = "12345678-aaaa-bbbb-cccc-123456789abc"
     ledger.record_argument(
         task_id=task_id,
         role="hunter",
         phase="test_planning",
         backend="opencode",
         model="deepseek-v4-pro",
-        payload={"summary": "Candidate route bypass.", "evidence_ids": ["static-1"]},
+        payload={
+            "summary": "Candidate route bypass.",
+            "evidence_ids": [issued_evidence_id[:8], "invented"],
+        },
+        allowed_evidence_ids={issued_evidence_id},
     )
     ledger.record_argument(
         task_id=task_id,
@@ -71,9 +115,13 @@ def test_hypothesis_ledger_tracks_arguments_and_concrete_proof(settings) -> None
     )
     assert proof_id is not None
     ledger.start_proof(proof_id)
-    ledger.complete_proof(
-        proof_id,
-        [
+    _complete_proof_with_persisted_evidence(
+        ledger,
+        database,
+        scan_id=task.scan_id,
+        task_id=task_id,
+        proof_id=proof_id,
+        evidence=[
             {
                 "id": "probe-1",
                 "kind": "blackbox.probe_app",
@@ -107,9 +155,13 @@ def test_hypothesis_ledger_tracks_arguments_and_concrete_proof(settings) -> None
         request=request,
     )
     ledger.start_proof(reachability_only_id)
-    ledger.complete_proof(
-        reachability_only_id,
-        [
+    _complete_proof_with_persisted_evidence(
+        ledger,
+        database,
+        scan_id=task.scan_id,
+        task_id=task_id,
+        proof_id=reachability_only_id,
+        evidence=[
             {
                 "id": "probe-2",
                 "kind": "blackbox.probe_app",
@@ -134,9 +186,13 @@ def test_hypothesis_ledger_tracks_arguments_and_concrete_proof(settings) -> None
         request=request,
     )
     ledger.start_proof(ui_proof_id)
-    ledger.complete_proof(
-        ui_proof_id,
-        [
+    _complete_proof_with_persisted_evidence(
+        ledger,
+        database,
+        scan_id=task.scan_id,
+        task_id=task_id,
+        proof_id=ui_proof_id,
+        evidence=[
             {
                 "id": "poc-launch-ui",
                 "kind": "blackbox.poc_launch",
@@ -195,6 +251,99 @@ def test_hypothesis_ledger_tracks_arguments_and_concrete_proof(settings) -> None
             )
         )
         assert [argument.role for argument in arguments] == ["hunter", "critic"]
+        assert arguments[0].evidence_ids == [issued_evidence_id]
+        assert issued_evidence_id in hypothesis.support_evidence_ids
+        assert "invented" not in hypothesis.support_evidence_ids
+
+
+def test_complete_proof_rejects_unpersisted_evidence_receipts(settings) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            status="final",
+            filename="missing-proof-evidence.apk",
+            artifact_sha256="1" * 64,
+            artifact_path="missing-proof-evidence.apk",
+            stats={
+                "finding_count": 0,
+                "signal_count": 1,
+                "seal": {
+                    "evidence_id": "proof-seal",
+                    "sha256": "2" * 64,
+                    "current": True,
+                },
+            },
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            target_entry_ids=["00000000-0000-0000-0000-000000000091"],
+            hypotheses=["An ordinary app may trigger a privileged action."],
+        )
+        session.add_all([scan, task])
+        session.commit()
+        task_id = task.id
+
+    ledger = HypothesisLedger(database)
+    hypothesis = ledger.ensure_task_hypotheses(task)[0]
+    request = AgentRequestedTest(
+        hypothesis_id=hypothesis.id,
+        entry_point_id="00000000-0000-0000-0000-000000000091",
+        state="guest",
+        uri=None,
+        extras={},
+        rationale="Exercise the privileged action from an ordinary app.",
+    )
+    proof_id = ledger.plan_proof(
+        task_id=task_id,
+        test_case_id="missing-evidence-proof",
+        request=request,
+    )
+    assert proof_id is not None
+    ledger.start_proof(proof_id)
+    ledger.complete_proof(
+        proof_id,
+        [
+            {
+                "id": "missing-probe",
+                "kind": "blackbox.probe_app",
+                "exit_code": 0,
+                "metadata": {"request_id": "missing-request"},
+            },
+            {
+                "id": "missing-oracle",
+                "kind": "blackbox.logcat",
+                "exit_code": 0,
+                "metadata": {
+                    "request_id": "missing-request",
+                    "request_observed": True,
+                    "probe_success": True,
+                    "impact_contract_satisfied": True,
+                },
+            },
+        ],
+    )
+
+    with database.session_factory() as session:
+        attempt = session.get(ProofAttempt, proof_id)
+        persisted_hypothesis = session.get(SecurityHypothesis, hypothesis.id)
+        scan = session.get(Scan, attempt.scan_id)
+        assert attempt is not None and attempt.status == "inconclusive"
+        assert attempt.harm_demonstrated is False
+        assert attempt.oracle["evidence_receipt_valid"] is False
+        assert attempt.oracle["missing_evidence_ids"] == [
+            "missing-probe",
+            "missing-oracle",
+        ]
+        assert persisted_hypothesis is not None
+        assert persisted_hypothesis.status == "inconclusive"
+        assert persisted_hypothesis.support_evidence_ids == []
+        assert scan is not None
+        assert scan.stats["seal"]["current"] is False
+        assert scan.stats["seal"]["invalidated_reason"] == "proof_attempt_completed"
+        assert "finding_count" not in scan.stats
+        assert "signal_count" not in scan.stats
 
 
 def test_critic_and_arbiter_cannot_downgrade_platform_proven_hypothesis(
@@ -237,9 +386,13 @@ def test_critic_and_arbiter_cannot_downgrade_platform_proven_hypothesis(
     )
     assert proof_id is not None
     ledger.start_proof(proof_id)
-    ledger.complete_proof(
-        proof_id,
-        [
+    _complete_proof_with_persisted_evidence(
+        ledger,
+        database,
+        scan_id=task.scan_id,
+        task_id=task.id,
+        proof_id=proof_id,
+        evidence=[
             {
                 "id": "probe-webview",
                 "kind": "blackbox.probe_app",
@@ -544,9 +697,13 @@ def test_platform_proof_result_is_independent_from_model_verdict(settings) -> No
         request=request,
     )
     ledger.start_proof(proof_id)
-    ledger.complete_proof(
-        proof_id,
-        [
+    _complete_proof_with_persisted_evidence(
+        ledger,
+        database,
+        scan_id=task.scan_id,
+        task_id=task.id,
+        proof_id=proof_id,
+        evidence=[
             {
                 "id": "probe-proof",
                 "kind": "blackbox.probe_app",
@@ -614,9 +771,13 @@ def test_one_platform_proof_does_not_close_other_hypotheses(settings) -> None:  
         ),
     )
     ledger.start_proof(proof_id)
-    ledger.complete_proof(
-        proof_id,
-        [
+    _complete_proof_with_persisted_evidence(
+        ledger,
+        database,
+        scan_id=task.scan_id,
+        task_id=task.id,
+        proof_id=proof_id,
+        evidence=[
             {
                 "id": "probe-first",
                 "kind": "blackbox.probe_app",
@@ -695,9 +856,13 @@ def test_legacy_device_verdict_depends_on_selected_validation_profile(
         ),
     )
     ledger.start_proof(proof_id)
-    ledger.complete_proof(
-        proof_id,
-        [
+    _complete_proof_with_persisted_evidence(
+        ledger,
+        database,
+        scan_id=task.scan_id,
+        task_id=task.id,
+        proof_id=proof_id,
+        evidence=[
             {
                 "id": "legacy-probe",
                 "kind": "blackbox.probe_app",

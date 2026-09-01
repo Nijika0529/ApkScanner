@@ -99,15 +99,23 @@ flowchart LR
 
 | Verdict | 最低条件 |
 | --- | --- |
-| `supported_static` | 引用当前 Scan 的静态 Evidence，能够说明 source、control、sink 和可达路径 |
-| `refuted_static` | 静态证据表明入口受保护、路径不可达或没有实际安全影响 |
+| `candidate` | 原始规则/API 命中或信息不完整的调查线索；不进入高价值待验证队列 |
+| `supported_static` | 单个结构化 Hypothesis 同时给出 source、control、sink、reachable path、boundary、具体 security impact、missing control，并显式引用当前 Scan 中实际存在的 `static.*` Evidence |
+| `runtime_observed_unverified` | 已观察到目标运行行为，但没有归属于该 Hypothesis、且 `harm_demonstrated=true` 的平台 ProofAttempt；作为 Oracle 缺口单独排队 |
+| `refuted_static` | 当前 Scan 中可用的静态 Evidence 指出阻断该路径的具体 guard、权限等级或调用者校验；泛泛声称“已有保护”不构成反证 |
 | `reproduced_blackbox` | 临时普通 App UID Harness/PoC 与平台观察使用同一 request/test-case ID，且 Oracle 独立观察到具体危害 |
 | `not_reproduced` | 已执行的普通 App UID 用例被平台负向 Oracle 明确反驳；只反驳该用例，不宣称应用整体安全 |
 
 当前 Oracle 覆盖 Binder reply、Provider rows、目标 UID 日志、UI 文本、进程崩溃、文件状态变化
 以及 Web/网络/Socket/SSH 等标准化语义观察。Agent 也可提交由平台执行的多步骤实验，但必须提前
-声明具体 assertion step、观察类型和 ImpactContract；命令成功本身不等于危害成立。无法形成客观动态证据时，结论保持
-`supported_static` 或待验证状态，不会被模型自行提升。
+声明具体 assertion step、观察类型和 ImpactContract；命令成功本身不等于危害成立。无法形成客观动态证据时，运行观察进入
+`runtime_observed_unverified`；纯静态结论只有通过完整攻击链硬门槛才保留为 `supported_static`，否则回落为原始候选或 `inconclusive`。
+
+公开待验证项统一使用三层 `signal_tier`：`runtime_oracle_gap`（已有运行观察、缺危害 Oracle）、
+`static_chain`（完整且有证据的静态链）和 `raw_candidate`（其余原始或已关闭线索）。层级由平台按
+当前 Evidence 重新计算，模型给出的 confidence 只用于排序和展示，不等于平台 Proof，也不能提升
+Finding。扫描进入 `final` 后若发生人工处置、RuntimeObservation 或 ProofAttempt 变更，已有物化
+汇总和 `scan.seal` 会标记失效，必须重新汇总并封印后才能作为当前快照使用。
 
 ## 演示
 

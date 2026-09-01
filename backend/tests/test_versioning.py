@@ -116,12 +116,24 @@ def test_snapshot_diff_migrates_only_proven_poc(settings, tmp_path) -> None:  # 
         )
         session.add(hypothesis)
         session.flush()
+        proof_evidence = Evidence(
+            scan_id=baseline.id,
+            task_id=old_task.id,
+            kind="blackbox.oracle_result",
+            sha256="d" * 64,
+            path=str(tmp_path / "oracle-result.json"),
+            summary="Platform Oracle observed one target-owned row.",
+            metadata_json={"hypothesis_id": hypothesis.id},
+        )
+        session.add(proof_evidence)
+        session.flush()
         attempt = ProofAttempt(
             scan_id=baseline.id,
             task_id=old_task.id,
             hypothesis_id=hypothesis.id,
             test_case_id="old-proof",
             status="proven",
+            evidence_ids=[proof_evidence.id],
             harm_demonstrated=True,
             plan={
                 "hypothesis_id": hypothesis.id,
@@ -160,7 +172,11 @@ def test_snapshot_diff_migrates_only_proven_poc(settings, tmp_path) -> None:  # 
             severity="high",
             status="reproduced_blackbox",
             entry_point_ids=[old_entry.id],
-            metadata_json={"proof_attempt_ids": [attempt.id]},
+            evidence_ids=[proof_evidence.id],
+            metadata_json={
+                "hypothesis_id": hypothesis.id,
+                "proof_attempt_ids": [attempt.id],
+            },
         )
         session.add_all(
             [
@@ -179,6 +195,69 @@ def test_snapshot_diff_migrates_only_proven_poc(settings, tmp_path) -> None:  # 
                 ),
             ]
         )
+        session.flush()
+        hypothesis.final_finding_id = finding.id
+        for suffix, proof_status, proof_evidence_ids in (
+            ("failed", "failed", [proof_evidence.id]),
+            (
+                "missing-evidence",
+                "proven",
+                ["00000000-0000-0000-0000-000000000099"],
+            ),
+        ):
+            rejected_hypothesis = SecurityHypothesis(
+                scan=baseline,
+                task_id=old_task.id,
+                fingerprint=hashlib.sha256(suffix.encode()).hexdigest(),
+                category="provider_access",
+                claim=f"Untrusted historical claim: {suffix}.",
+                entry_point_ids=[old_entry.id],
+            )
+            session.add(rejected_hypothesis)
+            session.flush()
+            rejected_request = AgentRequestedTest(
+                hypothesis_id=rejected_hypothesis.id,
+                entry_point_id=old_entry.id,
+                uri="content://io.apkscanner.versiontest.secrets/items",
+                extras={},
+                operation="query",
+                oracle=AgentOracleSpec(
+                    kind="provider_rows",
+                    minimum_rows=1,
+                    impact="unauthorized_data_access",
+                ),
+                rationale="This historical claim must not be replayed without a valid receipt.",
+            )
+            rejected_attempt = ProofAttempt(
+                scan_id=baseline.id,
+                task_id=old_task.id,
+                hypothesis_id=rejected_hypothesis.id,
+                test_case_id=f"rejected-{suffix}",
+                prover="platform_ephemeral_harness",
+                status=proof_status,
+                evidence_ids=proof_evidence_ids,
+                harm_demonstrated=True,
+                plan=plan_with_proof_recipe(rejected_request),
+                oracle=rejected_request.oracle.model_dump(mode="json"),
+            )
+            rejected_finding = Finding(
+                scan=baseline,
+                dedupe_key=f"rejected-{suffix}",
+                rule_id="AGENT-ENTRY-INVESTIGATION",
+                title=f"Untrusted historical finding: {suffix}",
+                description="Status or harm flags alone are not proof.",
+                masvs="MASVS-PLATFORM",
+                severity="high",
+                status="reproduced_blackbox",
+                entry_point_ids=[old_entry.id],
+            )
+            session.add_all([rejected_attempt, rejected_finding])
+            session.flush()
+            rejected_hypothesis.final_finding_id = rejected_finding.id
+            rejected_finding.metadata_json = {
+                "hypothesis_id": rejected_hypothesis.id,
+                "proof_attempt_ids": [rejected_attempt.id],
+            }
         old_snapshot = service.build_snapshot(
             session,
             scan=baseline,
@@ -255,6 +334,17 @@ def test_snapshot_diff_regenerates_platform_harness_without_source_archive(
         )
         session.add(hypothesis)
         session.flush()
+        proof_evidence = Evidence(
+            scan_id=baseline.id,
+            task_id=old_task.id,
+            kind="blackbox.oracle_result",
+            sha256="9" * 64,
+            path="platform-harness-oracle.json",
+            summary="Platform Harness observed one target-owned row.",
+            metadata_json={"hypothesis_id": hypothesis.id},
+        )
+        session.add(proof_evidence)
+        session.flush()
         request = AgentRequestedTest(
             hypothesis_id=hypothesis.id,
             entry_point_id=old_entry.id,
@@ -275,6 +365,7 @@ def test_snapshot_diff_regenerates_platform_harness_without_source_archive(
             test_case_id="platform-harness-proof",
             prover="platform_ephemeral_harness",
             status="proven",
+            evidence_ids=[proof_evidence.id],
             harm_demonstrated=True,
             plan=plan_with_proof_recipe(request),
             oracle=request.oracle.model_dump(mode="json"),
@@ -291,9 +382,15 @@ def test_snapshot_diff_regenerates_platform_harness_without_source_archive(
             severity="high",
             status="reproduced_blackbox",
             entry_point_ids=[old_entry.id],
-            metadata_json={"proof_attempt_ids": [attempt.id]},
+            evidence_ids=[proof_evidence.id],
+            metadata_json={
+                "hypothesis_id": hypothesis.id,
+                "proof_attempt_ids": [attempt.id],
+            },
         )
         session.add(finding)
+        session.flush()
+        hypothesis.final_finding_id = finding.id
         service.build_snapshot(
             session,
             scan=baseline,
@@ -414,6 +511,99 @@ def test_proven_finding_becomes_pattern_but_match_stays_candidate(settings) -> N
         )
         session.add(finding)
         session.flush()
+        assert (
+            service.create_pattern_from_finding(
+                session,
+                scan=scan,
+                finding=finding,
+            )
+            is None
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="provider",
+            target_entry_ids=[source_entry.id],
+            hypotheses=["Third-party caller can read provider rows."],
+        )
+        session.add(task)
+        session.flush()
+        hypothesis = SecurityHypothesis(
+            scan=scan,
+            task_id=task.id,
+            fingerprint="7" * 64,
+            category="provider_access",
+            claim="Third-party caller can read provider rows.",
+            entry_point_ids=[source_entry.id],
+            final_finding_id=finding.id,
+        )
+        session.add(hypothesis)
+        session.flush()
+        proof_evidence = Evidence(
+            scan_id=scan.id,
+            task_id=task.id,
+            kind="blackbox.oracle_result",
+            sha256="6" * 64,
+            path="pattern-oracle-result.json",
+            summary="Platform Oracle observed an unauthorized provider row.",
+            metadata_json={"hypothesis_id": hypothesis.id},
+        )
+        session.add(proof_evidence)
+        session.flush()
+        rejected_attempts = [
+            ProofAttempt(
+                scan_id=scan.id,
+                task_id=task.id,
+                hypothesis_id=hypothesis.id,
+                test_case_id="pattern-failed-claim",
+                status="failed",
+                evidence_ids=[proof_evidence.id],
+                harm_demonstrated=True,
+            ),
+            ProofAttempt(
+                scan_id=scan.id,
+                task_id=task.id,
+                hypothesis_id=hypothesis.id,
+                test_case_id="pattern-missing-receipt",
+                status="proven",
+                evidence_ids=["00000000-0000-0000-0000-000000000098"],
+                harm_demonstrated=True,
+            ),
+        ]
+        session.add_all(rejected_attempts)
+        session.flush()
+        finding.metadata_json = {
+            "hypothesis_id": hypothesis.id,
+            "proof_attempt_ids": [item.id for item in rejected_attempts],
+        }
+        assert (
+            service.create_pattern_from_finding(
+                session,
+                scan=scan,
+                finding=finding,
+            )
+            is None
+        )
+        attempt = ProofAttempt(
+            scan_id=scan.id,
+            task_id=task.id,
+            hypothesis_id=hypothesis.id,
+            test_case_id="pattern-source-proof",
+            status="proven",
+            evidence_ids=[proof_evidence.id],
+            harm_demonstrated=True,
+            plan={
+                "entry_point_id": source_entry.id,
+                "oracle": {"impact": "unauthorized_data_access"},
+            },
+            oracle={"impact": "unauthorized_data_access"},
+        )
+        session.add(attempt)
+        session.flush()
+        finding.evidence_ids = [proof_evidence.id]
+        finding.metadata_json = {
+            "hypothesis_id": hypothesis.id,
+            "proof_attempt_ids": [attempt.id],
+        }
         pattern = service.create_pattern_from_finding(
             session,
             scan=scan,

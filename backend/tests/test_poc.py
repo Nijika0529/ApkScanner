@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import io
 import json
+import os
 import re
 import threading
 import zipfile
@@ -136,9 +138,21 @@ def test_platform_materializes_a_request_scoped_binder_harness(settings, tmp_pat
         target_component="com.example.target.SecretService",
     )
 
-    source = next((tmp_path / spec.project_path / "src").rglob("*.java")).read_text()
+    assert not (tmp_path / spec.project_path).exists()
+    attacker_project = tmp_path / spec.project_path
+    attacker_source = attacker_project / "src" / "attacker" / "Replacement.java"
+    attacker_source.parent.mkdir(parents=True)
+    (attacker_project / "AndroidManifest.xml").write_text(
+        '<manifest package="io.attacker.replacement" />',
+        encoding="utf-8",
+    )
+    attacker_source.write_text("// attacker replacement", encoding="utf-8")
+    snapshot_workspace = tmp_path / "private-snapshot"
+    builder._snapshot_project(tmp_path, spec, snapshot_workspace)
+    source = next((snapshot_workspace / spec.project_path / "src").rglob("*.java")).read_text()
     encoded = re.search(r'REQUEST_BASE64 = "([A-Za-z0-9+/=]+)"', source)
     assert encoded is not None
+    assert "attacker replacement" not in source
     payload = json.loads(base64.b64decode(encoded.group(1)))
     assert spec.package_name.startswith("io.apkscanner.poc.proof_")
     assert spec.harness_mode == "custom"
@@ -155,10 +169,252 @@ def test_platform_materializes_a_request_scoped_binder_harness(settings, tmp_pat
     assert 'receipt.put("receipt_terminal", terminal)' in source
     assert "@Override protected void onResume()" in source
     assert "}, 150L);" in source
-    manifest = (tmp_path / spec.project_path / "AndroidManifest.xml").read_text(
+    manifest = (snapshot_workspace / spec.project_path / "AndroidManifest.xml").read_text(
         encoding="utf-8"
     )
     assert 'android:debuggable="true"' in manifest
+
+
+def test_platform_proof_source_is_scoped_to_one_workspace(settings, tmp_path) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    builder = PocBuilder(settings, ToolRunner(settings), ArtifactStore(settings))
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+    request = AgentRequestedTest(
+        hypothesis_id="11111111-2222-4333-8444-555555555555",
+        entry_point_id="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        operation="auto",
+        oracle=AgentOracleSpec(kind="reachability", impact="none"),
+        rationale="Launch one exact target Activity from an ordinary app UID.",
+    )
+    spec = builder.materialize_proof_harness(
+        workspace_a,
+        request,
+        entry_kind="activity",
+        target_package_name="com.example.target",
+        target_component="com.example.target.MainActivity",
+    )
+    attacker_project = workspace_b / spec.project_path
+    attacker_source = (
+        attacker_project
+        / "src"
+        / Path(*spec.package_name.split("."))
+        / "PlatformProofActivity.java"
+    )
+    attacker_source.parent.mkdir(parents=True)
+    (attacker_project / "AndroidManifest.xml").write_text(
+        (
+            '<manifest xmlns:android="http://schemas.android.com/apk/res/android" '
+            f'package="{spec.package_name}"><application><activity '
+            'android:name=".PlatformProofActivity" /></application></manifest>'
+        ),
+        encoding="utf-8",
+    )
+    attacker_source.write_text(
+        f"package {spec.package_name}; // workspace-b-custom-source",
+        encoding="utf-8",
+    )
+
+    builder._snapshot_project(workspace_b, spec, tmp_path / "snapshot-b")
+    custom_source = next((tmp_path / "snapshot-b" / spec.project_path / "src").rglob("*.java"))
+    assert "workspace-b-custom-source" in custom_source.read_text(encoding="utf-8")
+
+    builder._snapshot_project(workspace_a, spec, tmp_path / "snapshot-a")
+    platform_source = next((tmp_path / "snapshot-a" / spec.project_path / "src").rglob("*.java"))
+    assert "workspace-b-custom-source" not in platform_source.read_text(encoding="utf-8")
+
+
+def test_platform_harness_rejects_an_escaped_manifest_package_before_writing(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = write_poc_project(workspace)
+    escaped = tmp_path / "escaped-package"
+    manifest = project / "AndroidManifest.xml"
+    manifest.write_text(
+        (
+            '<manifest xmlns:android="http://schemas.android.com/apk/res/android" '
+            f'package="io.apkscanner.poc.{escaped}"><application /></manifest>'
+        ),
+        encoding="utf-8",
+    )
+    builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
+    requested = poc_spec().model_copy(
+        update={
+            "harness_mode": "platform_generated",
+            "attack_class": "io.apkscanner.poc.providerprobe.MainActivity",
+            "launch_component": ".ApkScannerHarnessActivity",
+        }
+    )
+
+    snapshot_workspace = tmp_path / "snapshot"
+    snapshot_spec = builder._snapshot_project(workspace, requested, snapshot_workspace)
+    with pytest.raises(ValueError, match="manifest package is invalid"):
+        builder._materialize_platform_harness(snapshot_workspace, snapshot_spec)
+
+    assert not (escaped / "ApkScannerHarnessActivity.java").exists()
+    assert manifest.read_text(encoding="utf-8").endswith("<application /></manifest>")
+
+
+def test_platform_harness_rejects_a_preexisting_source_symlink(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = write_poc_project(workspace)
+    sentinel = tmp_path / "sentinel.java"
+    sentinel.write_text("do not overwrite", encoding="utf-8")
+    source_dir = project / "src" / "io" / "apkscanner" / "poc" / "providerprobe"
+    harness = source_dir / "ApkScannerHarnessActivity.java"
+    harness.symlink_to(sentinel)
+    builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
+    requested = poc_spec().model_copy(
+        update={
+            "harness_mode": "platform_generated",
+            "attack_class": "io.apkscanner.poc.providerprobe.MainActivity",
+            "launch_component": ".ApkScannerHarnessActivity",
+        }
+    )
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        builder._snapshot_project(workspace, requested, tmp_path / "snapshot")
+
+    assert sentinel.read_text(encoding="utf-8") == "do not overwrite"
+
+
+def test_platform_harness_rejects_a_preexisting_source_hardlink(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = write_poc_project(workspace)
+    sentinel = tmp_path / "sentinel.java"
+    sentinel.write_text("do not overwrite", encoding="utf-8")
+    source_dir = project / "src" / "io" / "apkscanner" / "poc" / "providerprobe"
+    harness = source_dir / "ApkScannerHarnessActivity.java"
+    os.link(sentinel, harness)
+    builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
+    requested = poc_spec().model_copy(
+        update={
+            "harness_mode": "platform_generated",
+            "attack_class": "io.apkscanner.poc.providerprobe.MainActivity",
+            "launch_component": ".ApkScannerHarnessActivity",
+        }
+    )
+
+    with pytest.raises(ValueError, match="hard-linked"):
+        builder._snapshot_project(workspace, requested, tmp_path / "snapshot")
+
+    assert sentinel.read_text(encoding="utf-8") == "do not overwrite"
+
+
+def test_project_validation_rejects_a_fifo_source_without_reading_it(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = write_poc_project(workspace)
+    fifo = project / "src" / "Blocking.java"
+    os.mkfifo(fifo)
+    builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
+
+    with pytest.raises(ValueError, match="not a regular"):
+        builder._snapshot_project(workspace, poc_spec(), tmp_path / "snapshot")
+
+
+def test_poc_snapshot_freezes_inputs_before_agent_paths_can_change(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = write_poc_project(workspace)
+    source = next((project / "src").rglob("MainActivity.java"))
+    original_source = source.read_bytes()
+    original_manifest = (project / "AndroidManifest.xml").read_bytes()
+    builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
+    snapshot_workspace = tmp_path / "snapshot"
+
+    snapshot_spec = builder._snapshot_project(workspace, poc_spec(), snapshot_workspace)
+
+    sentinel = tmp_path / "late-swap.java"
+    sentinel.write_text("class ReplacedAfterSnapshot {}", encoding="utf-8")
+    source.unlink()
+    source.symlink_to(sentinel)
+    (project / "AndroidManifest.xml").write_text("<manifest />", encoding="utf-8")
+
+    snapshot_project, sources, manifest, _effective = builder._validate_project(
+        snapshot_workspace,
+        snapshot_spec,
+    )
+    archive = builder._source_archive(snapshot_project, sources, manifest)
+    with zipfile.ZipFile(io.BytesIO(archive)) as source_zip:
+        assert source_zip.read("AndroidManifest.xml") == original_manifest
+        assert source_zip.read("src/io/apkscanner/poc/providerprobe/MainActivity.java") == (
+            original_source
+        )
+    normalized_root = tmp_path / "normalized"
+    normalized_root.mkdir()
+    normalized = builder._build_sources(sources, normalized_root)
+    assert normalized[0].read_bytes() == original_source
+
+
+def test_poc_snapshot_ignores_non_input_cache_and_special_files(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = write_poc_project(workspace)
+    source_root = project / "src"
+    os.mkfifo(source_root / "ignored-cache.pipe")
+    sentinel = tmp_path / "cache.bin"
+    sentinel.write_bytes(b"shared cache")
+    os.link(sentinel, source_root / "ignored-cache.bin")
+    gradle_cache = project / ".gradle" / "cache"
+    gradle_cache.mkdir(parents=True)
+    os.mkfifo(gradle_cache / "worker.pipe")
+    builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
+    snapshot_workspace = tmp_path / "snapshot"
+
+    snapshot_spec = builder._snapshot_project(workspace, poc_spec(), snapshot_workspace)
+    snapshot_project, sources, manifest, effective = builder._validate_project(
+        snapshot_workspace,
+        snapshot_spec,
+    )
+
+    assert snapshot_project == snapshot_workspace / poc_spec().project_path
+    assert [item.name for item in sources] == ["MainActivity.java"]
+    assert manifest.is_file()
+    assert effective == poc_spec()
+
+
+def test_poc_snapshot_project_recovery_skips_a_fifo_manifest_candidate(
+    settings,
+    tmp_path,
+) -> None:  # noqa: ANN001
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    write_poc_project(workspace)
+    decoy = workspace / "poc" / "aaa-decoy"
+    (decoy / "src").mkdir(parents=True)
+    (decoy / "src" / "Decoy.java").write_text("class Decoy {}", encoding="utf-8")
+    os.mkfifo(decoy / "AndroidManifest.xml")
+    builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
+    stale_spec = poc_spec().model_copy(update={"project_path": "poc/missing-project"})
+    snapshot_workspace = tmp_path / "snapshot"
+
+    snapshot_spec = builder._snapshot_project(workspace, stale_spec, snapshot_workspace)
+
+    assert snapshot_spec.project_path == poc_spec().project_path
+    assert (snapshot_workspace / snapshot_spec.project_path / "AndroidManifest.xml").is_file()
 
 
 def test_platform_harness_build_stage_is_completed_not_skipped(
@@ -577,16 +833,28 @@ public final class Exploit {
     )
     builder = PocBuilder(settings, ToolRunner(), ArtifactStore(settings))
 
-    materialized = builder._materialize_platform_harness(workspace, requested)
+    original_manifest = (project / "AndroidManifest.xml").read_bytes()
+    snapshot_workspace = tmp_path / "snapshot"
+    snapshot_spec = builder._snapshot_project(workspace, requested, snapshot_workspace)
+    materialized = builder._materialize_platform_harness(snapshot_workspace, snapshot_spec)
     validated, sources, manifest, effective = builder._validate_project(
-        workspace,
+        snapshot_workspace,
         materialized,
         oracle=oracle,
     )
 
-    harness = source_dir / "ApkScannerHarnessActivity.java"
+    snapshot_project = snapshot_workspace / requested.project_path
+    harness = (
+        snapshot_project
+        / "src"
+        / "io"
+        / "apkscanner"
+        / "poc"
+        / "providerprobe"
+        / "ApkScannerHarnessActivity.java"
+    )
     harness_text = harness.read_text(encoding="utf-8")
-    assert validated == project
+    assert validated == snapshot_project
     assert harness in sources
     assert 'getStringExtra("apkscanner_request_id")' in harness_text
     assert 'record.put("row_count"' in harness_text
@@ -606,6 +874,8 @@ public final class Exploit {
     application = ElementTree.parse(manifest).getroot().find("application")
     assert application is not None
     assert application.get("{http://schemas.android.com/apk/res/android}debuggable") == "true"
+    assert not (source_dir / "ApkScannerHarnessActivity.java").exists()
+    assert (project / "AndroidManifest.xml").read_bytes() == original_manifest
 
 
 def test_poc_builder_allows_platform_owned_ui_oracle_without_poc_self_report(
@@ -1238,10 +1508,13 @@ def test_personal_lab_ingests_an_agent_built_prebuilt_apk(
     apk = workspace / "poc" / "provider_probe" / "build" / "probe.apk"
     apk.parent.mkdir(parents=True)
     apk.write_bytes(b"signed-agent-apk")
+    verified_payloads: list[bytes] = []
 
     class VerifyingRunner:
         @staticmethod
         def run(argv, **_kwargs):  # noqa: ANN001, ANN205
+            verified_payloads.append(Path(argv[-1]).read_bytes())
+            apk.write_bytes(b"swapped-after-snapshot")
             stdout = (
                 "package: name='io.apkscanner.poc.providerprobe'\n"
                 "sdkVersion:'26'\n"
@@ -1272,6 +1545,8 @@ def test_personal_lab_ingests_an_agent_built_prebuilt_apk(
 
     assert result.ok is True
     assert result.apk_path is not None and result.apk_path.is_file()
+    assert result.apk_path.read_bytes() == b"signed-agent-apk"
+    assert verified_payloads == [b"signed-agent-apk", b"signed-agent-apk"]
     assert result.metadata["platform_managed_build"] is False
     assert [kind for kind, _result, _metadata in result.commands] == [
         "poc.prebuilt.verify_signature",
@@ -1829,7 +2104,7 @@ def test_poc_execution_is_correlated_into_the_hypothesis_proof(
         assert proof.harm_demonstrated is False
 
 
-def test_agent_dynamic_experiment_closes_the_bound_proof(
+def test_agent_dynamic_experiment_cannot_self_certify_platform_proof(
     settings,
 ) -> None:  # noqa: ANN001
     settings.ensure_directories()
@@ -1963,9 +2238,10 @@ def test_agent_dynamic_experiment_closes_the_bound_proof(
     with database.session_factory() as session:
         proof = session.get(ProofAttempt, executed[0]["proof_attempt_id"])
         assert proof is not None
-        assert proof.status == "proven"
-        assert proof.harm_demonstrated is True
-        assert proof.oracle["dynamic_experiment_succeeded"] is True
-        assert proof.oracle["impact_contract_ids"] == [
-            "semantic:bridge.token.callback"
-        ]
+        assert proof.status == "inconclusive"
+        assert proof.harm_demonstrated is False
+        assert proof.oracle["dynamic_experiment_executed"] is True
+        assert proof.oracle["dynamic_experiment_succeeded"] is False
+        assert proof.oracle["execution_demonstrated"] is True
+        assert proof.oracle["impact_contract_ids"] == []
+        assert proof.oracle["unvalidated_agent_assertion_ids"]

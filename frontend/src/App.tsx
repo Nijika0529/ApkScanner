@@ -49,6 +49,34 @@ const severityTone = {
   info: "neutral",
 } as const
 
+type SignalActionTier = "runtime_oracle_gap" | "static_chain" | "raw_candidate"
+
+const signalTierPresentation = {
+  runtime_oracle_gap: {
+    label: "运行已观察 · 缺 Oracle",
+    shortLabel: "Oracle 缺口",
+    tone: "info",
+    rank: 0,
+  },
+  static_chain: {
+    label: "完整静态链 · 待证明",
+    shortLabel: "完整静态链",
+    tone: "warning",
+    rank: 1,
+  },
+  raw_candidate: {
+    label: "原始静态候选",
+    shortLabel: "原始候选",
+    tone: "neutral",
+    rank: 2,
+  },
+} as const
+
+const severityRank = { critical: 0, high: 1, medium: 2, low: 3, info: 4 } as const
+const confidenceRank = { high: 0, medium: 1, low: 2 } as const
+const runtimeOracleGapStatuses = new Set(["runtime_observed_unverified", "oracle_gap"])
+const closedSignalStatuses = new Set(["false_positive", "refuted_static", "not_reproduced"])
+
 const DETAIL_REFRESH_EVENTS = [
   "static.started",
   "static.completed",
@@ -111,8 +139,8 @@ const MUTABLE_EXPLORATION_EVENTS = new Set([
 function statusTone(status: string): "neutral" | "good" | "warning" | "danger" | "info" {
   if (["final", "completed", "covered", "accepted", "reproduced_blackbox", "proven"].includes(status)) return "good"
   if (["failed", "critical", "high", "tool_failed"].includes(status)) return "danger"
-  if (["inconclusive", "timed_out", "blocked_device", "partial", "degraded", "preliminary_ready", "cancel_requested", "challenged"].includes(status)) return "warning"
-  if (["investigating", "static_running", "running", "queued", "accepted_for_proof", "proof_planned", "executing"].includes(status)) return "info"
+  if (["inconclusive", "timed_out", "blocked_device", "partial", "degraded", "preliminary_ready", "cancel_requested", "challenged", "supported_static", "static_path_supported"].includes(status)) return "warning"
+  if (["investigating", "static_running", "running", "queued", "accepted_for_proof", "proof_planned", "executing", "runtime_observed_unverified", "oracle_gap"].includes(status)) return "info"
   return "neutral"
 }
 
@@ -542,8 +570,10 @@ function ScanDetailView({ data, health, subscribeEvents, onRefresh, onDelete, on
     setArtifactGraphLoaded(false)
     setArtifactGraphError(null)
   }, [scan.id])
-  const verificationCandidates = signals.filter(isVerificationCandidate)
-  const staticSignals = signals.filter((signal) => !isVerificationCandidate(signal))
+  const runtimeOracleGaps = signals.filter((signal) => signalActionTier(signal) === "runtime_oracle_gap")
+  const staticChainCandidates = signals.filter((signal) => signalActionTier(signal) === "static_chain")
+  const verificationCandidates = [...runtimeOracleGaps, ...staticChainCandidates]
+  const staticSignals = signals.filter((signal) => signalActionTier(signal) === "raw_candidate")
   const findingProvenance = useMemo(
     () => buildFindingProvenance([...findings, ...signals], tasks, entries, hypotheses),
     [entries, findings, hypotheses, signals, tasks],
@@ -588,7 +618,7 @@ function ScanDetailView({ data, health, subscribeEvents, onRefresh, onDelete, on
         <Metric label="黑盒复现" value={reproduced} icon={ShieldX} tone="rose" />
         <Metric label="导出组件" value={exported} icon={Box} tone="cyan" />
         <Metric label="Deep Link" value={links} icon={Link2} tone="cyan" />
-        <Metric label="待验证风险" value={verificationCandidates.length} icon={Bot} tone="violet" />
+        <Metric label="高价值待验证" value={verificationCandidates.length} icon={Bot} tone="violet" />
         <Metric label="覆盖项目" value={`${Math.round(coveragePercent)}%`} icon={Gauge} tone="emerald" />
       </div>
       <Card className="p-4 sm:p-6">
@@ -597,7 +627,7 @@ function ScanDetailView({ data, health, subscribeEvents, onRefresh, onDelete, on
           if (value === "assets") void loadArtifactGraph()
         }}>
           <TabsList aria-label="扫描详情">
-            <TabsTrigger value="overview">总览</TabsTrigger><TabsTrigger value="assets">资产图谱</TabsTrigger><TabsTrigger value="entries">攻击面 <span className="ml-1 text-xs text-slate-500">{entries.length}</span></TabsTrigger><TabsTrigger value="findings">已证实 Finding <span className="ml-1 text-xs text-slate-500">{findings.length}</span></TabsTrigger><TabsTrigger value="proof-backlog">待验证风险 <span className="ml-1 text-xs text-slate-500">{verificationCandidates.length}</span></TabsTrigger><TabsTrigger value="signals">静态线索 <span className="ml-1 text-xs text-slate-500">{staticSignals.length}</span></TabsTrigger><TabsTrigger value="versions">版本演进{versionData && <span className="ml-1 text-xs text-slate-500">{versionData.matches.length}</span>}</TabsTrigger><TabsTrigger value="coverage">覆盖矩阵</TabsTrigger><TabsTrigger value="tasks">探索任务</TabsTrigger><TabsTrigger value="proofs">验证链 <span className="ml-1 text-xs text-slate-500">{hypotheses.length}</span></TabsTrigger><TabsTrigger value="audits">AI 审计 <span className="ml-1 text-xs text-slate-500">{audits.length}</span></TabsTrigger>
+            <TabsTrigger value="overview">总览</TabsTrigger><TabsTrigger value="assets">资产图谱</TabsTrigger><TabsTrigger value="entries">攻击面 <span className="ml-1 text-xs text-slate-500">{entries.length}</span></TabsTrigger><TabsTrigger value="findings">已证实 Finding <span className="ml-1 text-xs text-slate-500">{findings.length}</span></TabsTrigger><TabsTrigger value="proof-backlog">待验证风险 <span className="ml-1 text-xs text-slate-500">{verificationCandidates.length}</span></TabsTrigger><TabsTrigger value="signals">原始线索 <span className="ml-1 text-xs text-slate-500">{staticSignals.length}</span></TabsTrigger><TabsTrigger value="versions">版本演进{versionData && <span className="ml-1 text-xs text-slate-500">{versionData.matches.length}</span>}</TabsTrigger><TabsTrigger value="coverage">覆盖矩阵</TabsTrigger><TabsTrigger value="tasks">探索任务</TabsTrigger><TabsTrigger value="proofs">验证链 <span className="ml-1 text-xs text-slate-500">{hypotheses.length}</span></TabsTrigger><TabsTrigger value="audits">AI 审计 <span className="ml-1 text-xs text-slate-500">{audits.length}</span></TabsTrigger>
           </TabsList>
           <TabsContent value="overview"><Overview scan={scan} health={health} coverage={coverage} quality={quality} /></TabsContent>
           <TabsContent value="assets">{artifactGraphLoading ? <LoadingState /> : artifactGraphError ? <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">{artifactGraphError}<Button className="ml-3" variant="secondary" size="sm" onClick={() => { setArtifactGraphLoaded(false); void loadArtifactGraph() }}>重试</Button></div> : artifactGraph ? <ArtifactGraphView graph={artifactGraph} /> : <EmptyRow text={artifactGraphLoaded ? "当前扫描没有资产图谱" : "正在准备资产图谱"} />}</TabsContent>
@@ -630,17 +660,20 @@ function Overview({ scan, health, coverage, quality }: { scan: Scan; health: Hea
 
 function QualityFunnel({ quality }: { quality: ScanQualitySummary }) {
   const cacheRate = quality.efficiency.cached_input_rate
+  const oracleGap = quality.funnel.find((stage) => stage.key === "runtime_observed_unverified")
+  const mainFunnel = quality.funnel.filter((stage) => stage.key !== "runtime_observed_unverified")
   const formatCount = (value: number) => new Intl.NumberFormat("zh-CN").format(value)
   const formatMinutes = (seconds: number) => `${(seconds / 60).toFixed(seconds >= 600 ? 0 : 1)} 分钟`
   return <section className="space-y-4">
     <SectionTitle icon={Activity} title="扫描质量漏斗" description="从确定性入口到动态危害证明；用于定位时间、Token 和设备消耗发生在哪一层" />
     <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8">
-      {quality.funnel.map((stage, index) => <div key={stage.key} className={cn("relative rounded-xl border p-3", index >= quality.funnel.length - 2 ? "border-emerald-200 bg-emerald-50/60" : "border-slate-200 bg-slate-50")}>
+      {mainFunnel.map((stage, index) => <div key={stage.key} className={cn("relative rounded-xl border p-3", index >= mainFunnel.length - 2 ? "border-emerald-200 bg-emerald-50/60" : "border-slate-200 bg-slate-50")}>
         <p className="text-[11px] font-medium text-slate-500">{stage.label}</p>
         <p className="mt-1 text-2xl font-bold tabular-nums text-slate-900">{formatCount(stage.count)}</p>
-        {index < quality.funnel.length - 1 && <ChevronRight className="absolute -right-2.5 top-1/2 z-10 hidden h-5 w-5 -translate-y-1/2 rounded-full bg-white text-slate-400 xl:block" />}
+        {index < mainFunnel.length - 1 && <ChevronRight className="absolute -right-2.5 top-1/2 z-10 hidden h-5 w-5 -translate-y-1/2 rounded-full bg-white text-slate-400 xl:block" />}
       </div>)}
     </div>
+    {oracleGap && <div className="flex flex-col gap-2 rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between"><div><p className="text-xs font-semibold text-cyan-950">旁路：{oracleGap.label}</p><p className="mt-1 text-xs leading-5 text-cyan-800">已观察到运行行为，但尚未由平台 Oracle 证明安全影响，因此不进入“危害已证明”主漏斗。</p></div><Badge tone="info">{formatCount(oracleGap.count)}</Badge></div>}
     <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-6">
       <QualityCost label="Agent 调用" value={formatCount(quality.cost.agent_calls)} detail={`${formatCount(quality.cost.completed_agent_calls)} 次完成`} />
       <QualityCost label="模型 Token" value={formatCount(quality.cost.total_tokens)} detail={`输入 ${formatCount(quality.cost.input_tokens)} · 输出 ${formatCount(quality.cost.output_tokens)}`} />
@@ -925,35 +958,39 @@ function VersionEvolution({ scan, snapshot, diff, matches, entries, onCreated }:
 }
 
 function Findings({ findings, verificationCandidates, provenanceByFinding, scanStatus, onRefresh, onOpenOperator }: { findings: Finding[]; verificationCandidates: Finding[]; provenanceByFinding: Map<string, FindingProvenance>; scanStatus: string; onRefresh: () => Promise<void>; onOpenOperator: (finding: Finding) => void }) {
-  const sorted = [...findings].sort((a, b) => ["critical", "high", "medium", "low", "info"].indexOf(a.severity) - ["critical", "high", "medium", "low", "info"].indexOf(b.severity))
-  const pending = [...verificationCandidates].sort((a, b) => ["critical", "high", "medium", "low", "info"].indexOf(a.severity) - ["critical", "high", "medium", "low", "info"].indexOf(b.severity))
+  const sorted = [...findings].sort(compareConfirmedFindings)
+  const pending = [...verificationCandidates].sort(compareActionableSignals)
+  const runtimeGapCount = pending.filter((finding) => signalActionTier(finding) === "runtime_oracle_gap").length
+  const staticChainCount = pending.length - runtimeGapCount
   const isFinal = ["final", "failed"].includes(scanStatus)
   return <div className="space-y-6">
     <section className="space-y-3">
       <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm leading-relaxed text-emerald-950">这里只展示平台 Oracle 已证明具体安全影响、且所有 Evidence ID 均可核验的漏洞。静态规则与 AI 静态判断不会计入 Finding。</div>
       {!isFinal && <div className="rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-sm leading-relaxed text-cyan-950">扫描尚未完成，后续动态证明可能继续增加 Finding。</div>}
-      {sorted.map((finding) => <FindingCard key={finding.id} finding={finding} provenance={provenanceByFinding.get(finding.id)} onRefresh={onRefresh} onOpenOperator={onOpenOperator} />)}
+      {sorted.map((finding) => <FindingCard key={finding.id} finding={finding} canAccept provenance={provenanceByFinding.get(finding.id)} onRefresh={onRefresh} onOpenOperator={onOpenOperator} />)}
       {!findings.length && <EmptyRow text="尚无经过动态证据证明的 Finding" />}
     </section>
     {pending.length > 0 && <section className="space-y-3 border-t border-slate-200 pt-6">
       <div className="flex flex-col gap-3 rounded-xl border border-orange-200 bg-orange-50 px-4 py-4 sm:flex-row sm:items-center sm:justify-between">
-        <div><div className="flex items-center gap-2"><Bot className="h-4 w-4 text-orange-700" /><h3 className="font-bold text-orange-950">待验证风险</h3><Badge tone="warning">{pending.length}</Badge></div><p className="mt-2 text-sm leading-6 text-orange-900">以下风险已有静态证据支持，但尚未获得平台危害 Oracle。它们不会计入上方已证实 Finding 数量；可在“待验证风险”Tab 中重新验证。</p></div>
+        <div><div className="flex flex-wrap items-center gap-2"><Bot className="h-4 w-4 text-orange-700" /><h3 className="font-bold text-orange-950">高价值待验证风险</h3><Badge tone="info">运行已观察 {runtimeGapCount}</Badge><Badge tone="warning">完整静态链 {staticChainCount}</Badge></div><p className="mt-2 text-sm leading-6 text-orange-900">这里不混入原始规则命中：只展示已有完整静态攻击链，或运行时已观察到目标行为但仍缺平台 Oracle 的候选。它们不会计入已证实 Finding。</p></div>
       </div>
-      {pending.map((finding) => <FindingCard key={`pending-${finding.id}`} finding={finding} provenance={provenanceByFinding.get(finding.id)} onRefresh={onRefresh} onOpenOperator={onOpenOperator} />)}
+      {pending.map((finding) => <FindingCard key={`pending-${finding.id}`} finding={finding} signalTier={signalActionTier(finding)} canAccept={finding.can_accept === true} provenance={provenanceByFinding.get(finding.id)} onRefresh={onRefresh} onOpenOperator={onOpenOperator} />)}
     </section>}
   </div>
 }
 
 function Signals({ signals, provenanceByFinding, onRefresh, onOpenOperator }: { signals: Finding[]; provenanceByFinding: Map<string, FindingProvenance>; onRefresh: () => Promise<void>; onOpenOperator: (finding: Finding) => void }) {
-  const sorted = [...signals].sort((a, b) => ["critical", "high", "medium", "low", "info"].indexOf(a.severity) - ["critical", "high", "medium", "low", "info"].indexOf(b.severity))
-  return <div className="space-y-3"><div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">这些是静态规则、AI 静态支持或尚未完成影响证明的调查线索，用于指导后续验证；它们不计入最终 Finding，也不代表漏洞已经成立。</div>{sorted.map((finding) => <FindingCard key={finding.id} finding={finding} provenance={provenanceByFinding.get(finding.id)} onRefresh={onRefresh} onOpenOperator={onOpenOperator} />)}{!signals.length && <EmptyRow text="没有待验证线索" />}</div>
+  const sorted = [...signals].sort(compareActionableSignals)
+  return <div className="space-y-3"><div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm leading-relaxed text-slate-700">这里只保留尚未形成完整攻击链的 API/规则命中，以及其他低证据调查记录。严重度表示潜在影响，不代表漏洞已经成立；这些记录不会进入待验证风险或最终 Finding。</div>{sorted.map((finding) => <FindingCard key={finding.id} finding={finding} signalTier="raw_candidate" canAccept={finding.can_accept === true} provenance={provenanceByFinding.get(finding.id)} onRefresh={onRefresh} onOpenOperator={onOpenOperator} />)}{!signals.length && <EmptyRow text="没有原始静态线索" />}</div>
 }
 
 function ProofBacklog({ signals, tasks, provenanceByFinding, onRefresh, onOpenOperator }: { signals: Finding[]; tasks: InvestigationTask[]; provenanceByFinding: Map<string, FindingProvenance>; onRefresh: () => Promise<void>; onOpenOperator: (finding: Finding) => void }) {
   const [retrying, setRetrying] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const tasksById = new Map(tasks.map((task) => [task.id, task]))
-  const sorted = [...signals].sort((a, b) => ["critical", "high", "medium", "low", "info"].indexOf(a.severity) - ["critical", "high", "medium", "low", "info"].indexOf(b.severity))
+  const sorted = [...signals].sort(compareActionableSignals)
+  const runtimeGapCount = sorted.filter((signal) => signalActionTier(signal) === "runtime_oracle_gap").length
+  const staticChainCount = sorted.length - runtimeGapCount
 
   async function retry(task: InvestigationTask) {
     setRetrying(task.id)
@@ -969,9 +1006,12 @@ function ProofBacklog({ signals, tasks, provenanceByFinding, onRefresh, onOpenOp
   }
 
   return <div className="space-y-4">
-    <div className="rounded-xl border border-orange-200 bg-orange-50 px-4 py-3 text-sm leading-relaxed text-orange-950">这里集中展示 Agent 已建立具体静态攻击路径、但尚未获得平台危害 Oracle 的风险候选。它们不会计入最终 Finding；接入 ADB 后可使用平台临时验证 Harness、Agent 专用 PoC 或人工复现继续验证。</div>
+    <div className="rounded-xl border border-orange-200 bg-orange-50 px-4 py-3 text-sm leading-relaxed text-orange-950"><div className="mb-2 flex flex-wrap gap-2"><Badge tone="info">运行已观察 · 缺 Oracle {runtimeGapCount}</Badge><Badge tone="warning">完整静态链 {staticChainCount}</Badge></div>列表按处置价值、置信度、潜在影响排序。运行时已观察但缺平台 ProofAttempt 的 Oracle 缺口优先，其次是完整静态攻击链；原始规则命中已移到“原始线索”。</div>
     {error && <div role="alert" className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">{error}</div>}
     {sorted.map((signal) => {
+      const tier = signalActionTier(signal)
+      const tierPresentation = signalTierPresentation[tier]
+      const runtimeGap = tier === "runtime_oracle_gap"
       const backlog = asRecord(signal.metadata_json.proof_backlog)
       const taskId = textValue(backlog?.task_id) ?? textValue(signal.metadata_json.task_id)
       const task = taskId ? tasksById.get(taskId) : undefined
@@ -982,12 +1022,12 @@ function ProofBacklog({ signals, tasks, provenanceByFinding, onRefresh, onOpenOp
         blocked_before_execution: "自动测试在执行前受阻",
         manual_or_poc_required: "需要专用 PoC 或人工复现",
       }[automationState] ?? automationState
-      return <div key={signal.id} className="overflow-hidden rounded-xl border border-orange-200 bg-orange-50/40">
-        <div className="flex flex-col gap-3 border-b border-orange-200 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-          <div><div className="flex flex-wrap items-center gap-2"><Badge tone="warning">待动态证明</Badge><Badge>{stateLabel}</Badge></div>{gaps.length > 0 && <p className="mt-2 text-xs leading-5 text-orange-900">{gaps.slice(0, 2).join("；")}</p>}</div>
+      return <div key={signal.id} className={cn("overflow-hidden rounded-xl border", runtimeGap ? "border-cyan-200 bg-cyan-50/40" : "border-orange-200 bg-orange-50/40")}>
+        <div className={cn("flex flex-col gap-3 border-b px-4 py-3 sm:flex-row sm:items-center sm:justify-between", runtimeGap ? "border-cyan-200" : "border-orange-200")}>
+          <div><div className="flex flex-wrap items-center gap-2"><Badge tone={tierPresentation.tone}>{tierPresentation.label}</Badge><Badge>{stateLabel}</Badge></div>{gaps.length > 0 && <p className={cn("mt-2 text-xs leading-5", runtimeGap ? "text-cyan-900" : "text-orange-900")}>{gaps.slice(0, 2).join("；")}</p>}</div>
           {task && isTerminalTask(task.status) && <Button variant="secondary" size="sm" onClick={() => retry(task)} disabled={retrying === task.id}>{retrying === task.id ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}重新验证</Button>}
         </div>
-        <FindingCard finding={signal} provenance={provenanceByFinding.get(signal.id)} onRefresh={onRefresh} onOpenOperator={onOpenOperator} />
+        <FindingCard finding={signal} signalTier={tier} canAccept={signal.can_accept === true} provenance={provenanceByFinding.get(signal.id)} onRefresh={onRefresh} onOpenOperator={onOpenOperator} />
       </div>
     })}
     {!sorted.length && <EmptyRow text="没有等待动态证明的风险候选" />}
@@ -1053,17 +1093,78 @@ function buildFindingProvenance(findings: Finding[], tasks: InvestigationTask[],
   return result
 }
 
-function isVerificationCandidate(signal: Finding) {
-  const backlog = asRecord(signal.metadata_json.proof_backlog)
-  return backlog?.status === "proof_required"
-    || signal.status === "supported_static"
+function signalActionTier(signal: Finding): SignalActionTier {
+  const metadata = signal.metadata_json
+  if (closedSignalStatuses.has(signal.status)) return "raw_candidate"
+  if (signal.signal_tier && signal.signal_tier in signalTierPresentation) {
+    return signal.signal_tier
+  }
+  const adaptive = asRecord(metadata.adaptive_verification)
+  const staticGate = asRecord(metadata.platform_static_support_gate)
+  const requiredStaticFields = new Set([
+    "source",
+    "control",
+    "sink",
+    "reachable_path",
+    "boundary",
+    "security_impact",
+    "missing_control",
+  ])
+  const gateFields = Array.isArray(staticGate?.required_fields)
+    ? staticGate.required_fields.filter((value): value is string => typeof value === "string")
+    : []
+  const gateEvidenceIds = Array.isArray(staticGate?.static_evidence_ids)
+    ? staticGate.static_evidence_ids.filter((value): value is string => typeof value === "string" && Boolean(value))
+    : []
+  const gateSuppressions = Array.isArray(staticGate?.suppression_reasons)
+    ? staticGate.suppression_reasons
+    : null
+  const validStaticGate = textValue(staticGate?.schema_version) === "1.0"
+    && booleanValue(staticGate?.eligible) === true
+    && [...requiredStaticFields].every((field) => gateFields.includes(field))
+    && gateEvidenceIds.length > 0
+    && gateSuppressions?.length === 0
+  const runtimeObserved = booleanValue(adaptive?.runtime_observed) === true
+    || booleanValue(metadata.runtime_observed) === true
+  const modelVerdict = textValue(adaptive?.model_verdict)
+  const overrideReason = textValue(adaptive?.verdict_override_reason)
+    ?? textValue(metadata.verdict_override_reason)
+  const harmDemonstrated = booleanValue(metadata.harm_demonstrated) === true
+  const runtimeClaimMissingOracle = runtimeObserved
+    && !harmDemonstrated
+    && (modelVerdict === "reproduced_blackbox" || Boolean(overrideReason))
+
+  if (runtimeOracleGapStatuses.has(signal.status) || runtimeClaimMissingOracle) {
+    return "runtime_oracle_gap"
+  }
+  if (["static_path_supported", "supported_static"].includes(signal.status)
+    && validStaticGate) {
+    return "static_chain"
+  }
+  return "raw_candidate"
+}
+
+function compareActionableSignals(left: Finding, right: Finding) {
+  const tierDifference = signalTierPresentation[signalActionTier(left)].rank
+    - signalTierPresentation[signalActionTier(right)].rank
+  if (tierDifference) return tierDifference
+  const confidenceDifference = confidenceRank[left.confidence] - confidenceRank[right.confidence]
+  if (confidenceDifference) return confidenceDifference
+  const severityDifference = severityRank[left.severity] - severityRank[right.severity]
+  if (severityDifference) return severityDifference
+  return right.updated_at.localeCompare(left.updated_at)
+}
+
+function compareConfirmedFindings(left: Finding, right: Finding) {
+  return severityRank[left.severity] - severityRank[right.severity]
 }
 
 function findingReport(finding: Finding): FindingReport | null {
   const value = asRecord(finding.metadata_json.report)
   const verification = asRecord(value?.verification)
+  const claimedConfirmed = ["accepted", "reproduced_blackbox"].includes(finding.status)
+  const confirmed = claimedConfirmed && finding.can_accept !== false
   if (!value || !verification) {
-    const confirmed = finding.status === "reproduced_blackbox"
     const legacyStatus: FindingReport["verification"]["status"] = confirmed
       ? "confirmed"
       : finding.status === "refuted_static" || finding.status === "false_positive"
@@ -1091,21 +1192,38 @@ function findingReport(finding: Finding): FindingReport | null {
       hypothesis_id: textValue(finding.metadata_json.hypothesis_id) ?? "",
     }
   }
-  const kind = textValue(value?.kind)
-  const status = textValue(verification?.status)
+  let kind = textValue(value?.kind)
+  let status = textValue(verification?.status)
   if (!["finding", "pending_risk"].includes(kind ?? "") || !["confirmed", "pending", "refuted", "inconclusive"].includes(status ?? "")) return null
+  if (confirmed) {
+    kind = "finding"
+    status = "confirmed"
+  } else {
+    kind = "pending_risk"
+    status = ["false_positive", "refuted_static"].includes(finding.status)
+      ? "refuted"
+      : ["not_reproduced", "inconclusive"].includes(finding.status)
+        ? "inconclusive"
+        : "pending"
+  }
   return {
     schema_version: "1.0",
     kind: kind as FindingReport["kind"],
     title: textValue(value.title) ?? finding.title,
-    conclusion: textValue(value.conclusion) ?? finding.description,
+    conclusion: finding.status === "false_positive" && finding.review_note
+      ? `人工复核为误报：${finding.review_note}`
+      : textValue(value.conclusion) ?? finding.description,
     conditions: stringValues(value.conditions),
     attack_chain: stringValues(value.attack_chain),
     verification: {
       status: status as FindingReport["verification"]["status"],
       established_facts: stringValues(verification.established_facts),
-      missing_proof: textValue(verification.missing_proof) ?? null,
-      next_step: textValue(verification.next_step) ?? null,
+      missing_proof: claimedConfirmed && !confirmed
+        ? "平台未找到可归因、证据完整的危害证明回执。"
+        : textValue(verification.missing_proof) ?? null,
+      next_step: claimedConfirmed && !confirmed
+        ? "重新核验证明回执后再接受该记录。"
+        : textValue(verification.next_step) ?? null,
       evidence_ids: stringValues(verification.evidence_ids),
       proof_attempt_ids: stringValues(verification.proof_attempt_ids),
     },
@@ -1115,10 +1233,15 @@ function findingReport(finding: Finding): FindingReport | null {
   }
 }
 
-function FindingCard({ finding, provenance, onRefresh, onOpenOperator }: { finding: Finding; provenance?: FindingProvenance; onRefresh: () => Promise<void>; onOpenOperator: (finding: Finding) => void }) {
+function FindingCard({ finding, signalTier, canAccept = false, provenance, onRefresh, onOpenOperator }: { finding: Finding; signalTier?: SignalActionTier; canAccept?: boolean; provenance?: FindingProvenance; onRefresh: () => Promise<void>; onOpenOperator: (finding: Finding) => void }) {
   const [open, setOpen] = useState(false)
   const [reviewOpen, setReviewOpen] = useState(false)
   const report = findingReport(finding)
+  const tierPresentation = signalTier ? signalTierPresentation[signalTier] : null
+  const displayStatus = ["accepted", "reproduced_blackbox"].includes(finding.status)
+    && finding.can_accept === false
+    ? "candidate"
+    : finding.status
   return (
     <article className="content-auto rounded-xl border border-slate-200 bg-slate-50/70">
       <button
@@ -1130,7 +1253,8 @@ function FindingCard({ finding, provenance, onRefresh, onOpenOperator }: { findi
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="font-semibold text-slate-900">{finding.title}</h3>
-            <Badge tone={statusTone(finding.status)}>{statusLabel(finding.status)}</Badge>
+            {tierPresentation && <Badge tone={tierPresentation.tone}>{tierPresentation.shortLabel}</Badge>}
+            <Badge tone={statusTone(displayStatus)}>{statusLabel(displayStatus)}</Badge>
           </div>
           <p className="mt-1.5 line-clamp-2 text-sm leading-relaxed text-slate-500">
             {report?.conclusion ?? markdownToPlainText(finding.description)}
@@ -1138,7 +1262,7 @@ function FindingCard({ finding, provenance, onRefresh, onOpenOperator }: { findi
           <div className="mt-3 flex flex-wrap gap-3 text-[11px] text-slate-600">
             <span>{finding.masvs}</span>
             {finding.cwe && <span>{finding.cwe}</span>}
-            <span>置信度 {finding.confidence}</span>
+            <span>置信度 {confidenceLabel(finding.confidence)}</span>
             <span>{finding.source}</span>
           </div>
           {((provenance?.entryIds.length ?? 0) > 0 || (provenance?.taskIds.length ?? 0) > 0) && <div className="mt-3 flex flex-wrap items-center gap-1.5 text-[11px]">
@@ -1190,11 +1314,11 @@ function FindingCard({ finding, provenance, onRefresh, onOpenOperator }: { findi
           )}
           <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
             <p className="font-mono text-xs text-slate-600">rule · {finding.rule_id} · evidence {finding.evidence_ids.length}</p>
-            <div className="flex gap-2"><Button variant="secondary" size="sm" onClick={() => onOpenOperator(finding)}><Bot className="h-3.5 w-3.5" />交给平台 Agent</Button><Button variant="secondary" size="sm" onClick={() => setReviewOpen(true)}>人工审核</Button></div>
+            <div className="flex gap-2"><Button variant="secondary" size="sm" onClick={() => onOpenOperator(finding)}><Bot className="h-3.5 w-3.5" />交给平台 Agent</Button><Button variant="secondary" size="sm" onClick={() => setReviewOpen(true)}>{canAccept ? "人工审核" : "标记误报/待确认"}</Button></div>
           </div>
         </div>
       )}
-      <ReviewDialog finding={finding} open={reviewOpen} onOpenChange={setReviewOpen} onReviewed={onRefresh} />
+      <ReviewDialog finding={finding} canAccept={canAccept} open={reviewOpen} onOpenChange={setReviewOpen} onReviewed={onRefresh} />
     </article>
   )
 }
@@ -1224,14 +1348,17 @@ function FindingProvenancePanel({ provenance }: { provenance?: FindingProvenance
   </section>
 }
 
-function ReviewDialog({ finding, open, onOpenChange, onReviewed }: { finding: Finding; open: boolean; onOpenChange: (open: boolean) => void; onReviewed: () => Promise<void> }) {
-  const [status, setStatus] = useState<"accepted" | "false_positive" | "candidate">("accepted")
+function ReviewDialog({ finding, canAccept, open, onOpenChange, onReviewed }: { finding: Finding; canAccept: boolean; open: boolean; onOpenChange: (open: boolean) => void; onReviewed: () => Promise<void> }) {
+  const [status, setStatus] = useState<"accepted" | "false_positive" | "candidate">(canAccept ? "accepted" : "candidate")
   const [note, setNote] = useState("")
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   useEffect(() => {
-    if (open) setError(null)
-  }, [open, finding.id])
+    if (open) {
+      setError(null)
+      setStatus(canAccept ? "accepted" : "candidate")
+    }
+  }, [canAccept, open, finding.id])
   async function submit(event: FormEvent) {
     event.preventDefault()
     setSaving(true)
@@ -1247,7 +1374,10 @@ function ReviewDialog({ finding, open, onOpenChange, onReviewed }: { finding: Fi
       setSaving(false)
     }
   }
-  return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent><DialogTitle className="text-xl font-bold text-slate-950">审核 Finding</DialogTitle><DialogDescription className="mt-2 text-sm text-slate-600">Agent 和规则结论不会自动成为发布门禁，请记录人工判断依据。</DialogDescription><form className="mt-6 space-y-5" onSubmit={submit}><fieldset><legend className="mb-3 text-sm font-semibold text-slate-800">审核结论</legend><div className="grid grid-cols-3 gap-2">{([['accepted','接受'],['false_positive','误报'],['candidate','待确认']] as const).map(([value,label]) => <label key={value} className={cn("cursor-pointer rounded-lg border p-3 text-center text-sm", status === value ? "border-cyan-400 bg-cyan-400/10 text-cyan-800" : "border-slate-300 text-slate-600")}><input type="radio" name="status" value={value} checked={status === value} onChange={() => setStatus(value)} className="sr-only" />{label}</label>)}</div></fieldset><label className="block"><span className="mb-2 block text-sm font-semibold text-slate-800">审核备注 <span className="text-rose-700">*</span></span><textarea required minLength={1} maxLength={4000} value={note} onChange={(event) => setNote(event.target.value)} rows={5} className="field resize-y" placeholder="说明接受、误报或待确认的依据" /></label>{error && <p role="alert" className="text-sm text-rose-700">{error}</p>}<div className="flex justify-end gap-2"><Button type="button" variant="ghost" onClick={() => onOpenChange(false)} disabled={saving}>取消</Button><Button type="submit" disabled={saving || !note.trim()}>{saving && <LoaderCircle className="h-4 w-4 animate-spin" />}保存审核</Button></div></form></DialogContent></Dialog>
+  const options = canAccept
+    ? ([['accepted', '接受'], ['false_positive', '误报']] as const)
+    : ([['false_positive', '误报'], ['candidate', '待确认']] as const)
+  return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent><DialogTitle className="text-xl font-bold text-slate-950">审核 Finding</DialogTitle><DialogDescription className="mt-2 text-sm text-slate-600">{canAccept ? "该 Finding 已有平台危害证明，可记录接受或误报的人工判断。" : "该线索尚无平台危害证明，不能由人工直接提升为已接受漏洞；可标记误报或继续待确认。"}</DialogDescription><form className="mt-6 space-y-5" onSubmit={submit}><fieldset><legend className="mb-3 text-sm font-semibold text-slate-800">审核结论</legend><div className="grid grid-cols-2 gap-2">{options.map(([value,label]) => <label key={value} className={cn("cursor-pointer rounded-lg border p-3 text-center text-sm", status === value ? "border-cyan-400 bg-cyan-400/10 text-cyan-800" : "border-slate-300 text-slate-600")}><input type="radio" name="status" value={value} checked={status === value} onChange={() => setStatus(value)} className="sr-only" />{label}</label>)}</div></fieldset><label className="block"><span className="mb-2 block text-sm font-semibold text-slate-800">审核备注 <span className="text-rose-700">*</span></span><textarea required minLength={1} maxLength={4000} value={note} onChange={(event) => setNote(event.target.value)} rows={5} className="field resize-y" placeholder={canAccept ? "说明接受或误报的依据" : "说明误报或继续待确认的依据"} /></label>{error && <p role="alert" className="text-sm text-rose-700">{error}</p>}<div className="flex justify-end gap-2"><Button type="button" variant="ghost" onClick={() => onOpenChange(false)} disabled={saving}>取消</Button><Button type="submit" disabled={saving || !note.trim()}>{saving && <LoaderCircle className="h-4 w-4 animate-spin" />}保存审核</Button></div></form></DialogContent></Dialog>
 }
 
 function OperatorDialog({ open, onOpenChange, scan, finding, onFindingUpdated }: { open: boolean; onOpenChange: (open: boolean) => void; scan: Scan | null; finding: Finding | null; onFindingUpdated: () => Promise<void> }) {

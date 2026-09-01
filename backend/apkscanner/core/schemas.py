@@ -120,6 +120,11 @@ class FindingOut(ApiModel):
     updated_at: datetime
 
 
+class FindingSignalOut(FindingOut):
+    signal_tier: Literal["runtime_oracle_gap", "static_chain", "raw_candidate"]
+    can_accept: bool
+
+
 class SecuritySnapshotOut(ApiModel):
     id: str
     scan_id: str
@@ -970,9 +975,25 @@ class AgentHypothesisAssessment(BaseModel):
     source: str = Field(default="", max_length=2000)
     control: str = Field(default="", max_length=2000)
     sink: str = Field(default="", max_length=2000)
-    reachable_path: str = Field(default="", max_length=4000)
-    boundary: str = Field(default="", max_length=2000)
-    counterevidence: list[str] = Field(default_factory=list)
+    reachable_path: str = Field(
+        default="",
+        max_length=4000,
+        description="Ordered source -> ... -> sink chain, or the exact blocked edge.",
+    )
+    boundary: str = Field(
+        default="",
+        max_length=2000,
+        description="Trust transition written as attacker_context -> target_context.",
+    )
+    security_impact: str = Field(default="", max_length=4000)
+    missing_control: str = Field(default="", max_length=2000)
+    counterevidence: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Concrete evidence against the claim; refuted_static requires an exact guard or "
+            "unreachable edge tied to cited static Evidence."
+        ),
+    )
     proof_gaps: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
     confidence: Literal["high", "medium", "low"] = "medium"
@@ -1363,9 +1384,21 @@ class AdaptiveVerifierAssessment(BaseModel):
     confidence: Literal["high", "medium", "low"]
     runtime_observed: bool
     summary: str = Field(min_length=1, max_length=8000)
-    attack_chain: str = Field(default="", max_length=12_000)
+    attack_chain: str = Field(
+        default="",
+        max_length=12_000,
+        description=(
+            "Ordered attack chain; refuted_static requires the exact guard or unreachable edge."
+        ),
+    )
     security_impact: str = Field(default="", max_length=8000)
-    counterevidence: list[str] = Field(default_factory=list)
+    counterevidence: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Concrete evidence against the claim; static refutation requires an exact guard or "
+            "unreachable edge tied to cited static Evidence."
+        ),
+    )
     remaining_gaps: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
     experiments: list[AdaptiveVerifierExperiment] = Field(default_factory=list)

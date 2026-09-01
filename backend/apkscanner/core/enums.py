@@ -49,12 +49,30 @@ class TaskType(StrEnum):
 class FindingStatus(StrEnum):
     CANDIDATE = "candidate"
     SUPPORTED_STATIC = "supported_static"
+    RUNTIME_OBSERVED_UNVERIFIED = "runtime_observed_unverified"
     REFUTED_STATIC = "refuted_static"
     REPRODUCED_BLACKBOX = "reproduced_blackbox"
     NOT_REPRODUCED = "not_reproduced"
     INCONCLUSIVE = "inconclusive"
     ACCEPTED = "accepted"
     FALSE_POSITIVE = "false_positive"
+
+
+FINDING_STATUS_RANK = {
+    FindingStatus.INCONCLUSIVE.value: 0,
+    FindingStatus.CANDIDATE.value: 1,
+    FindingStatus.REFUTED_STATIC.value: 2,
+    FindingStatus.NOT_REPRODUCED.value: 3,
+    FindingStatus.SUPPORTED_STATIC.value: 4,
+    # Historical names remain rank-compatible during in-place DB reconciliation.
+    "static_path_supported": 4,
+    FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value: 5,
+    "oracle_gap": 5,
+    # An operator closure must not be reopened by another unproven signal.
+    FindingStatus.FALSE_POSITIVE.value: 6,
+    FindingStatus.ACCEPTED.value: 7,
+    FindingStatus.REPRODUCED_BLACKBOX.value: 8,
+}
 
 
 class Severity(StrEnum):
@@ -113,6 +131,7 @@ class EntryDisposition(StrEnum):
     CALLER_IDENTITY_PROTECTED = "caller_identity_protected"
     ATTACK_CHAIN_CANDIDATE = "attack_chain_candidate"
     STATICALLY_SUPPORTED = "statically_supported"
+    RUNTIME_OBSERVED_UNVERIFIED = "runtime_observed_unverified"
     DYNAMICALLY_NOT_REPRODUCED = "dynamically_not_reproduced"
     DYNAMICALLY_REFUTED = "dynamically_refuted"
     REPRODUCED_BLACKBOX = "reproduced_blackbox"
