@@ -27,7 +27,7 @@ def test_default_profiles_are_frozen_versioned_and_hashable(settings) -> None:  
     assert frozen.execution.proof_replay == "task_gateway"
     assert frozen.provider.backend == "codex"
     assert frozen.provider.provider == "deepseek"
-    assert frozen.provider.model == "deepseek-v4-flash"
+    assert frozen.provider.model == "deepseek-flash"
     assert frozen.provider.wire_api == "responses"
     assert set(frozen.phase_route.routes) == PHASE_NAMES
     assert len(frozen.fingerprint()) == 64
@@ -49,7 +49,7 @@ def test_phase_routes_reject_opencode_and_unknown_phases() -> None:
 def test_provider_profile_rejects_unsupported_model_and_unsafe_url(tmp_path: Path) -> None:
     catalog = tmp_path / "models.json"
     catalog.write_text('{"models": []}', encoding="utf-8")
-    with pytest.raises(ValidationError, match="deepseek-v4-flash"):
+    with pytest.raises(ValidationError, match="deepseek-flash"):
         ProviderProfile(model="deepseek-v4-pro", model_catalog_path=catalog)
     with pytest.raises(ValidationError, match="credentials"):
         ProviderProfile(

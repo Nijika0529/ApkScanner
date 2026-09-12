@@ -93,6 +93,41 @@ def test_web_search_items_have_explicit_audit_event_types() -> None:
     assert completed.data["action_type"] == "search"
 
 
+def test_sdk_0147_additive_web_search_fields_do_not_expand_audit_payload() -> None:
+    completed = normalize_codex_notification(
+        SimpleNamespace(
+            method="item/completed",
+            payload={
+                "turnId": "turn-147",
+                "emittedAtMs": 1_788_201_600_000,
+                "item": {
+                    "id": "web-147",
+                    "type": "webSearch",
+                    "status": "completed",
+                    "query": "Android exported provider exploit",
+                    "action": {"type": "search"},
+                    "results": [
+                        {
+                            "title": "untrusted remote content",
+                            "authorization": "Bearer sk-secret147",
+                        }
+                    ],
+                },
+            },
+        )
+    )
+
+    assert completed is not None
+    assert completed.event_type == "web_search.completed"
+    assert completed.data == {
+        "item_id": "web-147",
+        "item_type": "webSearch",
+        "status": "completed",
+        "query": "Android exported provider exploit",
+        "action_type": "search",
+    }
+
+
 def test_worker_events_redact_secret_keys_and_values() -> None:
     event = runtime_event_from_mapping(
         {

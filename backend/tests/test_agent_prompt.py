@@ -201,6 +201,23 @@ def test_adaptive_verifier_prompt_uses_semantic_oracles_and_direct_host_ssh() ->
     assert "最终由你对返回值、token、账号能力" in prompt
 
 
+def test_adaptive_verifier_prompt_restricts_remote_external_ports() -> None:
+    instructions = adaptive_verifier_developer_instructions(
+        ssh_available=True,
+        public_port_range=(12000, 16000),
+    )
+    assert "12000-16000" in instructions
+    assert "reachable from outside" in instructions
+
+    # Without a configured range the verifier gets no environment-specific claim.
+    assert "12000-16000" not in adaptive_verifier_developer_instructions(ssh_available=True)
+    # Without SSH material the remote-port rule is irrelevant.
+    assert "12000-16000" not in adaptive_verifier_developer_instructions(
+        ssh_available=False,
+        public_port_range=(12000, 16000),
+    )
+
+
 def test_adaptive_verifier_retry_reuses_prior_runtime_evidence() -> None:
     scan = Scan(
         id="00000000-0000-0000-0000-000000000001",

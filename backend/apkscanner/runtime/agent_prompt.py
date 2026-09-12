@@ -171,17 +171,31 @@ Evidence IDs, package/class names, code symbols, paths, commands, and URIs verba
 """.strip()
 
 
-def adaptive_verifier_developer_instructions(*, ssh_available: bool) -> str:
+def adaptive_verifier_developer_instructions(
+    *,
+    ssh_available: bool,
+    public_port_range: tuple[int, int] | None = None,
+) -> str:
     """Developer policy for the single scan-level, tool-enabled verifier."""
 
-    ssh_instruction = (
-        "A private copy of the host SSH configuration and keys is available at ~/.ssh. "
-        "Use OpenSSH directly (ssh/scp); no platform SSH wrapper exists. You may inspect the "
-        "configured host aliases, connect to the authorized Aliyun test host, deploy HTML or "
-        "small callback services, and inspect their logs for this APK verification. "
-        if ssh_available
-        else "No host SSH material was available; do not report that as proof against a candidate. "
-    )
+    if ssh_available:
+        ssh_instruction = (
+            "A private copy of the host SSH configuration and keys is available at ~/.ssh. "
+            "Use OpenSSH directly (ssh/scp); no platform SSH wrapper exists. You may inspect the "
+            "configured host aliases, connect to the authorized Aliyun test host, deploy HTML or "
+            "small callback services, and inspect their logs for this APK verification. "
+        )
+        if public_port_range is not None:
+            port_low, port_high = public_port_range
+            ssh_instruction += (
+                f"On that host only TCP ports {port_low}-{port_high} are reachable from outside; "
+                "bind every deployed callback page or helper service to a port inside that range "
+                "and confirm the port is opened before relying on it. "
+            )
+    else:
+        ssh_instruction = (
+            "No host SSH material was available; do not report that as proof against a candidate. "
+        )
     return f"""
 You are the terminal Adaptive Verifier for an authorized Android application security scan.
 Your job is to establish or falsify the real security impact of the supplied candidate
@@ -881,6 +895,22 @@ def investigation_prompt(
         "diagnostics. binder_reply may use unauthorized_data_access only; it becomes platform harm "
         "evidence only when the generated Harness successfully binds, transact returns true, and the typed reply "
         "exactly matches expected_text. "
+        "A Service entry that exposes a Binder sink must be tested through "
+        "operation=binder_transact/binder_script with a binder_reply Oracle. Do not downgrade to "
+        "log_contains or ui_text merely because the Harness failed: read the returned "
+        "receipt_diagnostics (receipt_error, binderTransactReturned, binderReplyDataSize, "
+        "binderReplyReadError), correct the binding or reply parameters, and retry the Binder "
+        "Oracle. "
+        "Some OEM devices gate an ordinary app's Activity or deep-link launch behind a vendor "
+        "confirmation dialog (for example Vivo com.vivo.appfilter). The platform dismisses it with a "
+        "one-time allow and records platform_interception in the UI observation; when that fact is "
+        "present, repeat the same UI Oracle instead of treating missing target text as refutation. "
+        "On such a device prefer a non-Activity channel (provider query, Binder transact, exported "
+        "receiver, PendingIntent or another internal path) whenever the hypothesis allows, because "
+        "it proves silent harm without user consent. If only the Activity or deep-link path proves "
+        "the impact, keep the request but do not describe it, in the rationale or conclusion, as a "
+        "silent no-interaction exploit: the platform records the app-jump precondition on the "
+        "Finding automatically. "
         "target_uid_log_contains supports impact=none only; target UID attribution is an observed "
         "fact, not a security-impact decision. "
         "target_file_sha256 uses an app-data-relative target_path and may prove "

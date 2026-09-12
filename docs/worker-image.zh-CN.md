@@ -8,7 +8,7 @@ JADX 和 Apktool 作为本地 vendored 资产放在 `docker/vendor/`；该目录
 
 | 工具 | 版本 | 镜像内位置 |
 | --- | --- | --- |
-| Codex SDK | `0.144.4` | Python package / bundled Codex CLI |
+| Codex SDK | `0.147.0` | Python package / bundled Codex CLI |
 | JADX | `1.5.6` | `/opt/jadx` |
 | Apktool | `3.0.3` | `/opt/apktool/apktool.jar` |
 | Android Platform | API 36 `platform-36_r02` | `/usr/lib/android-sdk/platforms/android-36` |
@@ -69,13 +69,24 @@ docker image inspect apk-scanner-codex-worker:0.2.0 \
 
 当前镜像约 650 MB，首次构建还需要下载 Android Platform 与 Build Tools。仅修改宿主控制面或
 前端时通常不需要重建 Worker；修改 `Dockerfile.worker`、`pyproject.toml`、
-`backend/apkscanner/runtime/codex_worker.py`、容器包装器或固定工具版本后应重建并运行 Docker
-契约测试。
+`backend/apkscanner/runtime/codex_worker.py`、容器包装器、`config/deepseek-models.json` 或固定
+工具版本后应重建并运行 Docker 契约测试。升级 SDK 时先保留旧镜像标签，再构建候选镜像；只有主机
+回归、镜像能力检查和 Docker 契约测试全部通过后，才把候选镜像标记为默认版本。
+
+模型目录（含默认 `deepseek-flash` / DeepSeek-V4.1-Flash）会烘焙进镜像。改动
+`config/deepseek-models.json` 时必须同步递增 `WORKER_REVISION` 与 `Dockerfile.worker` 的
+`io.apkscanner.worker-revision` label；镜像能力门禁会拒绝未重建的旧镜像，避免宿主与 Worker
+使用不同的模型目录。
 
 ```bash
 APKSCANNER_RUN_DOCKER_TESTS=1 \
   pytest -q backend/tests/test_codex_executor.py backend/tests/test_codex_worker_contract.py
 ```
+
+上述 Docker 门禁会实际启动打包的 App Server，验证持久 Thread 创建、Worker 重启后的 Thread
+恢复、失败 Turn 的错误传递、每角色 UID/工作区隔离，以及 Provider Key 不进入镜像配置或 Agent
+shell 环境。最后再运行需要真实 DeepSeek Key 的 Provider smoke，确认结构化输出、Web Search 和落盘
+脱敏；该步骤不能用占位 Key 替代。
 
 ## 密钥边界
 

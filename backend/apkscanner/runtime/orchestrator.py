@@ -2130,6 +2130,17 @@ class ScanOrchestrator:
                         "static_review_locations": surface.locations,
                         "static_review_attack_chains": surface.attack_chains,
                         "static_review_artifact": surface.artifact,
+                        "static_review_rollup": surface.rollup,
+                        **(
+                            {"static_review_site": surface.site}
+                            if surface.site is not None
+                            else {}
+                        ),
+                        **(
+                            {"static_review_parent_surface": surface.parent_surface}
+                            if surface.parent_surface
+                            else {}
+                        ),
                         **(
                             {"investigation_group": surface.investigation_group}
                             if surface.investigation_group is not None
@@ -2277,6 +2288,7 @@ class ScanOrchestrator:
                 android_api=self.settings.device_android_api,
                 adb_configured=self.device_pool.configured,
                 device_reset_policy=self.settings.device_reset_policy,
+                max_standalone_chain_sites=self.settings.max_standalone_chain_sites,
             )
             investigation_plan = planner.plan_with_decisions(scan.id, entries)
             tasks = investigation_plan.tasks
@@ -2414,6 +2426,12 @@ class ScanOrchestrator:
                     len(version_diff.replay_candidates) if version_diff else 0
                 ),
                 "pattern_match_count": len(pattern_matches),
+                "chain_site_count": investigation_plan.chain_site_total,
+                "chain_site_dispatched_count": investigation_plan.chain_site_dispatched,
+                "chain_site_merged_into_component_count": (
+                    investigation_plan.chain_site_merged_into_component
+                ),
+                "chain_site_deferred_count": investigation_plan.chain_site_deferred,
             }
             if scan.preliminary_at > preliminary_deadline:
                 late_by = int((scan.preliminary_at - preliminary_deadline).total_seconds())
@@ -3310,6 +3328,22 @@ class ScanOrchestrator:
                 for item in component
                 for attempt in harm_attempts_by_finding.get(item.id, [])
             ]
+            # An OEM app-jump guard that had to be allowed makes the runtime
+            # result user-assisted rather than silent. Carry that external
+            # control (and its precondition) into the Finding instead of
+            # presenting the chain as a no-interaction exploit.
+            component_external_controls: list[dict[str, Any]] = []
+            seen_external_controls: set[tuple[Any, Any]] = set()
+            for attempt in component_harm_attempts:
+                attempt_oracle = attempt.oracle if isinstance(attempt.oracle, dict) else {}
+                for control in attempt_oracle.get("external_controls") or []:
+                    if not isinstance(control, dict):
+                        continue
+                    key = (control.get("type"), control.get("vendor_package"))
+                    if key in seen_external_controls:
+                        continue
+                    seen_external_controls.add(key)
+                    component_external_controls.append(control)
             component_refuting_attempts = [
                 attempt
                 for item in component
@@ -3373,6 +3407,8 @@ class ScanOrchestrator:
             canonical_metadata.update(
                 {
                     "harm_demonstrated": bool(component_harm_attempts),
+                    "requires_user_interaction": bool(component_external_controls),
+                    "external_controls": component_external_controls,
                     "merged_finding_ids": self._ordered_union(
                         list(canonical_metadata.get("merged_finding_ids") or []),
                         [item.id for item in duplicates],
@@ -4134,7 +4170,10 @@ class ScanOrchestrator:
                                 },
                                 "developer_instructions": (
                                     adaptive_verifier_developer_instructions(
-                                        ssh_available=base_platform_context["ssh"]["available"]
+                                        ssh_available=base_platform_context["ssh"]["available"],
+                                        public_port_range=(
+                                            self.settings.ssh_public_port_range
+                                        ),
                                     )
                                 ),
                                 "prompt": batch["prompt"],
@@ -8648,6 +8687,19 @@ class ScanOrchestrator:
                 and entry.kind != "service"
             ):
                 reason = f"{request.operation} is allowed only for Service entries"
+            elif (
+                entry.kind == "service"
+                and request.oracle.kind == "log_contains"
+                and request.oracle.impact != "none"
+            ):
+                # AgentRequestedTest already requires binder_reply for
+                # binder_transact/binder_script, but an auto PoC plus a
+                # self-reported log is the remaining way a Binder hypothesis
+                # burns a device round without an observable impact channel.
+                reason = (
+                    "a Service PoC's own log cannot establish Binder harm; use "
+                    "operation=binder_transact with a binder_reply Oracle"
+                )
             elif (request.intent_action or request.categories) and entry.kind == "provider":
                 reason = "provider requests do not accept Intent routing fields"
             elif (

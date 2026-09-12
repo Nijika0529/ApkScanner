@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from inspect import signature
 from pathlib import Path
 
 from apkscanner.runtime.codex_runner import codex_config_overrides
@@ -11,6 +12,8 @@ from apkscanner.runtime.codex_sdk_baseline import (
     runtime_capability,
 )
 from openai_codex import Codex, CodexConfig
+from openai_codex.api import _collect_turn_result
+from openai_codex.generated.v2_all import ReasoningEffort
 
 
 def test_checked_sdk_baseline_matches_runtime_and_reviewed_protocol() -> None:
@@ -29,10 +32,20 @@ def test_checked_sdk_baseline_matches_runtime_and_reviewed_protocol() -> None:
     assert runtime_capability()["available"] is True
 
 
+def test_project_used_private_sdk_surface_remains_compatible() -> None:
+    parameters = signature(_collect_turn_result).parameters
+
+    assert list(parameters) == ["stream", "turn_id"]
+    assert parameters["turn_id"].kind.name == "KEYWORD_ONLY"
+    assert ReasoningEffort("high") is ReasoningEffort.high
+    # DeepSeek advertises "max" even though it is not a built-in OpenAI effort.
+    assert ReasoningEffort("max").value == "max"
+
+
 def test_codex_overrides_use_responses_env_key_and_filter_secrets() -> None:
     overrides = codex_config_overrides(
         provider="deepseek",
-        model="deepseek-v4-flash",
+        model="deepseek-flash",
         reasoning_effort="high",
         base_url="https://api.deepseek.com/",
         model_catalog_path="/opt/apk-scanner/config/deepseek-models.json",
@@ -62,13 +75,20 @@ def test_codex_overrides_use_responses_env_key_and_filter_secrets() -> None:
     assert not any("sk-" in item for item in overrides)
 
 
-def test_official_deepseek_catalog_loads_through_pinned_codex_runtime(monkeypatch) -> None:  # noqa: ANN001
+def test_official_deepseek_catalog_loads_through_pinned_codex_runtime(
+    monkeypatch,  # noqa: ANN001
+    tmp_path: Path,
+) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "unit-test-placeholder")
     catalog = Path("config/deepseek-models.json").resolve()
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
     config = CodexConfig(
+        # The ambient HOME may be read-only; keep CLI state hermetic.
+        env={"CODEX_HOME": str(codex_home)},
         config_overrides=codex_config_overrides(
             provider="deepseek",
-            model="deepseek-v4-flash",
+            model="deepseek-flash",
             reasoning_effort="high",
             base_url="https://api.deepseek.com/",
             model_catalog_path=catalog,
@@ -79,8 +99,8 @@ def test_official_deepseek_catalog_loads_through_pinned_codex_runtime(monkeypatc
     with Codex(config) as codex:
         models = {model.id: model for model in codex.models().data}
 
-    assert models["deepseek-v4-flash"].is_default is True
+    assert models["deepseek-flash"].is_default is True
     assert [
         option.reasoning_effort
-        for option in models["deepseek-v4-flash"].supported_reasoning_efforts
+        for option in models["deepseek-flash"].supported_reasoning_efforts
     ] == ["low", "high", "max"]

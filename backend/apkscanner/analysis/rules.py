@@ -7,9 +7,14 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..core.enums import Confidence, CoverageStatus, EntryPointKind, Severity
+from .android_chains import derive_chain_site
 from .fast_text_search import files_containing_any
 from .manifest import ManifestDocument, ParsedEntryPoint
 from .static_analysis import StaticAnalysisResult
+
+# Upper bound on addressable chain-site surfaces per scan. Sites beyond the cap
+# remain in their family roll-up surface so coverage is never silently dropped.
+STATIC_CHAIN_SITE_LIMIT = 60
 
 
 @dataclass(slots=True)
@@ -56,6 +61,11 @@ class StaticReviewSurfaceDraft:
     attack_chains: list[dict[str, Any]] = field(default_factory=list)
     artifact: dict[str, Any] | None = None
     investigation_group: dict[str, Any] | None = None
+    # A roll-up surface keeps every chain of a family for coverage and version
+    # diffing but is not dispatched on its own; per-site surfaces carry dispatch.
+    rollup: bool = False
+    site: dict[str, Any] | None = None
+    parent_surface: str | None = None
 
 
 CODE_RULES = (
@@ -516,6 +526,12 @@ class BuiltinRuleEngine:
                     int(item.get("line") or 0),
                 )
             )
+            site_surfaces = self._chain_site_surfaces(
+                family=family,
+                config=config,
+                rule_ids=present_rule_ids,
+                attack_chains=attack_chains,
+            )
             surfaces.append(
                 StaticReviewSurfaceDraft(
                     name=f"static://{family}",
@@ -532,6 +548,110 @@ class BuiltinRuleEngine:
                             for index, item in enumerate(attack_chains)
                         }.values()
                     ),
+                    # Only becomes a non-dispatched roll-up when per-site
+                    # surfaces actually replace it. A family built purely from
+                    # code rules has no sites and must still be dispatched.
+                    rollup=bool(site_surfaces),
+                )
+            )
+            surfaces.extend(site_surfaces)
+        return surfaces
+
+    @staticmethod
+    def _chain_site_surfaces(
+        *,
+        family: str,
+        config: dict[str, Any],
+        rule_ids: list[str],
+        attack_chains: list[dict[str, Any]],
+    ) -> list[StaticReviewSurfaceDraft]:
+        """Build one addressable surface per review-required chain site.
+
+        Chains that share an entry handler and sink are variants of the same
+        site. The planner later folds a site into its owning component task when
+        one exists, and ranks the remaining standalone sites by priority.
+        """
+
+        sites: dict[str, dict[str, Any]] = {}
+        for chain in attack_chains:
+            if chain.get("review_required") is not True:
+                continue
+            site = derive_chain_site(chain)
+            key = str(site["site_key"])
+            existing = sites.get(key)
+            if existing is None:
+                sites[key] = {
+                    **site,
+                    "chains": [chain],
+                    "fingerprints": [str(chain.get("fingerprint") or "")],
+                }
+                continue
+            existing["chains"].append(chain)
+            fingerprint = str(chain.get("fingerprint") or "")
+            if fingerprint and fingerprint not in existing["fingerprints"]:
+                existing["fingerprints"].append(fingerprint)
+            known_locations = {
+                (str(item.get("path") or ""), int(item.get("line") or 0))
+                for item in existing["locations"]
+            }
+            for location in site["locations"]:
+                location_key = (
+                    str(location.get("path") or ""),
+                    int(location.get("line") or 0),
+                )
+                if location_key in known_locations:
+                    continue
+                existing["locations"].append(location)
+                known_locations.add(location_key)
+            existing["priority"] = max(
+                int(existing.get("priority") or 0),
+                int(site.get("priority") or 0),
+            )
+        severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+        ordered = sorted(
+            sites.values(),
+            key=lambda item: (
+                -int(item.get("priority") or 0),
+                -severity_rank.get(str(config.get("severity") or ""), 0),
+                str(item.get("site_key") or ""),
+            ),
+        )[:STATIC_CHAIN_SITE_LIMIT]
+        surfaces: list[StaticReviewSurfaceDraft] = []
+        for site in ordered:
+            fingerprint = str(site.get("fingerprint") or site["chains"][0].get("fingerprint") or "")
+            surfaces.append(
+                StaticReviewSurfaceDraft(
+                    name=f"static://chain/{site['chain_kind']}/{fingerprint[:12]}",
+                    family=family,
+                    title=str(config["title"]),
+                    severity=str(config["severity"]),
+                    priority=int(site.get("priority") or config["priority"]),
+                    rule_ids=list(rule_ids),
+                    hypotheses=list(config["hypotheses"]),
+                    locations=list(site["locations"])[:8],
+                    attack_chains=list(site["chains"][:1]),
+                    site={
+                        key: site.get(key)
+                        for key in (
+                            "chain_kind",
+                            "family",
+                            "handler",
+                            "handler_class",
+                            "handler_method",
+                            "sink",
+                            "sink_class",
+                            "sink_method",
+                            "site_key",
+                            "hop_count",
+                            "priority",
+                        )
+                    }
+                    | {
+                        "fingerprints": list(site["fingerprints"]),
+                        "variant_count": len(site["chains"]),
+                    },
+                    parent_surface=f"static://{family}",
+                    rollup=False,
                 )
             )
         return surfaces

@@ -1790,7 +1790,7 @@ def test_codex_audit_records_frozen_execution_and_provider_profiles(settings) ->
         platform_context={"phase": "static_only"},
         backend="codex",
         phase="static_only",
-        capability={"version": "0.144.4", "runtime_version": "0.144.4"},
+        capability={"version": "0.147.0", "runtime_version": "0.147.0"},
     )
     transport = {
         "mode": "structured_output_tool",
@@ -1851,7 +1851,7 @@ def test_codex_audit_records_frozen_execution_and_provider_profiles(settings) ->
         request = audit["artifacts"]["request"]["content"]
         assert request["backend"] == "codex"
         assert request["provider"] == "deepseek"
-        assert request["model"] == "deepseek-v4-flash"
+        assert request["model"] == "deepseek-flash"
         assert request["runtime_options"]["output_mode"] == "json_schema"
         assert request["runtime_options"]["execution_profile"]["sandbox"] == "full_access"
         assert request["runtime_options"]["execution_profile"]["container_scope"] == "scan"

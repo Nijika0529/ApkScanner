@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,11 +35,13 @@ class Settings:
     adaptive_verifier_resume_attempts: int = 1
     adaptive_verifier_copy_host_ssh: bool = True
     adaptive_verifier_ssh_source: Path | None = None
+    # Ports the authorized remote (Aliyun) host can expose to the public internet.
+    ssh_public_port_range: tuple[int, int] | None = None
     agent_permission_profile: str = "personal_lab"
     investigator_backend: str = "codex"
     codex_enabled: bool = False
     codex_provider: str = "deepseek"
-    codex_model: str = "deepseek-v4-flash"
+    codex_model: str = "deepseek-flash"
     codex_reasoning_effort: str = "high"
     codex_bin: str | None = None
     codex_isolation: str = "docker"
@@ -59,6 +62,8 @@ class Settings:
     agent_rescue_phase_seconds: int = 8 * 60
     agent_final_phase_seconds: int = 3 * 60
     agent_no_progress_limit: int = 3
+    # Standalone chain sites admitted per scan; the rest stay as inventory.
+    max_standalone_chain_sites: int = 12
     rescue_audit_sample_rate: float = 0.15
     codex_uid_min: int = 21_000
     codex_uid_max: int = 21_999
@@ -122,6 +127,25 @@ class Settings:
             verifier_ssh_source = Path(configured_verifier_ssh.strip()).expanduser().resolve()
         else:
             verifier_ssh_source = None
+        configured_port_range = (os.getenv("APKSCANNER_SSH_PUBLIC_PORT_RANGE") or "").strip()
+        ssh_public_port_range: tuple[int, int] | None = None
+        if configured_port_range:
+            port_range_match = re.fullmatch(
+                r"(\d{1,5})\s*-\s*(\d{1,5})", configured_port_range
+            )
+            if port_range_match is None:
+                raise ValueError(
+                    "APKSCANNER_SSH_PUBLIC_PORT_RANGE must look like 12000-16000"
+                )
+            port_low, port_high = (
+                int(port_range_match.group(1)),
+                int(port_range_match.group(2)),
+            )
+            if not 1 <= port_low <= port_high <= 65535:
+                raise ValueError(
+                    "APKSCANNER_SSH_PUBLIC_PORT_RANGE is outside the valid TCP port range"
+                )
+            ssh_public_port_range = (port_low, port_high)
         configured_host_adb = os.getenv("APKSCANNER_HOST_ADB")
         if configured_host_adb is None:
             host_adb_executable = "adb"
@@ -168,13 +192,14 @@ class Settings:
                 "APKSCANNER_ADAPTIVE_VERIFIER_COPY_HOST_SSH", True
             ),
             adaptive_verifier_ssh_source=verifier_ssh_source,
+            ssh_public_port_range=ssh_public_port_range,
             agent_permission_profile=os.getenv(
                 "APKSCANNER_AGENT_PERMISSION_PROFILE", "personal_lab"
             ).lower(),
             investigator_backend=os.getenv("APKSCANNER_INVESTIGATOR_BACKEND", "codex").lower(),
             codex_enabled=_env_bool("APKSCANNER_CODEX_ENABLED"),
             codex_provider=os.getenv("APKSCANNER_CODEX_PROVIDER", "deepseek").lower(),
-            codex_model=os.getenv("APKSCANNER_CODEX_MODEL", "deepseek-v4-flash"),
+            codex_model=os.getenv("APKSCANNER_CODEX_MODEL", "deepseek-flash"),
             codex_reasoning_effort=os.getenv("APKSCANNER_CODEX_REASONING_EFFORT", "high").lower(),
             codex_bin=os.getenv("APKSCANNER_CODEX_BIN"),
             codex_isolation=os.getenv("APKSCANNER_CODEX_ISOLATION", "docker").lower(),
@@ -213,6 +238,9 @@ class Settings:
                 60, int(os.getenv("APKSCANNER_AGENT_FINAL_PHASE_SECONDS", 180))
             ),
             agent_no_progress_limit=max(1, int(os.getenv("APKSCANNER_AGENT_NO_PROGRESS_LIMIT", 3))),
+            max_standalone_chain_sites=max(
+                0, int(os.getenv("APKSCANNER_MAX_STANDALONE_CHAIN_SITES", 12))
+            ),
             rescue_audit_sample_rate=max(
                 0.0,
                 min(
@@ -430,6 +458,16 @@ class Settings:
             ),
         }
 
+    @property
+    def codex_home_dir(self) -> Path:
+        """Writable ``CODEX_HOME`` for host-side Codex CLI state.
+
+        The Codex CLI otherwise defaults to ``~/.codex``, which fails when the
+        HOME directory is read-only or sandboxed. Keeping CLI state inside the
+        private data directory makes host and smoke runs hermetic.
+        """
+        return self.data_dir / "codex-home"
+
     def ensure_directories(self) -> None:
         for path in (
             self.data_dir,
@@ -438,5 +476,7 @@ class Settings:
             self.data_dir / "workspaces",
             self.data_dir / "evidence",
             self.data_dir / "reports",
+            self.data_dir / "tmp",
+            self.codex_home_dir,
         ):
             ensure_private_directory(path)

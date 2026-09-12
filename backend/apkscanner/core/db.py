@@ -10,7 +10,7 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from .config import Settings
-from .permissions import create_private_file, ensure_private_file
+from .permissions import create_private_file, ensure_private_directory, ensure_private_file
 
 
 class Base(DeclarativeBase):
@@ -23,6 +23,12 @@ class Database:
         sqlite = url.get_backend_name() == "sqlite"
         self._sqlite_read_only = sqlite and url.query.get("mode") == "ro"
         self._sqlite_path = self._sqlite_database_path(url) if sqlite else None
+        # SQLite probes OS temp directories (``/var/tmp`` before ``/tmp``) for
+        # sort/aggregate spill files. Restricted sandboxes and read-only
+        # containers may not expose those paths, which surfaces as a confusing
+        # "unable to open database file" on ordinary queries. Keep spill files
+        # inside the private data directory instead.
+        self._sqlite_temp_dir = settings.data_dir / "tmp" if sqlite else None
         if self._sqlite_path is not None:
             if url.query.get("mode") in {"ro", "rw"}:
                 ensure_private_file(self._sqlite_path)
@@ -39,12 +45,32 @@ class Database:
 
     def _configure_sqlite(self, dbapi_connection, _connection_record) -> None:  # noqa: ANN001
         cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA busy_timeout=10000")
-        if not self._sqlite_read_only:
-            cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
+        try:
+            cursor.execute("PRAGMA busy_timeout=10000")
+            if not self._sqlite_read_only:
+                cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA foreign_keys=ON")
+            self._pin_sqlite_temp_directory(cursor)
+        finally:
+            cursor.close()
         self._harden_sqlite_files()
+
+    def _pin_sqlite_temp_directory(self, cursor) -> None:  # noqa: ANN001
+        """Point SQLite temp files at the private data directory.
+
+        ``temp_store_directory`` is deprecated but remains the only per-connection
+        way to override the OS temp probing order, and it degrades to a no-op on
+        SQLite builds that omit it. It must never make a connection unusable, so
+        failures are swallowed.
+        """
+        if self._sqlite_temp_dir is None:
+            return
+        try:
+            ensure_private_directory(self._sqlite_temp_dir)
+            escaped = str(self._sqlite_temp_dir).replace("'", "''")
+            cursor.execute(f"PRAGMA temp_store_directory='{escaped}'")
+        except Exception:  # pragma may be missing; directory may be read-only
+            return
 
     @staticmethod
     def _sqlite_database_path(url) -> Path | None:  # noqa: ANN001

@@ -122,6 +122,131 @@ def test_planner_coalesces_only_explicit_attack_chain_variants() -> None:
     assert plan.coalescing_decisions[0]["avoided_task_count"] == 1
 
 
+def _chain_site_entry(
+    entry_id: str,
+    *,
+    handler_class: str,
+    chain_kind: str = "nested_intent_redirection",
+    priority: int = 90,
+) -> EntryPoint:
+    return EntryPoint(
+        id=entry_id,
+        scan_id="scan",
+        kind="static_surface",
+        name=f"static://chain/{chain_kind}/{entry_id[-6:]}",
+        owner_component=f"static://chain/{chain_kind}/{entry_id[-6:]}",
+        exported=False,
+        metadata_json={
+            "static_review_family": "capability_delegation_boundary",
+            "static_review_priority": priority,
+            "static_review_hypotheses": [f"Trace the site in {handler_class}."],
+            "static_review_parent_surface": "static://capability_delegation_boundary",
+            "static_review_site": {
+                "site_key": f"{chain_kind}|{handler_class}|onCreate|com.example.Sink",
+                "chain_kind": chain_kind,
+                "handler": f"{handler_class}#onCreate",
+                "handler_class": handler_class,
+                "handler_method": "onCreate",
+                "sink": "com.example.Sink#start",
+                "sink_class": "com.example.Sink",
+            },
+        },
+    )
+
+
+def test_planner_attaches_chain_site_to_its_component_and_skips_rollup() -> None:
+    activity = EntryPoint(
+        id="00000000-0000-0000-0000-000000000201",
+        scan_id="scan",
+        kind="activity",
+        name="com.example.PublicActivity",
+        owner_component="com.example.PublicActivity",
+        exported=True,
+    )
+    rollup = EntryPoint(
+        id="00000000-0000-0000-0000-000000000202",
+        scan_id="scan",
+        kind="static_surface",
+        name="static://capability_delegation_boundary",
+        owner_component="static://capability_delegation_boundary",
+        exported=False,
+        metadata_json={
+            "static_review_rollup": True,
+            "static_review_family": "capability_delegation_boundary",
+            "static_review_hypotheses": ["family-wide hypothesis"],
+        },
+    )
+    site = _chain_site_entry(
+        "00000000-0000-0000-0000-000000000203",
+        handler_class="com.example.PublicActivity",
+    )
+
+    plan = InvestigationPlanner(
+        android_version="16",
+        adb_configured=True,
+    ).plan_with_decisions("scan", [activity, rollup, site])
+
+    assert len(plan.tasks) == 1
+    task = plan.tasks[0]
+    assert task.task_type == "component"
+    assert set(task.target_entry_ids) == {activity.id, site.id}
+    # The roll-up surface stays as inventory and never gets its own task.
+    assert rollup.id not in task.target_entry_ids
+    assert task.preconditions["chain_site_attachments"][0]["strategy"] == "component_handler_site"
+    assert plan.chain_site_total == 1
+    assert plan.chain_site_merged_into_component == 1
+    assert plan.chain_site_dispatched == 1
+    assert plan.chain_site_deferred == 0
+
+
+def test_planner_merges_chain_sites_that_share_one_handler() -> None:
+    first = _chain_site_entry(
+        "00000000-0000-0000-0000-000000000211",
+        handler_class="com.example.Internal",
+        chain_kind="nested_intent_redirection",
+    )
+    second = _chain_site_entry(
+        "00000000-0000-0000-0000-000000000212",
+        handler_class="com.example.Internal",
+        chain_kind="uri_permission_redelegation",
+    )
+
+    plan = InvestigationPlanner(
+        android_version="16",
+        adb_configured=True,
+    ).plan_with_decisions("scan", [first, second])
+
+    assert len(plan.tasks) == 1
+    assert set(plan.tasks[0].target_entry_ids) == {first.id, second.id}
+    assert plan.chain_site_total == 2
+    assert plan.chain_site_merged_into_component == 0
+    assert plan.chain_site_deferred == 0
+    assert plan.chain_site_dispatched == 2
+
+
+def test_planner_admits_standalone_chain_sites_by_priority() -> None:
+    entries = [
+        _chain_site_entry(
+            f"00000000-0000-0000-0000-0000000003{index:02d}",
+            handler_class=f"com.example.Internal{index}",
+            priority=90 + index,
+        )
+        for index in range(5)
+    ]
+
+    plan = InvestigationPlanner(
+        android_version="16",
+        adb_configured=True,
+        max_standalone_chain_sites=2,
+    ).plan_with_decisions("scan", entries)
+
+    assert len(plan.tasks) == 2
+    assert {task.priority for task in plan.tasks} == {93, 94}
+    assert plan.chain_site_total == 5
+    assert plan.chain_site_dispatched == 2
+    assert plan.chain_site_deferred == 3
+
+
 def test_planner_dispatches_internal_static_surface_without_device_side_effects() -> None:
     entry = EntryPoint(
         id="00000000-0000-0000-0000-000000000019",

@@ -53,6 +53,53 @@ def test_finding_report_is_hypothesis_scoped_and_compact(settings) -> None:  # n
     assert "任务总结" not in render_finding_description(report)
 
 
+def test_finding_report_declares_oem_user_interaction_precondition() -> None:
+    hypothesis = SecurityHypothesis(
+        id="3" * 36,
+        scan_id="1" * 36,
+        task_id="2" * 36,
+        fingerprint="b" * 64,
+        category="android.exported_component",
+        claim="导出 Activity 可被普通应用拉起并泄露数据",
+        impact="普通应用可读取敏感数据。",
+        preconditions=[],
+        entry_point_ids=[],
+    )
+    attempt = ProofAttempt(
+        id="4" * 36,
+        scan_id="1" * 36,
+        task_id="2" * 36,
+        hypothesis_id=hypothesis.id,
+        test_case_id="oem-consent-gated",
+        status="proven",
+        harm_demonstrated=True,
+        oracle={
+            "requires_user_interaction": True,
+            "external_controls": [
+                {
+                    "type": "oem_app_jump_guard",
+                    "vendor_package": "com.vivo.appfilter",
+                    "dismissed": True,
+                }
+            ],
+        },
+    )
+
+    report = build_finding_report(
+        task_id=hypothesis.task_id,
+        hypothesis=hypothesis,
+        assessment={},
+        evidence_ids=["evidence-1"],
+        attempts=[attempt],
+    )
+
+    assert report.requires_user_interaction is True
+    assert report.external_controls == ["oem_app_jump_guard com.vivo.appfilter"]
+    description = render_finding_description(report)
+    assert "需要用户确认" in description
+    assert "无交互静默利用" in description
+
+
 def test_operator_indexes_historical_poc_for_selected_finding(settings) -> None:  # noqa: ANN001
     settings.ensure_directories()
     database = Database(settings)

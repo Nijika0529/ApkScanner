@@ -111,7 +111,7 @@ def test_tool_runner_timeout_kills_the_spawned_process_group() -> None:
     )
     result = runner.run(
         [sys.executable, "-c", parent_script],
-        timeout=0.2,
+        timeout=1.0,
     )
 
     assert result.timed_out is True

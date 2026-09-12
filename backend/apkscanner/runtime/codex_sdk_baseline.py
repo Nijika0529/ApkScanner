@@ -12,13 +12,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 SDK_DISTRIBUTION = "openai-codex"
 RUNTIME_DISTRIBUTION = "openai-codex-cli-bin"
-PINNED_SDK_VERSION = "0.144.4"
+PINNED_SDK_VERSION = "0.147.0"
 MINIMUM_DEEPSEEK_CODEX_VERSION = "0.144.0"
-VERIFIED_SOURCE_COMMIT = "6751b54cae32b23786001e2414d749a9916201e1"
+VERIFIED_SOURCE_COMMIT = "025a88adbd7ae4d448fc938b28d0446eb1753317"
 # Bump whenever the host/worker protocol implementation changes without a
 # third-party SDK version change. The image capability gate prevents a stale
 # locally cached worker from silently speaking an older command schema.
-WORKER_REVISION = "20260831.1"
+WORKER_REVISION = "20260910.1"
 
 
 class SdkBaseline(BaseModel):

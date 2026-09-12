@@ -5,7 +5,9 @@ import os
 import shutil
 import stat
 import subprocess
+import threading
 from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,7 +16,6 @@ from apkscanner.runtime.agent_workspace import AgentWorkspaceManager
 from apkscanner.runtime.codex_executor import CodexDockerExecutor, ScanContainer
 from apkscanner.runtime.codex_protocol import (
     PersistentWorkerClient,
-    PersistentWorkerError,
     PersistentWorkerTimeout,
 )
 from apkscanner.runtime.codex_runner import CodexInvestigator, _ActiveDockerSession
@@ -27,6 +28,35 @@ TASK_ID = "00000000-0000-0000-0000-000000000102"
 
 def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
+
+
+class _ResponsesStubHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self) -> None:  # noqa: N802
+        content_length = int(self.headers.get("content-length", "0"))
+        self.rfile.read(content_length)
+        body = (
+            b'event: response.created\n'
+            b'data: {"type":"response.created","response":{"id":"resp-resume-probe"}}\n\n'
+            b'event: response.output_item.done\n'
+            b'data: {"type":"response.output_item.done","item":{"type":"message",'
+            b'"role":"assistant","id":"msg-resume-probe","content":[{"type":"output_text",'
+            b'"text":"{\\"ok\\":true}"}]}}\n\n'
+            b'event: response.completed\n'
+            b'data: {"type":"response.completed","response":{"id":"resp-resume-probe",'
+            b'"usage":{"input_tokens":0,"input_tokens_details":null,"output_tokens":0,'
+            b'"output_tokens_details":null,"total_tokens":0}}}\n\n'
+        )
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("content-length", str(len(body)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format: str, *args: object) -> None:
+        pass
 
 
 def _valid_agent_result() -> dict:
@@ -242,7 +272,7 @@ def test_workspace_manager_canonicalizes_snake_case_roles_for_worker_paths(setti
     assert workspace.workspace_key.endswith("-rescue-explorer")
     configuration = WorkerConfiguration(
         developer_instructions="Analyze the assigned APK.",
-        model="deepseek-v4-flash",
+        model="deepseek-flash",
         model_provider="deepseek",
         reasoning_effort="high",
         provider_base_url="https://api.deepseek.com/",
@@ -678,7 +708,7 @@ def test_real_scan_container_shares_input_but_isolates_session_uids(settings) ->
     or shutil.which("docker") is None,
     reason="requires APKSCANNER_RUN_DOCKER_TESTS=1, root, and Docker",
 )
-def test_real_worker_protocol_opens_persistent_codex_thread(
+def test_real_worker_protocol_opens_and_resumes_persistent_codex_thread(
     settings,
     monkeypatch,
 ) -> None:  # noqa: ANN001
@@ -702,6 +732,10 @@ def test_real_worker_protocol_opens_persistent_codex_thread(
         source_workspace=source,
     )
     executor = CodexDockerExecutor(configured)
+    responses_stub = ThreadingHTTPServer(("0.0.0.0", 0), _ResponsesStubHandler)
+    responses_thread = threading.Thread(target=responses_stub.serve_forever, daemon=True)
+    responses_thread.start()
+    provider_base_url = f"http://apkscanner-host:{responses_stub.server_port}/"
     container = executor.ensure_scan_container(
         scan_id=SCAN_ID,
         scan_workspace=scan_workspace,
@@ -722,10 +756,10 @@ def test_real_worker_protocol_opens_persistent_codex_thread(
         thread_id = client.open_session(
             configuration={
                 "developer_instructions": "Analyze only the assigned APK.",
-                "model": "deepseek-v4-flash",
+                "model": "deepseek-flash",
                 "model_provider": "deepseek",
                 "reasoning_effort": "high",
-                "provider_base_url": "http://127.0.0.1:9/",
+                "provider_base_url": provider_base_url,
                 "model_catalog_path": "/opt/apk-scanner/config/deepseek-models.json",
                 "workspace_path": session.container_workspace,
             },
@@ -733,21 +767,49 @@ def test_real_worker_protocol_opens_persistent_codex_thread(
         )
         assert thread_id
         assert process.poll() is None
-        with pytest.raises(PersistentWorkerError):
-            client.turn(
-                prompt="Return a JSON object with ok=true.",
-                output_schema={
-                    "type": "object",
-                    "properties": {"ok": {"type": "boolean"}},
-                    "required": ["ok"],
-                    "additionalProperties": False,
-                },
-                timeout_seconds=30,
-                no_event_timeout_seconds=30,
-                event_callback=None,
-                cancel_event=None,
-            )
+        result = client.turn(
+            prompt="Return a JSON object with ok=true.",
+            output_schema={
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+                "additionalProperties": False,
+            },
+            result_contract="json_object.v1",
+            timeout_seconds=30,
+            no_event_timeout_seconds=30,
+            event_callback=None,
+            cancel_event=None,
+        )
+        assert result["result"]["ok"] is True
         assert not (session.codex_home / "shell_snapshots").exists()
+        client.close()
+
+        process = executor.start_worker(container=container, session=session)
+        client = PersistentWorkerClient(
+            process,
+            session_id=f"{TASK_ID}:a1:primary",
+            event_spool=configured.data_dir / "runtime" / "events" / "real-resumed.ndjson",
+            cleanup=cleanup,
+        )
+        resumed_thread_id = client.open_session(
+            configuration={
+                "developer_instructions": "Analyze only the assigned APK.",
+                "model": "deepseek-flash",
+                "model_provider": "deepseek",
+                "reasoning_effort": "high",
+                "provider_base_url": provider_base_url,
+                "model_catalog_path": "/opt/apk-scanner/config/deepseek-models.json",
+                "workspace_path": session.container_workspace,
+            },
+            gateway_environment={},
+            resume_thread_id=thread_id,
+        )
+        assert resumed_thread_id == thread_id
+        assert process.poll() is None
     finally:
         client.close()
         executor.close_scan(SCAN_ID)
+        responses_stub.shutdown()
+        responses_stub.server_close()
+        responses_thread.join(timeout=5)

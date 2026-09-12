@@ -72,7 +72,7 @@ flowchart LR
 
 固定 Worker 镜像包含：
 
-- Python 3.13 与 `openai-codex==0.144.4`；
+- Python 3.13 与 `openai-codex==0.147.0`；
 - Codex CLI、Node.js 22.13、OpenJDK 17；
 - Android Platform 36 与 Build Tools 36.1；
 - JADX 1.5.6、Apktool 3.0.3、Smali、ripgrep、git、curl、jq、sqlite3；
@@ -111,11 +111,14 @@ Docker label 对账，不依据模糊容器名称删除其他实例。
 主调用链固定使用 Python SDK：
 
 ```text
-openai-codex==0.144.4
+openai-codex==0.147.0
 provider=deepseek
-model=deepseek-v4-flash
+model=deepseek-flash
 web_search=live
 ```
+
+`deepseek-flash` 对应 DeepSeek-V4.1-Flash（2026-09-10 上线）。旧模型名 `deepseek-v4-flash`
+已下线，DeepSeek 会把它路由到 V4.1 Flash；项目默认只使用 `deepseek-flash`。
 
 Provider 配置只保存 base URL、模型、能力和凭据环境变量名。`DEEPSEEK_API_KEY` 从宿主控制面环境
 进入当前 UID worker 的 `docker exec` 环境，keeper 和其他 UID 不获得 Key。Codex 的 shell

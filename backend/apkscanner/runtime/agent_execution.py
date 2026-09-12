@@ -66,7 +66,7 @@ class ProviderProfile(_FrozenContract):
     id: str = Field(default="deepseek_codex_flash_v1", pattern=r"^[a-z0-9_]+$")
     backend: Literal["codex"] = "codex"
     provider: Literal["deepseek"] = "deepseek"
-    model: Literal["deepseek-v4-flash"] = "deepseek-v4-flash"
+    model: Literal["deepseek-flash"] = "deepseek-flash"
     wire_api: Literal["responses"] = "responses"
     reasoning_effort: Literal["low", "high", "max"] = "high"
     base_url: str = "https://api.deepseek.com/"

@@ -1587,7 +1587,7 @@ public final class PlatformProofActivity extends Activity {
   private static final String TAG = "APKSCANNER_POC";
   private static final String REQUEST_BASE64 = "__REQUEST_BASE64__";
   private static final String RECEIPT_FILENAME = "__RECEIPT_FILENAME__";
-  private static final long BINDER_TIMEOUT_MILLIS = 8000L;
+  private static final long BINDER_TIMEOUT_MILLIS = 20000L;
   private final AtomicBoolean finished = new AtomicBoolean(false);
   private final AtomicBoolean proofStarted = new AtomicBoolean(false);
   private final Handler handler = new Handler(Looper.getMainLooper());
@@ -1752,6 +1752,7 @@ public final class PlatformProofActivity extends Activity {
         Parcel reply = Parcel.obtain();
         try {
           result.put("boundComponent", name.flattenToShortString());
+          result.put("callerUid", android.os.Process.myUid());
           String descriptor = request.optString("binder_interface_descriptor", "");
           if (!descriptor.isEmpty()) {
             data.writeInterfaceToken(descriptor);
@@ -1768,15 +1769,34 @@ public final class PlatformProofActivity extends Activity {
           result.put("binderTransactionCode", code);
           result.put("binderTransactReturned", returned);
           if (!replyType.isEmpty()) result.put("binderReplyType", replyType);
+          // Capture the raw reply before decoding. An empty reply, a missing
+          // writeNoException header, and a decode mismatch are otherwise
+          // indistinguishable to the platform binder_reply Oracle. marshall()
+          // returns a copy and does not consume the parcel position.
+          result.put("binderReplyDataSize", reply.dataSize());
+          try {
+            result.put("binderReplyMarshallBase64",
+                Base64.encodeToString(reply.marshall(), Base64.NO_WRAP));
+          } catch (Throwable marshallError) {
+            result.put("binderReplyMarshallError", String.valueOf(marshallError.getMessage()));
+          }
           if (!returned) throw new IllegalStateException("Binder transact returned false");
           reply.setDataPosition(0);
-          if (request.optBoolean("binder_read_exception", true)) reply.readException();
-          if (script != null) {
-            JSONArray replies = readBinderReplies(reply, script);
-            result.put("binderReplies", replies);
-            if (replies.length() == 1) result.put("binderReply", replies.get(0));
-          } else {
-            result.put("binderReply", readBinderValue(reply, replyType));
+          try {
+            if (request.optBoolean("binder_read_exception", true)) reply.readException();
+            if (script != null) {
+              JSONArray replies = readBinderReplies(reply, script);
+              result.put("binderReplies", replies);
+              if (replies.length() == 1) result.put("binderReply", replies.get(0));
+            } else {
+              result.put("binderReply", readBinderValue(reply, replyType));
+            }
+          } catch (Throwable readError) {
+            // The transaction itself succeeded; a decode failure must not be
+            // reported as a transport failure. The Oracle compares the decoded
+            // reply when present and falls back to the raw marshall bytes.
+            result.put("binderReplyReadError",
+                readError.getClass().getName() + ": " + String.valueOf(readError.getMessage()));
           }
           result.put("delivered", true);
           succeed();

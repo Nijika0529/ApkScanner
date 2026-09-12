@@ -4,6 +4,7 @@ import pytest
 from apkscanner.core.models import EntryPoint
 from apkscanner.core.schemas import AgentRequestedTest
 from apkscanner.runtime.orchestrator import ScanOrchestrator
+from pydantic import ValidationError
 
 
 def _payload(result: str, evidence_ids: list[str]) -> dict:  # noqa: ANN401
@@ -1195,3 +1196,93 @@ def test_provider_rows_oracle_rejects_a_non_query_operation() -> None:
 
     assert accepted == []
     assert any("requires a provider query operation" in gap for gap in gaps)
+
+
+def test_binder_transaction_requires_a_binder_reply_oracle() -> None:
+    entry = EntryPoint(
+        id="11111111-1111-1111-1111-111111111111",
+        scan_id="scan",
+        kind="service",
+        name="com.example.SecretService",
+        owner_component="com.example.SecretService",
+        exported=True,
+        metadata_json={},
+    )
+    # A Parcel reply never reaches logcat or the UI, so the schema rejects the
+    # structurally blind combination before it can consume a device round.
+    with pytest.raises(ValidationError, match="requires a binder_reply Oracle"):
+        AgentRequestedTest(
+            hypothesis_id="22222222-2222-2222-2222-222222222222",
+            entry_point_id=entry.id,
+            state="guest",
+            extras={},
+            operation="binder_transact",
+            binder_transaction_code=1,
+            binder_reply_type="string",
+            oracle={
+                "kind": "log_contains",
+                "expected_text": "service-secret=hunter2",
+                "impact": "unauthorized_data_access",
+            },
+            rationale="A Binder reply never reaches logcat.",
+        )
+
+    allowed = AgentRequestedTest(
+        hypothesis_id="22222222-2222-2222-2222-222222222222",
+        entry_point_id=entry.id,
+        state="guest",
+        extras={},
+        operation="binder_transact",
+        binder_transaction_code=1,
+        binder_reply_type="string",
+        oracle={
+            "kind": "binder_reply",
+            "expected_text": "service-secret=hunter2",
+            "match_mode": "exact",
+            "impact": "unauthorized_data_access",
+        },
+        rationale="The platform harness can read this reply.",
+    )
+
+    accepted, gaps = ScanOrchestrator._validate_requested_tests(
+        [allowed],
+        [entry],
+        hypothesis_ids={allowed.hypothesis_id},
+    )
+
+    assert accepted == [allowed]
+    assert gaps == []
+
+
+def test_service_log_oracle_cannot_claim_binder_harm() -> None:
+    entry = EntryPoint(
+        id="11111111-1111-1111-1111-111111111111",
+        scan_id="scan",
+        kind="service",
+        name="com.example.SecretService",
+        owner_component="com.example.SecretService",
+        exported=True,
+        metadata_json={},
+    )
+    request = AgentRequestedTest(
+        hypothesis_id="22222222-2222-2222-2222-222222222222",
+        entry_point_id=entry.id,
+        state="guest",
+        extras={},
+        operation="auto",
+        oracle={
+            "kind": "log_contains",
+            "expected_text": "service-secret=hunter2",
+            "impact": "unauthorized_data_access",
+        },
+        rationale="The PoC's own log is not platform harm.",
+    )
+
+    accepted, gaps = ScanOrchestrator._validate_requested_tests(
+        [request],
+        [entry],
+        hypothesis_ids={request.hypothesis_id},
+    )
+
+    assert accepted == []
+    assert any("Binder harm" in gap for gap in gaps)

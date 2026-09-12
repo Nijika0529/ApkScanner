@@ -31,7 +31,7 @@ def run_web_search_smoke() -> dict[str, Any]:
     from openai_codex.api import _collect_turn_result
 
     provider = os.getenv("APKSCANNER_CODEX_PROVIDER", "deepseek")
-    model = os.getenv("APKSCANNER_CODEX_MODEL", "deepseek-v4-flash")
+    model = os.getenv("APKSCANNER_CODEX_MODEL", "deepseek-flash")
     base_url = os.getenv("APKSCANNER_DEEPSEEK_BASE_URL", "https://api.deepseek.com/")
     catalog = Path(
         os.getenv(
@@ -39,54 +39,57 @@ def run_web_search_smoke() -> dict[str, Any]:
             "/opt/apk-scanner/config/deepseek-models.json",
         )
     )
-    config = CodexConfig(
-        config_overrides=codex_config_overrides(
-            provider=provider,
-            model=model,
-            reasoning_effort="high",
-            base_url=base_url,
-            model_catalog_path=catalog,
-            web_search="live",
-        )
-    )
     events = []
-    with (
-        tempfile.TemporaryDirectory(prefix="apkscanner-web-smoke-") as workspace,
-        Codex(config) as codex,
-    ):
-        thread = codex.thread_start(
-            approval_mode=ApprovalMode.deny_all,
-            cwd=workspace,
-            developer_instructions=(
-                "This is a capability smoke test. Use Web Search exactly once. "
-                "Do not use shell, files, MCP, or any other tool."
+    with tempfile.TemporaryDirectory(prefix="apkscanner-web-smoke-") as workspace:
+        # Keep Codex CLI state out of the ambient HOME, which may be read-only.
+        # The CLI requires this directory to already exist.
+        codex_home = Path(workspace) / "codex-home"
+        codex_home.mkdir()
+        config = CodexConfig(
+            env={"CODEX_HOME": str(codex_home)},
+            config_overrides=codex_config_overrides(
+                provider=provider,
+                model=model,
+                reasoning_effort="high",
+                base_url=base_url,
+                model_catalog_path=catalog,
+                web_search="live",
             ),
-            ephemeral=True,
-            model=model,
-            model_provider=provider,
-            sandbox=Sandbox.read_only,
-            service_name="apk-scanner-web-smoke",
         )
-        handle = thread.turn(
-            (
-                "Use Web Search to locate the official DeepSeek updates page. Return only "
-                "the requested JSON with its direct HTTPS URL and a short Chinese summary."
-            ),
-            approval_mode=ApprovalMode.deny_all,
-            cwd=workspace,
-            model=model,
-            output_schema=WEB_SMOKE_SCHEMA,
-            sandbox=Sandbox.read_only,
-        )
+        with Codex(config) as codex:
+            thread = codex.thread_start(
+                approval_mode=ApprovalMode.deny_all,
+                cwd=workspace,
+                developer_instructions=(
+                    "This is a capability smoke test. Use Web Search exactly once. "
+                    "Do not use shell, files, MCP, or any other tool."
+                ),
+                ephemeral=True,
+                model=model,
+                model_provider=provider,
+                sandbox=Sandbox.read_only,
+                service_name="apk-scanner-web-smoke",
+            )
+            handle = thread.turn(
+                (
+                    "Use Web Search to locate the official DeepSeek updates page. Return only "
+                    "the requested JSON with its direct HTTPS URL and a short Chinese summary."
+                ),
+                approval_mode=ApprovalMode.deny_all,
+                cwd=workspace,
+                model=model,
+                output_schema=WEB_SMOKE_SCHEMA,
+                sandbox=Sandbox.read_only,
+            )
 
-        def stream():  # noqa: ANN202
-            for notification in handle.stream():
-                event = normalize_codex_notification(notification)
-                if event is not None:
-                    events.append(event)
-                yield notification
+            def stream():  # noqa: ANN202
+                for notification in handle.stream():
+                    event = normalize_codex_notification(notification)
+                    if event is not None:
+                        events.append(event)
+                    yield notification
 
-        turn = _collect_turn_result(stream(), turn_id=handle.id)
+            turn = _collect_turn_result(stream(), turn_id=handle.id)
     payload = json.loads(turn.final_response or "")
     source_url = payload.get("source_url") if isinstance(payload, dict) else None
     parsed_url = urlsplit(source_url) if isinstance(source_url, str) else None

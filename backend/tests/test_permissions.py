@@ -119,6 +119,32 @@ def test_private_paths_reject_symbolic_links(settings, tmp_path: Path) -> None: 
         Database(linked_settings)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits are not portable")
+def test_ensure_directories_provisions_scratch_and_codex_home(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+
+    assert settings.codex_home_dir == settings.data_dir / "codex-home"
+    for directory in (settings.data_dir / "tmp", settings.codex_home_dir):
+        assert directory.is_dir()
+        assert _mode(directory) == 0o700
+
+
+def test_sqlite_connections_pin_temp_directory_to_private_data_dir(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    try:
+        with database.engine.connect() as connection:
+            pinned = connection.exec_driver_sql("PRAGMA temp_store_directory").scalar()
+    finally:
+        database.engine.dispose()
+
+    assert (settings.data_dir / "tmp").is_dir()
+    if pinned in (None, ""):
+        pytest.skip("this SQLite build omits the deprecated temp_store_directory pragma")
+    assert Path(str(pinned)) == settings.data_dir / "tmp"
+
+
 def test_sqlite_read_only_uri_does_not_request_wal(settings) -> None:  # noqa: ANN001
     settings.ensure_directories()
     writable = Database(settings)

@@ -1893,3 +1893,67 @@ class AndroidAttackChainAnalyzer:
             )
             unique[key] = item
         return [unique[key] for key in sorted(unique)]
+
+
+def derive_chain_site(chain: dict[str, Any]) -> dict[str, Any]:
+    """Derive one concrete, addressable site from a bounded chain candidate.
+
+    The candidate already carries its class path, marker locations and
+    method-local dataflow. This selects the entry-side handler and the sink
+    symbol so the planner can rank and dispatch a call site instead of an
+    aggregate family boundary.
+    """
+
+    source_markers = set(chain.get("source_markers") or [])
+    sink_markers = set(chain.get("sink_markers") or [])
+    locations = [
+        item for item in (chain.get("locations") or []) if isinstance(item, dict)
+    ]
+    path = [item for item in (chain.get("path") or []) if isinstance(item, dict)]
+
+    def first_marker_site(markers: set[str]) -> dict[str, Any]:
+        if markers:
+            for location in locations:
+                if location.get("marker") in markers:
+                    return location
+        return {}
+
+    source = first_marker_site(source_markers)
+    sink = first_marker_site(sink_markers)
+    source_class = source.get("class_name") or (
+        path[0].get("class_name") if path else None
+    )
+    sink_class = sink.get("class_name") or (
+        path[-1].get("class_name") if path else None
+    )
+    source_method = source.get("method")
+    sink_method = sink.get("method")
+    handler = (
+        f"{source_class}#{source_method or '<init>'}" if source_class else "unknown#<init>"
+    )
+    sink_symbol = (
+        f"{sink_class}#{sink_method or '<init>'}" if sink_class else "unknown#<init>"
+    )
+    return {
+        "chain_kind": str(chain.get("chain_kind") or ""),
+        "family": str(chain.get("family") or ""),
+        "handler": handler,
+        "handler_class": source_class,
+        "handler_method": source_method,
+        "sink": sink_symbol,
+        "sink_class": sink_class,
+        "sink_method": sink_method,
+        # Chains sharing an entry handler and sink are variants of one site.
+        "site_key": (
+            f"{chain.get('chain_kind')}|{source_class}|{source_method or ''}|{sink_class}"
+        ),
+        "locations": locations[:8],
+        "hop_count": chain.get("hop_count"),
+        "priority": chain.get("priority"),
+        "fingerprint": chain.get("fingerprint"),
+    }
+
+
+def chain_site_key(chain: dict[str, Any]) -> str:
+    return str(derive_chain_site(chain)["site_key"])
+

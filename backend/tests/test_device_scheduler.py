@@ -47,6 +47,24 @@ def test_settings_accept_an_absolute_host_adb_executable(
     assert settings.host_adb_executable == "/opt/android/platform-tools/adb"
 
 
+def test_settings_parse_the_remote_public_port_range(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # noqa: ANN001
+    monkeypatch.setenv("APKSCANNER_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("APKSCANNER_SSH_PUBLIC_PORT_RANGE", "12000-16000")
+
+    assert Settings.from_env().ssh_public_port_range == (12000, 16000)
+
+    monkeypatch.setenv("APKSCANNER_SSH_PUBLIC_PORT_RANGE", "bogus")
+    with pytest.raises(ValueError, match="12000-16000"):
+        Settings.from_env()
+
+    monkeypatch.setenv("APKSCANNER_SSH_PUBLIC_PORT_RANGE", "16000-12000")
+    with pytest.raises(ValueError, match="valid TCP port range"):
+        Settings.from_env()
+
+
 def test_settings_parse_an_independent_exploration_phase_budget(
     monkeypatch,
     tmp_path: Path,
@@ -735,6 +753,35 @@ def test_typed_binder_reply_oracle_emits_platform_impact_signal() -> None:
     assert metadata["oracle"]["observation"]["actual_text"] == "service-secret=hunter2"
 
 
+def test_binder_reply_oracle_surfaces_raw_reply_diagnostics() -> None:
+    oracle = AgentOracleSpec(
+        kind="binder_reply",
+        expected_text="service-secret=hunter2",
+        impact="unauthorized_data_access",
+    )
+
+    metadata = AdbDeviceAdapter._evaluate_probe_oracle(
+        oracle,
+        probe_payload={
+            "success": True,
+            "binderTransactReturned": True,
+            "binderReplyDataSize": 4,
+            "binderReplyMarshallBase64": "AAAAAA==",
+            "binderReplyReadError": "java.lang.IllegalStateException: bad offset",
+        },
+        output="",
+    )
+
+    observation = metadata["oracle"]["observation"]
+    # The transaction happened but the typed read failed: the platform must keep
+    # the raw reply so the failure is actionable instead of an opaque miss.
+    assert metadata["oracle"]["matched"] is False
+    assert observation["transact_returned"] is True
+    assert observation["reply_data_size"] == 4
+    assert observation["reply_marshall_base64"] == "AAAAAA=="
+    assert observation["reply_read_error"].startswith("java.lang")
+
+
 def test_binder_reply_claim_requires_successful_platform_transaction() -> None:
     oracle = AgentOracleSpec(
         kind="binder_reply",
@@ -1150,7 +1197,11 @@ def test_oem_jump_prompt_does_not_accept_permanent_only_button(settings) -> None
 
     result = adapter._dismiss_oem_jump_prompt()
 
-    assert result == {"detected": True, "dismissed": False, "reason": "no_known_button"}
+    assert result["detected"] is True
+    assert result["dismissed"] is False
+    assert result["reason"] == "no_known_button"
+    # A permanent grant is never selected, but it is reported for diagnosis.
+    assert [item["text"] for item in result["candidates"]] == ["始终打开"]
     assert not any("tap" in argv for argv in PermanentOnlyRunner.calls)
     assert PermanentOnlyRunner.calls[-1][-3:] == ["rm", "-f", dump_path]
 
@@ -1234,8 +1285,188 @@ def test_oem_jump_prompt_ignores_button_text_owned_by_another_package(settings) 
 
     result = adapter._dismiss_oem_jump_prompt()
 
-    assert result == {"detected": True, "dismissed": False, "reason": "no_known_button"}
+    assert result["detected"] is True
+    assert result["dismissed"] is False
+    assert result["reason"] == "no_known_button"
+    # The only clickable "打开" belongs to another package, so no candidate exists.
+    assert result["candidates"] == []
     assert not any("tap" in argv for argv in ForeignButtonRunner.calls)
+
+
+def test_poc_receipt_diagnostics_surface_binder_transport_failure() -> None:
+    diagnostics = AdbDeviceAdapter._poc_receipt_diagnostics(
+        {
+            "success": False,
+            "error": "Binder proof timed out",
+            "errorType": "java.lang.IllegalStateException",
+            "binderTransactReturned": False,
+            "binderReplyDataSize": 0,
+            "binderReplyReadError": "java.lang.IllegalStateException: bad offset",
+            "binderReplyMarshallBase64": "AAAB",
+            "unrelated": "dropped",
+        }
+    )
+
+    assert diagnostics["error"] == "Binder proof timed out"
+    assert diagnostics["errorType"] == "java.lang.IllegalStateException"
+    assert diagnostics["binderTransactReturned"] is False
+    assert diagnostics["binderReplyReadError"].startswith("java.lang")
+    assert diagnostics["binderReplyMarshallBase64"] == "AAAB"
+    assert "unrelated" not in diagnostics
+    assert AdbDeviceAdapter._poc_receipt_diagnostics(None) == {}
+
+
+# Real Vivo AppJumpPrompt layout: the caption lives in content-desc on the
+# clickable Button (android:id/buttonN) and repeats as text on a non-clickable
+# child. button1=始终打开, button3=仅打开一次, button2=取消.
+_VIVO_JUMP_PROMPT = (
+    '<hierarchy rotation="0">'
+    '<node package="com.vivo.appfilter" resource-id="com.vivo.appfilter:id/parentPanel">'
+    '<node package="com.vivo.appfilter" resource-id="android:id/button1" '
+    'class="android.widget.Button" content-desc="始终打开" clickable="true" '
+    'bounds="[168,2065][1092,2226]">'
+    '<node package="com.vivo.appfilter" text="始终打开" '
+    'resource-id="com.vivo.appfilter:id/vbutton_title" clickable="false" '
+    'bounds="[518,2110][742,2180]" /></node>'
+    '<node package="com.vivo.appfilter" resource-id="android:id/button3" '
+    'class="android.widget.Button" content-desc="仅打开一次" clickable="true" '
+    'bounds="[168,2268][1092,2429]">'
+    '<node package="com.vivo.appfilter" text="仅打开一次" '
+    'resource-id="com.vivo.appfilter:id/vbutton_title" clickable="false" '
+    'bounds="[490,2313][770,2383]" /></node>'
+    '<node package="com.vivo.appfilter" resource-id="android:id/button2" '
+    'class="android.widget.Button" content-desc="取消" clickable="true" '
+    'bounds="[168,2471][1092,2632]" />'
+    "</node></hierarchy>"
+)
+
+
+def test_vivo_jump_prompt_reads_content_desc_and_picks_one_time_button() -> None:
+    result = AdbDeviceAdapter._parse_vivo_jump_prompt(_VIVO_JUMP_PROMPT)
+
+    assert result["detected"] is True
+    assert result["button"] == "仅打开一次"
+    assert result["bounds"] == [168, 2268, 1092, 2429]
+    assert {(168 + 1092) // 2, (2268 + 2429) // 2} == {630, 2348}
+    labels = {item["label"] for item in result["candidates"]}
+    assert labels == {"始终打开", "仅打开一次", "取消"}
+
+
+def test_vivo_jump_prompt_falls_back_to_child_text_for_button3() -> None:
+    # Some builds leave content-desc empty and only set the child TextView text.
+    prompt = (
+        "<hierarchy>"
+        '<node package="com.vivo.appfilter" resource-id="android:id/button1" '
+        'clickable="true" bounds="[0,0][10,10]" />'
+        '<node package="com.vivo.appfilter" resource-id="android:id/button3" '
+        'clickable="true" bounds="[20,20][220,120]">'
+        '<node package="com.vivo.appfilter" text="仅打开一次" clickable="false" '
+        'bounds="[40,40][200,100]" /></node>'
+        "</hierarchy>"
+    )
+
+    result = AdbDeviceAdapter._parse_vivo_jump_prompt(prompt)
+
+    assert result["detected"] is True
+    assert result["button"] == "仅打开一次"
+    assert result["bounds"] == [20, 20, 220, 120]
+
+
+def test_vivo_jump_prompt_never_selects_permanent_or_cancel() -> None:
+    prompt = (
+        "<hierarchy>"
+        '<node package="com.vivo.appfilter" resource-id="android:id/button1" '
+        'content-desc="始终打开" clickable="true" bounds="[0,0][100,100]" />'
+        '<node package="com.vivo.appfilter" resource-id="android:id/button2" '
+        'content-desc="取消" clickable="true" bounds="[0,100][100,200]" />'
+        "</hierarchy>"
+    )
+
+    result = AdbDeviceAdapter._parse_vivo_jump_prompt(prompt)
+
+    assert result["detected"] is True
+    assert "button" not in result
+    assert {item["label"] for item in result["candidates"]} == {"始终打开", "取消"}
+
+
+_APPFILTER_PROMPT = (
+    "<hierarchy>"
+    '<node package="com.vivo.appfilter" text="仅打开一次" '
+    'resource-id="com.vivo.appfilter:id/once" clickable="true" '
+    'bounds="[200,20][400,120]" />'
+    "</hierarchy>"
+)
+
+
+def test_poll_poc_ui_dismisses_vendor_prompt_and_then_matches(settings) -> None:  # noqa: ANN001
+    class InterceptionRunner:
+        calls: list[list[str]] = []
+        tapped = False
+
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @classmethod
+        def run(cls, argv, **_kwargs):  # noqa: ANN001, ANN206
+            cls.calls.append(argv)
+            if "input" in argv and "tap" in argv:
+                cls.tapped = True
+                return CommandResult(argv, 0, "", "")
+            if "uiautomator" in argv:
+                return CommandResult(argv, 0, "UI hierarchy dumped", "")
+            if "cat" in argv:
+                path = argv[-1]
+                if "apkscanner_oem_jump.dump" in path:
+                    if cls.tapped:
+                        return CommandResult(
+                            argv,
+                            0,
+                            '<hierarchy><node package="com.example.target" /></hierarchy>',
+                            "",
+                        )
+                    return CommandResult(argv, 0, _APPFILTER_PROMPT, "")
+                if cls.tapped:
+                    return CommandResult(
+                        argv,
+                        0,
+                        (
+                            '<hierarchy><node package="com.example.target" '
+                            'text="Sensitive record: username=admin password=hunter2" />'
+                            "</hierarchy>"
+                        ),
+                        "",
+                    )
+                return CommandResult(argv, 0, _APPFILTER_PROMPT, "")
+            return CommandResult(argv, 0, "", "")
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        InterceptionRunner(),  # type: ignore[arg-type]
+    )
+    oracle = AgentOracleSpec(
+        kind="ui_text",
+        expected_text="Sensitive record: username=admin password=hunter2",
+        impact="unauthorized_data_access",
+    )
+
+    _result, metadata, _attempts, _seconds = adapter._poll_poc_ui(
+        oracle=oracle,
+        package_name="com.example.target",
+        baseline_output='<hierarchy><node package="com.example.target" /></hierarchy>',
+        baseline_valid=True,
+        timeout_seconds=15,
+        budget=None,
+    )
+
+    assert (metadata.get("oracle") or {}).get("matched") is True
+    interception = metadata.get("platform_interception")
+    assert interception is not None
+    assert interception["detected"] is True
+    assert interception["vendor_package"] == "com.vivo.appfilter"
+    assert interception["kind"] == "app_jump_confirmation"
+    assert interception["dismissed"] is True
+    assert any("input" in argv and "tap" in argv for argv in InterceptionRunner.calls)
 
 
 def test_android13_device_is_local_verdict_but_not_release_gate_eligible(

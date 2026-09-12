@@ -7,7 +7,7 @@
 ![Android](https://img.shields.io/badge/Android-release%20baseline%20API%2036-3DDC84?logo=android&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.122%2B-009688?logo=fastapi&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=111)
-![Codex SDK](https://img.shields.io/badge/Codex%20SDK-0.144.4-111111)
+![Codex SDK](https://img.shields.io/badge/Codex%20SDK-0.147.0-111111)
 
 APKScanner 是一个面向授权 Android APK 的安全审计平台。它先用确定性分析枚举组件、
 Deep Link 和代码攻击面，再让 Codex Agent 沿真实调用链探索、生成 PoC，并通过独占 ADB
@@ -40,7 +40,7 @@ APKScanner 的核心设计是：**平台保证覆盖和事实，Agent 负责探�
 | 确定性攻击面 | 解析生效 Manifest，枚举 Activity、Service、Receiver、Provider、Alias、权限与 Deep Link；结合 Apktool/Smali、JADX 和归档规则生成 Security IR |
 | 产品资产图谱 | 递归拆解内嵌 APK 与 H5/JS 资源；连接宿主加载证据、内嵌 APK 与插件入口；枚举 SO 并生成 ELF、动态符号、JNI 摘要，连接 Java native 声明、`loadLibrary`、JNI 导出与具体 ABI 库 |
 | 目标感知规划 | 通用枚举之后应用显式目标 Profile；按同一实现和攻击链归并入口变体，保留全部入口 ID、合并原因与成本回执，并把插件、Web 和 Native 子链限制为少量高价值任务 |
-| 深度 Agent 调查 | `openai-codex==0.144.4` + DeepSeek Responses API；持久 Thread、多轮增量证据回灌、Critic/Rescue/Final 有界扇出，并按证据增量收敛无进展轮次 |
+| 深度 Agent 调查 | `openai-codex==0.147.0` + DeepSeek-V4.1-Flash（`deepseek-flash`）Responses API；持久 Thread、多轮增量证据回灌、Critic/Rescue/Final 有界扇出，并按证据增量收敛无进展轮次 |
 | Docker 隔离 | 一次扫描一个无密钥 keeper 容器；每个 `task + attempt + role` 使用独立 Unix UID、HOME、`CODEX_HOME`、临时目录和可写工作区 |
 | 真机验证 | ADB 设备池支持 USB 与 IP:Port 动态接入；仅安装、执行、观察、清理的短动态批次占用 serial，静态阅读、Agent 推理和构建阶段不占设备 |
 | 证据闭环 | 持久化 Hypothesis、Argument、ProofAttempt、Evidence、Oracle 和 Verdict；支持普通 App UID Harness、Agent PoC 与可断点恢复的多步骤 Dynamic Experiment，模型文字不能自证漏洞成立 |

@@ -1,6 +1,9 @@
 from pathlib import Path
 
-from apkscanner.analysis.android_chains import AndroidAttackChainAnalyzer
+from apkscanner.analysis.android_chains import (
+    AndroidAttackChainAnalyzer,
+    derive_chain_site,
+)
 from apkscanner.analysis.manifest import parse_manifest
 from apkscanner.analysis.rules import BuiltinRuleEngine
 from apkscanner.analysis.static_analysis import StaticAnalysisResult
@@ -538,7 +541,12 @@ def test_binder_claimed_package_authorization_requires_calling_uid_binding(tmp_p
     surfaces = engine.static_review_surfaces(manifest, findings)
 
     assert any(item.rule_id == "CHAIN-ANDROID-RUNTIME-IPC" for item in findings)
-    assert [item.family for item in surfaces].count("runtime_ipc_boundary") == 1
+    runtime_surfaces = [
+        item for item in surfaces if item.family == "runtime_ipc_boundary"
+    ]
+    # One non-dispatched family roll-up plus one addressable surface per site.
+    assert sum(item.rollup for item in runtime_surfaces) == 1
+    assert any(item.site and not item.rollup for item in runtime_surfaces)
 
 
 def test_service_manager_identity_bypass_detects_multi_service_no_auth(tmp_path) -> None:
@@ -761,3 +769,63 @@ def test_forward_search_direction_tagged_on_all_chains(tmp_path) -> None:
             f"chain {chain['chain_kind']} should have search_direction"
         )
         assert chain["search_direction"] in {"forward", "reverse", "bidirectional"}
+
+
+def test_derive_chain_site_selects_handler_and_sink() -> None:
+    chain = {
+        "chain_kind": "nested_intent_redirection",
+        "family": "capability_delegation_boundary",
+        "priority": 96,
+        "hop_count": 1,
+        "fingerprint": "f" * 64,
+        "source_markers": ["nested_intent_input"],
+        "sink_markers": ["intent_dispatch"],
+        "path": [
+            {"class_name": "com.example.Entry"},
+            {"class_name": "com.example.Internal"},
+        ],
+        "locations": [
+            {
+                "marker": "nested_intent_input",
+                "class_name": "com.example.Entry",
+                "method": "onCreate",
+                "path": "Entry.java",
+                "line": 10,
+            },
+            {
+                "marker": "intent_dispatch",
+                "class_name": "com.example.Internal",
+                "method": "start",
+                "path": "Internal.java",
+                "line": 20,
+            },
+        ],
+    }
+
+    site = derive_chain_site(chain)
+
+    assert site["handler"] == "com.example.Entry#onCreate"
+    assert site["handler_class"] == "com.example.Entry"
+    assert site["sink"] == "com.example.Internal#start"
+    assert site["site_key"].startswith("nested_intent_redirection|com.example.Entry|onCreate")
+    assert [item["line"] for item in site["locations"]] == [10, 20]
+
+
+def test_derive_chain_site_falls_back_to_path_when_marker_location_is_missing() -> None:
+    chain = {
+        "chain_kind": "service_manager_identity_bypass",
+        "family": "runtime_ipc_boundary",
+        "source_markers": ["binder_entrypoint"],
+        "sink_markers": ["caller_supplied_identity"],
+        "path": [
+            {"class_name": "com.example.Binder"},
+            {"class_name": "com.example.Binder"},
+        ],
+        "locations": [],
+    }
+
+    site = derive_chain_site(chain)
+
+    assert site["handler"] == "com.example.Binder#<init>"
+    assert site["sink"] == "com.example.Binder#<init>"
+    assert site["locations"] == []

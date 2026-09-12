@@ -455,7 +455,7 @@ def test_critic_and_arbiter_cannot_downgrade_platform_proven_hypothesis(
         payload=refuting_payload,
         result_value="refuted_static",
         backend="opencode",
-        model="deepseek-v4-flash",
+        model="deepseek-flash",
     )
 
     with database.session_factory() as session:
@@ -1055,3 +1055,79 @@ def test_finalize_closes_each_hypothesis_from_its_own_receipt(settings) -> None:
         assert evidence_by_hypothesis[blocked_id] == ["static-block"]
         assert evidence_by_hypothesis[supported_id] == ["static-sink"]
         assert evidence_by_hypothesis[unassessed_id] == []
+
+
+def test_complete_proof_carries_oem_app_jump_precondition(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="oem.apk",
+            artifact_sha256="c" * 64,
+            artifact_path=str(settings.data_dir / "oem.apk"),
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            target_entry_ids=["00000000-0000-0000-0000-000000000001"],
+            hypotheses=["An ordinary app can start the exported activity."],
+        )
+        session.add_all([scan, task])
+        session.commit()
+
+    ledger = HypothesisLedger(database)
+    hypotheses = ledger.ensure_task_hypotheses(task)
+    request = AgentRequestedTest(
+        hypothesis_id=hypotheses[0].id,
+        entry_point_id="00000000-0000-0000-0000-000000000001",
+        state="guest",
+        extras={},
+        operation="auto",
+        rationale="Start the exported activity from an ordinary app UID.",
+    )
+    proof_id = ledger.plan_proof(task_id=task.id, test_case_id="oem-1", request=request)
+    assert proof_id is not None
+    ledger.start_proof(proof_id)
+    _complete_proof_with_persisted_evidence(
+        ledger,
+        database,
+        scan_id=task.scan_id,
+        task_id=task.id,
+        proof_id=proof_id,
+        evidence=[
+            {
+                "id": "oem-ui",
+                "kind": "blackbox.poc_ui_dump",
+                "exit_code": 0,
+                "metadata": {
+                    "request_id": "request-oem",
+                    "request_observed": True,
+                    "platform_interception": {
+                        "detected": True,
+                        "vendor_package": "com.vivo.appfilter",
+                        "kind": "app_jump_confirmation",
+                        "dismissed": True,
+                    },
+                },
+            }
+        ],
+    )
+
+    with database.session_factory() as session:
+        attempt = session.get(ProofAttempt, proof_id)
+        assert attempt is not None
+        # An allowed OEM app-jump guard makes this a user-assisted proof, and the
+        # precondition must survive into the persisted attempt receipt.
+        assert attempt.oracle["requires_user_interaction"] is True
+        assert attempt.oracle["oem_consent_gated"] is True
+        assert attempt.oracle["external_controls"] == [
+            {
+                "type": "oem_app_jump_guard",
+                "vendor_package": "com.vivo.appfilter",
+                "kind": "app_jump_confirmation",
+                "dismissed": True,
+                "requires_user_interaction": True,
+                "evidence_id": "oem-ui",
+            }
+        ]

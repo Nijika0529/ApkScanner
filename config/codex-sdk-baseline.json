@@ -2,11 +2,11 @@
   "schema_version": "1.0",
   "language": "python",
   "sdk_distribution": "openai-codex",
-  "sdk_version": "0.144.4",
+  "sdk_version": "0.147.0",
   "runtime_distribution": "openai-codex-cli-bin",
-  "runtime_version": "0.144.4",
-  "source_commit": "6751b54cae32b23786001e2414d749a9916201e1",
-  "source_commit_time": "2026-08-01T01:17:26+00:00",
-  "generated_protocol_sha256": "85e21305e212d00a33e1092f134b71135944cde4dfc711922636b74558b7eab1",
-  "verified_at": "2026-08-01T03:46:25+00:00"
+  "runtime_version": "0.147.0",
+  "source_commit": "025a88adbd7ae4d448fc938b28d0446eb1753317",
+  "source_commit_time": "2026-08-18T06:08:40+00:00",
+  "generated_protocol_sha256": "f2039408a2986babd0a63f6c8c733271e4402ed36ffe36cefc389ab1811c9b32",
+  "verified_at": "2026-09-01T09:18:24+00:00"
 }

@@ -169,6 +169,12 @@ def test_platform_materializes_a_request_scoped_binder_harness(settings, tmp_pat
     assert 'receipt.put("receipt_terminal", terminal)' in source
     assert "@Override protected void onResume()" in source
     assert "}, 150L);" in source
+    # Binder proof diagnostics: raw reply bytes and a decode failure must reach
+    # the platform even when the typed read fails.
+    assert "binderReplyDataSize" in source
+    assert "binderReplyMarshallBase64" in source
+    assert "binderReplyReadError" in source
+    assert "callerUid" in source
     manifest = (snapshot_workspace / spec.project_path / "AndroidManifest.xml").read_text(
         encoding="utf-8"
     )

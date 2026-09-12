@@ -19,6 +19,7 @@ from pydantic import ValidationError
 
 from ..core.config import Settings
 from ..core.models import EntryPoint, InvestigationTask, Scan
+from ..core.permissions import ensure_private_directory
 from ..core.schemas import (
     ADAPTIVE_VERIFIER_RESULT_JSON_SCHEMA,
     AGENT_RESULT_JSON_SCHEMA,
@@ -504,7 +505,8 @@ class CodexInvestigator:
             gateway_environment=gateway_environment,
             cancel_event=cancel_event,
             developer_instructions_text=adaptive_verifier_developer_instructions(
-                ssh_available=ssh_available
+                ssh_available=ssh_available,
+                public_port_range=self.settings.ssh_public_port_range,
             ),
         )
         session_key = (scan.id, task.id, task.attempts, role)
@@ -919,8 +921,13 @@ class CodexInvestigator:
     def _client(self):  # noqa: ANN202
         from openai_codex import Codex, CodexConfig
 
+        # Never rely on the ambient HOME: restricted/sandboxed homes make the
+        # Codex CLI fail to initialize its state runtime under ~/.codex.
+        codex_home = self.settings.codex_home_dir
+        ensure_private_directory(codex_home)
         config = CodexConfig(
             codex_bin=self.settings.codex_bin,
+            env={"CODEX_HOME": str(codex_home)},
             config_overrides=codex_config_overrides(
                 provider=self.settings.codex_provider,
                 model=self.settings.codex_model,

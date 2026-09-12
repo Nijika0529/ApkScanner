@@ -2,9 +2,15 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+from typing import Any
 
 from ..core.enums import EntryPointKind, TaskStatus, TaskType
 from ..core.models import EntryPoint, InvestigationTask
+
+# Standalone chain sites (those whose handler has no component task) are admitted
+# in priority order; the rest stay as inventory surfaces instead of consuming
+# devices and Agent turns.
+DEFAULT_MAX_STANDALONE_CHAIN_SITES = 12
 
 # Curated from the Android Manifest.permission API reference. Keep unknown
 # framework/OEM permissions unresolved so they continue to Agent review.
@@ -70,6 +76,10 @@ class InvestigationPlan:
     tasks: list[InvestigationTask] = field(default_factory=list)
     static_closures: list[StaticEntryClosure] = field(default_factory=list)
     coalescing_decisions: list[dict[str, object]] = field(default_factory=list)
+    chain_site_total: int = 0
+    chain_site_dispatched: int = 0
+    chain_site_merged_into_component: int = 0
+    chain_site_deferred: int = 0
 
 
 class InvestigationPlanner:
@@ -80,11 +90,13 @@ class InvestigationPlanner:
         adb_configured: bool,
         android_api: int = 36,
         device_reset_policy: str = "never",
+        max_standalone_chain_sites: int = DEFAULT_MAX_STANDALONE_CHAIN_SITES,
     ):
         self.android_version = android_version
         self.android_api = android_api
         self.adb_configured = adb_configured
         self.device_reset_policy = device_reset_policy
+        self.max_standalone_chain_sites = max(0, int(max_standalone_chain_sites))
 
     def plan(self, scan_id: str, entries: list[EntryPoint]) -> list[InvestigationTask]:
         return self.plan_with_decisions(scan_id, entries).tasks
@@ -99,6 +111,10 @@ class InvestigationPlanner:
         component_tasks_by_name: dict[str, InvestigationTask] = {}
         for entry in entries:
             if entry.kind == EntryPointKind.STATIC_SURFACE.value:
+                if (entry.metadata_json or {}).get("static_review_rollup") is True:
+                    # Roll-up surfaces keep family coverage and version diffing
+                    # but are not dispatched; per-site surfaces carry dispatch.
+                    continue
                 plan.tasks.append(self._static_review_task(scan_id, entry))
                 continue
             closure = self._static_closure(entry)
@@ -125,11 +141,166 @@ class InvestigationPlanner:
                 *self._deep_link_hypotheses(owner)[1:],
             ]
             owner_task.priority = max(owner_task.priority, 98)
-        plan.tasks, plan.coalescing_decisions = self._coalesce_explicit_groups(
+        # Chain sites fold into the component task that owns their handler; only
+        # sites without a component task become standalone, and those are admitted
+        # by priority so granularity does not explode the task count.
+        plan.tasks, attachment_decisions = self._attach_chain_sites(plan.tasks, entries)
+        plan.tasks, group_decisions = self._coalesce_explicit_groups(plan.tasks, entries)
+        plan.tasks, deferred_chain_entries = self._admit_standalone_chain_sites(
             plan.tasks,
             entries,
         )
+        plan.coalescing_decisions = [*attachment_decisions, *group_decisions]
+        plan.chain_site_total = sum(
+            1
+            for entry in entries
+            if isinstance((entry.metadata_json or {}).get("static_review_site"), dict)
+        )
+        plan.chain_site_merged_into_component = sum(
+            int(item.get("merged_entry_count") or 0)
+            for item in attachment_decisions
+            if item.get("strategy") == "component_handler_site"
+        )
+        plan.chain_site_deferred = deferred_chain_entries
+        plan.chain_site_dispatched = max(
+            0,
+            plan.chain_site_total - plan.chain_site_deferred,
+        )
         return plan
+
+    @staticmethod
+    def _chain_site_of(entry: EntryPoint) -> dict[str, Any] | None:
+        site = (entry.metadata_json or {}).get("static_review_site")
+        return site if isinstance(site, dict) else None
+
+    @classmethod
+    def _task_chain_site(
+        cls,
+        task: InvestigationTask,
+        entries_by_id: dict[str, EntryPoint],
+    ) -> dict[str, Any] | None:
+        if task.task_type != TaskType.STATIC_REVIEW.value:
+            return None
+        for entry_id in task.target_entry_ids:
+            entry = entries_by_id.get(entry_id)
+            if entry is None:
+                continue
+            site = cls._chain_site_of(entry)
+            if site is not None:
+                return site
+        return None
+
+    @classmethod
+    def _attach_chain_sites(
+        cls,
+        tasks: list[InvestigationTask],
+        entries: list[EntryPoint],
+    ) -> tuple[list[InvestigationTask], list[dict[str, object]]]:
+        entries_by_id = {entry.id: entry for entry in entries}
+        component_by_handler: dict[str, InvestigationTask] = {}
+        for task in tasks:
+            if task.task_type != TaskType.COMPONENT.value:
+                continue
+            for entry_id in task.target_entry_ids:
+                entry = entries_by_id.get(entry_id)
+                if entry is None:
+                    continue
+                component_by_handler.setdefault(entry.name, task)
+                if entry.owner_component:
+                    component_by_handler.setdefault(entry.owner_component, task)
+
+        attached: set[int] = set()
+        handler_tasks: dict[str, InvestigationTask] = {}
+        decisions: list[dict[str, object]] = []
+        for task in tasks:
+            site = cls._task_chain_site(task, entries_by_id)
+            if site is None:
+                continue
+            handler = str(site.get("handler_class") or site.get("handler") or "")
+            owner = component_by_handler.get(handler)
+            if owner is None:
+                existing = handler_tasks.get(handler)
+                if existing is None:
+                    handler_tasks[handler] = task
+                    continue
+                strategy = "same_handler_site"
+                reason = (
+                    f"chain site {site.get('site_key')} shares handler {handler} "
+                    "with another chain site in this scan"
+                )
+                base = existing
+            else:
+                strategy = "component_handler_site"
+                reason = (
+                    f"chain site {site.get('site_key')} belongs to the component task "
+                    f"that already investigates handler {handler}"
+                )
+                base = owner
+            merged = cls._merge_tasks(base, task, reason=reason, strategy=strategy)
+            attached.add(id(task))
+            decisions.append(merged)
+
+        remaining = [task for task in tasks if id(task) not in attached]
+        return remaining, decisions
+
+    @staticmethod
+    def _merge_tasks(
+        base: InvestigationTask,
+        extra: InvestigationTask,
+        *,
+        strategy: str,
+        reason: str,
+    ) -> dict[str, object]:
+        base.target_entry_ids = list(
+            dict.fromkeys([*base.target_entry_ids, *extra.target_entry_ids])
+        )
+        base.hypotheses = list(dict.fromkeys([*base.hypotheses, *extra.hypotheses]))
+        base.allowed_side_effects = list(
+            dict.fromkeys([*base.allowed_side_effects, *extra.allowed_side_effects])
+        )
+        base.priority = max(int(base.priority or 0), int(extra.priority or 0))
+        preconditions = dict(base.preconditions or {})
+        attachments = list(preconditions.get("chain_site_attachments") or [])
+        attachments.append(
+            {
+                "strategy": strategy,
+                "reason": reason,
+                "merged_task_id": extra.id,
+                "merged_entry_ids": list(extra.target_entry_ids),
+            }
+        )
+        base.preconditions = {**preconditions, "chain_site_attachments": attachments}
+        return {
+            "group_key": f"chain-site:{extra.id}",
+            "strategy": strategy,
+            "reason": reason,
+            "source_task_count": 2,
+            "result_task_count": 1,
+            "avoided_task_count": 1,
+            "merged_entry_count": len(extra.target_entry_ids),
+            "entry_point_ids": list(extra.target_entry_ids),
+        }
+
+    def _admit_standalone_chain_sites(
+        self,
+        tasks: list[InvestigationTask],
+        entries: list[EntryPoint],
+    ) -> tuple[list[InvestigationTask], int]:
+        entries_by_id = {entry.id: entry for entry in entries}
+        standalone = [
+            task
+            for task in tasks
+            if self._task_chain_site(task, entries_by_id) is not None
+        ]
+        if len(standalone) <= self.max_standalone_chain_sites:
+            return tasks, 0
+        standalone.sort(key=lambda task: (-int(task.priority or 0), str(task.id)))
+        kept = {id(task) for task in standalone[: self.max_standalone_chain_sites]}
+        deferred = [task for task in standalone if id(task) not in kept]
+        deferred_ids = {id(task) for task in deferred}
+        deferred_entry_count = sum(len(task.target_entry_ids) for task in deferred)
+        remaining = [task for task in tasks if id(task) not in deferred_ids]
+        return remaining, deferred_entry_count
 
     @staticmethod
     def _coalesce_explicit_groups(
@@ -498,6 +669,19 @@ class InvestigationPlanner:
             for value in metadata.get("static_review_hypotheses", [])
             if isinstance(value, str)
         ]
+        site = metadata.get("static_review_site")
+        if isinstance(site, dict):
+            hypotheses = list(
+                dict.fromkeys(
+                    [
+                        (
+                            f"处理程序 {site.get('handler')} 到 sink {site.get('sink')} "
+                            "的攻击链是否可被普通第三方应用到达，并产生具体未授权影响。"
+                        ),
+                        *hypotheses,
+                    ]
+                )
+            )
         if not hypotheses:
             hypotheses = [
                 "The assigned static code signal participates in a reachable security boundary.",
@@ -514,6 +698,14 @@ class InvestigationPlanner:
                 "static_semantic_seed": True,
                 "family": metadata.get("static_review_family"),
                 "rule_ids": list(metadata.get("static_review_rule_ids") or []),
+                **(
+                    {
+                        "chain_site": site,
+                        "parent_surface": metadata.get("static_review_parent_surface"),
+                    }
+                    if isinstance(site, dict)
+                    else {}
+                ),
             },
             allowed_side_effects=[],
             device_profile={

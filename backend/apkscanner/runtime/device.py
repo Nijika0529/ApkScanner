@@ -846,7 +846,12 @@ class AdbDeviceAdapter:
             bounds = prompt.get("bounds")
             button_text = prompt.get("button")
             if not isinstance(bounds, list) or not isinstance(button_text, str):
-                return {"detected": True, "dismissed": False, "reason": "no_known_button"}
+                return {
+                    "detected": True,
+                    "dismissed": False,
+                    "reason": "no_known_button",
+                    "candidates": prompt.get("candidates", []),
+                }
 
             center_x = (bounds[0] + bounds[2]) // 2
             center_y = (bounds[1] + bounds[3]) // 2
@@ -882,6 +887,7 @@ class AdbDeviceAdapter:
                 "button": button_text,
                 "bounds": bounds,
                 "tap_center": [center_x, center_y],
+                "candidates": prompt.get("candidates", []),
                 "result": tap,
             }
         finally:
@@ -893,7 +899,14 @@ class AdbDeviceAdapter:
 
     @staticmethod
     def _parse_vivo_jump_prompt(value: str) -> dict[str, Any]:
-        """Return only a clickable button owned by Vivo's prompt package."""
+        """Return the Vivo jump-prompt's positive action and observed buttons.
+
+        Only buttons owned by ``com.vivo.appfilter`` are considered. Permanent
+        grants ("始终打开"/"始终允许") are never selected so one experiment cannot
+        change later app-jump behavior. When no known one-time label is present,
+        the raw clickable candidates are returned so the ROM's actual labels can
+        be folded back into this matcher.
+        """
 
         try:
             root = ElementTree.fromstring(value)
@@ -905,31 +918,93 @@ class AdbDeviceAdapter:
         )
         if not detected:
             return {"detected": False}
-        for candidate in ("仅打开一次", "打开"):
-            for node in nodes:
-                resource_id = node.attrib.get("resource-id", "")
-                if (
-                    node.attrib.get("package") != "com.vivo.appfilter"
-                    or node.attrib.get("text") != candidate
-                    or node.attrib.get("clickable") != "true"
-                    or (
-                        resource_id
-                        and not resource_id.startswith("com.vivo.appfilter:")
-                    )
-                ):
-                    continue
-                match = re.fullmatch(
-                    r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]",
-                    node.attrib.get("bounds", ""),
-                )
-                if match is None:
+
+        def label_of(node) -> str:  # noqa: ANN001
+            # Vivo renders the button caption in ``content-desc`` on the clickable
+            # Button and repeats it as ``text`` on a non-clickable child.
+            direct = (node.attrib.get("content-desc") or node.attrib.get("text") or "").strip()
+            if direct:
+                return direct
+            for child in node.iter():
+                nested = (
+                    child.attrib.get("text") or child.attrib.get("content-desc") or ""
+                ).strip()
+                if nested:
+                    return nested
+            return ""
+
+        # A permanent grant would change later app-jump behavior, and cancel would
+        # abort the experiment. Neither is ever selected.
+        blocked = {
+            "始终打开",
+            "始终允许",
+            "总是允许",
+            "永久允许",
+            "取消",
+            "拒绝",
+            "不允许",
+            "禁止",
+        }
+        clickable: list[dict[str, Any]] = []
+        for node in nodes:
+            if node.attrib.get("package") != "com.vivo.appfilter":
+                continue
+            match = re.fullmatch(
+                r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]",
+                node.attrib.get("bounds", ""),
+            )
+            if node.attrib.get("clickable") != "true" or match is None:
+                continue
+            label = label_of(node)
+            clickable.append(
+                {
+                    "label": label,
+                    "text": node.attrib.get("text", ""),
+                    "content_desc": node.attrib.get("content-desc", ""),
+                    "resource_id": node.attrib.get("resource-id", ""),
+                    "bounds": [int(value) for value in match.groups()],
+                }
+            )
+        for candidate in (
+            "仅打开一次",
+            "仅此一次",
+            "仅本次允许",
+            "仅本次",
+            "本次允许",
+            "打开",
+            "允许",
+            "确定",
+            "继续",
+        ):
+            if candidate in blocked:
+                continue
+            for node in clickable:
+                if node["label"] != candidate:
                     continue
                 return {
                     "detected": True,
                     "button": candidate,
-                    "bounds": [int(value) for value in match.groups()],
+                    "bounds": node["bounds"],
+                    "candidates": clickable,
                 }
-        return {"detected": True}
+        # Framework resource ids are stable across some Vivo builds even when the
+        # caption changes: button3 is the one-time action, button1 permanent and
+        # button2 cancel. Only use button3, and never when its caption is blocked.
+        for node in clickable:
+            if node["resource_id"] not in {
+                "android:id/button3",
+                "com.vivo.appfilter:id/button3",
+            }:
+                continue
+            if node["label"] in blocked:
+                continue
+            return {
+                "detected": True,
+                "button": node["label"] or "button3",
+                "bounds": node["bounds"],
+                "candidates": clickable,
+            }
+        return {"detected": True, "candidates": clickable}
 
     def execute_poc(
         self,
@@ -1353,6 +1428,7 @@ class AdbDeviceAdapter:
                                 "matching_line_count": len(matching),
                                 "pid_fallback_line_count": len(pid_fallback_matching),
                                 "durable_receipt_observed": receipt_observed,
+                                "poc_diagnostics": self._poc_receipt_diagnostics(log_poc_payload),
                                 "poll_attempts": poll_attempts,
                                 "observation_window_seconds": observation_seconds,
                                 **log_poc_oracle,
@@ -1672,6 +1748,9 @@ class AdbDeviceAdapter:
                 "receipt_stage": payload.get("receipt_stage") if payload is not None else None,
                 "receipt_terminal": terminal,
                 "receipt_validation_error": error,
+                "receipt_error": payload.get("error") if payload is not None else None,
+                "receipt_error_type": payload.get("errorType") if payload is not None else None,
+                "receipt_diagnostics": self._poc_receipt_diagnostics(payload),
                 "poc_success": bool(terminal and payload and payload.get("success") is True),
                 "poc_claimed_security_impact": bool(
                     terminal
@@ -1777,6 +1856,8 @@ class AdbDeviceAdapter:
             ["adb", "-s", self.serial or "", "shell", "uiautomator", "dump"]
         )
         metadata: dict[str, Any] = {}
+        interception: dict[str, Any] | None = None
+        interception_handled = False
         while True:
             attempts += 1
             remaining = max(1, int(deadline - time.monotonic()))
@@ -1784,19 +1865,57 @@ class AdbDeviceAdapter:
                 budget=budget,
                 cap=min(45, remaining),
             )
+            prompt = (
+                self._parse_vivo_jump_prompt(last.stdout)
+                if last.exit_code == 0 and last.stdout
+                else {"detected": False}
+            )
+            observation_valid = last.exit_code == 0
+            if prompt.get("detected"):
+                # OEM behavior: launching a target Activity from an ordinary app
+                # can be gated behind a vendor confirmation dialog. The dialog is
+                # not a target observation, and leaving it on screen makes every
+                # subsequent uiautomator dump blind to the target UI.
+                observation_valid = False
+                if not interception_handled:
+                    interception_handled = True
+                    dismissed = self._dismiss_oem_jump_prompt(budget=budget)
+                    # The dialog can vanish between our own dump and the helper's
+                    # dump (a one-time allow, or the OEM auto-closing it). Either
+                    # way it is gone, so re-observe instead of recording a miss.
+                    prompt_gone = (
+                        dismissed.get("dismissed") is True
+                        or dismissed.get("detected") is False
+                    )
+                    interception = {
+                        "detected": True,
+                        "vendor_package": "com.vivo.appfilter",
+                        "kind": "app_jump_confirmation",
+                        "dismissed": prompt_gone,
+                        "reason": dismissed.get("reason"),
+                        "button": dismissed.get("button"),
+                        "candidates": dismissed.get("candidates") or [],
+                    }
+                    if prompt_gone:
+                        # Re-observe immediately after the dialog cleared.
+                        continue
+                elif interception is not None:
+                    interception["still_present"] = True
             metadata = self._evaluate_ui_oracle(
                 oracle,
                 last.stdout,
                 package_name=package_name,
                 baseline_output=baseline_output,
                 baseline_valid=baseline_valid,
-                observation_valid=last.exit_code == 0,
+                observation_valid=observation_valid,
             )
             metadata["observation_policy"] = {
                 "mode": "adaptive_adb_latency",
                 "window_seconds": adaptive_window,
                 "recent_ui_dump_p50_seconds": self._recent_ui_dump_p50(),
             }
+            if interception is not None:
+                metadata["platform_interception"] = interception
             if (
                 bool((metadata.get("oracle") or {}).get("matched"))
                 or time.monotonic() >= deadline
@@ -2048,6 +2167,49 @@ class AdbDeviceAdapter:
         return None
 
     @staticmethod
+    def _poc_receipt_diagnostics(payload: dict[str, Any] | None) -> dict[str, Any]:
+        """Keep the bounded failure/transport facts a PoC receipt already records.
+
+        The generated harness writes ``error``/``errorType`` plus transport
+        details into its durable receipt. Discarding them leaves the agent and the
+        Oracle unable to distinguish a failed bind, a failed transaction, and a
+        reply-decoding mismatch.
+        """
+
+        if not isinstance(payload, dict):
+            return {}
+        interesting = (
+            "delivered",
+            "bound",
+            "boundComponent",
+            "callerUid",
+            "error",
+            "errorType",
+            "result_summary",
+            "row_count",
+            "binderTransactionCode",
+            "binderTransactReturned",
+            "binderReplyType",
+            "binderReply",
+            "binderReplies",
+            "binderReplyReadError",
+            "binderReplyDataSize",
+            "binderReplyMarshallBase64",
+            "binderReplyMarshallError",
+        )
+        diagnostics: dict[str, Any] = {}
+        for key in interesting:
+            value = payload.get(key)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                value = value[:500]
+            elif isinstance(value, list):
+                value = value[:8]
+            diagnostics[key] = value
+        return diagnostics
+
+    @staticmethod
     def _oracle_metadata(
         oracle: AgentOracleSpec,
         *,
@@ -2160,6 +2322,22 @@ class AdbDeviceAdapter:
                     "reply_index": oracle.reply_index,
                     "match_mode": oracle.match_mode,
                     "transact_returned": transact_returned,
+                    "reply_read_error": (
+                        probe_payload.get("binderReplyReadError")
+                        if isinstance(probe_payload, dict)
+                        else None
+                    ),
+                    "reply_data_size": (
+                        probe_payload.get("binderReplyDataSize")
+                        if isinstance(probe_payload, dict)
+                        else None
+                    ),
+                    "reply_marshall_base64": (
+                        str(probe_payload.get("binderReplyMarshallBase64"))[:512]
+                        if isinstance(probe_payload, dict)
+                        and probe_payload.get("binderReplyMarshallBase64")
+                        else None
+                    ),
                 },
                 impact_observed=(matched and oracle.impact == "unauthorized_data_access"),
                 refutation_observed=success and transact_returned,

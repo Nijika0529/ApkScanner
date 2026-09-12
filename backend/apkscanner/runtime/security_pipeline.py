@@ -561,6 +561,41 @@ class HypothesisLedger:
                     ProofAttemptStatus.REFUTED.value,
                 }:
                     status = ProofAttemptStatus.INCONCLUSIVE.value
+            external_controls: list[dict[str, Any]] = []
+            for item in evidence:
+                metadata = item.get("metadata", {})
+                interception = metadata.get("platform_interception")
+                if isinstance(interception, dict) and interception.get("detected") is True:
+                    external_controls.append(
+                        {
+                            "type": "oem_app_jump_guard",
+                            "vendor_package": interception.get("vendor_package"),
+                            "kind": interception.get("kind"),
+                            "dismissed": interception.get("dismissed") is True,
+                            "requires_user_interaction": True,
+                            "evidence_id": item.get("id"),
+                        }
+                    )
+                elif metadata.get("oem_jump_prompt_auto_allowed"):
+                    external_controls.append(
+                        {
+                            "type": "oem_app_jump_guard",
+                            "vendor_package": "com.vivo.appfilter",
+                            "kind": "app_jump_confirmation",
+                            "dismissed": True,
+                            "requires_user_interaction": True,
+                            "evidence_id": item.get("id"),
+                        }
+                    )
+            deduped_controls: list[dict[str, Any]] = []
+            seen_controls: set[tuple[Any, Any]] = set()
+            for control in external_controls:
+                key = (control.get("type"), control.get("vendor_package"))
+                if key in seen_controls:
+                    continue
+                seen_controls.add(key)
+                deduped_controls.append(control)
+            oem_consent_gated = bool(deduped_controls)
             oracle = {
                 "schema_version": "1.0",
                 "correlated_probe_result": correlated,
@@ -592,16 +627,17 @@ class HypothesisLedger:
                 "harm_demonstrated": harm_demonstrated,
                 "evidence_receipt_valid": evidence_receipt_valid,
                 "missing_evidence_ids": missing_evidence_ids,
-                "oem_consent_gated": any(
-                    item.get("metadata", {}).get("oem_jump_prompt_auto_allowed")
-                    for item in evidence
-                ),
+                "oem_consent_gated": oem_consent_gated,
+                "requires_user_interaction": oem_consent_gated,
+                "external_controls": deduped_controls,
                 "policy": (
                     "A model claim and successful reachability test are not proof of harm. "
                     "Harm requires both demonstrated execution and a platform Prover's "
                     "satisfied ImpactContract on a device eligible for the selected "
                     "validation profile. Development legacy verdicts become Findings but "
-                    "remain ineligible for the Android 16 release gate."
+                    "remain ineligible for the Android 16 release gate. When an OEM "
+                    "app-jump guard had to be allowed, the attempt is user-assisted rather "
+                    "than silent, and the precondition is carried into the Finding."
                 ),
             }
             completed_at = now()

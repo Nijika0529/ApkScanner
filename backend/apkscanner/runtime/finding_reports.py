@@ -33,6 +33,10 @@ class FindingReport(BaseModel):
     remediation: list[str] = Field(default_factory=list, max_length=2)
     task_id: str
     hypothesis_id: str
+    # An OEM app-jump guard that had to be allowed makes the runtime result
+    # user-assisted rather than silent; surfaces must show that precondition.
+    requires_user_interaction: bool = False
+    external_controls: list[str] = Field(default_factory=list, max_length=3)
 
 
 def _compact(value: Any, *, limit: int) -> str:
@@ -131,6 +135,25 @@ def build_finding_report(
         count=2,
         limit=500,
     )
+    external_controls: list[str] = []
+    for attempt in attempts:
+        if not attempt.harm_demonstrated:
+            continue
+        for control in (attempt.oracle or {}).get("external_controls") or []:
+            if not isinstance(control, dict):
+                continue
+            label = " ".join(
+                str(value)
+                for value in (control.get("type"), control.get("vendor_package"))
+                if value
+            )
+            if label and label not in external_controls:
+                external_controls.append(label)
+    requires_user_interaction = any(
+        (attempt.oracle or {}).get("requires_user_interaction") is True
+        for attempt in attempts
+        if attempt.harm_demonstrated
+    )
     if confirmed:
         conclusion = _compact(
             "已通过真机执行观察到该攻击链产生独立安全影响："
@@ -169,11 +192,16 @@ def build_finding_report(
         remediation=_remediation(assessment),
         task_id=task_id,
         hypothesis_id=hypothesis.id,
+        requires_user_interaction=requires_user_interaction,
+        external_controls=external_controls[:3],
     )
 
 
 def render_finding_description(report: FindingReport) -> str:
     lines = [report.conclusion]
+    if report.requires_user_interaction:
+        controls = "、".join(report.external_controls) or "OEM app-jump guard"
+        lines.append(f"前提：该结论需要用户确认（{controls}），不属于无交互静默利用。")
     if report.conditions:
         lines.append("触发条件：" + "；".join(report.conditions))
     if report.attack_chain:
