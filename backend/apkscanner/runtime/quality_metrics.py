@@ -23,6 +23,7 @@ from ..core.proof_receipts import evidence_backed_harm_attempts
 from .finding_policy import evidence_backed_signal_tiers, partition_findings
 
 _DYNAMIC_EVIDENCE_PREFIXES = ("blackbox.", "dynamic_experiment.")
+_USAGE_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens")
 
 
 def build_scan_quality_summary(session: Session, scan_id: str) -> dict[str, Any]:
@@ -71,6 +72,8 @@ def build_scan_quality_summary(session: Session, scan_id: str) -> dict[str, Any]
     turns = list(
         session.execute(
             select(
+                AgentTurnRecord.id,
+                AgentTurnRecord.session_record_id,
                 AgentTurnRecord.phase,
                 AgentTurnRecord.status,
                 AgentTurnRecord.usage_json,
@@ -179,14 +182,33 @@ def build_scan_quality_summary(session: Session, scan_id: str) -> dict[str, Any]
             "duration_seconds": 0.0,
         }
     )
-    for turn in turns:
-        usage = _usage_values(turn.usage_json or {})
+    # Codex reports usage per worker session, not per turn: the ``total`` block grows on
+    # every turn of the same session, so summing turns multiplies the real spend. Walk each
+    # session in order and book only the delta against the previous turn of that session.
+    session_totals: dict[str, dict[str, int]] = {}
+    for turn in sorted(
+        turns, key=lambda item: str(item.completed_at or item.started_at or "")
+    ):
         phase = turn.phase or "unknown"
         bucket = phase_usage[phase]
         bucket["calls"] += 1
-        for key in ("input_tokens", "cached_input_tokens", "output_tokens"):
-            bucket[key] += usage[key]
         bucket["duration_seconds"] += _duration_seconds(turn.started_at, turn.completed_at)
+        raw_usage = turn.usage_json or {}
+        usage = _usage_values(_cumulative_usage(raw_usage))
+        if not any(usage.values()):
+            continue
+        if _is_nested_usage(raw_usage):
+            key = str(turn.session_record_id or turn.id)
+            previous = session_totals.get(key) or dict.fromkeys(_USAGE_FIELDS, 0)
+            delta = {
+                field: max(0, usage[field] - previous.get(field, 0))
+                for field in _USAGE_FIELDS
+            }
+            session_totals[key] = usage
+        else:
+            delta = usage
+        for field in _USAGE_FIELDS:
+            bucket[field] += delta[field]
 
     input_tokens = sum(int(item["input_tokens"]) for item in phase_usage.values())
     cached_input_tokens = sum(
@@ -294,6 +316,31 @@ def _duration_seconds(started_at: datetime | None, completed_at: datetime | None
         return max(0.0, (completed_at - started_at).total_seconds())
     except TypeError:
         return 0.0
+
+
+def _is_nested_usage(usage: dict[str, Any]) -> bool:
+    """True when the payload is a worker session envelope with cumulative counters."""
+    if not isinstance(usage, dict):
+        return False
+    return any(
+        isinstance(usage.get(key), dict) and usage.get(key) for key in ("total", "last")
+    )
+
+
+def _cumulative_usage(usage: dict[str, Any]) -> dict[str, Any]:
+    """Unwrap the nested worker usage envelope down to the cumulative counters.
+
+    Codex workers report ``{"last": {...}, "total": {...}, "model_context_window": n}``
+    where ``total`` is cumulative for the worker session and ``last`` covers only the
+    final request. Flat provider shapes are returned unchanged.
+    """
+    if not isinstance(usage, dict):
+        return {}
+    for key in ("total", "last"):
+        candidate = usage.get(key)
+        if isinstance(candidate, dict) and candidate:
+            return candidate
+    return usage
 
 
 def _usage_values(usage: dict[str, Any]) -> dict[str, int]:

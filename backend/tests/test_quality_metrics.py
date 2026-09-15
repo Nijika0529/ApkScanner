@@ -379,3 +379,77 @@ def test_quality_funnel_ignores_merged_runtime_duplicates(settings) -> None:  # 
 
     funnel = {item["key"]: item["count"] for item in summary["funnel"]}
     assert funnel["runtime_observed_unverified"] == 1
+
+
+def test_cumulative_worker_usage_is_booked_as_session_deltas(settings) -> None:  # noqa: ANN001
+    """Codex reports cumulative per-session totals; only the deltas are real spend."""
+
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="cumulative-usage.apk",
+            artifact_sha256="c" * 64,
+            artifact_path="cumulative-usage.apk",
+        )
+        task = InvestigationTask(scan=scan, task_type="component", status="completed")
+        session.add_all([scan, task])
+        session.flush()
+        agent_session = AgentSessionRecord(
+            scan_id=scan.id,
+            task_id=task.id,
+            session_key="cumulative-session",
+            role="primary",
+        )
+        session.add(agent_session)
+        session.flush()
+        started = datetime(2026, 9, 13, tzinfo=UTC)
+        session.add_all(
+            [
+                AgentTurnRecord(
+                    scan_id=scan.id,
+                    task_id=task.id,
+                    session_record_id=agent_session.id,
+                    audit_id="00000000-0000-0000-0000-000000000101",
+                    phase="test_planning",
+                    status="completed",
+                    usage_json={
+                        "last": {"input_tokens": 600, "output_tokens": 60},
+                        "total": {"input_tokens": 1000, "output_tokens": 100},
+                        "model_context_window": 996_147,
+                    },
+                    started_at=started,
+                    completed_at=started + timedelta(seconds=10),
+                ),
+                AgentTurnRecord(
+                    scan_id=scan.id,
+                    task_id=task.id,
+                    session_record_id=agent_session.id,
+                    audit_id="00000000-0000-0000-0000-000000000102",
+                    phase="exploration_round",
+                    status="completed",
+                    usage_json={
+                        "last": {"input_tokens": 700, "output_tokens": 80},
+                        "total": {"input_tokens": 1800, "output_tokens": 260},
+                        "model_context_window": 996_147,
+                    },
+                    started_at=started + timedelta(seconds=20),
+                    completed_at=started + timedelta(seconds=30),
+                ),
+            ]
+        )
+        session.commit()
+        scan_id = scan.id
+
+    with database.session_factory() as session:
+        summary = build_scan_quality_summary(session, scan_id)
+
+    # Session total is 1800/260: the second turn is only its 800/160 delta, never 2800/360.
+    assert summary["cost"]["input_tokens"] == 1800
+    assert summary["cost"]["output_tokens"] == 260
+    assert summary["cost"]["total_tokens"] == 2060
+    by_phase = {item["phase"]: item for item in summary["phase_usage"]}
+    assert by_phase["test_planning"]["input_tokens"] == 1000
+    assert by_phase["test_planning"]["output_tokens"] == 100
+    assert by_phase["exploration_round"]["input_tokens"] == 800
+    assert by_phase["exploration_round"]["output_tokens"] == 160
