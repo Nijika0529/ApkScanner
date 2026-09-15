@@ -583,7 +583,7 @@ def cancel_campaign(
 
 
 @router.post("/supervisor/campaigns/{campaign_id}/continue", status_code=202)
-def continue_campaign(
+async def continue_campaign(
     campaign_id: str,
     request: Request,
     supervisor: SupervisorService = Depends(get_supervisor),
@@ -600,7 +600,7 @@ def continue_campaign(
 
 
 @router.post("/supervisor/campaigns/{campaign_id}/entries", status_code=202)
-def append_campaign_entries(
+async def append_campaign_entries(
     campaign_id: str,
     payload: CampaignAppendRequest,
     request: Request,

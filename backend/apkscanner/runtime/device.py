@@ -6,6 +6,7 @@ import heapq
 import json
 import re
 import secrets
+import shlex
 import threading
 import time
 import xml.etree.ElementTree as ElementTree
@@ -21,6 +22,13 @@ from ..core.schemas import AgentOracleSpec, AgentPocSpec
 from ..platform.tools import CommandResult, TimeBudget, ToolRunner
 
 POC_DURABLE_RECEIPT_FILENAME = "apkscanner-proof-receipt.json"
+
+# Deep-link names are rendered from raw manifest attributes of the untrusted APK.
+# The adb client joins remote-shell argv with spaces and never escapes it, so the
+# value is shell-quoted before dispatch; only whitespace and NUL must be rejected
+# here, because quoting already neutralizes ``;``/``$``/backticks and legitimate
+# manifest URIs may contain them.
+_SAFE_DEEP_LINK = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:[^\s\x00]*$")
 
 
 @dataclass(slots=True)
@@ -386,7 +394,11 @@ class AdbDeviceAdapter:
             }
         scheduler_state = self.scheduler.snapshot()
         active_task_id = scheduler_state["active_task_id"]
-        if non_blocking and active_task_id:
+        # Production leases arrive through ``AdbDevicePool.task_lease``, which sets
+        # ``_active_cancel_event`` without taking this adapter's own scheduler slot.
+        # Treat an active pool lease as busy so the health probe never runs ADB
+        # commands against a device another task holds exclusively.
+        if non_blocking and (active_task_id or self._active_cancel_event is not None):
             return self._busy_capability(
                 active_task_id=active_task_id,
                 waiting_count=len(scheduler_state["waiting"]),
@@ -2059,7 +2071,7 @@ class AdbDeviceAdapter:
                 return None
             return ["shell", "am", "start", "-W", "-n", f"{package_name}/{entry.name}"]
         if entry.kind == "deep_link":
-            if not entry.name or any(character in entry.name for character in "\r\n\x00"):
+            if not entry.name or _SAFE_DEEP_LINK.fullmatch(entry.name) is None:
                 return None
             return [
                 "shell",
@@ -2068,8 +2080,10 @@ class AdbDeviceAdapter:
                 "-W",
                 "-a",
                 "android.intent.action.VIEW",
+                # Quoted because adb re-joins argv without escaping; keeps
+                # legitimate ``&``/``#`` query characters working.
                 "-d",
-                entry.name,
+                shlex.quote(entry.name),
                 "-p",
                 package_name,
             ]

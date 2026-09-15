@@ -46,6 +46,33 @@ def _compact(value: Any, *, limit: int) -> str:
     return f"{text[: max(0, limit - 1)].rstrip()}…"
 
 
+def _oracle_fact_texts(oracle: Any) -> list[str]:
+    """Human-readable platform-oracle facts recorded on a proven attempt.
+
+    ``security_pipeline.complete_proof`` stores ``oracle["observed_facts"]`` as a
+    list of dicts; reading the singular ``observed_fact`` returned nothing and
+    silently dropped the platform's own observation from the finding report.
+    """
+
+    if not isinstance(oracle, dict):
+        return []
+    texts: list[str] = []
+    facts = oracle.get("observed_facts")
+    for fact in facts if isinstance(facts, list) else []:
+        value = (
+            fact.get("details") or fact.get("fact_type") if isinstance(fact, dict) else fact
+        )
+        if value:
+            texts.append(str(value))
+    if not texts:
+        legacy = oracle.get("observed_fact") or oracle.get("security_impact")
+        if isinstance(legacy, dict):
+            legacy = legacy.get("details") or legacy.get("fact_type")
+        if legacy:
+            texts.append(str(legacy))
+    return texts
+
+
 def _unique_text(values: list[Any], *, count: int, limit: int) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
@@ -119,10 +146,10 @@ def build_finding_report(
                 if attempt.harm_demonstrated
             ],
             *[
-                (attempt.oracle or {}).get("observed_fact")
-                or (attempt.oracle or {}).get("security_impact")
+                text
                 for attempt in attempts
                 if attempt.harm_demonstrated
+                for text in _oracle_fact_texts(attempt.oracle)
             ],
             assessment.get("reachable_path"),
             assessment.get("sink"),

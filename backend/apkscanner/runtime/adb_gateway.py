@@ -295,13 +295,23 @@ def validate_adaptive_adb_args(args: list[str]) -> None:
         raise ValueError("ADB server and transport commands remain platform-owned")
 
 
-def validate_dynamic_experiment_adb_args(args: list[str]) -> None:
+def validate_dynamic_experiment_adb_args(
+    args: list[str],
+    *,
+    deferred_value_indices: frozenset[int] = frozenset(),
+) -> None:
     """Keep persisted Agent experiments inside a device-only ADB boundary.
 
     The live adaptive verifier intentionally has a broader contract, including
     workspace-aware host file transfer. Persisted ``DynamicExperimentService``
     plans do not receive that path translation, so they may use only direct
     diagnostics or device-side shell commands and must never name host paths.
+
+    ``deferred_value_indices`` names argument positions whose runtime value is not
+    known yet (an unresolved ``${state}`` reference).  Only the value-format
+    checks are skipped for those positions; the ``${ref}`` placeholder still has to
+    satisfy every command/subcommand allowlist, and the rendered value is
+    re-validated by ``_execute_step`` before it reaches the device.
     """
 
     validate_adaptive_adb_args(args)
@@ -336,6 +346,10 @@ def validate_dynamic_experiment_adb_args(args: list[str]) -> None:
     shell_command = raw_shell_command.rsplit("/", 1)[-1].lower()
     shell_tail_raw = args[2:]
     shell_tail = [value.lower() for value in args[2:]]
+    # Tail-relative positions of deferred values (shell_tail_raw[i] == args[i + 2]).
+    deferred_tail = frozenset(
+        index - 2 for index in deferred_value_indices if index >= 2
+    )
     if (
         shell_command.startswith("-")
         or shell_command in _DYNAMIC_EXPERIMENT_FORBIDDEN_SHELL_COMMANDS
@@ -346,7 +360,11 @@ def validate_dynamic_experiment_adb_args(args: list[str]) -> None:
     if shell_command == "am" and (not shell_tail or shell_tail[0] not in _AM_ALLOWED):
         raise ValueError("this Activity Manager action is outside the experiment allowlist")
     if shell_command == "am" and shell_tail[0] == "force-stop" and (
-        len(shell_tail_raw) != 2 or _SAFE_PACKAGE.fullmatch(shell_tail_raw[1]) is None
+        len(shell_tail_raw) != 2
+        or (
+            1 not in deferred_tail
+            and _SAFE_PACKAGE.fullmatch(shell_tail_raw[1]) is None
+        )
     ):
         raise ValueError("force-stop must name exactly one Android package")
     if shell_command == "pm" and (not shell_tail or shell_tail[0] not in _PACKAGE_QUERY):
@@ -360,17 +378,23 @@ def validate_dynamic_experiment_adb_args(args: list[str]) -> None:
     ):
         raise ValueError("dynamic experiments may query but not mutate content")
     if shell_command == "dumpsys":
-        _validate_dumpsys_observation(shell_tail_raw)
+        _validate_dumpsys_observation(
+            shell_tail_raw, deferred_value_indices=deferred_tail
+        )
     if shell_command == "input" and (
         not shell_tail or shell_tail[0] not in _DYNAMIC_EXPERIMENT_INPUT_ACTIONS
     ):
         raise ValueError("this input action is outside the experiment allowlist")
     if shell_command == "uiautomator":
-        _validate_uiautomator_dump(shell_tail_raw)
+        _validate_uiautomator_dump(
+            shell_tail_raw, deferred_value_indices=deferred_tail
+        )
     if shell_command == "logcat":
         _validate_logcat_observation(shell_tail_raw)
     if shell_command in {"mkdir", "rm"}:
-        _validate_temp_file_operation(shell_command, shell_tail_raw)
+        _validate_temp_file_operation(
+            shell_command, shell_tail_raw, deferred_value_indices=deferred_tail
+        )
 
 
 def validate_dynamic_experiment_adb_template(args: list[str]) -> None:
@@ -378,13 +402,17 @@ def validate_dynamic_experiment_adb_template(args: list[str]) -> None:
 
     State references may fill data values, but may not select a command or
     subcommand because replacing them with a neutral token must still satisfy
-    the same structural policy.
+    the same structural policy.  Positions holding a ``${ref}`` defer only the
+    value-format checks: the runtime value is re-validated before execution.
     """
 
+    deferred = frozenset(
+        index for index, value in enumerate(args) if _STATE_TEMPLATE_REFERENCE.search(value)
+    )
     rendered = [
         _STATE_TEMPLATE_REFERENCE.sub("apkscanner_state", value) for value in args
     ]
-    validate_dynamic_experiment_adb_args(rendered)
+    validate_dynamic_experiment_adb_args(rendered, deferred_value_indices=deferred)
 
 
 def quote_dynamic_experiment_adb_args(args: list[str]) -> list[str]:
@@ -454,16 +482,23 @@ def _is_typed_dynamic_component_position(args: list[str], index: int) -> bool:
     )
 
 
-def _validate_dumpsys_observation(tail: list[str]) -> None:
+def _validate_dumpsys_observation(
+    tail: list[str],
+    *,
+    deferred_value_indices: frozenset[int] = frozenset(),
+) -> None:
     if not tail:
         return
     service = tail[0].lower()
     if len(tail) == 1:
         return
-    if service == "package" and len(tail) == 2 and _SAFE_PACKAGE.fullmatch(tail[1]):
+    package_value = 1 not in deferred_value_indices
+    if service == "package" and len(tail) == 2 and (
+        not package_value or _SAFE_PACKAGE.fullmatch(tail[1])
+    ):
         return
     if service in {"gfxinfo", "meminfo", "procstats", "batterystats"} and (
-        len(tail) == 2 and _SAFE_PACKAGE.fullmatch(tail[1])
+        len(tail) == 2 and (not package_value or _SAFE_PACKAGE.fullmatch(tail[1]))
     ):
         return
     allowed = _DUMPSYS_READ_ONLY_SUBCOMMANDS.get(service)
@@ -484,25 +519,45 @@ def _validate_logcat_observation(tail: list[str]) -> None:
             raise ValueError("dynamic experiments may observe but not clear device logs")
 
 
-def _validate_uiautomator_dump(tail: list[str]) -> None:
+def _validate_uiautomator_dump(
+    tail: list[str],
+    *,
+    deferred_value_indices: frozenset[int] = frozenset(),
+) -> None:
     if not tail or tail[0].lower() != "dump":
         raise ValueError("dynamic experiments may only dump the UI hierarchy")
     output_args = tail[1:]
+    offset = 1
     if output_args and output_args[0] == "--compressed":
         output_args = output_args[1:]
-    if len(output_args) != 1 or not _is_safe_dynamic_temp_path(output_args[0]):
+        offset = 2
+    if len(output_args) != 1:
+        raise ValueError(
+            "UI hierarchy dumps must use a platform-scoped /data/local/tmp/apkscanner path"
+        )
+    if offset in deferred_value_indices:
+        return
+    if not _is_safe_dynamic_temp_path(output_args[0]):
         raise ValueError(
             "UI hierarchy dumps must use a platform-scoped /data/local/tmp/apkscanner path"
         )
 
 
-def _validate_temp_file_operation(command: str, tail: list[str]) -> None:
+def _validate_temp_file_operation(
+    command: str,
+    tail: list[str],
+    *,
+    deferred_value_indices: frozenset[int] = frozenset(),
+) -> None:
     allowed_options = {"mkdir": {"-p"}, "rm": {"-f", "-r", "-rf", "-fr"}}[command]
-    paths = [value for value in tail if not value.startswith("-")]
+    paths = [(index, value) for index, value in enumerate(tail) if not value.startswith("-")]
     options = {value for value in tail if value.startswith("-")}
     if not paths or not options <= allowed_options:
         raise ValueError("temporary file operation options are outside the allowlist")
-    if any(not _is_safe_dynamic_temp_path(value) for value in paths):
+    if any(
+        index not in deferred_value_indices and not _is_safe_dynamic_temp_path(value)
+        for index, value in paths
+    ):
         raise ValueError(
             "temporary file operations are restricted to /data/local/tmp/apkscanner paths"
         )

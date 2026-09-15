@@ -498,7 +498,7 @@ class PersistentWorkerClient:
                 turn_key = (stream_id, request_id)
                 if envelope_type == "turn.start":
                     active_turns[turn_key] = line_number
-                elif envelope_type in {"turn.result", "turn.error"}:
+                elif envelope_type in {"turn.result", "turn.error", "worker.error"}:
                     active_turns.pop(turn_key, None)
             if envelope.get("type") == "event":
                 event = self._runtime_event(

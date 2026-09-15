@@ -5,6 +5,7 @@ import json
 import re
 import struct
 import zipfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -14,6 +15,11 @@ from ..platform.tools import TimeBudget, ToolRunner
 from .fast_text_search import files_containing_any
 
 NATIVE_INDEX_SCHEMA_VERSION = "1.0"
+
+# A ZIP entry's declared size can be forged, so extraction bounds the bytes
+# actually produced instead of trusting the central directory.
+_MAX_NATIVE_LIBRARY_BYTES = 512 * 1024 * 1024
+_NATIVE_EXTRACTION_CHUNK = 1024 * 1024
 
 _ELF_TYPES = {
     0: "NONE",
@@ -163,10 +169,32 @@ class NativeArtifactAnalyzer:
                 destination = native_root.joinpath(*normalized.parts)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 digest = hashlib.sha256()
-                with archive.open(archive_path) as source, destination.open("wb") as target:
-                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                        digest.update(chunk)
-                        target.write(chunk)
+                extracted = 0
+                try:
+                    with archive.open(archive_path) as source, destination.open("wb") as target:
+                        while chunk := source.read(_NATIVE_EXTRACTION_CHUNK):
+                            extracted += len(chunk)
+                            if extracted > _MAX_NATIVE_LIBRARY_BYTES:
+                                raise ValueError(
+                                    f"native library {archive_path} expands beyond the "
+                                    f"{_MAX_NATIVE_LIBRARY_BYTES} byte extraction limit"
+                                )
+                            digest.update(chunk)
+                            target.write(chunk)
+                except ValueError:
+                    destination.unlink(missing_ok=True)
+                    raise
+                except (
+                    RuntimeError,
+                    NotImplementedError,
+                    zipfile.BadZipFile,
+                    EOFError,
+                    zlib.error,
+                ) as exc:
+                    destination.unlink(missing_ok=True)
+                    raise ValueError(
+                        f"native library {archive_path} could not be extracted: {exc}"
+                    ) from exc
                 summary = self._elf_summary(destination, budget)
                 sha256 = digest.hexdigest()
                 abi = normalized.parts[1] if len(normalized.parts) >= 3 else "unknown"
@@ -365,7 +393,10 @@ class NativeArtifactAnalyzer:
 
     @staticmethod
     def _executable_stack(text: str) -> bool | None:
-        line = NativeArtifactAnalyzer._first_match(r"^\s*GNU_STACK\s+(.+)$", text)
+        # ``readelf -lW`` prints GNU_STACK on its own line, so the anchors need
+        # MULTILINE; without it the pattern could never match and the
+        # executable-stack hardening signal was always null.
+        line = NativeArtifactAnalyzer._first_match(r"(?m)^\s*GNU_STACK\s+(.+)$", text)
         if line is None:
             return None
         fields = line.split()

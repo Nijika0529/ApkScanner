@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import Counter
 from collections.abc import Iterable
 from typing import Any
@@ -27,12 +28,22 @@ def build_android_threat_model(
 
     entry_list = list(entries)
     exported = [entry for entry in entry_list if entry.exported]
+
+    def signature_guarded(entry: EntryPoint) -> bool:
+        # aapt2 emits compound levels such as ``signature|privileged``; matching
+        # only the exact whole string misclassified those as unguarded, which
+        # contradicts rules.py/disposition.py and inflated the attack surface.
+        tokens = {
+            token
+            for token in re.split(r"[|,\s]+", str(entry.permission_protection or "").lower())
+            if token
+        }
+        return bool(tokens & {"signature", "signatureorsystem", "internal"})
+
     unguarded = [
         entry
         for entry in exported
-        if not entry.permission
-        or str(entry.permission_protection or "").lower()
-        not in {"signature", "signatureorsystem", "internal"}
+        if not entry.permission or not signature_guarded(entry)
     ]
     kind_counts = Counter(entry.kind for entry in entry_list)
     model: dict[str, Any] = {

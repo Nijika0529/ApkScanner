@@ -182,7 +182,10 @@ def consume_worker_process(
                     with suppress(Exception):
                         event_callback(event)
                 continue
-            if envelope_type == "result":
+            if envelope_type in {"result", "turn.result"}:
+                # ``codex_worker`` emits ``turn.result`` with the turn payload under
+                # ``result``; without it the compatibility branch below returned the
+                # whole envelope instead of the worker's result object.
                 candidate = value.get("result")
                 if not isinstance(candidate, dict):
                     raise RuntimeError("worker result envelope is invalid")

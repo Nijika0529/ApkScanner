@@ -8,10 +8,13 @@ import shutil
 import tempfile
 import time
 import zipfile
+import zlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+from defusedxml.common import DefusedXmlException
 
 from ..core.config import Settings
 from ..core.permissions import ensure_private_directory
@@ -37,6 +40,48 @@ _LOADER_REFERENCE_SUFFIXES = {
 
 class InvalidApkError(ValueError):
     pass
+
+
+# ZIP headers are attacker-controlled. ``ZipInfo.file_size`` may be forged to a tiny
+# value while the DEFLATE stream still expands to gigabytes, so every entry read is
+# bounded by the number of bytes actually produced rather than the declared size.
+_ZIP_READ_CHUNK = 1024 * 1024
+_SUPPORTED_ZIP_COMPRESSION = frozenset(
+    {
+        zipfile.ZIP_STORED,
+        zipfile.ZIP_DEFLATED,
+        zipfile.ZIP_BZIP2,
+        zipfile.ZIP_LZMA,
+    }
+)
+_ENTRY_READ_ERRORS = (
+    KeyError,
+    RuntimeError,
+    NotImplementedError,
+    zipfile.BadZipFile,
+    EOFError,
+    zlib.error,
+)
+
+
+def _read_zip_entry(
+    archive: zipfile.ZipFile,
+    item: zipfile.ZipInfo | str,
+    *,
+    limit: int,
+) -> bytes:
+    """Read one entry while enforcing a hard cap on the bytes actually produced.
+
+    Raises ``InvalidApkError`` when the real payload exceeds ``limit`` instead of
+    trusting the declared central-directory size.
+    """
+
+    with archive.open(item) as source:
+        data = source.read(limit + 1)
+    if len(data) > limit:
+        name = item if isinstance(item, str) else item.filename
+        raise InvalidApkError(f"ZIP entry {name!r} expands beyond the {limit} byte read limit")
+    return data
 
 
 @dataclass(slots=True)
@@ -167,7 +212,18 @@ class ApkInspector:
                     self.settings.tool_timeout_seconds,
                 )
                 tool_results["apktool_no_resources"] = self._serialize_result(fallback)
-                if fallback.exit_code == 0 and decoded_dir.is_dir():
+                candidate = decoded_dir / "AndroidManifest.xml"
+                if (
+                    fallback.exit_code == 0
+                    and candidate.is_file()
+                    and candidate.stat().st_size > 0
+                    and candidate.read_bytes().lstrip().startswith(b"<")
+                ):
+                    # ``--no-res`` still decodes the manifest; without this check the
+                    # valid fallback manifest was produced and then ignored.
+                    manifest_path = candidate
+                    searchable_roots.append(decoded_dir)
+                elif fallback.exit_code == 0 and decoded_dir.is_dir():
                     searchable_roots.append(decoded_dir)
 
         if manifest_path is None and self.runner.available("aapt2"):
@@ -205,7 +261,7 @@ class ApkInspector:
                 "AndroidManifest.xml could not be decoded; install apktool or provide a valid APK"
             )
         manifest_text = manifest_path.read_text(encoding="utf-8", errors="replace")
-        manifest = parse_manifest(manifest_text)
+        manifest = self._parse_manifest_or_invalid(manifest_text)
         archive_dir = workspace / "archive"
         self._extract_searchable_files(apk_path, archive_dir)
         searchable_roots.append(archive_dir)
@@ -512,7 +568,9 @@ class ApkInspector:
         workspace_manifest = workspace / manifest_relative
         if not workspace_manifest.is_file():
             return None
-        manifest = parse_manifest(workspace_manifest.read_text(encoding="utf-8", errors="replace"))
+        manifest = self._parse_manifest_or_invalid(
+            workspace_manifest.read_text(encoding="utf-8", errors="replace")
+        )
         decompilation = {
             **dict(metadata.get("decompilation") or {}),
             "cache_hit": True,
@@ -745,7 +803,28 @@ class ApkInspector:
         ] = {}
         with zipfile.ZipFile(apk_path) as archive:
             for archive_path in embedded_names:
-                raw = archive.read(archive_path)
+                try:
+                    raw = _read_zip_entry(
+                        archive,
+                        archive_path,
+                        limit=min(
+                            self.settings.max_uncompressed_bytes,
+                            self.settings.max_upload_bytes,
+                        ),
+                    )
+                except (*_ENTRY_READ_ERRORS, InvalidApkError) as exc:
+                    graph["nodes"].append(
+                        {
+                            "id": f"artifacts/embedded-unreadable/{len(graph['nodes'])}",
+                            "kind": "embedded_apk_analysis_failed",
+                            "path": str(archive_path),
+                            "name": PurePosixPath(archive_path).name,
+                            "archive_path": archive_path,
+                            "sha256": None,
+                            "error": str(exc),
+                        }
+                    )
+                    continue
                 child_sha256 = hashlib.sha256(raw).hexdigest()
                 child_prefix = f"artifacts/{child_sha256}"
                 if child_sha256 in ancestry or len(ancestry) >= 8:
@@ -764,7 +843,10 @@ class ApkInspector:
                             _artifact_origin=archive_path,
                             _ancestry=ancestry,
                         )
-                    except InvalidApkError as exc:
+                    except (InvalidApkError, ValueError) as exc:
+                        # Native extraction reports malformed children as plain
+                        # ValueError; either way one bad embedded APK must be
+                        # recorded and skipped, not abort the enclosing scan.
                         failed_id = f"artifacts/{child_sha256}/failed"
                         graph["nodes"].append(
                             {
@@ -1263,6 +1345,12 @@ class ApkInspector:
             for item in infos:
                 if "\x00" in item.filename:
                     raise InvalidApkError("APK contains a NUL byte in a ZIP path")
+                if item.flag_bits & 0x1:
+                    raise InvalidApkError(f"APK contains an encrypted ZIP entry: {item.filename}")
+                if item.compress_type not in _SUPPORTED_ZIP_COMPRESSION:
+                    raise InvalidApkError(
+                        f"APK uses an unsupported ZIP compression method for {item.filename}"
+                    )
                 normalized = PurePosixPath(item.filename.replace("\\", "/"))
                 if normalized.is_absolute() or ".." in normalized.parts:
                     raise InvalidApkError(f"unsafe ZIP path: {item.filename}")
@@ -1311,11 +1399,26 @@ class ApkInspector:
                     and security_hashed_bytes + item.file_size <= security_hash_budget
                 ):
                     digest = hashlib.sha256()
-                    with archive.open(item) as source:
-                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                            digest.update(chunk)
-                    fact["content_sha256"] = digest.hexdigest()
-                    security_hashed_bytes += item.file_size
+                    entry_limit = min(
+                        16 * 1024 * 1024,
+                        security_hash_budget - security_hashed_bytes,
+                    )
+                    produced = 0
+                    try:
+                        with archive.open(item) as source:
+                            while chunk := source.read(_ZIP_READ_CHUNK):
+                                produced += len(chunk)
+                                if produced > entry_limit:
+                                    produced = -1
+                                    break
+                                digest.update(chunk)
+                    except _ENTRY_READ_ERRORS:
+                        # Corrupt or forged entry; keep the metadata fact without a
+                        # content digest instead of aborting the whole scan.
+                        produced = -1
+                    if produced >= 0:
+                        fact["content_sha256"] = digest.hexdigest()
+                        security_hashed_bytes += produced
                 security_resources.append(fact)
                 if len(security_resources) >= 4000:
                     break
@@ -1372,11 +1475,29 @@ class ApkInspector:
         }
 
     @staticmethod
+    def _parse_manifest_or_invalid(xml_text: str) -> ManifestDocument:
+        """Translate any manifest parse failure into a clean invalid-APK error.
+
+        ``parse_manifest`` raises plain ``ValueError`` for a well-formed XML
+        manifest that lacks ``<application>`` and ``ParseError`` /
+        ``DefusedXmlException`` for hostile or malformed input.  Leaking those as
+        generic exceptions turned a bad APK into an unexpected scan failure and,
+        for embedded APKs, aborted the enclosing scan.
+        """
+
+        try:
+            return parse_manifest(xml_text)
+        except InvalidApkError:
+            raise
+        except (ValueError, SyntaxError, DefusedXmlException) as exc:
+            raise InvalidApkError(f"AndroidManifest.xml could not be parsed: {exc}") from exc
+
+    @staticmethod
     def _plaintext_manifest(apk_path: Path) -> str | None:
         with zipfile.ZipFile(apk_path) as archive:
             try:
-                content = archive.read("AndroidManifest.xml")
-            except KeyError:
+                content = _read_zip_entry(archive, "AndroidManifest.xml", limit=16 * 1024 * 1024)
+            except _ENTRY_READ_ERRORS:
                 return None
         if content.lstrip().startswith(b"<"):
             return content.decode("utf-8", errors="replace")
@@ -1408,12 +1529,18 @@ class ApkInspector:
                     continue
                 if item.file_size > 2_000_000:
                     continue
-                total += item.file_size
+                try:
+                    content = _read_zip_entry(archive, item, limit=2_000_000)
+                except (*_ENTRY_READ_ERRORS, InvalidApkError):
+                    # A hostile or corrupt entry must not abort the whole scan; the
+                    # declared-size limit above is only a fast path.
+                    continue
+                total += len(content)
                 if total > 250_000_000:
                     break
                 target = destination.joinpath(*PurePosixPath(item.filename).parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(archive.read(item))
+                target.write_bytes(content)
 
     @staticmethod
     def _serialize_result(result: CommandResult) -> dict[str, Any]:

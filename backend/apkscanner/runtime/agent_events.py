@@ -165,7 +165,10 @@ def normalize_codex_notification(notification: Any) -> AgentRuntimeEvent | None:
         "filechange",
         "mcptoolcall",
         "dynamictoolcall",
-        "collabtoolcall",
+        # Codex SDK item type is ``collabAgentToolCall`` (normalized below); the
+        # previous ``collabtoolcall`` literal never matched and the tools' events
+        # fell through to sdk.notification.unknown.
+        "collabagenttoolcall",
     }:
         return AgentRuntimeEvent(
             f"model.tool.{state}",

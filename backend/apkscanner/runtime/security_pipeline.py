@@ -673,10 +673,13 @@ class HypothesisLedger:
                         evidence_ids,
                     )
                 elif (
-                    oracle_refuted
-                    and dynamic_verdict_eligible
+                    status == ProofAttemptStatus.REFUTED.value
                     and hypothesis.status != HypothesisStatus.PROVEN.value
                 ):
+                    # ``status`` already encodes receipt validity, execution and
+                    # verdict eligibility; using it here keeps a rejected evidence
+                    # receipt from challenging the hypothesis with evidence IDs
+                    # that were never persisted.
                     hypothesis.status = HypothesisStatus.CHALLENGED.value
                     hypothesis.refute_evidence_ids = self._merge_ids(
                         hypothesis.refute_evidence_ids,

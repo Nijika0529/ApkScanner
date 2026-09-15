@@ -1689,7 +1689,10 @@ public final class PlatformProofActivity extends Activity {
         return;
       }
       ComponentName started = startService(target);
-      result.put("delivered", started != null);
+      if (started == null) {
+        throw new IllegalStateException("startService returned null");
+      }
+      result.put("delivered", true);
       succeed();
       return;
     }

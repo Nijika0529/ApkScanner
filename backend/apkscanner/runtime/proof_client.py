@@ -7,6 +7,10 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+# The replay endpoint is the control plane's live proof server.  A hung server must
+# not wedge the agent's PoC process forever, so the request is bounded.
+_PROOF_REPLAY_TIMEOUT_SECONDS = 120.0
+
 
 def main() -> None:
     if len(sys.argv) != 2:
@@ -37,7 +41,9 @@ def main() -> None:
         method="POST",
     )
     try:
-        with urlopen(request, timeout=None) as response:  # noqa: S310
+        with urlopen(  # noqa: S310
+            request, timeout=_PROOF_REPLAY_TIMEOUT_SECONDS
+        ) as response:
             body = response.read().decode("utf-8", errors="replace")
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")

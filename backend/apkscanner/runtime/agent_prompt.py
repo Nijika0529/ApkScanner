@@ -396,12 +396,28 @@ def investigation_prompt(
                 "code_anchors": [
                     {
                         key: anchor.get(key)
-                        for key in ("path", "file", "line", "symbol", "method", "class")
+                        for key in (
+                            "path",
+                            "file",
+                            "line",
+                            "line_start",
+                            "line_end",
+                            "symbol",
+                            "method",
+                            "class",
+                            "language",
+                            "sha256",
+                            "truncated",
+                        )
                         if anchor.get(key) is not None
                     }
                     for anchor in (entry.code_anchors or [])[:16]
                     if isinstance(anchor, dict)
                 ],
+                # The prompt tells a static-review seed to start from
+                # ``entry_points[0].metadata.static_review_locations``; without this
+                # projection that pointer resolved to nothing in the inline context.
+                "metadata": _static_review_entry_metadata(entry.metadata_json),
             }
             for entry in entries
         ]
@@ -451,8 +467,8 @@ def investigation_prompt(
             "read-only at /scan-input/target.apk, so you may run the container's JADX into your "
             "writable workspace when the platform Java output is absent or partial. Before creating "
             "any file, run pwd "
-            "and compare it with platform_context.agent_workspace.writable_root. Always create PoC "
-            "files beneath the exact platform_context.agent_workspace.poc_root using relative "
+            "and compare it with platform_context.workspace.writable_root. Always create PoC "
+            "files beneath the exact platform_context.workspace.poc_root using relative "
             "poc/<name>/ paths. Never create a repository-level /work/ApkScanner/poc directory or "
             "place PoC files under a decompiler root. You may build arbitrary local "
             "analysis helpers and complete Android PoC projects inside the task workspace. For a "
@@ -670,7 +686,10 @@ def investigation_prompt(
             "reference is in scope and must be followed until a guard, harmless terminal, or concrete "
             "sink is established. "
         )
-    if task.task_type == "static_review":
+    if task.task_type == "static_review" and phase in {"static_only", "test_planning"}:
+        # Only the seed pass is intentionally source-only.  Later rescue/review
+        # phases are tool-enabled and must keep their own phase instruction
+        # instead of being told to return requested_tests=[].
         phase_instruction = (
             "This is a bounded static semantic review seeded by a high-value code signal, not an "
             "exported-component reachability test and not a request for a whole-APK inventory. "
@@ -939,6 +958,32 @@ def investigation_prompt(
         f"additional tests and decide from platform-issued evidence. {response_instruction}"
         "\n\nTASK_CONTEXT_JSON:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
     )
+
+
+_STATIC_REVIEW_METADATA_KEYS = (
+    "effective_enabled",
+    "direct_invocation_applicable",
+    "static_review_family",
+    "static_review_title",
+    "static_review_severity",
+    "static_review_priority",
+    "static_review_rule_ids",
+    "static_review_hypotheses",
+    "static_review_locations",
+    "static_review_artifact",
+    "static_review_rollup",
+    "static_review_site",
+    "static_review_parent_surface",
+    "investigation_group",
+)
+
+
+def _static_review_entry_metadata(metadata: Any) -> dict[str, Any]:
+    """Project only the bounded static-review seed facts into the compact prompt."""
+
+    if not isinstance(metadata, dict):
+        return {}
+    return {key: copy.deepcopy(metadata[key]) for key in _STATIC_REVIEW_METADATA_KEYS if key in metadata}
 
 
 def _compact_tool_context(platform_context: dict[str, Any]) -> dict[str, Any]:

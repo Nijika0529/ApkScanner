@@ -969,3 +969,140 @@ def test_complete_global_decompilation_without_components_counts_as_code_coverag
     by_domain = {item.domain: item for item in coverage}
 
     assert by_domain["MASVS-CODE"].status == "covered"
+
+
+def _forged_size_zip(path: Path, *, name: str, raw: bytes) -> None:
+    """Write a one-entry ZIP whose central directory lies about the payload size."""
+
+    import struct
+    import zlib
+
+    compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
+    compressed = compressor.compress(raw) + compressor.flush()
+    crc = zlib.crc32(raw) & 0xFFFFFFFF
+    encoded_name = name.encode()
+    local = struct.pack(
+        "<IHHHHHIIIHH",
+        0x04034B50,
+        20,
+        0,
+        8,
+        0,
+        0,
+        crc,
+        1,
+        len(compressed),
+        len(encoded_name),
+        0,
+    )
+    payload = local + encoded_name + compressed
+    central = struct.pack(
+        "<IHHHHHHIIIHHHHHII",
+        0x02014B50,
+        20,
+        20,
+        0,
+        8,
+        0,
+        0,
+        crc,
+        len(compressed),
+        1,
+        len(encoded_name),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ) + encoded_name
+    offset = len(payload)
+    payload += central
+    payload += struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 1, 1, len(central), offset, 0)
+    path.write_bytes(payload)
+
+
+def test_forged_zip_size_cannot_expand_beyond_the_read_limit(settings, tmp_path) -> None:  # noqa: ANN001
+    """A tiny declared size must not let a DEFLATE bomb allocate real memory."""
+
+    bomb = tmp_path / "bomb.apk"
+    _forged_size_zip(bomb, name="assets/bomb.js", raw=b"\x00" * (8 * 1024 * 1024))
+    inspector = ApkInspector(settings)
+
+    facts = inspector._validate_zip(bomb)
+    assert facts["uncompressed_bytes"] == 1
+
+    destination = tmp_path / "archive"
+    inspector._extract_searchable_files(bomb, destination)
+    # The forged entry is rejected by the bounded reader and never written out.
+    assert list(destination.rglob("*.js")) == []
+
+
+def test_encrypted_and_unsupported_zip_entries_are_rejected(settings, tmp_path) -> None:  # noqa: ANN001
+    import struct
+    import zlib
+
+    def write(path: Path, *, flag_bits: int, compress_type: int) -> None:
+        name = b"AndroidManifest.xml"
+        data = b"<manifest/>"
+        crc = zlib.crc32(data) & 0xFFFFFFFF
+        local = struct.pack(
+            "<IHHHHHIIIHH",
+            0x04034B50,
+            20,
+            flag_bits,
+            compress_type,
+            0,
+            0,
+            crc,
+            len(data),
+            len(data),
+            len(name),
+            0,
+        )
+        payload = local + name + data
+        central = struct.pack(
+            "<IHHHHHHIIIHHHHHII",
+            0x02014B50,
+            20,
+            20,
+            flag_bits,
+            compress_type,
+            0,
+            0,
+            crc,
+            len(data),
+            len(data),
+            len(name),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ) + name
+        offset = len(payload)
+        payload += central
+        payload += struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 1, 1, len(central), offset, 0)
+        path.write_bytes(payload)
+
+    inspector = ApkInspector(settings)
+    encrypted = tmp_path / "encrypted.apk"
+    write(encrypted, flag_bits=0x1, compress_type=0)
+    with pytest.raises(InvalidApkError, match="encrypted"):
+        inspector._validate_zip(encrypted)
+
+    unsupported = tmp_path / "unsupported.apk"
+    write(unsupported, flag_bits=0, compress_type=99)
+    with pytest.raises(InvalidApkError, match="unsupported ZIP compression"):
+        inspector._validate_zip(unsupported)
+
+
+def test_manifest_without_application_is_a_clean_invalid_apk() -> None:
+    xml = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<manifest xmlns:android="http://schemas.android.com/apk/res/android" '
+        'package="com.example.empty" />'
+    )
+    with pytest.raises(InvalidApkError, match="could not be parsed"):
+        ApkInspector._parse_manifest_or_invalid(xml)

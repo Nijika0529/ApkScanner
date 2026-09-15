@@ -2439,3 +2439,55 @@ def test_hypothesis_and_private_evaluation_endpoints(settings) -> None:  # noqa:
         assert report.json()["benchmark_evaluations"][0]["name"] == "private-evaluation"
         html_report = client.get(f"/api/v1/scans/{scan_id}/report/html")
         assert "验证链" in html_report.text
+
+
+def test_campaign_entry_append_schedules_clones_from_the_event_loop(settings) -> None:  # noqa: ANN001
+    """Regression: the sync handler ran in a worker thread where ``create_task`` failed.
+
+    ``POST /supervisor/campaigns/{id}/entries`` committed its campaign changes before
+    calling ``asyncio.create_task``, so the previous ``RuntimeError: no running event
+    loop`` left clone scans queued forever while returning HTTP 500.
+    """
+
+    from apkscanner.core.db import Database
+
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        source = Scan(
+            status="final",
+            filename="campaign-source.apk",
+            artifact_sha256="a" * 64,
+            artifact_path=str(Path(settings.data_dir) / "campaign-source.apk"),
+            stats={"upload_bytes": 3},
+        )
+        session.add(source)
+        session.commit()
+        source_id = source.id
+
+    app = create_app(settings)
+    headers = {"X-APKScanner-Request": "console"}
+    with TestClient(app) as client:
+        launched = client.post(
+            "/api/v1/supervisor/campaigns/launch",
+            headers=headers,
+            json={
+                "name": "entry-append-regression",
+                "goal": "append a clone without a worker-thread crash",
+                "entries": [{"id": "first_rescan", "kind": "scan_clone", "scan_id": source_id}],
+            },
+        )
+        assert launched.status_code == 202
+        campaign_id = launched.json()["campaign_id"]
+
+        appended = client.post(
+            f"/api/v1/supervisor/campaigns/{campaign_id}/entries",
+            headers=headers,
+            json={
+                "entries": [
+                    {"id": "second_rescan", "kind": "scan_clone", "scan_id": source_id}
+                ]
+            },
+        )
+        assert appended.status_code == 202
+        assert appended.json()["scan_ids"]

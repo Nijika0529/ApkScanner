@@ -33,7 +33,7 @@ def test_proof_client_calls_the_complete_task_endpoint(
 
     def fake_urlopen(request: Request, *, timeout):  # noqa: ANN001, ANN202
         captured.append(request)
-        assert timeout is None
+        assert timeout == proof_client._PROOF_REPLAY_TIMEOUT_SECONDS
         return _Response()
 
     monkeypatch.chdir(tmp_path)

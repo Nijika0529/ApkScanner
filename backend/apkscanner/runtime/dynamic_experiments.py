@@ -110,6 +110,11 @@ class DynamicExperimentService:
             except DynamicExperimentPolicyError as exc:
                 self._mark_preparation_error(capsule_id, str(exc))
                 return self.get(capsule_id)
+            except (ValueError, LookupError):
+                # Control-flow refusals such as "already complete" or an unknown
+                # capsule must propagate instead of being rewritten as an execution
+                # error, which would overwrite a completed verdict with "paused".
+                raise
             try:
                 with self.device_pool.task_lease(
                     f"dynamic:{capsule_id}",
@@ -154,6 +159,8 @@ class DynamicExperimentService:
             except DynamicExperimentPolicyError as exc:
                 self._mark_preparation_error(capsule_id, str(exc))
                 return self.get(capsule_id)
+            except (ValueError, LookupError):
+                raise
             self._record_acquired(capsule_id, 0.0, adapter)
             try:
                 self._execute_pending_steps(capsule_id, adapter, cancel_event)
@@ -305,11 +312,23 @@ class DynamicExperimentService:
             session.commit()
             receipt_id = receipt.id
 
-        result = adapter.execute_gateway(
-            quote_dynamic_experiment_adb_args(args),
-            timeout=step.timeout_seconds,
-            policy="adaptive",
-        )
+        try:
+            result = adapter.execute_gateway(
+                quote_dynamic_experiment_adb_args(args),
+                timeout=step.timeout_seconds,
+                policy="adaptive",
+            )
+        except Exception as exc:
+            # The receipt was already committed as "running"; a raising gateway (for
+            # instance a host-side spawn failure) must not leave it dangling forever.
+            with self.database.session_factory() as session:
+                receipt = session.get(DynamicExperimentReceipt, receipt_id)
+                if receipt is not None:
+                    receipt.status = "failed"
+                    receipt.error = f"gateway error: {exc}"
+                    receipt.completed_at = _now()
+                    session.commit()
+            raise
         checks: dict[str, Any] = {
             "exit_code": {
                 "expected": step.expected_exit_code,

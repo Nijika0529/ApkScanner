@@ -313,7 +313,7 @@ def test_agent_round_prompts_have_distinct_non_conflicting_roles() -> None:
     assert "A zero-result reference search is proof" in planning
     assert "catalog contains only the assigned seed" in planning
     assert "may still be examined freely" in planning
-    assert "platform_context.agent_workspace.poc_root" in planning
+    assert "platform_context.workspace.poc_root" in planning
     assert "harness_mode=platform_generated" in planning
     assert "attack_class" in planning
     assert "do not search for aapt, aapt2, d8, dx, sdkmanager" in planning

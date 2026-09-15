@@ -48,6 +48,17 @@ from .codex_protocol import (
 )
 from .codex_sdk_baseline import PINNED_SDK_VERSION, WORKER_REVISION, runtime_capability
 
+# Phases that may only review supplied evidence: no workspace writes, raw ADB, or
+# target-network access is granted to their sessions.
+_REVIEW_ONLY_PHASES = frozenset(
+    {
+        "adversarial_review",
+        "rescue_review",
+        "final_evaluation",
+        "recovery_evaluation",
+    }
+)
+
 
 @dataclass(slots=True)
 class CodexRunResult:
@@ -157,6 +168,37 @@ class CodexInvestigator:
                     self._deep_capability = dict(capability)
         return capability
 
+    def _session_capabilities(self, platform_context: dict[str, Any]) -> dict[str, bool]:
+        """Capability flags the session is actually granted for this phase.
+
+        The task prompt and the developer instructions must describe the same
+        sandbox the worker is launched into.  Passing ``workspace_write=False`` to
+        ``investigation_prompt`` while the container grants write/ADB access used
+        to send the read-only instruction and drop the whole PoC-authoring
+        contract from the default Docker path.
+        """
+
+        phase = str(platform_context.get("phase") or "")
+        restricted_review = phase in _REVIEW_ONLY_PHASES
+        device = platform_context.get("device")
+        proof_replay = platform_context.get("proof_replay")
+        adb_access = bool(
+            not restricted_review
+            and isinstance(device, dict)
+            and device.get("serial")
+            and isinstance(proof_replay, dict)
+            and proof_replay.get("available") is True
+        )
+        return {
+            "direct_tool_access": True,
+            "shell_access": True,
+            "workspace_write": not restricted_review,
+            "adb_access": adb_access,
+            "network_access": (
+                not restricted_review and self.settings.codex_shell_network == "public_egress"
+            ),
+        }
+
     def investigate(
         self,
         *,
@@ -180,7 +222,7 @@ class CodexInvestigator:
             entries,
             evidence,
             platform_context or {},
-            direct_tool_access=True,
+            **self._session_capabilities(platform_context or {}),
         )
         if self.settings.codex_isolation == "docker":
             return self._investigate_docker(
@@ -196,11 +238,12 @@ class CodexInvestigator:
             )
         if cancel_event is not None and cancel_event.is_set():
             raise AgentCancelledError("Codex investigation was cancelled before dispatch")
+        session_capabilities = self._session_capabilities(platform_context or {})
         with self._client() as codex:
             thread = codex.thread_start(
                 approval_mode=ApprovalMode.deny_all,
                 cwd=str(workspace),
-                developer_instructions=developer_instructions(direct_tool_access=True),
+                developer_instructions=developer_instructions(**session_capabilities),
                 ephemeral=False,
                 model=self.settings.codex_model,
                 model_provider=self.settings.codex_provider,
@@ -377,29 +420,8 @@ class CodexInvestigator:
             if phase == "rescue_exploration"
             else "primary"
         )
-        restricted_review = phase in {
-            "adversarial_review",
-            "rescue_review",
-            "final_evaluation",
-            "recovery_evaluation",
-        }
-        device = platform_context.get("device")
-        proof_replay = platform_context.get("proof_replay")
-        adb_access = bool(
-            not restricted_review
-            and isinstance(device, dict)
-            and device.get("serial")
-            and isinstance(proof_replay, dict)
-            and proof_replay.get("available") is True
-        )
         actual_developer_instructions = developer_instructions(
-            direct_tool_access=True,
-            shell_access=True,
-            workspace_write=not restricted_review,
-            adb_access=adb_access,
-            network_access=(
-                not restricted_review and self.settings.codex_shell_network == "public_egress"
-            ),
+            **self._session_capabilities(platform_context)
         )
         active = self._prepare_active_session(
             scan=scan,

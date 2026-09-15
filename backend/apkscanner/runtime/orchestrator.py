@@ -10521,6 +10521,10 @@ class ScanOrchestrator:
         ]
         workspace_policy = {
             "writable_root": ".",
+            # The Agent prompt tells PoC authors to place sources under this
+            # relative root; it must exist in the investigation context too, not
+            # only in the adaptive-verifier context.
+            "poc_root": "poc",
             "shared_scan_workspace_exposed": expose_shared_workspace,
             "context_file": "context.json",
             "decompiled_roots": (

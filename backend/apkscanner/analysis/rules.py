@@ -1276,10 +1276,14 @@ class BuiltinRuleEngine:
             for status in component_statuses
         )
         global_decompilation_status = str(result.decompilation.get("status") or "")
+        # ``complete_success`` is the status emitted by the jadx summarizer; the
+        # bare ``complete`` value only ever came from hand-written fixtures, so
+        # accepting just one of the two silently disabled full-code coverage.
+        complete_decompilation = global_decompilation_status in {"complete", "complete_success"}
         global_code_available = bool(
             result.decompilation.get("output_usable")
             or result.decompilation.get("generated_java_files", 0)
-            or global_decompilation_status in {"complete", "partial_success"}
+            or global_decompilation_status in {"complete", "complete_success", "partial_success"}
         )
         code_available = (
             component_code_available
@@ -1287,7 +1291,7 @@ class BuiltinRuleEngine:
             or any(item.rule_id.startswith("CODE-") for item in findings)
         )
         full_code_coverage = (
-            global_decompilation_status == "complete"
+            complete_decompilation
             and global_code_available
             and all(status == "source_available" for status in component_statuses)
         )
