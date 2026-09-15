@@ -9,7 +9,7 @@ from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 
-from apkscanner.cli import serve_command
+from apkscanner.cli import build_parser, serve_command
 from apkscanner.runtime.codex_sdk_baseline import WORKER_REVISION
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -99,11 +99,36 @@ def test_serve_command_defaults_to_loopback(monkeypatch) -> None:  # noqa: ANN00
         SimpleNamespace(run=lambda *args, **kwargs: calls.append({"args": args, **kwargs})),
     )
 
-    assert serve_command(Namespace(port=8000, reload=False)) == 0
+    parsed = build_parser().parse_args(["serve"])
+    assert parsed.host == "127.0.0.1"
+
+    assert serve_command(Namespace(port=8000, reload=False, host=parsed.host)) == 0
     assert calls == [
         {
             "args": ("apkscanner.main:app",),
             "host": "127.0.0.1",
+            "port": 8000,
+            "reload": False,
+        }
+    ]
+
+
+def test_serve_command_accepts_an_explicit_bind_address(monkeypatch) -> None:  # noqa: ANN001
+    calls: list[dict[str, object]] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "uvicorn",
+        SimpleNamespace(run=lambda *args, **kwargs: calls.append({"args": args, **kwargs})),
+    )
+
+    parsed = build_parser().parse_args(["serve", "--host", "0.0.0.0"])
+    assert parsed.host == "0.0.0.0"
+
+    assert serve_command(Namespace(port=8000, reload=False, host=parsed.host)) == 0
+    assert calls == [
+        {
+            "args": ("apkscanner.main:app",),
+            "host": "0.0.0.0",
             "port": 8000,
             "reload": False,
         }

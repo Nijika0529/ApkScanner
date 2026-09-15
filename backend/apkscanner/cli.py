@@ -215,7 +215,7 @@ def context_command(args: argparse.Namespace) -> int:
 def serve_command(args: argparse.Namespace) -> int:
     import uvicorn
 
-    uvicorn.run("apkscanner.main:app", host="127.0.0.1", port=args.port, reload=args.reload)
+    uvicorn.run("apkscanner.main:app", host=args.host, port=args.port, reload=args.reload)
     return 0
 
 
@@ -224,6 +224,9 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     serve = subparsers.add_parser("serve", help="Run the local API and Web console")
     serve.add_argument("--port", type=int, default=8000)
+    # Default stays loopback; bind 0.0.0.0 explicitly to expose the console to a
+    # host-side browser (for example Windows reaching a WSL service).
+    serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--reload", action="store_true")
     serve.set_defaults(handler=serve_command)
     scan = subparsers.add_parser("scan", help="Run a foreground APK scan")

@@ -654,12 +654,12 @@ function Overview({ scan, health, coverage, quality }: { scan: Scan; health: Hea
       <DevicePoolPanel />
       <div className="space-y-6"><div><SectionTitle icon={ListChecks} title="MASVS 基线" description="APK-only 初始覆盖" /><div className="mt-4 space-y-3">{baselines.map((item) => <div key={item.id} className="rounded-xl border border-slate-200 bg-slate-50 p-3"><div className="mb-2 flex items-center justify-between gap-3"><span className="text-xs font-semibold text-slate-700">{item.domain.replace("MASVS-", "")}</span><Badge tone={statusTone(item.status)}>{statusLabel(item.status)}</Badge></div><p className="text-xs leading-relaxed text-slate-500">{item.gap_reason ?? item.title}</p></div>)}</div></div><div><SectionTitle icon={ServerCog} title="运行能力" description="缺失能力会形成覆盖缺口" /><div className="mt-4 grid grid-cols-2 gap-2">{health?.capabilities.map((item) => <div key={item.name} title={item.detail ?? undefined} className="flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-xs"><span className={cn("h-2 w-2 rounded-full", item.busy ? "bg-amber-400" : item.available ? "bg-emerald-400" : "bg-slate-300")} /><span className="truncate text-slate-600">{item.name}{item.busy ? " · 忙碌" : ""}</span></div>)}</div></div></div>
     </div>
+    <FailureReasons quality={quality} />
     {scan.error && <p className="text-rose-700">{scan.error}</p>}
   </div>
 }
 
 function QualityFunnel({ quality }: { quality: ScanQualitySummary }) {
-  const cacheRate = quality.efficiency.cached_input_rate
   const oracleGap = quality.funnel.find((stage) => stage.key === "runtime_observed_unverified")
   const mainFunnel = quality.funnel.filter((stage) => stage.key !== "runtime_observed_unverified")
   const formatCount = (value: number) => new Intl.NumberFormat("zh-CN").format(value)
@@ -674,19 +674,21 @@ function QualityFunnel({ quality }: { quality: ScanQualitySummary }) {
       </div>)}
     </div>
     {oracleGap && <div className="flex flex-col gap-2 rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between"><div><p className="text-xs font-semibold text-cyan-950">旁路：{oracleGap.label}</p><p className="mt-1 text-xs leading-5 text-cyan-800">已观察到运行行为，但尚未由平台 Oracle 证明安全影响，因此不进入“危害已证明”主漏斗。</p></div><Badge tone="info">{formatCount(oracleGap.count)}</Badge></div>}
-    <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-6">
+    <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
       <QualityCost label="Agent 调用" value={formatCount(quality.cost.agent_calls)} detail={`${formatCount(quality.cost.completed_agent_calls)} 次完成`} />
-      <QualityCost label="模型 Token" value={formatCount(quality.cost.total_tokens)} detail={`输入 ${formatCount(quality.cost.input_tokens)} · 输出 ${formatCount(quality.cost.output_tokens)}`} />
-      <QualityCost label="输入缓存" value={cacheRate === null ? "暂无" : `${Math.round(cacheRate * 100)}%`} detail={`${formatCount(quality.cost.cached_input_tokens)} cached tokens`} />
       <QualityCost label="Agent 时长" value={formatMinutes(quality.cost.agent_seconds)} detail={`${quality.phase_usage.length} 个阶段`} />
       <QualityCost label="设备占用" value={formatMinutes(quality.cost.device_held_seconds)} detail={`${quality.cost.device_lease_count} 次租约 · 等待 ${formatMinutes(quality.cost.device_wait_seconds)}`} />
       <QualityCost label="验证产物" value={`${quality.cost.poc_builds} PoC`} detail={`${quality.cost.dynamic_experiments} 个动态实验 · 合并 ${quality.efficiency.merged_entry_variants} 个入口变体`} />
     </div>
-    {quality.failure_reasons.length > 0 && <div className="rounded-xl border border-amber-200 bg-amber-50/60 p-4">
-      <div className="flex items-center gap-2"><AlertTriangle className="h-4 w-4 text-amber-700" /><p className="text-sm font-semibold text-amber-950">未闭合与失败原因</p></div>
-      <div className="mt-3 grid gap-2 lg:grid-cols-2">{quality.failure_reasons.slice(0, 6).map((item) => <div key={item.kind} className="rounded-lg border border-amber-200 bg-white px-3 py-2"><div className="flex items-center justify-between gap-3"><p className="text-xs font-semibold text-slate-800">{item.label}</p><Badge tone="warning">{item.count}</Badge></div>{item.examples[0] && <p className="mt-1 line-clamp-2 text-[11px] leading-5 text-slate-500" title={item.examples[0]}>{item.examples[0]}</p>}</div>)}</div>
-    </div>}
   </section>
+}
+
+function FailureReasons({ quality }: { quality: ScanQualitySummary }) {
+  if (!quality.failure_reasons.length) return null
+  return <div className="rounded-xl border border-amber-200 bg-amber-50/60 p-4">
+    <div className="flex items-center gap-2"><AlertTriangle className="h-4 w-4 text-amber-700" /><p className="text-sm font-semibold text-amber-950">未闭合与失败原因</p></div>
+    <div className="mt-3 grid gap-2 lg:grid-cols-2">{quality.failure_reasons.slice(0, 6).map((item) => <div key={item.kind} className="rounded-lg border border-amber-200 bg-white px-3 py-2"><div className="flex items-center justify-between gap-3"><p className="text-xs font-semibold text-slate-800">{item.label}</p><Badge tone="warning">{item.count}</Badge></div>{item.examples[0] && <p className="mt-1 line-clamp-2 text-[11px] leading-5 text-slate-500" title={item.examples[0]}>{item.examples[0]}</p>}</div>)}</div>
+  </div>
 }
 
 function QualityCost({ label, value, detail }: { label: string; value: string; detail: string }) {

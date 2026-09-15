@@ -5,6 +5,14 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
+export function parseTimestamp(value: string) {
+  // Platform timestamps are UTC. SQLite/Pydantic may serialize them without an
+  // explicit offset, which `new Date` would otherwise read as local time and
+  // display the raw UTC clock value.
+  const hasOffset = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value)
+  return new Date(hasOffset ? value : `${value}Z`)
+}
+
 export function formatDate(value: string | null | undefined) {
   if (!value) return "—"
   return new Intl.DateTimeFormat("zh-CN", {
@@ -12,7 +20,7 @@ export function formatDate(value: string | null | undefined) {
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
-  }).format(new Date(value))
+  }).format(parseTimestamp(value))
 }
 
 export function shortHash(value: string) {
