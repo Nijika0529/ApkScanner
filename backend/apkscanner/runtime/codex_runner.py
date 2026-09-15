@@ -100,6 +100,7 @@ class CodexInvestigator:
         self._session_condition = threading.Condition(self._session_lock)
         self._sessions: dict[tuple[str, str, int, str], _ActiveDockerSession] = {}
         self._busy_sessions: set[tuple[str, str, int, str]] = set()
+        self._scan_session_limits: dict[str, int] = {}
 
     def capability(self, *, deep: bool = False) -> dict[str, Any]:
         capability = runtime_capability()
@@ -776,6 +777,30 @@ class CodexInvestigator:
             self._busy_sessions.add(key)
             return active
 
+    def set_scan_session_limit(self, scan_id: str, limit: int | None) -> None:
+        """Raise or clear one scan's worker-session ceiling.
+
+        Device-bound admission lets a scan with N attached ADB devices run N
+        investigation tasks, so the per-scan session ceiling follows that
+        decision.  The global ``codex_max_sessions`` budget still applies, and
+        ``None`` restores the configured default once the scan stops admitting.
+        """
+        with self._session_condition:
+            if limit is None:
+                self._scan_session_limits.pop(scan_id, None)
+            else:
+                self._scan_session_limits[scan_id] = max(1, int(limit))
+            self._session_condition.notify_all()
+
+    def _effective_scan_session_limit(self, scan_id: str) -> int:
+        return min(
+            self.settings.codex_max_sessions,
+            max(
+                self.settings.codex_max_sessions_per_scan,
+                self._scan_session_limits.get(scan_id, 0),
+            ),
+        )
+
     def _wait_for_worker_capacity(
         self,
         scan_id: str,
@@ -787,7 +812,7 @@ class CodexInvestigator:
         while True:
             scan_count = sum(1 for key in self._sessions if key[0] == scan_id)
             global_full = len(self._sessions) >= self.settings.codex_max_sessions
-            scan_full = scan_count >= self.settings.codex_max_sessions_per_scan
+            scan_full = scan_count >= self._effective_scan_session_limit(scan_id)
             if not global_full and not scan_full:
                 return
             candidates = [
@@ -855,6 +880,7 @@ class CodexInvestigator:
                 self._sessions.pop(key) for key in list(self._sessions) if key[0] == scan_id
             ]
             self._busy_sessions = {key for key in self._busy_sessions if key[0] != scan_id}
+            self._scan_session_limits.pop(scan_id, None)
             self._session_condition.notify_all()
         for active in sessions:
             with suppress(Exception):
@@ -902,6 +928,7 @@ class CodexInvestigator:
             sessions = list(self._sessions.values())
             self._sessions.clear()
             self._busy_sessions.clear()
+            self._scan_session_limits.clear()
             self._session_condition.notify_all()
         for active in sessions:
             with suppress(Exception):

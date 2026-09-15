@@ -55,6 +55,9 @@ class Settings:
     codex_max_sessions: int = 8
     codex_max_sessions_per_scan: int = 6
     agent_analysis_slots: int = 4
+    # Investigation admission follows the connected ADB device pool; this is the
+    # hard safety ceiling for that device-bound concurrency.
+    max_investigation_concurrency: int = 16
     poc_build_slots: int = 2
     agent_initial_phase_seconds: int = 15 * 60
     agent_exploration_phase_seconds: int = 10 * 60
@@ -221,6 +224,9 @@ class Settings:
                 1, int(os.getenv("APKSCANNER_CODEX_MAX_SESSIONS_PER_SCAN", 6))
             ),
             agent_analysis_slots=max(1, int(os.getenv("APKSCANNER_AGENT_ANALYSIS_SLOTS", 4))),
+            max_investigation_concurrency=max(
+                1, int(os.getenv("APKSCANNER_MAX_INVESTIGATION_CONCURRENCY", 16))
+            ),
             poc_build_slots=max(1, int(os.getenv("APKSCANNER_POC_BUILD_SLOTS", 2))),
             agent_initial_phase_seconds=max(
                 60, int(os.getenv("APKSCANNER_AGENT_INITIAL_PHASE_SECONDS", 900))

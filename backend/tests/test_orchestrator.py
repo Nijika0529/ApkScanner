@@ -2577,10 +2577,13 @@ def test_task_dispatch_honors_configured_analysis_slots(settings) -> None:  # no
         )
     assert persisted_scan is not None
     assert persisted_scan.stats["execution_policy"] == {
-        "concurrency_policy": "resource_aware_phase_admission",
+        "concurrency_policy": "device_bound_phase_admission",
+        "concurrency_basis": "analysis_slots",
         "investigation_concurrency_at_start": 1,
         "adb_concurrency": 0,
         "analysis_slots": 1,
+        "effective_analysis_slots": 1,
+        "max_investigation_concurrency": configured.max_investigation_concurrency,
         "build_slots": configured.poc_build_slots,
         "device_slots": 0,
         "device_ownership": "dynamic_execution_phase",
@@ -2589,7 +2592,7 @@ def test_task_dispatch_honors_configured_analysis_slots(settings) -> None:  # no
     assert statuses == ["completed"] * 6
 
 
-def test_analysis_dispatch_is_not_bounded_by_device_count(settings) -> None:  # noqa: ANN001
+def test_investigation_dispatch_tracks_device_count(settings) -> None:  # noqa: ANN001
     configured = replace(
         settings,
         adb_serial="device-a",
@@ -2652,7 +2655,10 @@ def test_analysis_dispatch_is_not_bounded_by_device_count(settings) -> None:  # 
     orchestrator._run_task = fake_run_task  # type: ignore[method-assign]
     orchestrator._run_tasks(scan_id)
 
-    assert max_active == configured.agent_analysis_slots
+    # Two attached devices admit two concurrent investigation tasks, and the
+    # shared analysis token never drops below the configured floor.
+    assert max_active == 2
+    assert orchestrator._analysis_slots.limit == max(2, configured.agent_analysis_slots)
     with database.session_factory() as session:
         persisted_scan = session.get(Scan, scan_id)
         statuses = list(
@@ -2662,16 +2668,152 @@ def test_analysis_dispatch_is_not_bounded_by_device_count(settings) -> None:  # 
         )
     assert persisted_scan is not None
     assert persisted_scan.stats["execution_policy"] == {
-        "concurrency_policy": "resource_aware_phase_admission",
-        "investigation_concurrency_at_start": configured.agent_analysis_slots,
+        "concurrency_policy": "device_bound_phase_admission",
+        "concurrency_basis": "device_pool_capacity",
+        "investigation_concurrency_at_start": 2,
         "adb_concurrency": 2,
         "analysis_slots": configured.agent_analysis_slots,
+        "effective_analysis_slots": max(2, configured.agent_analysis_slots),
+        "max_investigation_concurrency": configured.max_investigation_concurrency,
         "build_slots": configured.poc_build_slots,
         "device_slots": 2,
         "device_ownership": "dynamic_execution_phase",
         "agent_workspace_scope": "task_attempt",
     }
     assert statuses == ["completed"] * 4
+
+
+def test_device_count_raises_admission_above_configured_analysis_slots(settings) -> None:  # noqa: ANN001
+    configured = replace(
+        settings,
+        adb_serial="device-a",
+        adb_serials=("device-a", "device-b", "device-c", "device-d"),
+        agent_analysis_slots=2,
+        codex_max_sessions_per_scan=2,
+    )
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            status="preliminary_ready",
+            filename="four-devices.apk",
+            artifact_sha256="7" * 64,
+            artifact_path=str(configured.data_dir / "four-devices.apk"),
+        )
+        session.add(scan)
+        session.flush()
+        session.add_all(
+            [
+                InvestigationTask(
+                    scan_id=scan.id,
+                    task_type="component",
+                    status="queued",
+                    priority=100 - index,
+                )
+                for index in range(8)
+            ]
+        )
+        session.commit()
+        scan_id = scan.id
+
+    orchestrator = ScanOrchestrator(configured, database, ArtifactStore(configured))
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+    observed_session_limits: set[int] = set()
+
+    def fake_run_task(
+        _scan_id: str,
+        task_id: str,
+        _timeout_seconds: int | None = None,
+    ) -> None:
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+            observed_session_limits.add(
+                orchestrator.codex._effective_scan_session_limit(_scan_id)
+            )
+        time.sleep(0.08)
+        with database.session_factory() as session:
+            task = session.get(InvestigationTask, task_id)
+            assert task is not None
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            session.commit()
+        with state_lock:
+            active -= 1
+
+    orchestrator._run_task = fake_run_task  # type: ignore[method-assign]
+    orchestrator._run_tasks(scan_id)
+
+    assert max_active == 4
+    # The per-scan Codex worker ceiling follows the device-bound decision too.
+    assert observed_session_limits == {4}
+    # Releasing the scan restores the shared token to its configured floor.
+    assert orchestrator._analysis_slots.limit == configured.agent_analysis_slots
+
+
+def test_device_bound_admission_respects_hard_ceiling_and_live_pool(settings) -> None:  # noqa: ANN001
+    configured = replace(
+        settings,
+        adb_serial="device-a",
+        adb_serials=("device-a", "device-b", "device-c", "device-d"),
+        agent_analysis_slots=2,
+        max_investigation_concurrency=3,
+    )
+    configured.ensure_directories()
+    database = Database(configured)
+    database.create_all()
+    orchestrator = ScanOrchestrator(configured, database, ArtifactStore(configured))
+
+    # Four devices, but the configured ceiling caps the pool at three.
+    assert orchestrator._current_investigation_concurrency() == 3
+
+    # Unplugging a device mid-run narrows admission without a restart.
+    assert orchestrator.device_pool.remove("device-d") is True
+    assert orchestrator._current_investigation_concurrency() == 3
+
+    assert orchestrator.device_pool.remove("device-c") is True
+    assert orchestrator._current_investigation_concurrency() == 2
+
+    # The global Codex worker-session budget is a hard upper bound as well.
+    tight = replace(
+        configured,
+        adb_serials=("device-a", "device-b", "device-c", "device-d", "device-e"),
+        agent_analysis_slots=2,
+        max_investigation_concurrency=16,
+        codex_max_sessions=4,
+        codex_max_sessions_per_scan=4,
+    )
+    tight.ensure_directories()
+    tight_database = Database(tight)
+    tight_database.create_all()
+    tight_orchestrator = ScanOrchestrator(tight, tight_database, ArtifactStore(tight))
+    assert tight_orchestrator._current_investigation_concurrency() == 4
+
+
+def test_shared_analysis_token_follows_widest_active_scan(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+
+    # A six-device scan widens the process-wide analysis token.
+    assert orchestrator._apply_investigation_admission("scan-a", 6) == 6
+    # A narrower scan must not throttle it back down.
+    assert orchestrator._apply_investigation_admission("scan-b", 2) == 6
+    assert orchestrator._analysis_slots.limit == 6
+
+    # Releasing the widest scan shrinks the token back to the configured floor.
+    orchestrator._release_investigation_admission("scan-a")
+    assert orchestrator._analysis_slots.limit == settings.agent_analysis_slots
+    orchestrator._release_investigation_admission("scan-b")
+    assert orchestrator._analysis_slots.limit == settings.agent_analysis_slots
+    assert orchestrator.codex._effective_scan_session_limit("scan-a") == (
+        settings.codex_max_sessions_per_scan
+    )
 
 
 def test_paused_scan_does_not_claim_queued_tasks_until_resumed(settings) -> None:  # noqa: ANN001
@@ -2849,8 +2991,10 @@ def test_single_investigation_limit_is_shared_across_scans(settings) -> None:  #
     orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
     state_lock = threading.Lock()
     start = threading.Barrier(2)
+    overlap = threading.Barrier(2, timeout=10)
     active = 0
     max_active = 0
+    overlapped: list[bool] = []
 
     def fake_run_task(
         _scan_id: str,
@@ -2861,7 +3005,15 @@ def test_single_investigation_limit_is_shared_across_scans(settings) -> None:  #
         with state_lock:
             active += 1
             max_active = max(max_active, active)
-        time.sleep(0.08)
+        # Both scans must hold their task at the same time; the rendezvous turns a
+        # scheduling-dependent race into a deterministic assertion.
+        try:
+            overlap.wait()
+            with state_lock:
+                overlapped.append(True)
+        except threading.BrokenBarrierError:
+            with state_lock:
+                overlapped.append(False)
         with database.session_factory() as session:
             task = session.get(InvestigationTask, task_id)
             assert task is not None
@@ -2881,8 +3033,9 @@ def test_single_investigation_limit_is_shared_across_scans(settings) -> None:  #
     for worker in workers:
         worker.start()
     for worker in workers:
-        worker.join(timeout=5)
+        worker.join(timeout=15)
         assert not worker.is_alive()
+    assert overlapped == [True, True]
     assert max_active == 2
 
 

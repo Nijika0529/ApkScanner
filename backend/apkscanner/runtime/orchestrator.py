@@ -101,6 +101,7 @@ from .agent_prompt import (
     investigation_prompt,
 )
 from .codex_runner import CodexInvestigator, CodexRunResult
+from .concurrency import ResizableSemaphore
 from .device import AdbDeviceAdapter, AdbDevicePool, DeviceLeaseCancelledError
 from .disposition import (
     disposition_coverage_rate,
@@ -248,7 +249,9 @@ class ScanOrchestrator:
         self._live_proof_base_url: str | None = None
         self._task_cancellations_lock = threading.Lock()
         self._shutting_down = threading.Event()
-        self._analysis_slots = threading.BoundedSemaphore(settings.agent_analysis_slots)
+        self._analysis_slots = ResizableSemaphore(settings.agent_analysis_slots)
+        self._admission_targets: dict[str, int] = {}
+        self._admission_lock = threading.Lock()
         self._build_slots = threading.BoundedSemaphore(settings.poc_build_slots)
 
     @staticmethod
@@ -2466,16 +2469,24 @@ class ScanOrchestrator:
     def _run_tasks(self, scan_id: str) -> str:
         adb_concurrency = self.device_pool.capacity
         initial_concurrency = self._current_investigation_concurrency()
+        self._apply_investigation_admission(scan_id, initial_concurrency)
         with self.database.session_factory() as session:
             scan = session.get(Scan, scan_id)
             assert scan is not None
             scan.stats = {
                 **dict(scan.stats or {}),
                 "execution_policy": {
-                    "concurrency_policy": "resource_aware_phase_admission",
+                    "concurrency_policy": "device_bound_phase_admission",
+                    "concurrency_basis": (
+                        "device_pool_capacity" if adb_concurrency else "analysis_slots"
+                    ),
                     "investigation_concurrency_at_start": initial_concurrency,
                     "adb_concurrency": adb_concurrency,
                     "analysis_slots": self.settings.agent_analysis_slots,
+                    "effective_analysis_slots": self._analysis_slots.limit,
+                    "max_investigation_concurrency": (
+                        self.settings.max_investigation_concurrency
+                    ),
                     "build_slots": self.settings.poc_build_slots,
                     "device_slots": adb_concurrency,
                     "device_ownership": "dynamic_execution_phase",
@@ -2487,12 +2498,13 @@ class ScanOrchestrator:
                 scan_id,
                 "investigation.pool.started",
                 (
-                    "资源感知探索池已启动：分析、构建和设备执行分别调度"
+                    f"设备绑定探索池已启动：{adb_concurrency} 台 ADB 设备对应 "
+                    f"{initial_concurrency} 路并发调查任务"
                     if adb_concurrency
                     else "资源感知探索池已启动：先运行无设备分析，设备接入后执行证明"
                 ),
                 {
-                    "concurrency_policy": "resource_aware_phase_admission",
+                    "concurrency_policy": "device_bound_phase_admission",
                     "investigation_concurrency": initial_concurrency,
                     "adb_concurrency": adb_concurrency,
                     "analysis_slots": self.settings.agent_analysis_slots,
@@ -2515,52 +2527,56 @@ class ScanOrchestrator:
             )
         futures: set[Future[None]] = set()
         with ThreadPoolExecutor(
-            # The executor is only a thread container. Analysis admission is
-            # independent from the device pool; build and device stages acquire
-            # their own process-wide resource tokens.
+            # The executor is only a thread container. Admission follows the live
+            # device pool; build and device stages acquire their own
+            # process-wide resource tokens.
             max_workers=max(1, task_count),
             thread_name_prefix="investigation",
         ) as executor:
-            while True:
-                if self._shutting_down.is_set():
-                    return "shutdown"
-                execution_state = self._scan_execution_state(scan_id)
-                if execution_state in {"stopping", "stopped"}:
-                    self.stop_scan_tasks(scan_id)
-                elif execution_state == "running":
-                    desired_concurrency = self._current_investigation_concurrency()
-                    while len(futures) < desired_concurrency:
-                        if not self._has_queued_tasks(scan_id):
-                            break
-                        claimed = self._claim_next_task(scan_id)
-                        if claimed is None:
-                            break
-                        task_id, timeout_seconds = claimed
-                        futures.add(
-                            executor.submit(
-                                self._run_claimed_task,
-                                scan_id,
-                                task_id,
-                                timeout_seconds,
-                            )
-                        )
-                if not futures:
+            try:
+                while True:
+                    if self._shutting_down.is_set():
+                        return "shutdown"
+                    execution_state = self._scan_execution_state(scan_id)
                     if execution_state in {"stopping", "stopped"}:
-                        return execution_state
-                    if not self._has_queued_tasks(scan_id):
-                        return "completed"
-                    # A paused scan intentionally keeps its queued rows untouched.
-                    # Polling lets pause/resume survive service restarts without an
-                    # in-memory-only control object.
-                    self._shutting_down.wait(0.5)
-                    continue
-                completed, futures = wait(
-                    futures,
-                    timeout=0.5,
-                    return_when=FIRST_COMPLETED,
-                )
-                for future in completed:
-                    future.result()
+                        self.stop_scan_tasks(scan_id)
+                    elif execution_state == "running":
+                        desired_concurrency = self._current_investigation_concurrency()
+                        self._apply_investigation_admission(scan_id, desired_concurrency)
+                        while len(futures) < desired_concurrency:
+                            if not self._has_queued_tasks(scan_id):
+                                break
+                            claimed = self._claim_next_task(scan_id)
+                            if claimed is None:
+                                break
+                            task_id, timeout_seconds = claimed
+                            futures.add(
+                                executor.submit(
+                                    self._run_claimed_task,
+                                    scan_id,
+                                    task_id,
+                                    timeout_seconds,
+                                )
+                            )
+                    if not futures:
+                        if execution_state in {"stopping", "stopped"}:
+                            return execution_state
+                        if not self._has_queued_tasks(scan_id):
+                            return "completed"
+                        # A paused scan intentionally keeps its queued rows untouched.
+                        # Polling lets pause/resume survive service restarts without an
+                        # in-memory-only control object.
+                        self._shutting_down.wait(0.5)
+                        continue
+                    completed, futures = wait(
+                        futures,
+                        timeout=0.5,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    for future in completed:
+                        future.result()
+            finally:
+                self._release_investigation_admission(scan_id)
 
     @staticmethod
     def _execution_state_from_stats(stats: dict[str, Any] | None) -> str:
@@ -5212,7 +5228,25 @@ class ScanOrchestrator:
             session.commit()
 
     def _current_investigation_concurrency(self) -> int:
-        """Admit analysis independently while device execution stays device-bounded."""
+        """Admit one concurrent investigation task per connected ADB device.
+
+        The pool capacity is re-read on every admission decision, so plugging an
+        extra device mid-scan widens the pool without a restart.  The result stays
+        bounded by the global Codex worker-session budget and by
+        ``max_investigation_concurrency``; with no device attached the analysis
+        slots keep desktop-only scans pipelined.  Device execution itself stays
+        leased per device, so a task never shares a phone.
+        """
+        device_capacity = self.device_pool.capacity
+        if device_capacity > 0:
+            return max(
+                1,
+                min(
+                    device_capacity,
+                    self.settings.max_investigation_concurrency,
+                    self.settings.codex_max_sessions,
+                ),
+            )
         return max(
             1,
             min(
@@ -5220,6 +5254,35 @@ class ScanOrchestrator:
                 self.settings.codex_max_sessions_per_scan,
             ),
         )
+
+    def _apply_investigation_admission(self, scan_id: str, desired: int) -> int:
+        """Publish one admission decision to the shared analysis and session pools.
+
+        The analysis token is process-wide, so it follows the widest target among
+        the scans currently admitting tasks; the per-scan Codex session ceiling is
+        published per scan.
+        """
+        with self._admission_lock:
+            self._admission_targets[scan_id] = desired
+            widest = max(self._admission_targets.values())
+        analysis_limit = self._analysis_slots.set_limit(
+            max(widest, self.settings.agent_analysis_slots)
+        )
+        self.codex.set_scan_session_limit(
+            scan_id,
+            max(desired, self.settings.codex_max_sessions_per_scan),
+        )
+        return analysis_limit
+
+    def _release_investigation_admission(self, scan_id: str) -> None:
+        """Drop a finished scan from the shared pools and shrink the token again."""
+        with self._admission_lock:
+            self._admission_targets.pop(scan_id, None)
+            widest = max(self._admission_targets.values(), default=0)
+        self._analysis_slots.set_limit(
+            max(widest, self.settings.agent_analysis_slots)
+        )
+        self.codex.set_scan_session_limit(scan_id, None)
 
     @staticmethod
     def _default_execution_dag() -> dict[str, Any]:

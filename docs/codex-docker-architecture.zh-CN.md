@@ -218,6 +218,10 @@ Gateway Token 绑定 scan、task、attempt、serial、允许动作和过期时�
 - 只有 prepare、安装、动作、观察、Oracle 和 cleanup 组成的短动态批次占用 serial；Agent 推理、Critic/Rescue 和 PoC 构建不占设备；
 - 同一任务的后续批次优先请求原 serial；迁移到其他设备时必须重新 prepare；
 - 在线设备数量决定动态验证容量；运行中接入设备可以扩大并发；
+- 调查任务准入与设备池绑定：N 台设备准入 N 路并发调查任务，上限为
+  `APKSCANNER_MAX_INVESTIGATION_CONCURRENCY` 与全局 `APKSCANNER_CODEX_MAX_SESSIONS`；
+  扫描过程中插拔设备会在下一次准入决策生效，无需重启服务；
+- 无设备时退回 `APKSCANNER_AGENT_ANALYSIS_SLOTS` 的无设备分析并发；
 - drain 停止新 lease，不打断当前任务；活跃设备不能重连或删除；
 - 没有设备时静态分析仍可进行，动态任务保留明确状态；
 - 默认 reset policy 为 `never`，不会自动清除目标应用登录态和本地数据。
@@ -322,7 +326,8 @@ codex mcp add ida-headless -- \
 | `APKSCANNER_CODEX_MAX_CONTAINERS` | `2` | 全局扫描容器上限 |
 | `APKSCANNER_CODEX_MAX_SESSIONS` | `6` | 全局活动 UID Session 上限 |
 | `APKSCANNER_CODEX_MAX_SESSIONS_PER_SCAN` | `6` | 单 Scan 活动 Session 上限 |
-| `APKSCANNER_AGENT_ANALYSIS_SLOTS` | `4` | 无设备 Agent 分析并发 |
+| `APKSCANNER_AGENT_ANALYSIS_SLOTS` | `4` | 无设备 Agent 分析并发（有设备时同时作为分析令牌下限） |
+| `APKSCANNER_MAX_INVESTIGATION_CONCURRENCY` | `16` | 设备绑定调查并发硬上限 |
 | `APKSCANNER_POC_BUILD_SLOTS` | `2` | PoC 编译并发 |
 | `APKSCANNER_AGENT_INITIAL_PHASE_SECONDS` | `900` | 首轮分析阶段时限 |
 | `APKSCANNER_AGENT_EXPLORATION_PHASE_SECONDS` | `600` | 后续纠错/探索阶段时限（独立于首轮） |
