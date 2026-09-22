@@ -26,6 +26,11 @@ dev = [
   "pytest-asyncio>=1.2,<2",
   "ruff>=0.14,<1",
 ]
+# Optional fast bytecode-level cross references (ASC/droidasc). Pinned because the
+# package is young and monkey-patches androguard.
+asc = [
+  "droidasc==0.1.1",
+]
 
 [project.scripts]
 apk-scanner = "apkscanner.cli:main"

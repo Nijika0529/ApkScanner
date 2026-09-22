@@ -1376,7 +1376,8 @@ class AdbDeviceAdapter:
                         line for line in matching if request_id not in line
                     ]
                     normalized = [line.lower().replace(" ", "") for line in request_matching]
-                    log_poc_payload = self._last_json_payload(request_matching)
+                    log_poc_payloads = self._correlated_json_payloads(request_matching)
+                    log_poc_payload = self._select_poc_oracle_payload(log_poc_payloads, oracle)
                     log_poc_oracle = self._evaluate_poc_oracle(
                         oracle,
                         poc_payload=log_poc_payload,
@@ -1387,7 +1388,9 @@ class AdbDeviceAdapter:
                     )
                     log_poc_success = (
                         any('"success":true' in line for line in normalized)
-                        or bool(log_poc_payload and log_poc_payload.get("success") is True)
+                        or any(
+                            payload.get("success") is True for payload in log_poc_payloads
+                        )
                         or log_oracle_matched
                     )
                     receipt_result: CommandResult | None = None
@@ -1399,7 +1402,13 @@ class AdbDeviceAdapter:
                             self._poll_poc_durable_receipt(
                                 package_name=spec.package_name,
                                 request_id=request_id,
-                                timeout_seconds=min(5, max(1, spec.timeout_seconds)),
+                                # A ui_text Oracle does not wait on logcat, so the
+                                # receipt must be allowed to arrive within the PoC's
+                                # own window; a fixed 5s cap lost the terminal
+                                # receipt of every slower PoC.
+                                timeout_seconds=self._poc_receipt_timeout(
+                                    spec.timeout_seconds, budget
+                                ),
                                 budget=budget,
                             )
                         )
@@ -1717,6 +1726,20 @@ class AdbDeviceAdapter:
             if time.monotonic() >= deadline or (budget is not None and budget.expired):
                 return last, matching, attempts, time.monotonic() - started
             time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+
+    @staticmethod
+    def _poc_receipt_timeout(poc_timeout_seconds: int, budget: TimeBudget | None) -> int:
+        """Allow a terminal receipt to arrive within the PoC's own window.
+
+        ``_poll_poc_durable_receipt`` returns as soon as the receipt is terminal, so
+        a wider bound only affects PoCs that never write one.  The wait still cannot
+        outlive the shared task budget.
+        """
+
+        requested = max(1, int(poc_timeout_seconds))
+        if budget is None:
+            return requested
+        return max(1, budget.remaining(requested))
 
     def _poll_poc_durable_receipt(
         self,
@@ -2167,8 +2190,11 @@ class AdbDeviceAdapter:
         }
 
     @staticmethod
-    def _last_json_payload(lines: list[str]) -> dict[str, Any] | None:
-        for line in reversed(lines):
+    def _correlated_json_payloads(lines: list[str]) -> list[dict[str, Any]]:
+        """Parse every JSON object a PoC logged, in log order."""
+
+        payloads: list[dict[str, Any]] = []
+        for line in lines:
             start = line.find("{")
             if start < 0:
                 continue
@@ -2177,8 +2203,41 @@ class AdbDeviceAdapter:
             except json.JSONDecodeError:
                 continue
             if isinstance(value, dict):
-                return value
-        return None
+                payloads.append(value)
+        return payloads
+
+    @staticmethod
+    def _poc_oracle_payload_keys(oracle: AgentOracleSpec | None) -> tuple[str, ...]:
+        if oracle is None:
+            return ()
+        if oracle.kind == "provider_rows":
+            return ("rowCount", "row_count")
+        if oracle.kind == "binder_reply":
+            return ("binderReplies", "binderReply")
+        if oracle.kind in {"reachability", "log_contains"}:
+            return ("success",)
+        return ()
+
+    @classmethod
+    def _select_poc_oracle_payload(
+        cls,
+        payloads: list[dict[str, Any]],
+        oracle: AgentOracleSpec | None,
+    ) -> dict[str, Any] | None:
+        """Prefer the newest correlated record that carries the measurement.
+
+        A PoC may log a per-step measurement and then a summary object.  Taking the
+        literal last JSON made ``provider_rows``/``binder_reply`` Oracles miss a
+        measurement that was present, and could turn that miss into a refutation.
+        """
+
+        if not payloads:
+            return None
+        keys = cls._poc_oracle_payload_keys(oracle)
+        for payload in reversed(payloads):
+            if any(key in payload for key in keys):
+                return payload
+        return payloads[-1]
 
     @staticmethod
     def _poc_receipt_diagnostics(payload: dict[str, Any] | None) -> dict[str, Any]:
@@ -2712,6 +2771,11 @@ class AdbDevicePool:
             str(adapter.serial): adapter for adapter in adapters if adapter.serial is not None
         }
         self.scheduler = DevicePoolScheduler(tuple(self._by_serial))
+        # User-requested drains and probe-detected disconnections are tracked
+        # separately so a successful probe cannot silently un-drain a device the
+        # operator deliberately took out of service.
+        self._user_drained: set[str] = set()
+        self._unavailable: set[str] = set()
 
     @property
     def adapters(self) -> tuple[AdbDeviceAdapter, ...]:
@@ -2729,8 +2793,25 @@ class AdbDevicePool:
 
     @property
     def capacity(self) -> int:
+        """Devices that can actually run a task right now.
+
+        Configured-but-disconnected devices are excluded (they are probe-marked
+        unavailable), so investigation concurrency follows the connected phones
+        instead of the persisted device records.
+        """
+
         state = self.scheduler.snapshot()
-        return max(0, len(self.adapters) - len(state.get("draining", [])))
+        draining = set(state.get("draining", []))
+        with self._lock:
+            return max(
+                0,
+                sum(1 for serial in self._by_serial if serial not in draining),
+            )
+
+    @property
+    def unavailable(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(sorted(self._unavailable))
 
     @property
     def serials(self) -> tuple[str, ...]:
@@ -2743,19 +2824,52 @@ class AdbDevicePool:
         serial = str(adapter.serial)
         with self._lock:
             self._by_serial[serial] = adapter
+            self._unavailable.discard(serial)
+            self._user_drained.discard(serial)
             self.scheduler.add_serial(serial)
 
     def drain(self, serial: str) -> bool:
-        return self.scheduler.drain_serial(serial)
+        if not self.scheduler.drain_serial(serial):
+            return False
+        with self._lock:
+            self._user_drained.add(serial)
+        return True
 
     def restore(self, serial: str) -> bool:
+        with self._lock:
+            self._user_drained.discard(serial)
+            still_unavailable = serial in self._unavailable
+        if still_unavailable:
+            # Keep it out of the assignable set until a probe/reconnect succeeds.
+            return self.scheduler.drain_serial(serial)
         return self.scheduler.restore_serial(serial)
+
+    def mark_available(self, serial: str) -> bool:
+        """Record a successful probe/reconnect and make the device assignable."""
+
+        with self._lock:
+            self._unavailable.discard(serial)
+            user_drained = serial in self._user_drained
+        if user_drained:
+            return False
+        return self.scheduler.restore_serial(serial)
+
+    def mark_unavailable(self, serial: str) -> bool:
+        """Record a failed probe/disconnect and stop assigning the device."""
+
+        with self._lock:
+            if serial not in self._by_serial:
+                return False
+            self._unavailable.add(serial)
+        return self.scheduler.drain_serial(serial)
 
     def remove(self, serial: str) -> bool:
         if not self.scheduler.remove_serial(serial):
             return False
         with self._lock:
             self._by_serial.pop(serial, None)
+            self._user_drained.discard(serial)
+            self._unavailable.discard(serial)
         return True
 
     def is_active(self, serial: str) -> bool:
@@ -2772,8 +2886,9 @@ class AdbDevicePool:
         state = self.scheduler.snapshot()
         return {
             "configured": self.configured,
-            "capacity": len(self.adapters),
+            "capacity": self.capacity,
             "serials": list(self.serials),
+            "unavailable": list(self.unavailable),
             "active": state["active"],
             "draining": state.get("draining", []),
             "waiting": state["waiting"],

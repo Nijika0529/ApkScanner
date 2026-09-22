@@ -71,6 +71,9 @@ class CapabilityRegistry:
         self._lock = threading.RLock()
         self._manifests: dict[str, CapabilityManifest] = {}
         self._adapters: dict[str, CapabilityAdapter] = {}
+        # Adapter ids installed by ``_install_builtins``; ``_adapters`` also holds
+        # MCP adapters bound at runtime, which must not block a manifest reload.
+        self._builtin_ids: set[str] = set()
         self._install_builtins()
         self.reload()
 
@@ -96,13 +99,13 @@ class CapabilityRegistry:
             manifest = CapabilityManifest.model_validate_json(path.read_bytes())
             if manifest.runtime == "builtin_python":
                 raise ValueError("external manifests cannot claim the builtin_python runtime")
-            if manifest.id in loaded or manifest.id in self._adapters:
+            if manifest.id in loaded or manifest.id in self._builtin_ids:
                 raise ValueError(f"duplicate capability ID: {manifest.id}")
             if manifest.runtime == "python_script":
                 self._resolve_script(manifest)
             loaded[manifest.id] = manifest
         with self._lock:
-            builtin_ids = set(self._adapters)
+            builtin_ids = set(self._builtin_ids)
             self._manifests = {
                 **{key: value for key, value in self._manifests.items() if key in builtin_ids},
                 **loaded,
@@ -180,6 +183,7 @@ class CapabilityRegistry:
         for manifest, adapter in builtins:
             self._manifests[manifest.id] = manifest
             self._adapters[manifest.id] = adapter
+            self._builtin_ids.add(manifest.id)
 
     def _scan_timeline(self, value: dict[str, Any]) -> dict[str, Any]:
         scan_id = value.get("scan_id")

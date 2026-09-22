@@ -660,8 +660,13 @@ def test_plugin_archive_trust_without_signature_check(tmp_path) -> None:
     assert "caller_identity_authorization" in chain["risk_markers"]
 
 
-def test_reverse_search_finds_path_missed_by_forward(tmp_path) -> None:
-    """Reverse (sink→source) search on reversed adjacency catches paths forward missed."""
+def test_reverse_search_does_not_fabricate_reversed_paths(tmp_path) -> None:
+    """A sink→source reference must not be reported as a source→sink chain.
+
+    The reverse pass traverses the *reversed* caller graph.  Walking the forward
+    graph from the sink and reversing the node list used to emit a path whose
+    edges did not exist in that direction.
+    """
     root = tmp_path / "jadx"
     _write(
         root,
@@ -670,7 +675,7 @@ def test_reverse_search_finds_path_missed_by_forward(tmp_path) -> None:
         package com.example.target;
         class ExportBinder extends IExportService.Stub {
           void onTransact(int code, Parcel data, Parcel reply, int flags) {
-            // no reference to helper — forward search from here won't find the sink
+            // no reference to the identity helper
           }
         }
         """,
@@ -683,24 +688,60 @@ def test_reverse_search_finds_path_missed_by_forward(tmp_path) -> None:
         class IdentityHelper {
           void checkCaller() {
             String callerPackage = getCallingPackage();
-            // references ExportBinder → reverse edge B→A makes this reachable
+            // references ExportBinder, i.e. sink → source, not a real call chain
             com.example.target.ExportBinder svc = null;
           }
         }
         """,
     )
 
-    manifest = _manifest()
-    chains = AndroidAttackChainAnalyzer().analyze(manifest, [root])
+    chains = AndroidAttackChainAnalyzer().analyze(_manifest(), [root])
+    kinds = {item["chain_kind"] for item in chains}
+
+    assert "binder_claimed_identity_authorization" not in kinds, (
+        "an inverted (sink→source) reference must not be reported as a chain"
+    )
+
+
+def test_reverse_search_reports_a_real_source_to_sink_path(tmp_path) -> None:
+    """The reverse pass must return the genuine source→sink node order."""
+    root = tmp_path / "jadx"
+    _write(
+        root,
+        "sources/com/example/target/ExportBinder.java",
+        """
+        package com.example.target;
+        class ExportBinder extends IExportService.Stub {
+          void onTransact(int code, Parcel data, Parcel reply, int flags) {
+            com.example.target.IdentityHelper helper =
+                new com.example.target.IdentityHelper();
+            helper.checkCaller();
+          }
+        }
+        """,
+    )
+    _write(
+        root,
+        "sources/com/example/target/IdentityHelper.java",
+        """
+        package com.example.target;
+        class IdentityHelper {
+          void checkCaller() {
+            String callerPackage = getCallingPackage();
+          }
+        }
+        """,
+    )
+
+    chains = AndroidAttackChainAnalyzer().analyze(_manifest(), [root])
     by_kind = {item["chain_kind"]: item for item in chains}
 
     assert "binder_claimed_identity_authorization" in by_kind
     chain = by_kind["binder_claimed_identity_authorization"]
-    assert chain["search_direction"] == "reverse", (
-        "reverse search should find this path that forward search missed"
-    )
-    assert "caller_supplied_identity" in chain["sink_markers"]
-    assert "binder_entrypoint" in chain["source_markers"]
+    assert [item["class_name"] for item in chain["path"]] == [
+        "com.example.target.ExportBinder",
+        "com.example.target.IdentityHelper",
+    ], "the reported path must follow real caller→callee edges"
 
 
 def test_bidirectional_confluence_boosts_priority(tmp_path) -> None:

@@ -79,3 +79,6 @@ apk/
 poc/
 probe/local.properties
 Samsung_Vulnerabilities/
+
+# ASC xref benchmark outputs (decompiled trees, reports, pulled APKs)
+benchmarks/results/

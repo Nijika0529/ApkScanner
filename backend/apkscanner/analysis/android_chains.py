@@ -1396,16 +1396,20 @@ class AndroidAttackChainAnalyzer:
         adjacency: dict[str, set[str]],
         spec: ChainSpec,
     ) -> list[dict[str, Any]]:
-        """Reverse chain search: sink→source, catches paths forward search missed.
+        """Reverse chain search: start from sinks and walk real caller edges.
 
-        Uses the *original* adjacency graph because the edge direction is
-        sink→source (the sink node references the source node).  Forward
-        search starts from source nodes and follows edges outward; reverse
-        search starts from sink nodes and follows edges outward — the same
-        BFS, just with different start nodes.
+        ``adjacency`` maps a class to the classes it references (caller→callee),
+        so a genuine source→…→sink path only exists in that direction.  Searching
+        from the sink must therefore traverse the *reversed* adjacency: each hop
+        then moves to a class that references the current one, and the resulting
+        sink→…→source list reversed is a real source→…→sink path.  Walking the
+        forward graph from the sink and reversing the list fabricated paths whose
+        edges did not exist.
         """
+
         source_nodes = {name for name, node in nodes.items() if set(node.markers) & spec.sources}
         sink_nodes = [name for name, node in nodes.items() if set(node.markers) & spec.sinks]
+        reverse_adjacency = self._reverse_adjacency(adjacency)
         candidates: list[dict[str, Any]] = []
         for sink_name in sorted(sink_nodes)[:80]:
             sink_node = nodes[sink_name]
@@ -1417,13 +1421,19 @@ class AndroidAttackChainAnalyzer:
             paths = self._bounded_paths(
                 sink_name,
                 effective_sources,
-                adjacency,
+                reverse_adjacency,
                 max_hops=spec.max_hops,
             )
             if not paths and spec.endpoint_discovery:
                 paths = [[sink_name]]
             for path in paths[:2]:
                 path.reverse()
+                if len(path) > 1 and not self._source_references_first_hop(
+                    nodes[path[0]],
+                    spec.sources,
+                    path[1],
+                ):
+                    continue
                 candidate = self._candidate(manifest, nodes, path, spec)
                 candidate["search_direction"] = "reverse"
                 candidates.append(candidate)

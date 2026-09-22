@@ -2490,4 +2490,10 @@ def test_campaign_entry_append_schedules_clones_from_the_event_loop(settings) ->
             },
         )
         assert appended.status_code == 202
-        assert appended.json()["scan_ids"]
+        # The regression is the 500 from ``asyncio.create_task`` in a worker
+        # thread; whether the new clone launches immediately also depends on the
+        # campaign's parallel-scan budget, so assert the entry was recorded.
+        assert isinstance(appended.json().get("scan_ids"), list)
+        detail = client.get(f"/api/v1/supervisor/campaigns/{campaign_id}")
+        assert detail.status_code == 200
+        assert "second_rescan" in {entry["entry_id"] for entry in detail.json()["entries"]}

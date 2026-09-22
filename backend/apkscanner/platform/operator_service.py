@@ -95,7 +95,10 @@ class PlatformOperatorService:
             task = InvestigationTask(
                 scan_id=scan.id,
                 task_type="operator",
-                status=TaskStatus.QUEUED.value,
+                # Claimed by this Operator session immediately, not by the scan
+                # dispatcher: a QUEUED row would be picked up as ordinary
+                # investigation work and race the Operator turn.
+                status=TaskStatus.RUNNING.value,
                 priority=100,
                 target_entry_ids=target_entry_ids,
                 hypotheses=[finding.title for finding in findings],
@@ -860,7 +863,13 @@ class PlatformOperatorService:
                     metadata.pop("proof_gap_code", None)
                     metadata.pop("oracle_gap", None)
                 if applied_verdict == FindingStatus.REFUTED_STATIC.value:
-                    metadata["platform_static_refutation_gate"] = static_refutation_gate
+                    # Only replace the receipt when the Operator explicitly asked
+                    # for a static refutation.  An "unchanged" verdict inherits the
+                    # finding's existing refuted_static status, and the gate built
+                    # from this update carries no evidence, so overwriting here
+                    # destroyed a valid receipt and reopened the finding.
+                    if update.verdict == FindingStatus.REFUTED_STATIC.value:
+                        metadata["platform_static_refutation_gate"] = static_refutation_gate
                 elif not preserve_human_closure:
                     metadata.pop("platform_static_refutation_gate", None)
                 report_payload = metadata.get("report")

@@ -23,6 +23,7 @@ class Database:
         sqlite = url.get_backend_name() == "sqlite"
         self._sqlite_read_only = sqlite and url.query.get("mode") == "ro"
         self._sqlite_path = self._sqlite_database_path(url) if sqlite else None
+        self._sqlite_synchronous = (settings.sqlite_synchronous or "FULL").upper()
         # SQLite probes OS temp directories (``/var/tmp`` before ``/tmp``) for
         # sort/aggregate spill files. Restricted sandboxes and read-only
         # containers may not expose those paths, which surfaces as a confusing
@@ -47,6 +48,9 @@ class Database:
         cursor = dbapi_connection.cursor()
         try:
             cursor.execute("PRAGMA busy_timeout=10000")
+            # Applied before the WAL switch so schema creation and bulk writes do
+            # not pay one fsync per statement on slow storage.
+            cursor.execute(f"PRAGMA synchronous={self._sqlite_synchronous}")
             if not self._sqlite_read_only:
                 cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA foreign_keys=ON")

@@ -2147,3 +2147,64 @@ def test_process_crash_miss_requires_a_completed_isolated_observation_window() -
 
     assert incomplete["oracle_refuted"] is False
     assert complete["oracle_refuted"] is True
+
+
+def test_poc_oracle_payload_prefers_the_record_with_the_measurement() -> None:
+    """A trailing summary record must not hide the step that carried the result."""
+
+    provider = AgentOracleSpec(
+        kind="provider_rows",
+        minimum_rows=1,
+        impact="unauthorized_data_access",
+    )
+    lines = [
+        '{"request_id":"r","success":true,"row_count":7}',
+        '{"request_id":"r","test":"summary"}',
+    ]
+    payloads = AdbDeviceAdapter._correlated_json_payloads(lines)
+    selected = AdbDeviceAdapter._select_poc_oracle_payload(payloads, provider)
+
+    assert selected == {"request_id": "r", "success": True, "row_count": 7}
+    metadata = AdbDeviceAdapter._evaluate_poc_oracle(
+        provider,
+        poc_payload=selected,
+        output="\n".join(lines),
+    )
+    assert metadata["oracle"]["matched"] is True
+
+    # With no measurement anywhere the newest record is still used.
+    fallback = AdbDeviceAdapter._select_poc_oracle_payload(
+        AdbDeviceAdapter._correlated_json_payloads(['{"a":1}', '{"b":2}']),
+        provider,
+    )
+    assert fallback == {"b": 2}
+
+
+def test_pool_capacity_follows_probe_availability(settings) -> None:  # noqa: ANN001
+    """Device-bound concurrency must follow connected phones, not configured rows."""
+
+    settings.ensure_directories()
+    runner = ToolRunner(timeout_seconds=5)
+    pool = AdbDevicePool(
+        [AdbDeviceAdapter(settings, runner, serial=f"device-{index}") for index in range(3)]
+    )
+
+    assert pool.capacity == 3
+    assert pool.mark_unavailable("device-1") is True
+    assert pool.capacity == 2, "a probe-marked device must not count toward concurrency"
+    assert pool.snapshot()["unavailable"] == ["device-1"]
+
+    assert pool.mark_available("device-1") is True
+    assert pool.capacity == 3
+
+    # A user-requested drain must survive a later successful probe.
+    assert pool.drain("device-2") is True
+    assert pool.capacity == 2
+    assert pool.mark_available("device-2") is False
+    assert pool.capacity == 2
+    assert pool.restore("device-2") is True
+    assert pool.capacity == 3
+
+    assert pool.remove("device-0") is True
+    assert pool.capacity == 2
+    assert pool.unavailable == ()

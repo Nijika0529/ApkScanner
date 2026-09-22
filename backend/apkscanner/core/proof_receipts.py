@@ -57,25 +57,37 @@ def _attributable_attempts(
 
     attempts: list[ProofAttempt] = []
     if declared_ids:
-        attempts = [
-            attempt
-            for attempt in session.scalars(
-                base.where(
-                    ProofAttempt.id.in_(declared_ids),
-                    ProofAttempt.hypothesis_id.in_(allowed_hypothesis_ids),
-                ).order_by(ProofAttempt.created_at)
-            )
-            if qualifies(attempt)
-        ]
-    if not attempts:
-        attempts = list(
-            session.scalars(
-                base.where(
-                    ProofAttempt.hypothesis_id.in_(allowed_hypothesis_ids)
-                ).order_by(ProofAttempt.created_at)
-            )
+        attempts = _evidence_backed_attempts_for_scan(
+            session,
+            finding.scan_id,
+            [
+                attempt
+                for attempt in session.scalars(
+                    base.where(
+                        ProofAttempt.id.in_(declared_ids),
+                        ProofAttempt.hypothesis_id.in_(allowed_hypothesis_ids),
+                    ).order_by(ProofAttempt.created_at)
+                )
+                if qualifies(attempt)
+            ],
         )
-    return [attempt for attempt in attempts if qualifies(attempt)]
+    if not attempts:
+        # Fall back only when no declared attempt is actually evidence-backed, so
+        # the singular result cannot disagree with the bulk form.
+        return _evidence_backed_attempts_for_scan(
+            session,
+            finding.scan_id,
+            [
+                attempt
+                for attempt in session.scalars(
+                    base.where(
+                        ProofAttempt.hypothesis_id.in_(allowed_hypothesis_ids)
+                    ).order_by(ProofAttempt.created_at)
+                )
+                if qualifies(attempt)
+            ],
+        )
+    return attempts
 
 
 def attributable_harm_attempts(
@@ -84,7 +96,7 @@ def attributable_harm_attempts(
 ) -> list[ProofAttempt]:
     """Return same-scan harm receipts bound to this finding's hypotheses."""
 
-    attempts = _attributable_attempts(
+    return _attributable_attempts(
         session,
         finding,
         metadata_key="proof_attempt_ids",
@@ -92,7 +104,6 @@ def attributable_harm_attempts(
             attempt.status == "proven" and attempt.harm_demonstrated is True
         ),
     )
-    return _evidence_backed_attempts_for_scan(session, finding.scan_id, attempts)
 
 
 def attributable_harm_attempts_by_finding(
@@ -153,12 +164,27 @@ def attributable_harm_attempts_by_finding(
         for attempt in attempts:
             attempts_by_hypothesis[attempt.hypothesis_id].append(attempt)
         for finding in scan_findings:
-            result[finding.id] = [
+            candidates = [
                 attempt
                 for hypothesis_id in hypothesis_ids_by_finding.get(finding.id, set())
                 for attempt in attempts_by_hypothesis.get(hypothesis_id, [])
             ]
-            result[finding.id].sort(key=lambda attempt: attempt.created_at)
+            metadata = (
+                finding.metadata_json if isinstance(finding.metadata_json, dict) else {}
+            )
+            declared_ids = {
+                value
+                for value in (metadata.get("proof_attempt_ids") or [])
+                if isinstance(value, str) and value
+            }
+            scoped = [attempt for attempt in candidates if attempt.id in declared_ids]
+            # Mirror the singular form: keep only declared receipts when at least
+            # one of them is itself evidence-backed, otherwise count every backed
+            # sibling attempt.  Without this the two forms disagreed, so
+            # ``can_accept`` could be true while the accept gate returned 409.
+            result[finding.id] = sorted(
+                scoped or candidates, key=lambda attempt: attempt.created_at
+            )
     return result
 
 
@@ -229,7 +255,7 @@ def attributable_refutation_attempts(
 ) -> list[ProofAttempt]:
     """Return same-scan, evidence-backed platform Oracle refutations for this finding."""
 
-    attempts = _attributable_attempts(
+    return _attributable_attempts(
         session,
         finding,
         metadata_key="refutation_attempt_ids",
@@ -251,4 +277,3 @@ def attributable_refutation_attempts(
             is True
         ),
     )
-    return _evidence_backed_attempts_for_scan(session, finding.scan_id, attempts)

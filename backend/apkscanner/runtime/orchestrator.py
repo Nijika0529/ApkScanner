@@ -22,8 +22,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from sqlalchemy import select, update
+from sqlalchemy import desc, select, update
 
+from ..analysis.asc_xrefs import (
+    AscXrefExtractor,
+    build_asc_queries,
+    evidence_summary,
+    relevance_filter,
+)
 from ..analysis.manifest import parse_manifest
 from ..analysis.rules import BuiltinRuleEngine
 from ..analysis.security_design import build_android_threat_model, finding_identity
@@ -192,6 +198,7 @@ class ScanOrchestrator:
             executable_overrides={"adb": settings.host_adb_executable},
         )
         self.inspector = ApkInspector(settings, self.runner)
+        self.asc = AscXrefExtractor(settings, self.runner)
         self.rules = BuiltinRuleEngine()
         self.evidence = EvidenceRecorder(store)
         self.hypothesis_ledger = HypothesisLedger(database)
@@ -221,6 +228,10 @@ class ScanOrchestrator:
         for item in enabled_records:
             if item.state == "draining":
                 self.device_pool.drain(item.serial)
+            elif item.state == "unavailable":
+                # A record from a previous session whose phone is gone must not
+                # inflate device-bound concurrency until a probe/reconnect succeeds.
+                self.device_pool.mark_unavailable(item.serial)
         self.poc_builder = PocBuilder(settings, self.runner, store)
         self.dynamic_experiments = DynamicExperimentService(
             database,
@@ -289,12 +300,16 @@ class ScanOrchestrator:
                         record.last_seen_at = now()
                         record.state = "draining" if record.serial in draining else "ready"
                         changed = True
+                        # A successful probe returns the phone to the assignable set
+                        # so device-bound concurrency follows connected devices.
+                        self.device_pool.mark_available(record.serial)
                     elif probe and not capability.get("busy"):
                         record.last_error = str(
                             capability.get("detail") or "ADB device is unavailable"
                         )[:4000]
                         record.state = "unavailable"
                         changed = True
+                        self.device_pool.mark_unavailable(record.serial)
                 verdict_metadata = self.settings.verdict_metadata(record.api_level)
                 verdict_metadata.update(
                     {
@@ -1909,6 +1924,7 @@ class ScanOrchestrator:
                 "embedded_artifacts": "内嵌 APK 与插件链",
                 "rule_evaluation": "静态规则评估",
                 "target_profile": "目标审计 Profile 规划",
+                "asc_xrefs": "ASC 字节码交叉引用",
             }
             static_phase_started: dict[str, float] = {}
 
@@ -2286,6 +2302,13 @@ class ScanOrchestrator:
                     summary=self._static_tool_evidence_summary(tool, payload),
                     metadata=metadata,
                 )
+            self._run_asc_xrefs(
+                session,
+                scan,
+                entries,
+                preliminary_budget,
+                progress=record_static_phase,
+            )
             planner = InvestigationPlanner(
                 android_version=self.settings.device_android_version,
                 android_api=self.settings.device_android_api,
@@ -5255,6 +5278,20 @@ class ScanOrchestrator:
             ),
         )
 
+    def _publish_analysis_limit(self, widest: int) -> int:
+        """Size the process-wide analysis token to the current admission target.
+
+        The token bounds concurrent Agent investigations across all scans.  It must
+        equal the device-bound target when tasks are admitted: an
+        ``agent_analysis_slots`` floor here let one phone run several concurrent
+        investigations, which is exactly the over-subscription this bound exists to
+        prevent.  ``agent_analysis_slots`` only sizes the idle/desktop-only pool.
+        """
+
+        if widest > 0:
+            return self._analysis_slots.set_limit(widest)
+        return self._analysis_slots.set_limit(max(1, self.settings.agent_analysis_slots))
+
     def _apply_investigation_admission(self, scan_id: str, desired: int) -> int:
         """Publish one admission decision to the shared analysis and session pools.
 
@@ -5265,9 +5302,7 @@ class ScanOrchestrator:
         with self._admission_lock:
             self._admission_targets[scan_id] = desired
             widest = max(self._admission_targets.values())
-        analysis_limit = self._analysis_slots.set_limit(
-            max(widest, self.settings.agent_analysis_slots)
-        )
+        analysis_limit = self._publish_analysis_limit(widest)
         self.codex.set_scan_session_limit(
             scan_id,
             max(desired, self.settings.codex_max_sessions_per_scan),
@@ -5279,9 +5314,7 @@ class ScanOrchestrator:
         with self._admission_lock:
             self._admission_targets.pop(scan_id, None)
             widest = max(self._admission_targets.values(), default=0)
-        self._analysis_slots.set_limit(
-            max(widest, self.settings.agent_analysis_slots)
-        )
+        self._publish_analysis_limit(widest)
         self.codex.set_scan_session_limit(scan_id, None)
 
     @staticmethod
@@ -6242,6 +6275,7 @@ class ScanOrchestrator:
                 },
             )
         target_code_context = self._target_code_context(scan_id, entries)
+        target_xrefs = self._target_xrefs_context(scan_id, entries)
         scope_plan = InvestigationPlanner(
             android_version=self.settings.device_android_version,
             android_api=self.settings.device_android_api,
@@ -6631,6 +6665,7 @@ class ScanOrchestrator:
                     "poc_builder": poc_builder_capability,
                     "coverage_gaps": ([] if blind_rescue or critic_turn else coverage_gaps),
                     "target_code_context": dispatch_code_context,
+                    "target_xrefs": target_xrefs,
                     "entry_scope": entry_scope,
                     "executed_agent_tests": ([] if critic_turn else executed_tests or []),
                     "agent_round_history": (
@@ -8567,9 +8602,18 @@ class ScanOrchestrator:
         if list(getattr(result, "coverage_gaps", []) or []):
             reasons.append("coverage_gap")
         components = target_code_context.get("components", [])
+        # The code index emits source_available / partial_source_available /
+        # smali_fallback / target_decompilation_failed / source_not_found.  The old
+        # {"complete", "available"} vocabulary never matched, so every task with a
+        # resolved component was classified partial and forced through blind rescue.
         if any(
             isinstance(component, dict)
-            and str(component.get("status") or "") not in {"complete", "available"}
+            and str(component.get("status") or "")
+            not in {
+                "source_available",
+                "smali_fallback",
+                "static_signal_source_available",
+            }
             for component in components
         ):
             reasons.append("partial_static_context")
@@ -9302,9 +9346,9 @@ class ScanOrchestrator:
             return None
         if entry.kind == "provider":
             authorities = {
-                item
+                item.strip()
                 for item in str(entry.metadata_json.get("authorities") or "").split(";")
-                if item
+                if item.strip()
             }
             if candidate.scheme != "content" or candidate.netloc not in authorities:
                 return "provider URI must preserve a manifest-declared authority"
@@ -10386,6 +10430,139 @@ class ScanOrchestrator:
             "components": components,
         }
 
+    def _run_asc_xrefs(
+        self,
+        session,  # noqa: ANN001
+        scan: Scan,
+        entries: list[EntryPoint],
+        budget,  # noqa: ANN001
+        *,
+        progress=None,  # noqa: ANN001
+    ) -> None:
+        """Record ASC bytecode-level inbound cross references as scan Evidence.
+
+        Optional: disabled by default, and any failure (package missing, sandbox
+        without ``multiprocessing``, tool error) becomes an unusable-tool receipt
+        instead of failing the scan.
+        """
+
+        if not self.settings.asc_enabled:
+            return
+        if progress is not None:
+            progress("asc_xrefs", "started", {"query_limit": self.settings.asc_max_queries})
+        queries = build_asc_queries(
+            entries,
+            max_queries=self.settings.asc_max_queries,
+        )
+        try:
+            extraction = self.asc.extract(
+                Path(scan.artifact_path),
+                queries,
+                budget=budget,
+            )
+        except Exception as exc:  # defensive: extraction already isolates
+            if progress is not None:
+                progress(
+                    "asc_xrefs",
+                    "failed",
+                    {"error": f"{type(exc).__name__}: {exc}"},
+                )
+            return
+        payload = extraction.as_evidence_payload()
+        usable = extraction.usable
+        status = (
+            "succeeded"
+            if usable
+            else "unavailable"
+            if not extraction.references and not extraction.tool_version
+            else "tool_failed"
+        )
+        metadata = {
+            "static_output_usable": usable,
+            "static_tool_status": status,
+            "static_tool_timed_out": False,
+            "static_tool_exit_code": 0 if usable else 1,
+            "asc_transport": extraction.transport,
+            "asc_tool_version": extraction.tool_version,
+            "asc_reference_count": len(extraction.references),
+            "asc_dex_entry_count": int(extraction.stats.get("dex_entry_count") or 0),
+            "asc_error_count": len(extraction.errors),
+        }
+        self.evidence.json(
+            session,
+            scan_id=scan.id,
+            task_id=None,
+            kind="static.droidasc",
+            value=payload,
+            summary=evidence_summary(payload),
+            metadata=metadata,
+        )
+        if progress is not None:
+            progress(
+                "asc_xrefs",
+                "completed" if usable else "failed",
+                {
+                    "references": len(extraction.references),
+                    "queries": len(extraction.queries),
+                    "transport": extraction.transport,
+                    "errors": extraction.errors[:3],
+                },
+            )
+
+    def _target_xrefs_context(
+        self,
+        scan_id: str,
+        entries: list[EntryPoint],
+    ) -> dict[str, Any] | None:
+        """Project the scan's ASC xrefs into a bounded, per-task reference set."""
+
+        with self.database.session_factory() as session:
+            record = session.scalar(
+                select(Evidence)
+                .where(
+                    Evidence.scan_id == scan_id,
+                    Evidence.kind == "static.droidasc",
+                )
+                .order_by(desc(Evidence.created_at))
+                .limit(1)
+            )
+            if record is None:
+                return None
+            record_id = record.id
+            artifact_path = record.path
+            artifact_sha256 = record.sha256
+        try:
+            payload = self.store.read_json_artifact(
+                "evidence",
+                artifact_path,
+                artifact_sha256,
+            )
+        except (OSError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        references = payload.get("references")
+        if not isinstance(references, list):
+            return None
+        selected = relevance_filter(
+            [item for item in references if isinstance(item, dict)],
+            entries,
+            limit=self.settings.asc_context_max_references,
+        )
+        if not selected:
+            return None
+        return {
+            "schema_version": "1.0",
+            "source_evidence_id": record_id,
+            "tool": "droidasc",
+            "tool_version": payload.get("tool_version"),
+            "transport": payload.get("transport"),
+            "policy": "platform_issued_bytecode_inbound_references",
+            "total_reference_count": len(references),
+            "reference_count": len(selected),
+            "references": selected,
+        }
+
     def _load_or_build_code_index(self, scan_id: str) -> dict[str, Any] | None:
         workspace = self.settings.data_dir / "workspaces" / scan_id
         index_path = workspace / "code_index.json"
@@ -10603,7 +10780,7 @@ class ScanOrchestrator:
             "platform_context": {
                 key: value
                 for key, value in effective_context.items()
-                if key not in stable_keys and key != "context_manifest"
+                if key not in stable_keys and key not in {"context_manifest", "target_xrefs"}
             },
         }
         evidence_index = {
@@ -10625,6 +10802,9 @@ class ScanOrchestrator:
             "evidence": (Path("evidence-index.json"), evidence_index),
             "latest_round": (round_path, dynamic_context),
         }
+        xrefs_payload = effective_context.get("target_xrefs")
+        if isinstance(xrefs_payload, dict) and xrefs_payload.get("references"):
+            materialized_documents["xrefs"] = (Path("xrefs.json"), xrefs_payload)
         manifest_documents: dict[str, dict[str, Any]] = {}
         for name, (relative_path, value) in materialized_documents.items():
             encoded = json.dumps(
@@ -10644,10 +10824,19 @@ class ScanOrchestrator:
             }
         context_manifest = {
             "schema_version": "1.0",
-            "read_order": ["stable", "evidence", "latest_round"],
+            "read_order": [
+                "stable",
+                "evidence",
+                *(["xrefs"] if "xrefs" in materialized_documents else []),
+                "latest_round",
+            ],
             "documents": manifest_documents,
             "legacy_context_path": "context.json",
-            "policy": "read_manifest_then_open_only_the_evidence_needed_for_the_current_hypothesis",
+            "policy": (
+                "read_manifest_then_open_only_the_evidence_needed_for_the_current_hypothesis; "
+                "xrefs.json lists platform-issued bytecode-level inbound references "
+                "(which class/method references a queried string/type/method)"
+            ),
         }
         effective_context["context_manifest"] = context_manifest
         manifest_bytes = json.dumps(

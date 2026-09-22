@@ -213,7 +213,15 @@ class SupervisorService:
                         entry.status = "canceled"
                         entry.completed_at = now_value
             for entry in entries:
-                if entry.status != "running" or entry.launched_scan_id is None:
+                if entry.status != "running":
+                    continue
+                if entry.launched_scan_id is None:
+                    # The launched scan row was deleted (FK is ON DELETE SET NULL),
+                    # so this entry can never be reconciled.  Record it as failed
+                    # instead of leaving it running and consuming a parallel slot.
+                    entry.status = "failed"
+                    entry.error = "launched scan disappeared before completion"
+                    entry.completed_at = now_value
                     continue
                 scan = session.get(Scan, entry.launched_scan_id)
                 if scan is None or scan.status == "failed":
@@ -339,6 +347,15 @@ class SupervisorService:
             campaign = session.get(CampaignRun, campaign_id)
             if campaign is None:
                 raise LookupError("campaign does not exist")
+            if campaign.status in {
+                "completed",
+                "completed_with_errors",
+                "canceled",
+                "timed_out",
+            }:
+                # Already terminal: cancelling must not rewrite its outcome or
+                # its result_json/completed_at.
+                return self._campaign_payload(campaign_id)
             campaign.cancel_requested = True
             campaign.status = "canceling"
             running_task_ids = list(

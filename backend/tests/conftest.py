@@ -40,6 +40,9 @@ def settings(tmp_path: Path) -> Settings:
     return Settings(
         data_dir=tmp_path,
         database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        # Throwaway databases: skip the per-statement fsync that makes building
+        # the ~190-statement schema cost seconds on slow storage.
+        sqlite_synchronous="OFF",
         tool_timeout_seconds=30,
     )
 

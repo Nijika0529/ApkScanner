@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from typing import Any
 
 from sqlalchemy import select
@@ -145,7 +146,10 @@ class BenchmarkEvaluator:
             assert target_recall is not None
             if not 0.0 <= target_recall <= 1.0:
                 raise ValueError("target recall must be between 0 and 1")
-            target_count = round(len(spec.vulnerabilities) * target_recall)
+            target_count = min(
+                len(spec.vulnerabilities),
+                math.floor(len(spec.vulnerabilities) * target_recall + 0.5),
+            )
             ranked = sorted(
                 spec.vulnerabilities,
                 key=lambda item: (
@@ -284,17 +288,33 @@ class BenchmarkEvaluator:
     ) -> dict[str, Any]:
         entry_names = {entry.id: entry.name for entry in entries}
         confirmed = findings
+        # A ground truth that only requires ``static`` proof must be satisfiable by
+        # a platform-supported static finding, which ``partition_findings`` places
+        # in ``signals``.  Without this pool such a truth was always a false
+        # negative even when the matching static finding existed.
+        static_candidates = [
+            finding
+            for finding in signals
+            if finding.status == FindingStatus.SUPPORTED_STATIC.value
+        ]
         ai_noise = [
             finding
             for finding in signals
             if finding.source in {"codex", "opencode"}
         ]
-        findings_by_id = {finding.id: finding for finding in confirmed}
+        findings_by_id = {
+            finding.id: finding for finding in [*confirmed, *static_candidates]
+        }
         candidate_ids_by_truth: list[list[str]] = []
         for truth in spec.vulnerabilities:
+            pool = (
+                [*confirmed, *static_candidates]
+                if truth.minimum_proof == "static"
+                else confirmed
+            )
             candidates = [
                 finding
-                for finding in confirmed
+                for finding in pool
                 if cls._matches(
                     truth,
                     finding,
@@ -338,7 +358,9 @@ class BenchmarkEvaluator:
             truth_index: finding_id
             for finding_id, truth_index in finding_assignment.items()
         }
-        unmatched_finding_ids = set(findings_by_id) - set(finding_assignment)
+        unmatched_finding_ids = {
+            finding.id for finding in confirmed
+        } - set(finding_assignment)
         matches: list[dict[str, Any]] = []
         missed: list[dict[str, Any]] = []
         for truth_index, truth in enumerate(spec.vulnerabilities):

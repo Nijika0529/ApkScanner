@@ -90,6 +90,7 @@ def terminal_task_statuses() -> set[str]:
         "completed",
         "not_reproduced",
         "inconclusive",
+        "timed_out",
         "failed",
         "canceled",
         "deleted",

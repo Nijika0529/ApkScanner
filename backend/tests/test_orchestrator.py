@@ -2656,7 +2656,8 @@ def test_investigation_dispatch_tracks_device_count(settings) -> None:  # noqa: 
     orchestrator._run_tasks(scan_id)
 
     # Two attached devices admit two concurrent investigation tasks, and the
-    # shared analysis token never drops below the configured floor.
+    # shared analysis token is sized to that device-bound target (it returns to
+    # the configured desktop-only floor once no scan is admitting).
     assert max_active == 2
     assert orchestrator._analysis_slots.limit == max(2, configured.agent_analysis_slots)
     with database.session_factory() as session:
@@ -2673,7 +2674,7 @@ def test_investigation_dispatch_tracks_device_count(settings) -> None:  # noqa: 
         "investigation_concurrency_at_start": 2,
         "adb_concurrency": 2,
         "analysis_slots": configured.agent_analysis_slots,
-        "effective_analysis_slots": max(2, configured.agent_analysis_slots),
+        "effective_analysis_slots": 2,
         "max_investigation_concurrency": configured.max_investigation_concurrency,
         "build_slots": configured.poc_build_slots,
         "device_slots": 2,
@@ -2806,9 +2807,10 @@ def test_shared_analysis_token_follows_widest_active_scan(settings) -> None:  # 
     assert orchestrator._apply_investigation_admission("scan-b", 2) == 6
     assert orchestrator._analysis_slots.limit == 6
 
-    # Releasing the widest scan shrinks the token back to the configured floor.
+    # Releasing the widest scan shrinks the token to the remaining scan's target,
+    # then back to the desktop-only floor once nothing is admitting.
     orchestrator._release_investigation_admission("scan-a")
-    assert orchestrator._analysis_slots.limit == settings.agent_analysis_slots
+    assert orchestrator._analysis_slots.limit == 2
     orchestrator._release_investigation_admission("scan-b")
     assert orchestrator._analysis_slots.limit == settings.agent_analysis_slots
     assert orchestrator.codex._effective_scan_session_limit("scan-a") == (

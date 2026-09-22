@@ -19,6 +19,11 @@ def _env_bool(name: str, default: bool = False) -> bool:
 class Settings:
     data_dir: Path
     database_url: str
+    # SQLite durability level.  WAL keeps the file consistent, but the default
+    # FULL fsyncs every commit; creating the schema runs ~190 DDL statements, so
+    # that costs seconds on a slow disk.  NORMAL is the standard WAL setting and
+    # OFF is appropriate for throwaway test databases.
+    sqlite_synchronous: str = "FULL"
     max_upload_bytes: int = 512 * 1024 * 1024
     max_zip_entries: int = 100_000
     max_uncompressed_bytes: int = 2 * 1024 * 1024 * 1024
@@ -54,9 +59,13 @@ class Settings:
     codex_max_containers: int = 2
     codex_max_sessions: int = 8
     codex_max_sessions_per_scan: int = 6
+    # Concurrent investigations when NO ADB device is attached (desktop-only
+    # static analysis). With at least one connected device the device count rules
+    # instead, so this value does not widen device-bound concurrency.
     agent_analysis_slots: int = 4
     # Investigation admission follows the connected ADB device pool; this is the
-    # hard safety ceiling for that device-bound concurrency.
+    # hard safety ceiling for that device-bound concurrency. Devices that are
+    # draining or probe-marked unavailable are not counted.
     max_investigation_concurrency: int = 16
     poc_build_slots: int = 2
     agent_initial_phase_seconds: int = 15 * 60
@@ -68,6 +77,20 @@ class Settings:
     # Standalone chain sites admitted per scan; the rest stay as inventory.
     max_standalone_chain_sites: int = 12
     rescue_audit_sample_rate: float = 0.15
+    # Optional ASC (droidasc) bytecode-level inbound cross references. When
+    # enabled, results are recorded as ``static.droidasc`` Evidence and projected
+    # into each task's bounded agent context as ``xrefs.json``. Disabled and
+    # failure-isolated by default.
+    asc_enabled: bool = False
+    # ``auto`` prefers the in-process library (no multiprocessing) and falls back
+    # to the CLI; ``library``/``cli`` pin one transport.
+    asc_transport: str = "auto"
+    asc_path: str = "droidasc"
+    asc_workers: int = 8
+    asc_timeout_seconds: int = 300
+    asc_max_queries: int = 24
+    asc_max_results_per_query: int = 200
+    asc_context_max_references: int = 400
     codex_uid_min: int = 21_000
     codex_uid_max: int = 21_999
     codex_cpu_limit: float = 6.0
@@ -160,6 +183,9 @@ class Settings:
         settings = cls(
             data_dir=data_dir,
             database_url=database_url,
+            sqlite_synchronous=os.getenv(
+                "APKSCANNER_SQLITE_SYNCHRONOUS", "FULL"
+            ).upper(),
             max_upload_bytes=int(os.getenv("APKSCANNER_MAX_UPLOAD_BYTES", 512 * 1024 * 1024)),
             tool_timeout_seconds=int(os.getenv("APKSCANNER_TOOL_TIMEOUT", 600)),
             preliminary_after_seconds=int(os.getenv("APKSCANNER_PRELIMINARY_AFTER", 14_400)),
@@ -253,6 +279,19 @@ class Settings:
                     1.0,
                     float(os.getenv("APKSCANNER_RESCUE_AUDIT_SAMPLE_RATE", 0.15)),
                 ),
+            ),
+            asc_enabled=os.getenv("APKSCANNER_ASC_ENABLED", "").strip().lower()
+            in {"1", "true", "yes", "on"},
+            asc_transport=os.getenv("APKSCANNER_ASC_TRANSPORT", "auto").strip().lower(),
+            asc_path=os.getenv("APKSCANNER_ASC_PATH", "droidasc"),
+            asc_workers=max(1, int(os.getenv("APKSCANNER_ASC_WORKERS", 8))),
+            asc_timeout_seconds=max(1, int(os.getenv("APKSCANNER_ASC_TIMEOUT_SECONDS", 300))),
+            asc_max_queries=max(1, int(os.getenv("APKSCANNER_ASC_MAX_QUERIES", 24))),
+            asc_max_results_per_query=max(
+                1, int(os.getenv("APKSCANNER_ASC_MAX_RESULTS_PER_QUERY", 200))
+            ),
+            asc_context_max_references=max(
+                1, int(os.getenv("APKSCANNER_ASC_CONTEXT_MAX_REFERENCES", 400))
             ),
             codex_uid_min=int(os.getenv("APKSCANNER_CODEX_UID_MIN", 21_000)),
             codex_uid_max=int(os.getenv("APKSCANNER_CODEX_UID_MAX", 21_999)),
@@ -361,6 +400,12 @@ class Settings:
     def validate_codex_configuration(self) -> None:
         from ..runtime.agent_execution import frozen_agent_configuration
 
+        if self.sqlite_synchronous.upper() not in {"EXTRA", "FULL", "NORMAL", "OFF"}:
+            raise ValueError(
+                "APKSCANNER_SQLITE_SYNCHRONOUS must be EXTRA, FULL, NORMAL, or OFF"
+            )
+        if self.asc_transport not in {"auto", "library", "cli"}:
+            raise ValueError("APKSCANNER_ASC_TRANSPORT must be auto, library, or cli")
         if self.device_reset_policy not in {"never", "per_round", "per_test"}:
             raise ValueError("APKSCANNER_DEVICE_RESET_POLICY must be never, per_round, or per_test")
         if self.device_android_api < 36:
