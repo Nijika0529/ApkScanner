@@ -201,4 +201,3 @@ function textValue(value: unknown): string | undefined {
 function numberValue(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined
 }
-

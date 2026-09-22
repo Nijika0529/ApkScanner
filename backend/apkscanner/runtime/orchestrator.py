@@ -8,7 +8,6 @@ import secrets
 import shutil
 import threading
 import time
-import uuid
 import zipfile
 from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -24,23 +23,15 @@ from sqlalchemy import desc, select, update
 
 from ..analysis.asc_xrefs import (
     AscXrefExtractor,
-    build_asc_queries,
-    evidence_summary,
     relevance_filter,
 )
 from ..analysis.manifest import parse_manifest
 from ..analysis.rules import BuiltinRuleEngine
-from ..analysis.security_design import build_android_threat_model, finding_identity
+from ..analysis.security_design import finding_identity
 from ..analysis.static_analysis import CODE_INDEX_CONTEXT_VERSION, ApkInspector
-from ..analysis.target_profiles import (
-    active_profile_id,
-    investigation_group,
-    target_review_surfaces,
-)
 from ..core.config import Settings
 from ..core.db import Database
 from ..core.enums import (
-    CoverageStatus,
     EntryPointKind,
     FindingStatus,
     HypothesisStatus,
@@ -55,10 +46,7 @@ from ..core.finding_policy import (
     static_evidence_is_usable,
 )
 from ..core.models import (
-    AdbDeviceRecord,
     AgentRuntimeEventRecord,
-    AgentSessionRecord,
-    AgentTurnRecord,
     CoverageItem,
     DynamicExperimentCapsule,
     DynamicExperimentReceipt,
@@ -68,7 +56,6 @@ from ..core.models import (
     InvestigationTask,
     ProofAttempt,
     Scan,
-    ScanContainerRecord,
     SecurityHypothesis,
     ValidationFixture,
 )
@@ -77,7 +64,6 @@ from ..core.proof_receipts import (
 )
 from ..core.repository import add_event, now
 from ..core.schemas import (
-    AGENT_RESULT_JSON_SCHEMA,
     AgentInvestigationResult,
     AgentOracleSpec,
     AgentRequestedTest,
@@ -88,15 +74,13 @@ from .adaptive_verification import AdaptiveVerificationMixin
 from .adb_gateway import (
     validate_dynamic_experiment_adb_template,
 )
+from .agent_audit import AgentAuditRecorder, normalization_repairs, rejected_requested_tests
 from .agent_events import AgentCancelledError, AgentRuntimeEvent
-from .agent_prompt import (
-    developer_instructions,
-    investigation_prompt,
-)
 from .attacker_templates import attacker_template_catalog, materialize_attacker_templates
 from .codex_runner import CodexInvestigator, CodexRunResult
 from .concurrency import ResizableSemaphore
-from .device import AdbDeviceAdapter, AdbDevicePool, DeviceLeaseCancelledError
+from .device import AdbDeviceAdapter, DeviceLeaseCancelledError
+from .device_registry import DeviceRegistry
 from .dynamic_experiments import DynamicExperimentService
 from .finalization import ScanFinalizer
 from .finding_reports import (
@@ -112,6 +96,7 @@ from .proof_recipes import ProofRecipe, bind_proof_recipe, proof_recipe_from_pla
 from .runtime_artifacts import RuntimeArtifactService
 from .runtime_contracts import task_gateway_environment
 from .security_pipeline import HypothesisLedger
+from .static_analysis_pipeline import StaticAnalysisPipeline
 from .versioning import SecurityEvolutionService
 
 # Temporary import compatibility for integrations written before LiveProofContext
@@ -132,37 +117,22 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
         self.asc = AscXrefExtractor(settings, self.runner)
         self.rules = BuiltinRuleEngine()
         self.evidence = EvidenceRecorder(store)
+        self.agent_audits = AgentAuditRecorder(
+            settings=settings,
+            database=database,
+            evidence=self.evidence,
+        )
         self.hypothesis_ledger = HypothesisLedger(database)
-        configured_serials = settings.configured_adb_serials
-        with self.database.session_factory() as session:
-            records = {item.serial: item for item in session.scalars(select(AdbDeviceRecord))}
-            for serial in configured_serials:
-                if serial not in records:
-                    record = AdbDeviceRecord(
-                        serial=serial,
-                        label="environment bootstrap",
-                        state="ready",
-                        enabled=True,
-                        metadata_json={"source": "environment"},
-                    )
-                    session.add(record)
-                    records[serial] = record
-            session.commit()
-            enabled_records = [item for item in records.values() if item.enabled]
-        self.devices = [
-            AdbDeviceAdapter(settings, self.runner, serial=item.serial) for item in enabled_records
-        ]
+        self.device_registry = DeviceRegistry.bootstrap(
+            settings=settings,
+            database=database,
+            runner=self.runner,
+        )
+        self.device_pool = self.device_registry.pool
+        self.devices = list(self.device_pool.adapters)
         # Compatibility handle for integrations that customize the first
         # adapter. Scheduling always goes through the mutable pool below.
         self.device = self.devices[0] if self.devices else AdbDeviceAdapter(settings, self.runner)
-        self.device_pool = AdbDevicePool(self.devices)
-        for item in enabled_records:
-            if item.state == "draining":
-                self.device_pool.drain(item.serial)
-            elif item.state == "unavailable":
-                # A record from a previous session whose phone is gone must not
-                # inflate device-bound concurrency until a probe/reconnect succeeds.
-                self.device_pool.mark_unavailable(item.serial)
         self.poc_builder = PocBuilder(settings, self.runner, store)
         self.dynamic_experiments = DynamicExperimentService(
             database,
@@ -178,6 +148,16 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
             self.device_pool,
         )
         self.security_evolution = SecurityEvolutionService()
+        self.static_pipeline = StaticAnalysisPipeline(
+            settings=settings,
+            database=database,
+            inspector=self.inspector,
+            asc=self.asc,
+            rules=self.rules,
+            evidence=self.evidence,
+            device_pool=self.device_pool,
+            security_evolution=self.security_evolution,
+        )
         self.codex = CodexInvestigator(settings)
         self.investigators = {"codex": self.codex}
         self._running: set[str] = set()
@@ -203,93 +183,11 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
             resolve_task_investigator=self.resolve_task_investigator,
         )
 
-    @staticmethod
-    def _validate_adb_serial(serial: str) -> str:
-        serial = serial.strip()
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,254}", serial):
-            raise ValueError("ADB serial contains unsupported characters")
-        return serial
-
+    # Compatibility surface for callers created before device management became
+    # an independent runtime service. New platform routes depend on
+    # ``device_registry`` directly.
     def list_adb_devices(self, *, probe: bool = False) -> list[dict[str, Any]]:
-        pool = self.device_pool.snapshot()
-        active = dict(pool.get("active") or {})
-        draining = set(pool.get("draining") or [])
-        adapters = {str(item.serial): item for item in self.device_pool.adapters}
-        with self.database.session_factory() as session:
-            records = list(
-                session.scalars(select(AdbDeviceRecord).order_by(AdbDeviceRecord.created_at))
-            )
-            output: list[dict[str, Any]] = []
-            changed = False
-            for record in records:
-                adapter = adapters.get(record.serial)
-                capability: dict[str, Any] = {}
-                if adapter is not None:
-                    capability = adapter.capability(
-                        non_blocking=(not probe or record.serial in active)
-                    )
-                    if probe and not capability.get("busy") and capability.get("available"):
-                        api_text = str(capability.get("api_level") or "")
-                        record.api_level = int(api_text) if api_text.isdigit() else None
-                        record.android_version = (
-                            str(capability.get("android_version") or "") or None
-                        )
-                        record.last_error = None
-                        record.last_seen_at = now()
-                        record.state = "draining" if record.serial in draining else "ready"
-                        changed = True
-                        # A successful probe returns the phone to the assignable set
-                        # so device-bound concurrency follows connected devices.
-                        self.device_pool.mark_available(record.serial)
-                    elif probe and not capability.get("busy"):
-                        record.last_error = str(
-                            capability.get("detail") or "ADB device is unavailable"
-                        )[:4000]
-                        record.state = "unavailable"
-                        changed = True
-                        self.device_pool.mark_unavailable(record.serial)
-                verdict_metadata = self.settings.verdict_metadata(record.api_level)
-                verdict_metadata.update(
-                    {
-                        key: capability[key]
-                        for key in verdict_metadata
-                        if capability.get(key) is not None
-                    }
-                )
-                if capability and not capability.get("available"):
-                    verdict_metadata["android16_verdict_eligible"] = False
-                    verdict_metadata["dynamic_verdict_eligible"] = False
-                    verdict_metadata["release_gate_eligible"] = False
-                    verdict_metadata["compatibility_smoke_only"] = False
-                    verdict_metadata["verdict_scope"] = "unavailable"
-                output.append(
-                    {
-                        "id": record.id,
-                        "serial": record.serial,
-                        "label": record.label,
-                        "state": (
-                            "draining"
-                            if record.serial in draining
-                            else "busy"
-                            if record.serial in active
-                            else record.state
-                        ),
-                        "enabled": record.enabled,
-                        "api_level": record.api_level,
-                        "android_version": record.android_version,
-                        "available": bool(capability.get("available")),
-                        **verdict_metadata,
-                        "busy": record.serial in active,
-                        "active_task_id": active.get(record.serial),
-                        "last_error": record.last_error,
-                        "last_seen_at": record.last_seen_at,
-                        "created_at": record.created_at,
-                        "updated_at": record.updated_at,
-                    }
-                )
-            if changed:
-                session.commit()
-            return output
+        return self.device_registry.list_devices(probe=probe)
 
     def connect_adb_device(
         self,
@@ -298,142 +196,16 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
         label: str | None = None,
         connect: bool = True,
     ) -> dict[str, Any]:
-        serial = self._validate_adb_serial(serial)
-        if self.device_pool.is_active(serial):
-            raise RuntimeError("Device is active; wait for the owning task before reconnecting it")
-        if not self.runner.available("adb"):
-            raise RuntimeError("adb is not installed on the host")
-        if connect and ":" in serial:
-            result = self.runner.run(["adb", "connect", serial], timeout=30)
-            combined = f"{result.stdout}\n{result.stderr}".strip().lower()
-            if result.exit_code != 0 or "failed" in combined or "unable" in combined:
-                raise RuntimeError(combined or "adb connect failed")
-        adapter = AdbDeviceAdapter(self.settings, self.runner, serial=serial)
-        capability = adapter.capability(non_blocking=False)
-        if not capability.get("available"):
-            raise RuntimeError(str(capability.get("detail") or "ADB device is unavailable"))
-        api_text = str(capability.get("api_level") or "")
-        api_level = int(api_text) if api_text.isdigit() else None
-        if api_level is None:
-            raise RuntimeError("Could not determine the Android API level")
-        verdict_metadata = self.settings.verdict_metadata(api_level)
-        if not verdict_metadata["dynamic_verdict_eligible"]:
-            raise RuntimeError(
-                "The selected validation profile does not permit this Android API "
-                "to issue a scoped dynamic verdict"
-            )
-        with self.database.session_factory() as session:
-            record = session.scalar(select(AdbDeviceRecord).where(AdbDeviceRecord.serial == serial))
-            if record is None:
-                record = AdbDeviceRecord(serial=serial)
-                session.add(record)
-            record.label = label.strip() if label and label.strip() else record.label
-            record.enabled = True
-            record.state = "ready"
-            record.api_level = api_level
-            record.android_version = str(capability.get("android_version") or "") or None
-            record.last_error = None
-            record.last_seen_at = now()
-            record.metadata_json = {
-                **dict(record.metadata_json or {}),
-                "source": "runtime_api",
-                **verdict_metadata,
-            }
-            session.commit()
-            record_id = record.id
-        self.device_pool.add(adapter)
-        self.device_pool.restore(serial)
-        self.device_pool.wake_waiters()
-        self._record_device_pool_event(
-            "device.pool.connected",
-            "运行时 ADB 设备已加入探索队列",
-            {
-                "serial": serial,
-                "api_level": api_level,
-                **verdict_metadata,
-            },
-        )
-        return next(item for item in self.list_adb_devices() if item["id"] == record_id)
+        return self.device_registry.connect(serial, label=label, connect=connect)
 
     def drain_adb_device(self, serial: str) -> dict[str, Any]:
-        serial = self._validate_adb_serial(serial)
-        if not self.device_pool.drain(serial):
-            raise KeyError(serial)
-        with self.database.session_factory() as session:
-            record = session.scalar(select(AdbDeviceRecord).where(AdbDeviceRecord.serial == serial))
-            if record is None:
-                raise KeyError(serial)
-            record.state = "draining"
-            session.commit()
-            record_id = record.id
-        self._record_device_pool_event(
-            "device.pool.draining",
-            "ADB 设备已停止接收新任务，等待当前 lease 释放",
-            {"serial": serial, "active": self.device_pool.is_active(serial)},
-        )
-        return next(item for item in self.list_adb_devices() if item["id"] == record_id)
+        return self.device_registry.drain(serial)
 
     def reconnect_adb_device(self, serial: str) -> dict[str, Any]:
-        serial = self._validate_adb_serial(serial)
-        if self.device_pool.is_active(serial):
-            raise RuntimeError("Device is active; drain it and wait for the task to release it")
-        if ":" in serial:
-            result = self.runner.run(["adb", "connect", serial], timeout=30)
-            if result.exit_code != 0:
-                raise RuntimeError(result.stderr.strip() or "adb reconnect failed")
-        return self.connect_adb_device(serial, connect=False)
+        return self.device_registry.reconnect(serial)
 
     def remove_adb_device(self, serial: str) -> None:
-        serial = self._validate_adb_serial(serial)
-        if self.device_pool.is_active(serial):
-            raise RuntimeError("Device is active; drain it and wait for the task to release it")
-        # Best-effort removal from the runtime pool: a device may be persisted in
-        # the database from a previous bootstrap but absent from the current
-        # runtime pool (e.g. the server was restarted with different
-        # APKSCANNER_ADB_SERIALS).  The database record is the source of truth,
-        # so deleting it below is what actually removes the device.
-        self.device_pool.remove(serial)
-        with self.database.session_factory() as session:
-            record = session.scalar(select(AdbDeviceRecord).where(AdbDeviceRecord.serial == serial))
-            if record is None:
-                raise KeyError(serial)
-            session.delete(record)
-            session.commit()
-        self._record_device_pool_event(
-            "device.pool.removed",
-            "ADB 设备已从运行时队列移除",
-            {"serial": serial},
-        )
-
-    def _record_device_pool_event(
-        self,
-        event_type: str,
-        message: str,
-        data: dict[str, Any],
-    ) -> None:
-        with self.database.session_factory() as session:
-            scan_ids = list(
-                session.scalars(
-                    select(Scan.id).where(
-                        Scan.status.in_(
-                            {
-                                ScanStatus.INVESTIGATING.value,
-                                ScanStatus.PRELIMINARY_READY.value,
-                            }
-                        )
-                    )
-                )
-            )
-            for scan_id in scan_ids:
-                add_event(
-                    session,
-                    scan_id,
-                    event_type,
-                    message,
-                    {**data, "source": "platform"},
-                )
-            if scan_ids:
-                session.commit()
+        self.device_registry.remove(serial)
 
     def resolve_investigator(self, requested: str = "configured") -> str:
         backend = (
@@ -731,54 +503,8 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                 )
             session.commit()
 
-    def _ensure_scan_container_record(self, scan_id: str) -> None:
-        if not self.settings.codex_enabled or self.settings.codex_isolation != "docker":
-            return
-        container_key = f"{scan_id}:scan-container"
-        with self.database.session_factory() as session:
-            record = session.scalar(
-                select(ScanContainerRecord).where(
-                    ScanContainerRecord.container_key == container_key
-                )
-            )
-            if record is None:
-                record = ScanContainerRecord(
-                    scan_id=scan_id,
-                    container_key=container_key,
-                    isolation="docker",
-                    status="prepared",
-                    metadata_json={"session_workspaces": {}},
-                )
-                session.add(record)
-            else:
-                record.status = "prepared"
-                record.completed_at = None
-            session.commit()
-
-    def _close_scan_container_record(self, scan_id: str) -> None:
-        with self.database.session_factory() as session:
-            record = session.scalar(
-                select(ScanContainerRecord).where(
-                    ScanContainerRecord.container_key == f"{scan_id}:scan-container"
-                )
-            )
-            if record is None:
-                return
-            scan = session.get(Scan, scan_id)
-            record.status = "failed" if scan is not None and scan.status == "failed" else "closed"
-            record.completed_at = now()
-            session.execute(
-                update(AgentSessionRecord)
-                .where(
-                    AgentSessionRecord.scan_id == scan_id,
-                    AgentSessionRecord.status.in_({"active", "idle"}),
-                )
-                .values(status=record.status, completed_at=record.completed_at)
-            )
-            session.commit()
-
     def _run_sync(self, scan_id: str) -> None:
-        self._ensure_scan_container_record(scan_id)
+        self.agent_audits.ensure_scan_container(scan_id)
         try:
             self._run_static(scan_id)
             task_outcome = self._run_tasks(scan_id)
@@ -839,611 +565,14 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                     session.commit()
         finally:
             self.codex.close_scan(scan_id)
-            self._close_scan_container_record(scan_id)
+            self.agent_audits.close_scan_container(scan_id)
 
     def _run_static(self, scan_id: str) -> None:
-        with self.database.session_factory() as session:
-            scan = session.get(Scan, scan_id)
-            if scan is None:
-                raise LookupError(f"unknown scan {scan_id}")
-            if scan.status in {
-                ScanStatus.STATIC_COMPLETE.value,
-                ScanStatus.PRELIMINARY_READY.value,
-                ScanStatus.INVESTIGATING.value,
-                ScanStatus.FINAL.value,
-            }:
-                return
-            scan.status = ScanStatus.STATIC_RUNNING.value
-            add_event(session, scan_id, "static.started", "Static analysis started")
-            session.commit()
+        # Preserve the existing test/integration seam where callers replace the
+        # optional ASC extractor after constructing the orchestrator.
+        self.static_pipeline.asc = self.asc
+        self.static_pipeline.run(scan_id)
 
-        with self.database.session_factory() as session:
-            scan = session.get(Scan, scan_id)
-            assert scan is not None
-            created_at = scan.created_at
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=UTC)
-            preliminary_deadline = created_at + timedelta(
-                seconds=self.settings.preliminary_after_seconds
-            )
-            preliminary_remaining = max(
-                1, int((preliminary_deadline - datetime.now(UTC)).total_seconds())
-            )
-            preliminary_budget = TimeBudget.from_seconds(preliminary_remaining)
-            phase_labels = {
-                "static_cache": "静态缓存恢复",
-                "static_cache_publish": "静态缓存发布",
-                "decompilation": "APK 解包与反编译",
-                "code_index": "组件代码索引",
-                "android_attack_chains": "Android 攻击链索引",
-                "native_analysis": "Native/JNI 资产分析",
-                "embedded_artifacts": "内嵌 APK 与插件链",
-                "rule_evaluation": "静态规则评估",
-                "target_profile": "目标审计 Profile 规划",
-                "asc_xrefs": "ASC 字节码交叉引用",
-            }
-            static_phase_started: dict[str, float] = {}
-
-            def record_static_phase(
-                phase: str,
-                status: str,
-                details: dict[str, Any] | None = None,
-            ) -> None:
-                label = phase_labels.get(phase, phase)
-                payload = dict(details or {})
-                if status == "started":
-                    static_phase_started[phase] = time.monotonic()
-                elif phase in static_phase_started and "elapsed_seconds" not in payload:
-                    payload["elapsed_seconds"] = round(
-                        time.monotonic() - static_phase_started[phase],
-                        3,
-                    )
-                payload.update({"phase": phase, "status": status})
-                scan.stats = {
-                    **dict(scan.stats or {}),
-                    "static_progress": {
-                        "phase": phase,
-                        "label": label,
-                        "status": status,
-                        **(
-                            {"elapsed_seconds": payload["elapsed_seconds"]}
-                            if payload.get("elapsed_seconds") is not None
-                            else {}
-                        ),
-                    },
-                }
-                add_event(
-                    session,
-                    scan.id,
-                    f"static.phase.{status}",
-                    f"{label}{'开始' if status == 'started' else '完成'}",
-                    payload,
-                )
-                session.commit()
-
-            result = self.inspector.inspect(
-                Path(scan.artifact_path),
-                scan.id,
-                preliminary_budget,
-                _progress=record_static_phase,
-            )
-            record_static_phase("rule_evaluation", "started")
-            findings, coverage = self.rules.evaluate(result)
-            record_static_phase(
-                "rule_evaluation",
-                "completed",
-                {"finding_count": len(findings)},
-            )
-            record_static_phase("target_profile", "started")
-            static_review_surfaces = self.rules.static_review_surfaces(
-                result.manifest,
-                findings,
-            )
-            static_review_surfaces.extend(self.rules.embedded_artifact_review_surfaces(result))
-            static_review_surfaces.extend(target_review_surfaces(result))
-            for surface in static_review_surfaces:
-                if surface.investigation_group is None:
-                    surface.investigation_group = investigation_group(
-                        package_name=result.manifest.package_name,
-                        name=surface.name,
-                        owner_component=surface.name,
-                        static_family=surface.family,
-                        artifact=surface.artifact,
-                    )
-            record_static_phase(
-                "target_profile",
-                "completed",
-                {
-                    "profile": active_profile_id(result.manifest.package_name),
-                    "surface_count": len(static_review_surfaces),
-                },
-            )
-            for surface in static_review_surfaces:
-                self.inspector.add_static_surface_to_code_index(
-                    result,
-                    surface_name=surface.name,
-                    locations=surface.locations,
-                    attack_chains=surface.attack_chains,
-                    package_name=(
-                        str(surface.artifact.get("package_name"))
-                        if surface.artifact and surface.artifact.get("package_name")
-                        else None
-                    ),
-                )
-                for finding in findings:
-                    if (
-                        finding.rule_id in surface.rule_ids
-                        and surface.name not in finding.entry_names
-                    ):
-                        finding.entry_names.append(surface.name)
-            if static_review_surfaces:
-                self.inspector.persist_code_index(result)
-            scan.package_name = result.manifest.package_name
-            scan.version_name = result.manifest.version_name
-            scan.version_code = result.manifest.version_code
-            scan.min_sdk = result.manifest.min_sdk
-            scan.target_sdk = result.manifest.target_sdk
-            scan.signing = result.signing
-            scan.tool_versions = result.tool_versions
-            scan.stats = {
-                **scan.stats,
-                **result.file_inventory,
-                "workspace": str(result.workspace),
-                "static_finding_count": len(findings),
-                "attack_chain_inventory": {
-                    "total": len(result.attack_chains),
-                    "review_required": sum(
-                        item.get("review_required") is not False for item in result.attack_chains
-                    ),
-                    "families": dict(
-                        Counter(
-                            str(item.get("family") or "unknown") for item in result.attack_chains
-                        )
-                    ),
-                    "kinds": dict(
-                        Counter(
-                            str(item.get("chain_kind") or "unknown")
-                            for item in result.attack_chains
-                        )
-                    ),
-                    "engine_versions": sorted(
-                        {
-                            str(item.get("engine_version"))
-                            for item in result.attack_chains
-                            if item.get("engine_version")
-                        }
-                    ),
-                },
-                "preliminary_deadline": preliminary_deadline.isoformat(),
-                "target_audit_profile": active_profile_id(result.manifest.package_name),
-                "decompilation": {
-                    key: value
-                    for key, value in result.decompilation.items()
-                    if key != "failed_classes"
-                },
-            }
-            entries: list[EntryPoint] = []
-            for parsed in result.manifest.entries:
-                code_context = result.code_index.get(
-                    parsed.owner_component or parsed.name,
-                    {},
-                )
-                public_anchors = [
-                    {key: value for key, value in anchor.items() if key != "content"}
-                    for anchor in code_context.get("anchors", [])
-                    if isinstance(anchor, dict)
-                ]
-                profile_group = investigation_group(
-                    package_name=result.manifest.package_name,
-                    name=parsed.name,
-                    owner_component=parsed.owner_component,
-                )
-                entry = EntryPoint(
-                    scan_id=scan.id,
-                    kind=parsed.kind,
-                    name=parsed.name,
-                    owner_component=parsed.owner_component,
-                    exported=parsed.exported,
-                    exported_reason=parsed.exported_reason,
-                    permission=parsed.permission,
-                    permission_protection=parsed.permission_protection,
-                    intent_filters=parsed.intent_filters,
-                    deep_links=parsed.deep_links,
-                    code_anchors=public_anchors,
-                    metadata_json={
-                        **parsed.metadata,
-                        **(
-                            {"investigation_group": profile_group}
-                            if profile_group is not None
-                            else {}
-                        ),
-                        "decompilation": {
-                            "status": code_context.get("status", "source_not_found"),
-                            "target_in_jadx_failure_list": bool(
-                                code_context.get("target_in_jadx_failure_list")
-                            ),
-                            "target_source_has_decompiler_errors": bool(
-                                code_context.get("target_source_has_decompiler_errors")
-                            ),
-                            "global_status": code_context.get(
-                                "global_decompilation_status",
-                                result.decompilation.get("status"),
-                            ),
-                        },
-                    },
-                )
-                session.add(entry)
-                entries.append(entry)
-            for surface in static_review_surfaces:
-                code_context = result.code_index.get(surface.name, {})
-                public_anchors = [
-                    {key: value for key, value in anchor.items() if key != "content"}
-                    for anchor in code_context.get("anchors", [])
-                    if isinstance(anchor, dict)
-                ]
-                entry = EntryPoint(
-                    scan_id=scan.id,
-                    kind=EntryPointKind.STATIC_SURFACE.value,
-                    name=surface.name,
-                    owner_component=surface.name,
-                    exported=False,
-                    exported_reason="static_semantic_seed",
-                    permission=None,
-                    permission_protection=None,
-                    intent_filters=[],
-                    deep_links=[],
-                    code_anchors=public_anchors,
-                    metadata_json={
-                        "effective_enabled": True,
-                        "direct_invocation_applicable": False,
-                        "static_review_family": surface.family,
-                        "static_review_title": surface.title,
-                        "static_review_severity": surface.severity,
-                        "static_review_priority": surface.priority,
-                        "static_review_rule_ids": surface.rule_ids,
-                        "static_review_hypotheses": surface.hypotheses,
-                        "static_review_locations": surface.locations,
-                        "static_review_attack_chains": surface.attack_chains,
-                        "static_review_artifact": surface.artifact,
-                        "static_review_rollup": surface.rollup,
-                        **(
-                            {"static_review_site": surface.site}
-                            if surface.site is not None
-                            else {}
-                        ),
-                        **(
-                            {"static_review_parent_surface": surface.parent_surface}
-                            if surface.parent_surface
-                            else {}
-                        ),
-                        **(
-                            {"investigation_group": surface.investigation_group}
-                            if surface.investigation_group is not None
-                            else {}
-                        ),
-                        "decompilation": {
-                            "status": code_context.get(
-                                "status",
-                                "source_not_found",
-                            ),
-                            "global_status": code_context.get(
-                                "global_decompilation_status",
-                                result.decompilation.get("status"),
-                            ),
-                        },
-                    },
-                )
-                session.add(entry)
-                entries.append(entry)
-            session.flush()
-            threat_model = build_android_threat_model(scan, entries)
-            scan.stats = {
-                **scan.stats,
-                "threat_model": threat_model,
-            }
-            entry_ids_by_name: dict[str, list[str]] = defaultdict(list)
-            for entry in entries:
-                entry_ids_by_name[entry.name].append(entry.id)
-            persisted_findings: list[Finding] = []
-            for draft in findings:
-                entry_ids = [
-                    entry_id
-                    for name in draft.entry_names
-                    for entry_id in entry_ids_by_name.get(name, [])
-                ]
-                identity = finding_identity(
-                    scan=scan,
-                    rule_id=draft.rule_id,
-                    category="static_signal",
-                    entry_names=[
-                        *draft.entry_names,
-                        *[
-                            str(location[key])
-                            for location in draft.locations
-                            for key in ("component", "path")
-                            if location.get(key)
-                        ],
-                    ],
-                    claim=draft.title,
-                )
-                persisted_finding = Finding(
-                    scan_id=scan.id,
-                    dedupe_key=draft.dedupe_key,
-                    rule_id=draft.rule_id,
-                    source=draft.source,
-                    title=draft.title,
-                    description=draft.description,
-                    remediation=draft.remediation,
-                    masvs=draft.masvs,
-                    cwe=draft.cwe,
-                    severity=draft.severity,
-                    confidence=draft.confidence,
-                    status=FindingStatus.CANDIDATE.value,
-                    entry_point_ids=entry_ids,
-                    locations=draft.locations,
-                    metadata_json={**draft.metadata, "identity": identity},
-                )
-                session.add(persisted_finding)
-                persisted_findings.append(persisted_finding)
-            for item in coverage:
-                session.add(
-                    CoverageItem(
-                        scan_id=scan.id,
-                        control_id=item.control_id,
-                        domain=item.domain,
-                        title=item.title,
-                        status=item.status,
-                        stages=item.stages,
-                        gap_reason=item.gap_reason,
-                    )
-                )
-            entry_coverage: dict[str, CoverageItem] = {}
-            for entry in entries:
-                coverage_item = CoverageItem(
-                    scan_id=scan.id,
-                    control_id=f"ENTRY-{entry.id}",
-                    domain="MASVS-PLATFORM",
-                    title=f"Entry point: {entry.name}",
-                    status=CoverageStatus.PARTIAL.value,
-                    stages={
-                        "static": "completed",
-                        "deterministic_dynamic": "pending",
-                        "agent": "pending",
-                        "blackbox": "pending",
-                    },
-                    gap_reason="Dynamic and semantic investigation pending.",
-                    entry_point_id=entry.id,
-                )
-                session.add(coverage_item)
-                entry_coverage[entry.id] = coverage_item
-            for tool, payload in result.tool_results.items():
-                decompilation = (
-                    {
-                        key: value
-                        for key, value in dict(payload.get("decompilation") or {}).items()
-                        if key != "failed_classes"
-                    }
-                    if tool == "jadx"
-                    else {}
-                )
-                timed_out = payload.get("timed_out") is True
-                exit_code = payload.get("exit_code")
-                output_usable = (
-                    decompilation.get("output_usable") is True
-                    if tool == "jadx"
-                    else exit_code == 0 and not timed_out
-                )
-                tool_status = (
-                    str(decompilation.get("status") or "unknown")
-                    if tool == "jadx"
-                    else "timed_out"
-                    if timed_out
-                    else "succeeded"
-                    if exit_code == 0
-                    else "tool_failed"
-                )
-                metadata = {
-                    **decompilation,
-                    "static_output_usable": output_usable,
-                    "static_tool_status": tool_status,
-                    "static_tool_timed_out": timed_out,
-                    "static_tool_exit_code": exit_code,
-                }
-                self.evidence.json(
-                    session,
-                    scan_id=scan.id,
-                    task_id=None,
-                    kind=f"static.{tool}",
-                    value=payload,
-                    summary=self._static_tool_evidence_summary(tool, payload),
-                    metadata=metadata,
-                )
-            self._run_asc_xrefs(
-                session,
-                scan,
-                entries,
-                preliminary_budget,
-                progress=record_static_phase,
-            )
-            planner = InvestigationPlanner(
-                android_version=self.settings.device_android_version,
-                android_api=self.settings.device_android_api,
-                adb_configured=self.device_pool.configured,
-                device_reset_policy=self.settings.device_reset_policy,
-                max_standalone_chain_sites=self.settings.max_standalone_chain_sites,
-            )
-            investigation_plan = planner.plan_with_decisions(scan.id, entries)
-            tasks = investigation_plan.tasks
-            static_closures = investigation_plan.static_closures
-            coalescing_decisions = investigation_plan.coalescing_decisions
-            closures_by_entry = {closure.entry_point_id: closure for closure in static_closures}
-            for entry_id, closure in closures_by_entry.items():
-                coverage_item = entry_coverage[entry_id]
-                coverage_item.status = CoverageStatus.COVERED.value
-                coverage_item.stages = {
-                    "static": "completed",
-                    "deterministic_dynamic": "not_applicable",
-                    "agent": "not_applicable",
-                    "blackbox": "not_applicable",
-                    "indirect_chain": "retained_for_scan_wide_seed_exploration",
-                }
-                coverage_item.gap_reason = closure.reason
-            for finding in persisted_findings:
-                self._annotate_direct_reachability(
-                    finding,
-                    closures_by_entry,
-                )
-            session.add_all(tasks)
-            session.flush()
-            security_snapshot = self.security_evolution.build_snapshot(
-                session,
-                scan=scan,
-                entries=entries,
-                code_index=result.code_index,
-            )
-            fresh_run = (scan.stats or {}).get("fresh_run")
-            isolated_fresh_run = isinstance(fresh_run, dict) and fresh_run.get("mode") == "isolated"
-            if isolated_fresh_run:
-                version_diff = None
-                pattern_matches = []
-                add_event(
-                    session,
-                    scan.id,
-                    "planning.fresh_run.isolated",
-                    "本轮为独立全新扫描，已禁用历史 PoC 回放与 Finding 模式卡注入",
-                    {
-                        "source_scan_id": fresh_run.get("source_scan_id"),
-                        "reuse_apk_only": True,
-                    },
-                )
-            else:
-                version_diff = self.security_evolution.build_version_diff(
-                    session,
-                    scan=scan,
-                    snapshot=security_snapshot,
-                )
-                pattern_matches = self.security_evolution.apply_diff_and_patterns(
-                    session,
-                    scan=scan,
-                    entries=entries,
-                    tasks=tasks,
-                    diff=version_diff,
-                )
-            for replay_task in (task for task in tasks if task.task_type == "version_replay"):
-                for entry_id in replay_task.target_entry_ids:
-                    coverage_item = entry_coverage.get(entry_id)
-                    if coverage_item is None:
-                        continue
-                    coverage_item.status = CoverageStatus.PARTIAL.value
-                    coverage_item.stages = {
-                        **dict(coverage_item.stages or {}),
-                        "deterministic_dynamic": "pending",
-                        "agent": "pending",
-                        "blackbox": "pending",
-                        "version_replay": "pending",
-                        "indirect_chain": ("retained_for_scan_wide_seed_exploration"),
-                    }
-                    coverage_item.gap_reason = (
-                        "普通应用直接入口已静态阻断；历史漏洞 PoC 仍需在"
-                        "当前版本回放，以验证修复并防止回归。"
-                    )
-            self.security_evolution.record_static_events(
-                session,
-                scan_id=scan.id,
-                snapshot=security_snapshot,
-                diff=version_diff,
-                pattern_matches=pattern_matches,
-            )
-            if static_closures:
-                add_event(
-                    session,
-                    scan.id,
-                    "planning.static_closed",
-                    f"{len(static_closures)} 个入口的普通应用直接调用路径已静态判定为阻断",
-                    {
-                        "count": len(static_closures),
-                        "threat_model": "ordinary_app_uid",
-                        "scope": "direct_invocation_only",
-                        "indirect_chain_targets_retained": True,
-                        "decisions": [closure.as_dict() for closure in static_closures[:200]],
-                        "truncated": len(static_closures) > 200,
-                    },
-                )
-            if coalescing_decisions:
-                avoided_task_count = sum(
-                    int(item.get("avoided_task_count") or 0) for item in coalescing_decisions
-                )
-                add_event(
-                    session,
-                    scan.id,
-                    "planning.tasks.coalesced",
-                    f"同一攻击链的入口变体已归并，避免 {avoided_task_count} 个重复调查任务",
-                    {
-                        "profile": active_profile_id(result.manifest.package_name),
-                        "group_count": len(coalescing_decisions),
-                        "avoided_task_count": avoided_task_count,
-                        "decisions": coalescing_decisions,
-                    },
-                )
-            scan.status = ScanStatus.PRELIMINARY_READY.value
-            scan.preliminary_at = now()
-            dispatched_entry_ids = {
-                entry_id for task in tasks for entry_id in task.target_entry_ids
-            }
-            scan.stats = {
-                **scan.stats,
-                "entry_point_count": len(entries),
-                "task_count": len(tasks),
-                "planning_raw_task_count": len(tasks)
-                + sum(int(item.get("avoided_task_count") or 0) for item in coalescing_decisions),
-                "coalesced_task_count": sum(
-                    int(item.get("avoided_task_count") or 0) for item in coalescing_decisions
-                ),
-                "coalescing_group_count": len(coalescing_decisions),
-                "static_closed_entry_count": len(static_closures),
-                "agent_dispatched_entry_count": len(dispatched_entry_ids),
-                "security_snapshot_hash": security_snapshot.snapshot_hash,
-                "version_diff_id": version_diff.id if version_diff else None,
-                "version_replay_candidate_count": (
-                    len(version_diff.replay_candidates) if version_diff else 0
-                ),
-                "pattern_match_count": len(pattern_matches),
-                "chain_site_count": investigation_plan.chain_site_total,
-                "chain_site_dispatched_count": investigation_plan.chain_site_dispatched,
-                "chain_site_merged_into_component_count": (
-                    investigation_plan.chain_site_merged_into_component
-                ),
-                "chain_site_deferred_count": investigation_plan.chain_site_deferred,
-            }
-            if scan.preliminary_at > preliminary_deadline:
-                late_by = int((scan.preliminary_at - preliminary_deadline).total_seconds())
-                scan.stats = {**scan.stats, "preliminary_sla_late_seconds": late_by}
-                add_event(
-                    session,
-                    scan.id,
-                    "scan.preliminary_sla_missed",
-                    "Preliminary-report deadline was missed",
-                    {"late_seconds": late_by},
-                )
-            add_event(
-                session,
-                scan.id,
-                "static.completed",
-                "Static analysis and attack-surface planning completed",
-                {
-                    "entries": len(entries),
-                    "findings": len(findings),
-                    "tasks": len(tasks),
-                    "static_closed_entries": len(static_closures),
-                },
-            )
-            add_event(
-                session,
-                scan.id,
-                "scan.preliminary_ready",
-                "Preliminary report is ready; investigations may continue",
-            )
-            session.commit()
 
     def _run_tasks(self, scan_id: str) -> str:
         adb_concurrency = self.device_pool.capacity
@@ -3179,7 +2308,7 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                         "agent_backend": agent_backend,
                     },
                 )
-                audit_id = self._record_agent_request(
+                audit_id = self.agent_audits.record_request(
                     scan=scan,
                     task=task,
                     entries=entries,
@@ -3303,7 +2432,7 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                     if proof_token is not None:
                         self.unregister_live_proof_context(task_id, proof_token)
                 self._raise_if_cancelled(cancel_event)
-                self._record_agent_response(
+                self.agent_audits.record_response(
                     scan_id=scan_id,
                     task_id=task_id,
                     audit_id=audit_id,
@@ -3342,7 +2471,7 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                         if isinstance(item.get("id"), str)
                     },
                 )
-                self._record_agent_runtime_events(
+                self.agent_audits.record_runtime_events(
                     scan_id=scan_id,
                     task_id=task_id,
                     audit_id=audit_id,
@@ -3455,7 +2584,7 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                 return result, None
             except AgentCancelledError as exc:
                 if audit_id is not None and runtime_events:
-                    self._record_agent_runtime_events(
+                    self.agent_audits.record_runtime_events(
                         scan_id=scan_id,
                         task_id=task_id,
                         audit_id=audit_id,
@@ -3465,7 +2594,7 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                         events=runtime_events,
                     )
                 if audit_id is not None:
-                    self._record_agent_cancellation(
+                    self.agent_audits.record_cancellation(
                         scan_id=scan_id,
                         task_id=task_id,
                         audit_id=audit_id,
@@ -3505,7 +2634,7 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                     }
                 )
                 if audit_id is not None and runtime_events:
-                    self._record_agent_runtime_events(
+                    self.agent_audits.record_runtime_events(
                         scan_id=scan_id,
                         task_id=task_id,
                         audit_id=audit_id,
@@ -3515,7 +2644,7 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                         events=runtime_events,
                     )
                 if audit_id is not None:
-                    self._record_agent_error(
+                    self.agent_audits.record_error(
                         scan_id=scan_id,
                         task_id=task_id,
                         audit_id=audit_id,
@@ -4172,7 +3301,7 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                             )
                             coverage_gaps.extend(execution_gaps)
 
-                        self._record_agent_test_validation(
+                        self.agent_audits.record_test_validation(
                             task_id=task_id,
                             turn_id=planning_turn_id,
                             submitted=submitted_tests,
@@ -4388,7 +3517,7 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                     debate_context=debate_context,
                 )
                 validated_result_value = proof_status
-            self._record_agent_validation(
+            self.agent_audits.record_validation(
                 task_id=task_id,
                 turn_id=agent_result.turn_id,
                 raw_payload=raw_payload,
@@ -4711,24 +3840,11 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
         finding: Finding,
         closures_by_entry: dict[str, Any],
     ) -> bool:
-        """Record a blocked direct edge without closing indirect vulnerability chains."""
+        return StaticAnalysisPipeline.annotate_direct_reachability(
+            finding,
+            closures_by_entry,
+        )
 
-        linked_entries = set(finding.entry_point_ids)
-        if not linked_entries or not linked_entries <= set(closures_by_entry):
-            return False
-        finding.metadata_json = {
-            **finding.metadata_json,
-            "direct_reachability_assessment": {
-                "status": "blocked",
-                "scope": "ordinary_app_direct_invocation_only",
-                "indirect_chain_paths_evaluated": False,
-                "threat_model": "ordinary_app_uid",
-                "entry_decisions": [
-                    closures_by_entry[entry_id].as_dict() for entry_id in sorted(linked_entries)
-                ],
-            },
-        }
-        return True
 
     def _mark_task_canceled(self, scan_id: str, task_id: str) -> None:
         with self.database.session_factory() as session:
@@ -5000,17 +4116,11 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
 
     @staticmethod
     def _rejected_requested_tests(result: Any) -> list[dict[str, Any]]:
-        rejected = getattr(result, "rejected_requested_tests", [])
-        if not isinstance(rejected, list):
-            return []
-        return deepcopy([item for item in rejected if isinstance(item, dict)])
+        return rejected_requested_tests(result)
 
     @staticmethod
     def _normalization_repairs(result: Any) -> list[dict[str, Any]]:
-        repairs = getattr(result, "normalization_repairs", [])
-        if not isinstance(repairs, list):
-            return []
-        return deepcopy([item for item in repairs if isinstance(item, dict)])
+        return normalization_repairs(result)
 
     @classmethod
     def _has_requested_test_work(cls, result: Any) -> bool:
@@ -6107,550 +5217,6 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
         )
         return result, error
 
-    @staticmethod
-    def _agent_role_for_phase(phase: str) -> str:
-        return (
-            "critic"
-            if phase == "adversarial_review"
-            else "rescue"
-            if phase == "rescue_review"
-            else "rescue_explorer"
-            if phase == "rescue_exploration"
-            else "verifier"
-            if phase == "adaptive_verification"
-            else "primary"
-        )
-
-    def _start_agent_turn_record(
-        self,
-        session,  # noqa: ANN001
-        *,
-        scan_id: str,
-        task_id: str,
-        attempt: int,
-        phase: str,
-        audit_id: str,
-        request_evidence_id: str,
-        round_index: int = 0,
-        workspace_path: str = "",
-    ) -> AgentTurnRecord:
-        role = self._agent_role_for_phase(phase)
-        container_key = f"{scan_id}:scan-container"
-        container = session.scalar(
-            select(ScanContainerRecord).where(ScanContainerRecord.container_key == container_key)
-        )
-        if container is None:
-            container = ScanContainerRecord(
-                scan_id=scan_id,
-                task_id=None,
-                container_key=container_key,
-                isolation=self.settings.codex_isolation,
-                workspace_path=workspace_path,
-                status="running",
-                metadata_json={"session_workspaces": {}},
-            )
-            session.add(container)
-            session.flush()
-        else:
-            container.status = "running"
-            container.completed_at = None
-            if workspace_path:
-                container.workspace_path = workspace_path
-        container_metadata = dict(container.metadata_json or {})
-        session_workspaces = dict(container_metadata.get("session_workspaces") or {})
-        session_key = f"{scan_id}:{task_id}:{attempt}:{role}"
-        if workspace_path:
-            session_workspaces[session_key] = workspace_path
-        container.metadata_json = {
-            **container_metadata,
-            "session_workspaces": session_workspaces,
-        }
-        agent_session = session.scalar(
-            select(AgentSessionRecord).where(AgentSessionRecord.session_key == session_key)
-        )
-        if agent_session is None:
-            agent_session = AgentSessionRecord(
-                scan_id=scan_id,
-                task_id=task_id,
-                container_record_id=container.id,
-                session_key=session_key,
-                role=role,
-                attempt=attempt,
-                backend="codex",
-                provider=self.settings.codex_provider,
-                model=self.settings.codex_model,
-                status="active",
-            )
-            session.add(agent_session)
-            session.flush()
-        else:
-            agent_session.status = "active"
-            agent_session.completed_at = None
-        turn = AgentTurnRecord(
-            scan_id=scan_id,
-            task_id=task_id,
-            session_record_id=agent_session.id,
-            audit_id=audit_id,
-            phase=phase,
-            round_index=round_index,
-            status="running",
-            request_evidence_id=request_evidence_id,
-        )
-        session.add(turn)
-        return turn
-
-    @staticmethod
-    def _finish_agent_turn_record(
-        session,  # noqa: ANN001
-        *,
-        audit_id: str,
-        status: str,
-        response_evidence_id: str | None = None,
-        thread_id: str | None = None,
-        turn_id: str | None = None,
-        usage: dict[str, Any] | None = None,
-        error: str | None = None,
-    ) -> None:
-        turn = session.scalar(select(AgentTurnRecord).where(AgentTurnRecord.audit_id == audit_id))
-        if turn is None or turn.status != "running":
-            return
-        turn.status = status
-        turn.response_evidence_id = response_evidence_id
-        turn.turn_id = turn_id
-        turn.usage_json = usage or {}
-        turn.error = error
-        turn.completed_at = now()
-        agent_session = session.get(AgentSessionRecord, turn.session_record_id)
-        if agent_session is not None:
-            agent_session.status = "idle" if status == "completed" else status
-            agent_session.thread_id = thread_id or agent_session.thread_id
-            agent_session.completed_at = turn.completed_at
-            container = session.get(ScanContainerRecord, agent_session.container_record_id)
-            if container is not None:
-                # A task turn ending does not imply the shared scan container ended.
-                container.status = "running"
-                container.completed_at = None
-
-    def _record_agent_request(
-        self,
-        *,
-        scan: Scan,
-        task: InvestigationTask,
-        entries: list[EntryPoint],
-        evidence: list[dict[str, Any]],
-        platform_context: dict[str, Any],
-        backend: str,
-        phase: str,
-        capability: dict[str, Any],
-        runtime_workspace: Path | None = None,
-    ) -> str:
-        if backend != "codex":
-            raise ValueError("OpenCode and other agent backends are not executable")
-        frozen = self.settings.frozen_agent_configuration()
-        provider = frozen.provider
-        execution = frozen.execution
-        frozen.phase_route.provider_profile_id(phase)
-        direct_tool_access = True
-        shell_access = execution.bash
-        workspace_write = execution.workspace_write
-        assigned_device = platform_context.get("device")
-        assigned_device_serial = (
-            assigned_device.get("serial") if isinstance(assigned_device, dict) else None
-        )
-        proof_replay = platform_context.get("proof_replay")
-        gateway_available = bool(
-            isinstance(proof_replay, dict) and proof_replay.get("available") is True
-        )
-        adb_access = (
-            execution.adb == "task_gateway" and bool(assigned_device_serial) and gateway_available
-        )
-        network_access = execution.shell_network == "public_egress"
-        audit_id = str(uuid.uuid4())
-        metadata = {
-            "audit_id": audit_id,
-            "backend": "codex",
-            "provider": provider.provider,
-            "model": provider.model,
-            "execution_profile_id": execution.id,
-            "execution_profile_sha256": execution.fingerprint(),
-            "provider_profile_id": provider.id,
-            "provider_profile_sha256": provider.fingerprint(),
-            "phase_route_sha256": frozen.phase_route.fingerprint(),
-            "isolation": self.settings.codex_isolation,
-            "phase": phase,
-            "attempt": task.attempts,
-        }
-        prompt = investigation_prompt(
-            scan,
-            task,
-            entries,
-            evidence,
-            platform_context,
-            direct_tool_access=direct_tool_access,
-            shell_access=shell_access,
-            workspace_write=workspace_write,
-            adb_access=adb_access,
-            network_access=network_access,
-        )
-        request = {
-            "schema_version": "1.0",
-            "backend": "codex",
-            "provider": provider.provider,
-            "model": provider.model,
-            "sdk_version": capability.get("version"),
-            "runtime_version": capability.get("runtime_version"),
-            "isolation": self.settings.codex_isolation,
-            "provider_base_url": provider.base_url,
-            "phase": phase,
-            "task_id": task.id,
-            "attempt": task.attempts,
-            "developer_instructions": developer_instructions(
-                direct_tool_access=direct_tool_access,
-                shell_access=shell_access,
-                workspace_write=workspace_write,
-                adb_access=adb_access,
-                network_access=network_access,
-            ),
-            "prompt": prompt,
-            "output_schema": AGENT_RESULT_JSON_SCHEMA,
-            "tool_boundary": {
-                "direct_tool_access": True,
-                "model_tools_enabled": True,
-                "workspace_tool_profile": "codex_full_access",
-                "workspace_tools": ["file", "shell", "apply_patch", "web_search"],
-                "shell_enabled": shell_access,
-                "write_enabled": workspace_write,
-                "native_write_tools_enabled": execution.apply_patch,
-                "allowed_write_roots": ["session_workspace", "session_tmp"],
-                "shared_scan_workspace_exposed": True,
-                "network_enabled": network_access,
-                "network_policy": (execution.shell_network if network_access else "disabled"),
-                "adb_enabled": adb_access,
-                "adb_evidence_policy": (
-                    "exploration_only; ordinary-app replay required for proof"
-                    if adb_access
-                    else "disabled"
-                ),
-                "subagents_enabled": False,
-                "mcp_allowlist": list(execution.mcp_allowlist),
-                "structured_output_tool_enabled": False,
-                "platform_executes_requested_tests": True,
-            },
-            "runtime_options": {
-                "reasoning_effort": provider.reasoning_effort,
-                "output_mode": "json_schema",
-                "execution_profile": execution.model_dump(mode="json"),
-                "execution_profile_sha256": execution.fingerprint(),
-                "provider_profile": provider.model_dump(mode="json"),
-                "provider_profile_sha256": provider.fingerprint(),
-                "phase_route": frozen.phase_route.model_dump(mode="json"),
-                "phase_route_sha256": frozen.phase_route.fingerprint(),
-                "max_agent_steps": None,
-                "max_provider_requests": None,
-                "structured_output_retries": 1,
-                "schema_validator": "pydantic@2",
-                "semantic_validator": "apkscanner@1.0",
-            },
-        }
-        with self.database.session_factory() as session:
-            request_evidence = self.evidence.json(
-                session,
-                scan_id=scan.id,
-                task_id=task.id,
-                kind="agent.request",
-                value=request,
-                summary=f"{backend} {phase} request",
-                metadata=metadata,
-            )
-            self._start_agent_turn_record(
-                session,
-                scan_id=scan.id,
-                task_id=task.id,
-                attempt=task.attempts,
-                phase=phase,
-                audit_id=audit_id,
-                request_evidence_id=request_evidence.id,
-                round_index=int(platform_context.get("round_index") or 0),
-                workspace_path=str(runtime_workspace or ""),
-            )
-            session.commit()
-        return audit_id
-
-    def _record_agent_response(
-        self,
-        *,
-        scan_id: str,
-        task_id: str,
-        audit_id: str,
-        backend: str,
-        phase: str,
-        attempt: int,
-        result: Any,
-    ) -> None:
-        metadata = {
-            "audit_id": audit_id,
-            "backend": backend,
-            "provider": self.settings.codex_provider,
-            "model": self.settings.codex_model,
-            "isolation": self.settings.codex_isolation,
-            "phase": phase,
-            "attempt": attempt,
-            "thread_id": result.thread_id,
-            "turn_id": result.turn_id,
-        }
-        response = {
-            "schema_version": "1.0",
-            "thread_id": result.thread_id,
-            "turn_id": result.turn_id,
-            "structured_output": result.result.model_dump(mode="json"),
-            "model_validation": {
-                "rejected_requested_tests": self._rejected_requested_tests(result.result),
-                "normalization_repairs": self._normalization_repairs(result.result),
-            },
-            "usage": result.usage,
-            "output_transport": getattr(result, "output_transport", {}),
-        }
-        with self.database.session_factory() as session:
-            response_evidence = self.evidence.json(
-                session,
-                scan_id=scan_id,
-                task_id=task_id,
-                kind="agent.response",
-                value=response,
-                summary=f"{backend} {phase} structured response",
-                metadata=metadata,
-            )
-            self._finish_agent_turn_record(
-                session,
-                audit_id=audit_id,
-                status="completed",
-                response_evidence_id=response_evidence.id,
-                thread_id=result.thread_id,
-                turn_id=result.turn_id,
-                usage=result.usage,
-            )
-            session.commit()
-
-    def _record_agent_runtime_events(
-        self,
-        *,
-        scan_id: str,
-        task_id: str,
-        audit_id: str,
-        backend: str,
-        phase: str,
-        attempt: int,
-        events: list[dict[str, Any]],
-    ) -> None:
-        metadata = {
-            "audit_id": audit_id,
-            "backend": backend,
-            "provider": self.settings.codex_provider,
-            "model": self.settings.codex_model,
-            "isolation": self.settings.codex_isolation,
-            "phase": phase,
-            "attempt": attempt,
-        }
-        with self.database.session_factory() as session:
-            self.evidence.json(
-                session,
-                scan_id=scan_id,
-                task_id=task_id,
-                kind="agent.events",
-                value={
-                    "schema_version": "1.0",
-                    "events": events,
-                },
-                summary=f"{backend} {phase} normalized runtime events",
-                metadata=metadata,
-            )
-            session.commit()
-
-    def _record_agent_error(
-        self,
-        *,
-        scan_id: str,
-        task_id: str,
-        audit_id: str,
-        backend: str,
-        phase: str,
-        attempt: int,
-        error: Exception | str,
-    ) -> None:
-        metadata = {
-            "audit_id": audit_id,
-            "backend": backend,
-            "provider": self.settings.codex_provider,
-            "model": self.settings.codex_model,
-            "isolation": self.settings.codex_isolation,
-            "phase": phase,
-            "attempt": attempt,
-        }
-        error_message = str(error)
-        audit_details = getattr(error, "audit_details", None)
-        value: dict[str, Any] = {
-            "schema_version": "1.0",
-            "error": error_message,
-        }
-        if isinstance(audit_details, dict) and audit_details:
-            value["details"] = audit_details
-        with self.database.session_factory() as session:
-            self.evidence.json(
-                session,
-                scan_id=scan_id,
-                task_id=task_id,
-                kind="agent.error",
-                value=value,
-                summary=f"{backend} {phase} failed",
-                metadata=metadata,
-            )
-            self._finish_agent_turn_record(
-                session,
-                audit_id=audit_id,
-                status="failed",
-                error=error_message,
-            )
-            session.commit()
-
-    def _record_agent_cancellation(
-        self,
-        *,
-        scan_id: str,
-        task_id: str,
-        audit_id: str,
-        backend: str,
-        phase: str,
-        attempt: int,
-        error: Exception | str,
-    ) -> None:
-        metadata = {
-            "audit_id": audit_id,
-            "backend": backend,
-            "provider": self.settings.codex_provider,
-            "model": self.settings.codex_model,
-            "isolation": self.settings.codex_isolation,
-            "phase": phase,
-            "attempt": attempt,
-        }
-        with self.database.session_factory() as session:
-            self.evidence.json(
-                session,
-                scan_id=scan_id,
-                task_id=task_id,
-                kind="agent.cancellation",
-                value={
-                    "schema_version": "1.0",
-                    "requested_by": "local_console_user",
-                    "acknowledged": True,
-                    "reason": str(error),
-                },
-                summary=f"{backend} {phase} cancelled by user",
-                metadata=metadata,
-            )
-            self._finish_agent_turn_record(
-                session,
-                audit_id=audit_id,
-                status="canceled",
-                error=str(error),
-            )
-            session.commit()
-
-    def _record_agent_test_validation(
-        self,
-        *,
-        task_id: str,
-        turn_id: str,
-        submitted: list[dict[str, Any]],
-        accepted: list[dict[str, Any]],
-        executed: list[dict[str, Any]],
-        gaps: list[str],
-        model_rejected: list[dict[str, Any]] | None = None,
-    ) -> None:
-        match = self._agent_response_for_turn(task_id, turn_id)
-        if match is None:
-            return
-        response, metadata = match
-        with self.database.session_factory() as session:
-            self.evidence.json(
-                session,
-                scan_id=response.scan_id,
-                task_id=task_id,
-                kind="agent.test_validation",
-                value={
-                    "schema_version": "1.0",
-                    "submitted": submitted,
-                    "accepted": accepted,
-                    "executed": executed,
-                    "gaps": gaps,
-                    "model_rejected": model_rejected or [],
-                },
-                summary="Platform validation of AI-requested tests",
-                metadata=metadata,
-            )
-            session.commit()
-
-    def _record_agent_validation(
-        self,
-        *,
-        task_id: str,
-        turn_id: str,
-        raw_payload: dict[str, Any],
-        validated_payload: dict[str, Any],
-    ) -> None:
-        match = self._agent_response_for_turn(task_id, turn_id)
-        if match is None:
-            return
-        response, metadata = match
-        claimed_evidence = list(raw_payload.get("evidence_ids", []))
-        accepted_evidence = list(validated_payload.get("evidence_ids", []))
-        with self.database.session_factory() as session:
-            self.evidence.json(
-                session,
-                scan_id=response.scan_id,
-                task_id=task_id,
-                kind="agent.validation",
-                value={
-                    "schema_version": "1.0",
-                    "claimed_result": raw_payload.get("result"),
-                    "final_result": validated_payload.get("result"),
-                    "claimed_severity": raw_payload.get("severity_proposal"),
-                    "final_severity": validated_payload.get("platform_severity"),
-                    "severity_disposition": validated_payload.get(
-                        "severity_disposition", "accepted"
-                    ),
-                    "downgraded": (raw_payload.get("result") != validated_payload.get("result")),
-                    "claimed_evidence_ids": claimed_evidence,
-                    "accepted_evidence_ids": accepted_evidence,
-                    "rejected_evidence_ids": sorted(set(claimed_evidence) - set(accepted_evidence)),
-                    "raw_structured_output": raw_payload,
-                    "validated_output": validated_payload,
-                },
-                summary="Platform evidence validation of AI result",
-                metadata=metadata,
-            )
-            session.commit()
-
-    def _agent_response_for_turn(
-        self,
-        task_id: str,
-        turn_id: str,
-    ) -> tuple[Evidence, dict[str, Any]] | None:
-        with self.database.session_factory() as session:
-            responses = list(
-                session.scalars(
-                    select(Evidence)
-                    .where(
-                        Evidence.task_id == task_id,
-                        Evidence.kind == "agent.response",
-                    )
-                    .order_by(Evidence.created_at.desc())
-                )
-            )
-            for response in responses:
-                if response.metadata_json.get("turn_id") == turn_id:
-                    return response, dict(response.metadata_json)
-        return None
-
     def _static_evidence_summaries(self, scan_id: str) -> list[dict[str, Any]]:
         return self._evidence_summaries_for_run(
             scan_id,
@@ -6768,75 +5334,15 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
         *,
         progress=None,  # noqa: ANN001
     ) -> None:
-        """Record ASC bytecode-level inbound cross references as scan Evidence.
-
-        Optional: disabled by default, and any failure (package missing, sandbox
-        without ``multiprocessing``, tool error) becomes an unusable-tool receipt
-        instead of failing the scan.
-        """
-
-        if not self.settings.asc_enabled:
-            return
-        if progress is not None:
-            progress("asc_xrefs", "started", {"query_limit": self.settings.asc_max_queries})
-        queries = build_asc_queries(
-            entries,
-            max_queries=self.settings.asc_max_queries,
-        )
-        try:
-            extraction = self.asc.extract(
-                Path(scan.artifact_path),
-                queries,
-                budget=budget,
-            )
-        except Exception as exc:  # defensive: extraction already isolates
-            if progress is not None:
-                progress(
-                    "asc_xrefs",
-                    "failed",
-                    {"error": f"{type(exc).__name__}: {exc}"},
-                )
-            return
-        payload = extraction.as_evidence_payload()
-        usable = extraction.usable
-        status = (
-            "succeeded"
-            if usable
-            else "unavailable"
-            if not extraction.references and not extraction.tool_version
-            else "tool_failed"
-        )
-        metadata = {
-            "static_output_usable": usable,
-            "static_tool_status": status,
-            "static_tool_timed_out": False,
-            "static_tool_exit_code": 0 if usable else 1,
-            "asc_transport": extraction.transport,
-            "asc_tool_version": extraction.tool_version,
-            "asc_reference_count": len(extraction.references),
-            "asc_dex_entry_count": int(extraction.stats.get("dex_entry_count") or 0),
-            "asc_error_count": len(extraction.errors),
-        }
-        self.evidence.json(
+        self.static_pipeline.asc = self.asc
+        self.static_pipeline.run_asc_xrefs(
             session,
-            scan_id=scan.id,
-            task_id=None,
-            kind="static.droidasc",
-            value=payload,
-            summary=evidence_summary(payload),
-            metadata=metadata,
+            scan,
+            entries,
+            budget,
+            progress=progress,
         )
-        if progress is not None:
-            progress(
-                "asc_xrefs",
-                "completed" if usable else "failed",
-                {
-                    "references": len(extraction.references),
-                    "queries": len(extraction.queries),
-                    "transport": extraction.transport,
-                    "errors": extraction.errors[:3],
-                },
-            )
+
 
     def _target_xrefs_context(
         self,
@@ -6974,18 +5480,8 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
         tool: str,
         payload: dict[str, Any],
     ) -> str:
-        if tool != "jadx":
-            return f"{tool} exited with {payload['exit_code']}"
-        decompilation = payload.get("decompilation")
-        if not isinstance(decompilation, dict):
-            return f"jadx exited with {payload['exit_code']}"
-        status = str(decompilation.get("status", "unknown"))
-        generated = int(decompilation.get("generated_java_files", 0))
-        errors = int(decompilation.get("reported_error_count", 0))
-        return (
-            f"jadx {status}: generated {generated} Java files; "
-            f"{errors} errors reported (exit {payload['exit_code']})"
-        )
+        return StaticAnalysisPipeline.static_tool_evidence_summary(tool, payload)
+
 
     def _materialize_agent_evidence(
         self,

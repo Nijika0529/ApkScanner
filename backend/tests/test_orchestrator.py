@@ -5132,8 +5132,8 @@ def test_terminal_write_yields_to_cancel_or_delete_without_completion_side_effec
         lambda payload, _evidence: (payload, "refuted_static"),
     )
     monkeypatch.setattr(
-        orchestrator,
-        "_record_agent_validation",
+        orchestrator.agent_audits,
+        "record_validation",
         win_terminal_race,
     )
 

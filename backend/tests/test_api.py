@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import apkscanner.platform.api as api_module
+import apkscanner.platform.execution_routes as execution_routes_module
 import pytest
 from apkscanner.core.enums import TaskStatus
 from apkscanner.core.models import (
@@ -1538,7 +1539,7 @@ def test_worker_completion_wins_a_race_with_task_cancellation(
     app = create_app(settings)
     transition_started = threading.Event()
     allow_transition = threading.Event()
-    original_transition = api_module._transition_task
+    original_transition = execution_routes_module.transition_task
 
     def delayed_transition(
         session,
@@ -1557,7 +1558,7 @@ def test_worker_completion_wins_a_race_with_task_cancellation(
             values=values,
         )
 
-    monkeypatch.setattr(api_module, "_transition_task", delayed_transition)
+    monkeypatch.setattr(execution_routes_module, "transition_task", delayed_transition)
     with TestClient(app) as client:
         with app.state.database.session_factory() as session:
             scan = Scan(
@@ -1671,7 +1672,7 @@ def test_ai_calls_are_exposed_as_integrity_checked_audit_records(settings) -> No
         session.add_all([scan, task, entry])
         session.commit()
 
-    audit_id = orchestrator._record_agent_request(
+    audit_id = orchestrator.agent_audits.record_request(
         scan=scan,
         task=task,
         entries=[entry],
@@ -1698,7 +1699,7 @@ def test_ai_calls_are_exposed_as_integrity_checked_audit_records(settings) -> No
             requested_tests=[],
         ),
     )
-    orchestrator._record_agent_response(
+    orchestrator.agent_audits.record_response(
         scan_id=scan.id,
         task_id=task.id,
         audit_id=audit_id,
@@ -1708,7 +1709,7 @@ def test_ai_calls_are_exposed_as_integrity_checked_audit_records(settings) -> No
         result=result,
     )
     raw = result.result.model_dump(mode="json")
-    orchestrator._record_agent_validation(
+    orchestrator.agent_audits.record_validation(
         task_id=task.id,
         turn_id=result.turn_id,
         raw_payload=raw,
@@ -1782,7 +1783,7 @@ def test_codex_audit_records_frozen_execution_and_provider_profiles(settings) ->
         session.add_all([scan, task, entry])
         session.commit()
 
-    audit_id = orchestrator._record_agent_request(
+    audit_id = orchestrator.agent_audits.record_request(
         scan=scan,
         task=task,
         entries=[entry],
@@ -1834,7 +1835,7 @@ def test_codex_audit_records_frozen_execution_and_provider_profiles(settings) ->
             requested_tests=[],
         ),
     )
-    orchestrator._record_agent_response(
+    orchestrator.agent_audits.record_response(
         scan_id=scan.id,
         task_id=task.id,
         audit_id=audit_id,

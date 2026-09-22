@@ -1044,5 +1044,3 @@ class LiveProofGatewayMixin:
             task_id=task_id,
             observation_kind=observation_kind,
         )
-
-

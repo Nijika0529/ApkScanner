@@ -44,17 +44,23 @@ API、报告、质量指标和扫描收尾应消费 `project_findings`，不应�
 - checksum 用来拒绝历史迁移被静默修改。
 - migration ledger 为 `apkscanner_schema_migrations`。
 - `is_current` 验证已执行迁移的结构不变量；可写启动会修复结构漂移，只读启动会明确报错。
+- SQLite 的建表、迁移和启动修复共享数据库旁的跨进程 startup lock，多个服务进程不得各自并发执行首次升级。
 
 数据修复与 DDL 分离。`core/startup_reconciliation.py` 只运行幂等的崩溃恢复和历史数据纠偏。新增一次性结构变化应写 migration；新增持续不变量修复应写 reconciler，并说明其幂等性。
+真实数据备份、验证与回滚步骤见 `docs/database-migration-runbook.zh-CN.md`。
 
 ## 控制面拆分
 
 - `runtime/live_proof_gateway.py`：实时 Proof/ADB/Observation 网关。
 - `runtime/adaptive_verification.py`：候选合并、自适应验证和平台裁决投影。
 - `runtime/finalization.py`：最终 Finding 投影、入口 disposition、seal 和 final event。
-- `platform/operator_routes.py`、`platform/device_routes.py`：独立路由切片。
+- `runtime/static_analysis_pipeline.py`：静态工具、入口、Finding seed、Evidence 和调查计划的物化流水线。
+- `runtime/agent_audit.py::AgentAuditRecorder`：Agent request/response 审计以及 container/session/turn 生命周期。
+- `runtime/device_registry.py`：持久化设备注册、健康探测和运行时 device pool 同步。
+- `platform/dependencies.py`：无路由的 FastAPI 依赖和实体查找边界。
+- `platform/operator_routes.py`、`platform/device_routes.py`、`platform/execution_routes.py`：按 Operator、设备和任务执行域拆分的路由切片。
 - `platform/finding_review_service.py`：人工审核事务，不在路由内维护领域规则。
-- `frontend/src/features/artifacts`、`frontend/src/features/devices`：前端 feature 切片。
+- `frontend/src/features/artifacts`、`frontend/src/features/devices`、`frontend/src/features/tasks`：前端 feature 切片。
 
 `ScanOrchestrator` 仍负责跨阶段生命周期，但新增能力应优先落到独立 service/mixin，再由它做薄协调；`platform/api.py` 只注册路由和保留尚未拆出的端点。
 

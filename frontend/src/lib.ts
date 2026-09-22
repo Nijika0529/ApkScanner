@@ -73,3 +73,67 @@ export function statusLabel(status: string) {
   }
   return labels[status] ?? status
 }
+
+export function statusTone(
+  status: string,
+): "neutral" | "good" | "warning" | "danger" | "info" {
+  if (
+    ["final", "completed", "covered", "accepted", "reproduced_blackbox", "proven"].includes(
+      status,
+    )
+  )
+    return "good"
+  if (["failed", "critical", "high", "tool_failed"].includes(status)) return "danger"
+  if (
+    [
+      "inconclusive",
+      "timed_out",
+      "blocked_device",
+      "partial",
+      "degraded",
+      "preliminary_ready",
+      "cancel_requested",
+      "challenged",
+      "supported_static",
+      "static_path_supported",
+    ].includes(status)
+  )
+    return "warning"
+  if (
+    [
+      "investigating",
+      "static_running",
+      "running",
+      "queued",
+      "accepted_for_proof",
+      "proof_planned",
+      "executing",
+      "runtime_observed_unverified",
+      "oracle_gap",
+    ].includes(status)
+  )
+    return "info"
+  return "neutral"
+}
+
+export function isAbortError(reason: unknown) {
+  return reason instanceof DOMException && reason.name === "AbortError"
+}
+
+export function textValue(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined
+}
+
+export function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+export function booleanValue(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined
+}
+
+export function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined
+}

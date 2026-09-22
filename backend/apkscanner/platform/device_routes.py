@@ -5,30 +5,30 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from ..core.schemas import AdbDeviceConnectRequest, AdbDeviceOut
-from ..runtime.orchestrator import ScanOrchestrator
+from ..runtime.device_registry import DeviceRegistry
 
 router = APIRouter()
 
 
-def get_orchestrator(request: Request) -> ScanOrchestrator:
-    return request.app.state.orchestrator
+def get_device_registry(request: Request) -> DeviceRegistry:
+    return request.app.state.orchestrator.device_registry
 
 
 @router.get("/devices", response_model=list[AdbDeviceOut])
 def list_adb_devices(
     probe: bool = Query(default=False),
-    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+    registry: DeviceRegistry = Depends(get_device_registry),
 ) -> list[dict[str, Any]]:
-    return orchestrator.list_adb_devices(probe=probe)
+    return registry.list_devices(probe=probe)
 
 
 @router.post("/devices", response_model=AdbDeviceOut, status_code=201)
 def connect_adb_device(
     control: AdbDeviceConnectRequest,
-    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+    registry: DeviceRegistry = Depends(get_device_registry),
 ) -> dict[str, Any]:
     try:
-        return orchestrator.connect_adb_device(
+        return registry.connect(
             control.serial,
             label=control.label,
             connect=control.connect,
@@ -40,10 +40,10 @@ def connect_adb_device(
 @router.post("/devices/{serial}/drain", response_model=AdbDeviceOut)
 def drain_adb_device(
     serial: str,
-    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+    registry: DeviceRegistry = Depends(get_device_registry),
 ) -> dict[str, Any]:
     try:
-        return orchestrator.drain_adb_device(serial)
+        return registry.drain(serial)
     except KeyError as exc:
         raise HTTPException(404, "ADB device not found") from exc
     except ValueError as exc:
@@ -53,10 +53,10 @@ def drain_adb_device(
 @router.post("/devices/{serial}/reconnect", response_model=AdbDeviceOut)
 def reconnect_adb_device(
     serial: str,
-    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+    registry: DeviceRegistry = Depends(get_device_registry),
 ) -> dict[str, Any]:
     try:
-        return orchestrator.reconnect_adb_device(serial)
+        return registry.reconnect(serial)
     except KeyError as exc:
         raise HTTPException(404, "ADB device not found") from exc
     except (RuntimeError, ValueError) as exc:
@@ -66,10 +66,10 @@ def reconnect_adb_device(
 @router.delete("/devices/{serial}")
 def remove_adb_device(
     serial: str,
-    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+    registry: DeviceRegistry = Depends(get_device_registry),
 ) -> dict[str, Any]:
     try:
-        orchestrator.remove_adb_device(serial)
+        registry.remove(serial)
     except KeyError as exc:
         raise HTTPException(404, "ADB device not found") from exc
     except (RuntimeError, ValueError) as exc:

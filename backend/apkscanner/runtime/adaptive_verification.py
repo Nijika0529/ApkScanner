@@ -1684,7 +1684,7 @@ class AdaptiveVerificationMixin:
                                 "isolation": self.settings.codex_isolation,
                             },
                         )
-                        self._start_agent_turn_record(
+                        self.agent_audits.start_turn(
                             session,
                             scan_id=scan_id,
                             task_id=task_id,
@@ -1754,7 +1754,7 @@ class AdaptiveVerificationMixin:
                             gateway_environment=gateway_environment,
                         )
                     except AgentCancelledError as exc:
-                        self._record_agent_cancellation(
+                        self.agent_audits.record_cancellation(
                             scan_id=scan_id,
                             task_id=task_id,
                             audit_id=audit_id,
@@ -1765,7 +1765,7 @@ class AdaptiveVerificationMixin:
                         )
                         raise
                     except Exception as exc:
-                        self._record_agent_error(
+                        self.agent_audits.record_error(
                             scan_id=scan_id,
                             task_id=task_id,
                             audit_id=audit_id,
@@ -1774,7 +1774,7 @@ class AdaptiveVerificationMixin:
                             attempt=task.attempts,
                             error=exc,
                         )
-                        self._record_agent_runtime_events(
+                        self.agent_audits.record_runtime_events(
                             scan_id=scan_id,
                             task_id=task_id,
                             audit_id=audit_id,
@@ -1868,7 +1868,7 @@ class AdaptiveVerificationMixin:
                             },
                         )
                         response_evidence_id = response_evidence.id
-                        self._finish_agent_turn_record(
+                        self.agent_audits.finish_turn(
                             session,
                             audit_id=audit_id,
                             status="completed",
@@ -1932,7 +1932,7 @@ class AdaptiveVerificationMixin:
                                     )
                                 }
                         session.commit()
-                    self._record_agent_runtime_events(
+                    self.agent_audits.record_runtime_events(
                         scan_id=scan_id,
                         task_id=task_id,
                         audit_id=audit_id,
@@ -2698,5 +2698,3 @@ class AdaptiveVerificationMixin:
                 },
             )
             session.commit()
-
-
