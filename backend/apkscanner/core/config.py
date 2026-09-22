@@ -398,7 +398,7 @@ class Settings:
         return settings
 
     def validate_codex_configuration(self) -> None:
-        from ..runtime.agent_execution import frozen_agent_configuration
+        from .agent_execution import frozen_agent_configuration
 
         if self.sqlite_synchronous.upper() not in {"EXTRA", "FULL", "NORMAL", "OFF"}:
             raise ValueError(
@@ -465,7 +465,7 @@ class Settings:
         frozen_agent_configuration(self)
 
     def frozen_agent_configuration(self):  # noqa: ANN202
-        from ..runtime.agent_execution import frozen_agent_configuration
+        from .agent_execution import frozen_agent_configuration
 
         return frozen_agent_configuration(self)
 

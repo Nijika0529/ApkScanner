@@ -19,6 +19,7 @@ from pydantic import ValidationError
 
 from ..core.config import Settings
 from ..core.models import EntryPoint, InvestigationTask, Scan
+from ..core.operator_schemas import OPERATOR_RECEIPT_JSON_SCHEMA, OperatorReceipt
 from ..core.permissions import ensure_private_directory
 from ..core.schemas import (
     ADAPTIVE_VERIFIER_RESULT_JSON_SCHEMA,
@@ -26,7 +27,6 @@ from ..core.schemas import (
     AdaptiveVerificationResult,
     AgentInvestigationResult,
 )
-from ..platform.operator_schemas import OPERATOR_RECEIPT_JSON_SCHEMA, OperatorReceipt
 from .agent_events import (
     AgentCancelledError,
     AgentEventCallback,

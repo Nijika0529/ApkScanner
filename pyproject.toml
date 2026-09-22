@@ -29,7 +29,7 @@ dev = [
 # Optional fast bytecode-level cross references (ASC/droidasc). Pinned because the
 # package is young and monkey-patches androguard.
 asc = [
-  "droidasc==0.1.1",
+  "droidasc==0.1.1.post2",
 ]
 
 [project.scripts]

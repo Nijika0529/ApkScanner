@@ -21,8 +21,8 @@ from ..core.models import CoverageItem, EntryPoint, RuntimeArtifact, Scan
 from ..core.permissions import ensure_private_directory, ensure_private_file
 from ..core.repository import add_event
 from ..core.schemas import RuntimeArtifactCaptureRequest
-from ..platform.artifacts import ArtifactStore
-from ..platform.tools import CommandResult
+from ..infrastructure.artifacts import ArtifactStore
+from ..infrastructure.tools import CommandResult
 from .device import AdbDeviceAdapter, AdbDevicePool
 from .planner import InvestigationPlanner
 

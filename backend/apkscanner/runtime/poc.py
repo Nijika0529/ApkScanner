@@ -18,8 +18,8 @@ from xml.etree import ElementTree
 
 from ..core.config import Settings
 from ..core.schemas import AgentOracleSpec, AgentPocSpec, AgentRequestedTest
-from ..platform.artifacts import ArtifactStore
-from ..platform.tools import CommandResult, ToolRunner
+from ..infrastructure.artifacts import ArtifactStore
+from ..infrastructure.tools import CommandResult, ToolRunner
 
 ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android"
 ALLOWED_SOURCE_SUFFIXES = {".java", ".xml"}

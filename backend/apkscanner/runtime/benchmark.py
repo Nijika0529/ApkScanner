@@ -9,9 +9,9 @@ from sqlalchemy import select
 from ..core.config import Settings
 from ..core.db import Database
 from ..core.enums import FindingStatus, ScanStatus
+from ..core.finding_policy import partition_findings
 from ..core.models import BenchmarkEvaluation, EntryPoint, Finding, Scan
 from ..core.schemas import BenchmarkSpec, GroundTruthVulnerability
-from .finding_policy import partition_findings
 
 _PROOF_RANK = {
     FindingStatus.SUPPORTED_STATIC.value: 1,

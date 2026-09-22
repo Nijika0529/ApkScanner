@@ -7,13 +7,17 @@ import threading
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from sqlalchemy import desc, select
 
 from ..core.db import Database
 from ..core.enums import FindingStatus, TaskStatus
+from ..core.finding_policy import (
+    build_static_refutation_gate,
+    evidence_backed_signal_tier,
+)
 from ..core.models import (
     EntryPoint,
     Evidence,
@@ -26,23 +30,23 @@ from ..core.models import (
     Scan,
     SecurityHypothesis,
 )
+from ..core.operator_schemas import OperatorReceipt, OperatorSessionCreate
 from ..core.permissions import ensure_private_directory
 from ..core.proof_receipts import (
     attributable_harm_attempts,
     attributable_refutation_attempts,
 )
 from ..core.repository import invalidate_scan_materialized_summary
-from ..runtime.finding_policy import (
-    build_static_refutation_gate,
-    evidence_backed_signal_tier,
-)
+from ..core.signal_projection import evidence_supports_runtime_observation
+from ..core.verdicts import decide_operator_verdict, normalize_signal_metadata
+from ..infrastructure.artifacts import ArtifactStore
+from ..infrastructure.tools import TimeBudget
 from ..runtime.finding_reports import FindingReport, render_finding_description
-from ..runtime.orchestrator import ScanOrchestrator, _LiveProofContext
+from ..runtime.live_proof import LiveProofContext
 from ..runtime.runtime_contracts import task_gateway_environment
-from ..runtime.signal_projection import evidence_supports_runtime_observation
-from .artifacts import ArtifactStore
-from .operator_schemas import OperatorReceipt, OperatorSessionCreate
-from .tools import TimeBudget
+
+if TYPE_CHECKING:
+    from ..runtime.orchestrator import ScanOrchestrator
 
 _ARTIFACT_SUFFIXES = {".apk", ".apks", ".zip", ".json", ".html", ".js", ".py", ".sh", ".md", ".txt"}
 _ARTIFACT_DIRS = {"poc", "pocs", "output", "outputs", "artifacts", "reports"}
@@ -265,7 +269,7 @@ class PlatformOperatorService:
         with lease_context as lease:
             device = lease.get("device") if isinstance(lease, dict) else None
             if device is not None:
-                endpoint = self.orchestrator._ensure_live_proof_endpoint()
+                endpoint = self.orchestrator.ensure_live_proof_endpoint()
                 port = urlsplit(endpoint).port
                 if port is None:
                     raise RuntimeError("internal Operator gateway has no TCP port")
@@ -293,8 +297,8 @@ class PlatformOperatorService:
                     source_workspace=source_workspace,
                     context={"phase": "platform_operator", "operator_session_id": session_id},
                 )
-                self.orchestrator._register_live_proof_context(
-                    _LiveProofContext(
+                self.orchestrator.register_live_proof_context(
+                    LiveProofContext(
                         token=gateway_token,
                         scan_id=scan.id,
                         task_id=task.id,
@@ -340,7 +344,7 @@ class PlatformOperatorService:
                     "operator",
                 )
                 if gateway_token is not None:
-                    self.orchestrator._unregister_live_proof_context(task.id, gateway_token)
+                    self.orchestrator.unregister_live_proof_context(task.id, gateway_token)
 
         receipt = result.result
         receipt_evidence_id = self._persist_receipt(scan.id, task.id, session_id, turn_id, receipt)
@@ -733,9 +737,7 @@ class PlatformOperatorService:
                     counterevidence=update.counterevidence,
                     blocked_edge=update.blocked_edge,
                 )
-                applied_verdict = update.verdict
-                override_reason: str | None = None
-                preserve_human_closure = (
+                preserve_human_closure = bool(
                     finding.status
                     in {
                         FindingStatus.FALSE_POSITIVE.value,
@@ -744,93 +746,21 @@ class PlatformOperatorService:
                     and isinstance(finding.review_note, str)
                     and finding.review_note.strip()
                 )
-                if preserve_human_closure:
-                    applied_verdict = finding.status
-                    override_reason = (
-                        "A human disposition can only be replaced by an explicit human review. "
-                        "The Operator evidence was retained for that review."
-                    )
-                elif (
-                    update.verdict == "unchanged"
-                    and finding.status == FindingStatus.ACCEPTED.value
-                ):
-                    applied_verdict = finding.status
-                elif harm_attempts:
-                    applied_verdict = FindingStatus.REPRODUCED_BLACKBOX.value
-                    if update.verdict != applied_verdict:
-                        override_reason = (
-                            "An attributable platform harm receipt prevents an Operator downgrade."
-                        )
-                elif update.verdict == "unchanged":
-                    applied_verdict = finding.status
-                elif update.verdict == FindingStatus.REPRODUCED_BLACKBOX.value:
-                    if runtime_observed or existing_tier == "runtime_oracle_gap":
-                        applied_verdict = FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value
-                        override_reason = (
-                            "Runtime behavior was observed, but no attributable platform harm "
-                            "ProofAttempt exists."
-                        )
-                    else:
-                        applied_verdict = FindingStatus.INCONCLUSIVE.value
-                        override_reason = (
-                            "Operator evidence did not include an attributable platform harm "
-                            "ProofAttempt or a platform runtime observation."
-                        )
-                elif update.verdict == FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value:
-                    if not runtime_observed and existing_tier != "runtime_oracle_gap":
-                        applied_verdict = FindingStatus.INCONCLUSIVE.value
-                        override_reason = (
-                            "No platform runtime-observation receipt was attributable to the "
-                            "finding."
-                        )
-                elif update.verdict == FindingStatus.NOT_REPRODUCED.value:
-                    if not refuting_attempts:
-                        applied_verdict = (
-                            FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value
-                            if runtime_observed or existing_tier == "runtime_oracle_gap"
-                            else FindingStatus.INCONCLUSIVE.value
-                        )
-                        override_reason = (
-                            "A negative Operator verdict requires an attributable platform Oracle "
-                            "refutation receipt."
-                        )
-                elif update.verdict == FindingStatus.SUPPORTED_STATIC.value:
-                    if existing_tier == "runtime_oracle_gap":
-                        applied_verdict = FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value
-                        override_reason = (
-                            "A static Operator assessment cannot erase an existing runtime "
-                            "Oracle gap."
-                        )
-                    elif evidence_backed_signal_tier(db, finding) != "static_chain":
-                        applied_verdict = finding.status
-                        override_reason = (
-                            "Static support requires the platform's complete static-chain gate "
-                            "receipt."
-                        )
-                elif update.verdict == FindingStatus.REFUTED_STATIC.value:
-                    if runtime_observed or existing_tier == "runtime_oracle_gap":
-                        applied_verdict = FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value
-                        override_reason = (
-                            "A model-only static refutation cannot close an existing runtime "
-                            "observation; an attributable platform Oracle refutation is required."
-                        )
-                    elif static_refutation_gate["eligible"] is not True:
-                        applied_verdict = (
-                            FindingStatus.INCONCLUSIVE.value
-                        )
-                        override_reason = (
-                            "Static refutation requires attributable usable static Evidence, "
-                            "concrete counterevidence, and an exact guard or blocked edge."
-                        )
-                elif (
-                    update.verdict == FindingStatus.INCONCLUSIVE.value
-                    and existing_tier == "runtime_oracle_gap"
-                ):
-                    applied_verdict = FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value
-                    override_reason = (
-                        "An inconclusive Operator turn cannot erase an existing runtime "
-                        "Oracle gap."
-                    )
+                decision = decide_operator_verdict(
+                    current_status=finding.status,
+                    requested_status=update.verdict,
+                    has_harm_proof=bool(harm_attempts),
+                    has_refutation_proof=bool(refuting_attempts),
+                    runtime_observed=runtime_observed,
+                    existing_signal_tier=existing_tier,
+                    preserve_human_closure=preserve_human_closure,
+                    static_support_eligible=existing_tier == "static_chain",
+                    static_refutation_eligible=(
+                        static_refutation_gate["eligible"] is True
+                    ),
+                )
+                applied_verdict = decision.applied_status
+                override_reason = decision.override_reason
                 finding.status = applied_verdict
                 metadata["harm_demonstrated"] = bool(harm_attempts) or (
                     applied_verdict == FindingStatus.ACCEPTED.value
@@ -838,30 +768,14 @@ class PlatformOperatorService:
                 )
                 metadata["proof_attempt_ids"] = harm_attempt_ids
                 metadata["refutation_attempt_ids"] = refuting_attempt_ids
-                if applied_verdict == FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value:
-                    metadata["signal_tier"] = "runtime_oracle_gap"
-                    metadata["proof_gap_code"] = "missing_platform_harm_oracle"
-                    metadata["oracle_gap"] = {
-                        **(
-                            dict(metadata.get("oracle_gap"))
-                            if isinstance(metadata.get("oracle_gap"), dict)
-                            else {}
-                        ),
-                        "schema_version": "1.0",
-                        "status": "open",
-                        "runtime_observed": bool(
-                            runtime_observed or existing_tier == "runtime_oracle_gap"
-                        ),
-                        "operator_session_id": session_id,
-                    }
-                elif applied_verdict == FindingStatus.SUPPORTED_STATIC.value:
-                    metadata["signal_tier"] = "static_chain"
-                    metadata.pop("proof_gap_code", None)
-                    metadata.pop("oracle_gap", None)
-                else:
-                    metadata.pop("signal_tier", None)
-                    metadata.pop("proof_gap_code", None)
-                    metadata.pop("oracle_gap", None)
+                metadata = normalize_signal_metadata(
+                    metadata,
+                    status=applied_verdict,
+                    runtime_observed=bool(
+                        runtime_observed or existing_tier == "runtime_oracle_gap"
+                    ),
+                    operator_session_id=session_id,
+                )
                 if applied_verdict == FindingStatus.REFUTED_STATIC.value:
                     # Only replace the receipt when the Operator explicitly asked
                     # for a static refutation.  An "unchanged" verdict inherits the

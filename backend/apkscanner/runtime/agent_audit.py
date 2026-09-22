@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..core.models import Evidence
-from ..platform.artifacts import ArtifactStore
+from ..infrastructure.artifacts import ArtifactStore
 
 AGENT_AUDIT_KINDS = {
     "agent.request",

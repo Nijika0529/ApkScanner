@@ -14,9 +14,9 @@ from .core.config import Settings
 from .core.db import Database
 from .core.models import EntryPoint, InvestigationTask, Scan
 from .core.schemas import BenchmarkSpec
-from .platform.artifacts import ArtifactStore
+from .infrastructure.artifacts import ArtifactStore
+from .infrastructure.tools import discover_tools
 from .platform.reports import ReportBuilder
-from .platform.tools import discover_tools
 from .runtime.benchmark import BenchmarkEvaluator
 from .runtime.orchestrator import ScanOrchestrator
 

@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..core.permissions import ensure_private_directory
-from ..platform.tools import TimeBudget, ToolRunner
+from ..infrastructure.tools import TimeBudget, ToolRunner
 from .fast_text_search import files_containing_any
 
 NATIVE_INDEX_SCHEMA_VERSION = "1.0"

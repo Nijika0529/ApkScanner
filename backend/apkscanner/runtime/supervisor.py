@@ -9,7 +9,7 @@ from sqlalchemy import desc, select
 
 from ..core.models import CampaignEntryRecord, CampaignRun, InvestigationTask, Scan
 from ..core.repository import add_event
-from ..platform.capabilities import CapabilityRegistry
+from .capabilities import CapabilityRegistry
 
 
 class TestEntrySeed(BaseModel):

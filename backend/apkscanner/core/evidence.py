@@ -5,13 +5,12 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from ..platform.artifacts import ArtifactStore
-from ..platform.tools import CommandResult
 from .models import Evidence
+from .ports import ArtifactWriter, CommandResultView
 
 
 class EvidenceRecorder:
-    def __init__(self, store: ArtifactStore):
+    def __init__(self, store: ArtifactWriter):
         self.store = store
 
     def command(
@@ -21,7 +20,7 @@ class EvidenceRecorder:
         scan_id: str,
         task_id: str | None,
         kind: str,
-        result: CommandResult,
+        result: CommandResultView,
         metadata: dict[str, Any] | None = None,
     ) -> Evidence:
         payload = {
@@ -79,7 +78,7 @@ class EvidenceRecorder:
         return evidence
 
     @staticmethod
-    def _summary(result: CommandResult) -> str:
+    def _summary(result: CommandResultView) -> str:
         stream = result.stdout.strip() or result.stderr.strip()
         first_line = stream.splitlines()[0] if stream else "no output"
         return f"exit={result.exit_code}: {first_line[:500]}"

@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from ..core.finding_policy import project_findings
 from ..core.models import (
     AgentTurnRecord,
     DynamicExperimentCapsule,
@@ -20,7 +21,6 @@ from ..core.models import (
     SecurityHypothesis,
 )
 from ..core.proof_receipts import evidence_backed_harm_attempts
-from .finding_policy import evidence_backed_signal_tiers, partition_findings
 
 _DYNAMIC_EVIDENCE_PREFIXES = ("blackbox.", "dynamic_experiment.")
 _USAGE_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens")
@@ -120,9 +120,16 @@ def build_scan_quality_summary(session: Session, scan_id: str) -> dict[str, Any]
             str,
         )
     ]
-    confirmed_findings, _signals = partition_findings(session, active_findings)
-    confirmed_finding_ids = {item.id for item in confirmed_findings}
-    finding_tier_by_id = evidence_backed_signal_tiers(session, active_findings)
+    finding_projections = project_findings(session, active_findings)
+    confirmed_findings = [
+        item.finding for item in finding_projections if item.is_confirmed
+    ]
+    confirmed_finding_ids = {
+        item.finding.id for item in finding_projections if item.is_confirmed
+    }
+    finding_tier_by_id = {
+        item.finding.id: item.signal_tier for item in finding_projections
+    }
     statically_supported = {
         item.id
         for item in hypotheses

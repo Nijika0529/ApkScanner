@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import case, select
 from sqlalchemy.orm import Session, selectinload
 
+from ..core.finding_policy import project_findings
 from ..core.models import (
     BenchmarkEvaluation,
     CoverageItem,
@@ -18,7 +19,6 @@ from ..core.models import (
     SecurityHypothesis,
 )
 from ..core.proof_receipts import evidence_backed_harm_attempts
-from ..runtime.finding_policy import evidence_backed_signal_tiers, partition_findings
 
 
 class ReportBuilder:
@@ -52,8 +52,9 @@ class ReportBuilder:
                 )
             )
         )
-        findings, signals = partition_findings(session, finding_records)
-        signal_tiers = evidence_backed_signal_tiers(session, signals)
+        finding_projections = project_findings(session, finding_records)
+        findings = [item.finding for item in finding_projections if item.is_confirmed]
+        signals = [item for item in finding_projections if not item.is_confirmed]
         tasks = list(
             session.scalars(
                 select(InvestigationTask)
@@ -136,8 +137,8 @@ class ReportBuilder:
             "findings": [self._finding(item) for item in findings],
             "signals": [
                 self._finding(
-                    item,
-                    signal_tier=signal_tiers[item.id],
+                    item.finding,
+                    signal_tier=item.signal_tier,
                 )
                 for item in signals
             ],

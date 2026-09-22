@@ -14,10 +14,10 @@ from .core.config import Settings
 from .core.db import Database
 from .core.enums import ScanStatus
 from .core.models import Scan
+from .infrastructure.artifacts import ArtifactStore
 from .platform.api import router
-from .platform.artifacts import ArtifactStore
-from .platform.capabilities import CapabilityRegistry
 from .platform.operator_service import PlatformOperatorService
+from .runtime.capabilities import CapabilityRegistry
 from .runtime.orchestrator import ScanOrchestrator
 from .runtime.supervisor import SupervisorService
 

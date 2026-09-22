@@ -24,6 +24,9 @@ from sqlalchemy.orm import Session, selectinload
 from .. import __version__
 from ..core.db import Database
 from ..core.enums import FindingStatus, ScanStatus, TaskStatus
+from ..core.finding_policy import (
+    project_findings,
+)
 from ..core.models import (
     AdaptiveVerificationCheckpoint,
     AgentSessionRecord,
@@ -37,11 +40,8 @@ from ..core.models import (
     EntryPoint,
     Evidence,
     Finding,
-    IndexedArtifact,
     InvestigationBrief,
     InvestigationTask,
-    OperatorSession,
-    OperatorTurn,
     PatternMatch,
     RuntimeArtifact,
     RuntimeObservation,
@@ -56,14 +56,8 @@ from ..core.models import (
     VulnerabilityOccurrence,
     VulnerabilityPattern,
 )
-from ..core.proof_receipts import (
-    attributable_harm_attempts,
-    attributable_harm_attempts_by_finding,
-)
-from ..core.repository import add_event, invalidate_scan_materialized_summary, now
+from ..core.repository import add_event, now
 from ..core.schemas import (
-    AdbDeviceConnectRequest,
-    AdbDeviceOut,
     AgentAuditOut,
     AgentProofReplay,
     AgentRuntimeObservation,
@@ -108,30 +102,23 @@ from ..core.schemas import (
     VulnerabilityOccurrenceOut,
     VulnerabilityPatternOut,
 )
+from ..core.verdicts import VerdictTransitionError
+from ..infrastructure.artifacts import ArtifactStore, ArtifactTooLargeError
 from ..runtime.adb_gateway import validate_dynamic_experiment_adb_template
 from ..runtime.agent_audit import AGENT_AUDIT_KINDS, build_agent_audits
 from ..runtime.benchmark import BenchmarkEvaluator
-from ..runtime.finding_policy import (
-    evidence_backed_signal_tier,
-    evidence_backed_signal_tiers,
-    partition_findings,
-)
+from ..runtime.capabilities import CapabilityInvocation, CapabilityRegistry
 from ..runtime.orchestrator import ScanOrchestrator
 from ..runtime.quality_metrics import build_scan_quality_summary
 from ..runtime.supervisor import CampaignAppendRequest, CampaignPlan, SupervisorService
-from .artifacts import ArtifactStore, ArtifactTooLargeError
-from .capabilities import CapabilityInvocation, CapabilityRegistry
-from .operator_schemas import (
-    IndexedArtifactOut,
-    OperatorSessionCreate,
-    OperatorSessionOut,
-    OperatorTurnCreate,
-    OperatorTurnOut,
-)
-from .operator_service import PlatformOperatorService
+from .device_routes import router as device_router
+from .finding_review_service import apply_finding_review
+from .operator_routes import router as operator_router
 from .reports import ReportBuilder
 
 router = APIRouter(prefix="/api/v1")
+router.include_router(device_router)
+router.include_router(operator_router)
 reports = ReportBuilder()
 
 
@@ -153,10 +140,6 @@ def get_capability_registry(request: Request) -> CapabilityRegistry:
 
 def get_supervisor(request: Request) -> SupervisorService:
     return request.app.state.supervisor
-
-
-def get_platform_operator(request: Request) -> PlatformOperatorService:
-    return request.app.state.platform_operator
 
 
 def get_session(database: Database = Depends(get_database)):
@@ -373,141 +356,6 @@ def supervisor_snapshot(
     supervisor: SupervisorService = Depends(get_supervisor),
 ) -> dict[str, Any]:
     return supervisor.snapshot()
-
-
-def _operator_session_out(
-    operator_session: OperatorSession,
-    turns: list[OperatorTurn],
-) -> OperatorSessionOut:
-    payload = OperatorSessionOut.model_validate(operator_session).model_dump()
-    payload["turns"] = [OperatorTurnOut.model_validate(turn).model_dump() for turn in turns]
-    return OperatorSessionOut.model_validate(payload)
-
-
-def _schedule_operator_turn(
-    request: Request,
-    service: PlatformOperatorService,
-    session_id: str,
-    turn_id: str,
-) -> None:
-    task = asyncio.create_task(
-        asyncio.to_thread(service.run_turn, session_id, turn_id),
-        name=f"platform-operator-{session_id}-{turn_id}",
-    )
-    request.app.state.background_tasks.add(task)
-    task.add_done_callback(request.app.state.background_tasks.discard)
-
-
-@router.get("/operator/sessions", response_model=list[OperatorSessionOut])
-def list_operator_sessions(
-    limit: int = Query(default=50, ge=1, le=200),
-    service: PlatformOperatorService = Depends(get_platform_operator),
-) -> list[OperatorSessionOut]:
-    result: list[OperatorSessionOut] = []
-    for operator_session in service.list_sessions(limit=limit):
-        current, turns = service.get_session(operator_session.id)
-        result.append(_operator_session_out(current, turns))
-    return result
-
-
-@router.post("/operator/sessions", status_code=202, response_model=OperatorSessionOut)
-async def create_operator_session(
-    payload: OperatorSessionCreate,
-    request: Request,
-    service: PlatformOperatorService = Depends(get_platform_operator),
-) -> OperatorSessionOut:
-    try:
-        session_id, turn_id = service.create_session(payload)
-    except ValueError as exc:
-        raise HTTPException(409, str(exc)) from exc
-    _schedule_operator_turn(request, service, session_id, turn_id)
-    operator_session, turns = service.get_session(session_id)
-    return _operator_session_out(operator_session, turns)
-
-
-@router.post(
-    "/supervisor/operator-dispatch",
-    status_code=202,
-    response_model=OperatorSessionOut,
-)
-async def supervisor_dispatch_operator(
-    payload: OperatorSessionCreate,
-    request: Request,
-    service: PlatformOperatorService = Depends(get_platform_operator),
-) -> OperatorSessionOut:
-    """Stable dispatch API for a future autonomous Supervisor Agent."""
-
-    return await create_operator_session(payload, request, service)
-
-
-@router.get("/operator/sessions/{session_id}", response_model=OperatorSessionOut)
-def get_operator_session(
-    session_id: str,
-    service: PlatformOperatorService = Depends(get_platform_operator),
-) -> OperatorSessionOut:
-    try:
-        operator_session, turns = service.get_session(session_id)
-    except KeyError as exc:
-        raise HTTPException(404, "Operator session not found") from exc
-    return _operator_session_out(operator_session, turns)
-
-
-@router.post(
-    "/operator/sessions/{session_id}/turns",
-    status_code=202,
-    response_model=OperatorSessionOut,
-)
-async def continue_operator_session(
-    session_id: str,
-    payload: OperatorTurnCreate,
-    request: Request,
-    service: PlatformOperatorService = Depends(get_platform_operator),
-) -> OperatorSessionOut:
-    try:
-        turn_id = service.add_turn(session_id, payload.instruction, payload.device_mode)
-    except KeyError as exc:
-        raise HTTPException(404, "Operator session not found") from exc
-    except ValueError as exc:
-        raise HTTPException(409, str(exc)) from exc
-    _schedule_operator_turn(request, service, session_id, turn_id)
-    operator_session, turns = service.get_session(session_id)
-    return _operator_session_out(operator_session, turns)
-
-
-@router.post("/operator/sessions/{session_id}/cancel")
-def cancel_operator_session(
-    session_id: str,
-    service: PlatformOperatorService = Depends(get_platform_operator),
-) -> dict[str, Any]:
-    if not service.cancel(session_id):
-        raise HTTPException(404, "Operator session not found")
-    return {"session_id": session_id, "cancel_requested": True}
-
-
-@router.get("/operator/artifacts", response_model=list[IndexedArtifactOut])
-def list_operator_artifacts(
-    scan_id: str | None = Query(default=None),
-    finding_id: str | None = Query(default=None),
-    operator_session_id: str | None = Query(default=None),
-    service: PlatformOperatorService = Depends(get_platform_operator),
-) -> list[IndexedArtifact]:
-    return service.list_artifacts(
-        scan_id=scan_id,
-        finding_id=finding_id,
-        operator_session_id=operator_session_id,
-    )
-
-
-@router.get("/operator/artifacts/{artifact_id}/download")
-def download_operator_artifact(
-    artifact_id: str,
-    service: PlatformOperatorService = Depends(get_platform_operator),
-) -> FileResponse:
-    try:
-        path = service.artifact_path(artifact_id)
-    except KeyError as exc:
-        raise HTTPException(404, "Artifact not found") from exc
-    return FileResponse(path, filename=path.name, media_type="application/octet-stream")
 
 
 @router.post("/supervisor/campaigns/validate")
@@ -1170,69 +1018,6 @@ def _transition_task(
     return result.rowcount == 1
 
 
-@router.get("/devices", response_model=list[AdbDeviceOut])
-def list_adb_devices(
-    probe: bool = Query(default=False),
-    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
-) -> list[dict[str, Any]]:
-    return orchestrator.list_adb_devices(probe=probe)
-
-
-@router.post("/devices", response_model=AdbDeviceOut, status_code=201)
-def connect_adb_device(
-    control: AdbDeviceConnectRequest,
-    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
-) -> dict[str, Any]:
-    try:
-        return orchestrator.connect_adb_device(
-            control.serial,
-            label=control.label,
-            connect=control.connect,
-        )
-    except (RuntimeError, ValueError) as exc:
-        raise HTTPException(409, str(exc)) from exc
-
-
-@router.post("/devices/{serial}/drain", response_model=AdbDeviceOut)
-def drain_adb_device(
-    serial: str,
-    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
-) -> dict[str, Any]:
-    try:
-        return orchestrator.drain_adb_device(serial)
-    except KeyError as exc:
-        raise HTTPException(404, "ADB device not found") from exc
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
-
-
-@router.post("/devices/{serial}/reconnect", response_model=AdbDeviceOut)
-def reconnect_adb_device(
-    serial: str,
-    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
-) -> dict[str, Any]:
-    try:
-        return orchestrator.reconnect_adb_device(serial)
-    except KeyError as exc:
-        raise HTTPException(404, "ADB device not found") from exc
-    except (RuntimeError, ValueError) as exc:
-        raise HTTPException(409, str(exc)) from exc
-
-
-@router.delete("/devices/{serial}")
-def remove_adb_device(
-    serial: str,
-    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
-) -> dict[str, Any]:
-    try:
-        orchestrator.remove_adb_device(serial)
-    except KeyError as exc:
-        raise HTTPException(404, "ADB device not found") from exc
-    except (RuntimeError, ValueError) as exc:
-        raise HTTPException(409, str(exc)) from exc
-    return {"serial": serial, "deleted": True}
-
-
 @router.get("/health", response_model=HealthResponse)
 def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> HealthResponse:
     tool_versions = {
@@ -1700,12 +1485,12 @@ def create_regression_case(
     )
     session.add(case_record)
     session.flush()
-    confirmed_source, _source_signals = partition_findings(session, [finding])
+    source_projection = project_findings(session, [finding])[0]
     proof_level = (
         "dynamic"
-        if confirmed_source
+        if source_projection.is_confirmed
         else "static"
-        if evidence_backed_signal_tier(session, finding) == "static_chain"
+        if source_projection.signal_tier == "static_chain"
         else "none"
     )
     session.add(
@@ -1834,8 +1619,11 @@ def list_findings(scan_id: str, session: Session = Depends(get_session)) -> list
             )
         )
     )
-    confirmed, _signals = partition_findings(session, findings)
-    return confirmed
+    return [
+        item.finding
+        for item in project_findings(session, findings)
+        if item.is_confirmed
+    ]
 
 
 @router.get("/scans/{scan_id}/signals", response_model=list[FindingSignalOut])
@@ -1860,16 +1648,16 @@ def list_finding_signals(
             )
         )
     )
-    _confirmed, signals = partition_findings(session, findings)
-    signal_tiers = evidence_backed_signal_tiers(session, signals)
-    harm_attempts = attributable_harm_attempts_by_finding(session, signals)
+    projections = [
+        item for item in project_findings(session, findings) if not item.is_confirmed
+    ]
     return [
         FindingSignalOut(
-            **FindingOut.model_validate(finding).model_dump(),
-            signal_tier=signal_tiers[finding.id],
-            can_accept=bool(harm_attempts.get(finding.id)),
+            **FindingOut.model_validate(item.finding).model_dump(),
+            signal_tier=item.signal_tier,
+            can_accept=item.has_harm_proof,
         )
-        for finding in signals
+        for item in projections
     ]
 
 
@@ -2080,117 +1868,15 @@ def review_finding(
     finding = session.get(Finding, finding_id)
     if finding is None:
         raise HTTPException(404, "Finding not found")
-    harm_attempts = attributable_harm_attempts(session, finding)
-    if review.status == FindingStatus.ACCEPTED.value:
-        if not harm_attempts:
-            raise HTTPException(
-                409,
-                (
-                    "Only a proof-backed confirmed finding can be accepted; "
-                    "static candidates and unverified signals must remain pending or be "
-                    "marked false positive."
-                ),
-            )
-        proof_attempt_ids = list(dict.fromkeys(attempt.id for attempt in harm_attempts))
-        proof_evidence_ids = list(
-            dict.fromkeys(
-                evidence_id
-                for attempt in harm_attempts
-                for evidence_id in attempt.evidence_ids
-                if isinstance(evidence_id, str) and evidence_id
-            )
+    try:
+        return apply_finding_review(
+            session,
+            finding,
+            status=review.status,
+            note=review.note,
         )
-        current_evidence_ids = (
-            finding.evidence_ids if isinstance(finding.evidence_ids, list) else []
-        )
-        candidate_evidence_ids = list(
-            dict.fromkeys(
-                evidence_id
-                for evidence_id in [*current_evidence_ids, *proof_evidence_ids]
-                if isinstance(evidence_id, str) and evidence_id
-            )
-        )
-        valid_evidence_ids = set(
-            session.scalars(
-                select(Evidence.id).where(
-                    Evidence.scan_id == finding.scan_id,
-                    Evidence.id.in_(candidate_evidence_ids),
-                )
-            )
-        )
-        finding.evidence_ids = [
-            evidence_id
-            for evidence_id in candidate_evidence_ids
-            if evidence_id in valid_evidence_ids
-        ]
-        metadata = dict(finding.metadata_json) if isinstance(finding.metadata_json, dict) else {}
-        metadata["harm_demonstrated"] = True
-        metadata["proof_attempt_ids"] = proof_attempt_ids
-        metadata["release_gate_eligible"] = any(
-            isinstance(attempt.oracle, dict)
-            and attempt.oracle.get("release_gate_eligible") is True
-            for attempt in harm_attempts
-        )
-        metadata["proof_backlog"] = {
-            **(
-                dict(metadata.get("proof_backlog"))
-                if isinstance(metadata.get("proof_backlog"), dict)
-                else {}
-            ),
-            "status": "verified",
-        }
-        metadata.pop("signal_tier", None)
-        metadata.pop("proof_gap_code", None)
-        metadata.pop("oracle_gap", None)
-        finding.metadata_json = metadata
-    if review.status == FindingStatus.CANDIDATE.value and harm_attempts:
-        raise HTTPException(
-            409,
-            (
-                "A platform-proven finding cannot be downgraded to candidate; "
-                "use an explicit false-positive review to override it."
-            ),
-        )
-    metadata = (
-        dict(finding.metadata_json)
-        if isinstance(finding.metadata_json, dict)
-        else {}
-    )
-    report = metadata.get("report")
-    if isinstance(report, dict):
-        report = dict(report)
-        verification = report.get("verification")
-        verification = dict(verification) if isinstance(verification, dict) else {}
-        if review.status == FindingStatus.ACCEPTED.value:
-            report["kind"] = "finding"
-            verification["status"] = "confirmed"
-            verification["missing_proof"] = None
-            verification["next_step"] = None
-            verification["evidence_ids"] = list(finding.evidence_ids or [])
-            verification["proof_attempt_ids"] = list(
-                metadata.get("proof_attempt_ids") or []
-            )
-        elif review.status == FindingStatus.FALSE_POSITIVE.value:
-            report["kind"] = "pending_risk"
-            verification["status"] = "refuted"
-            verification["missing_proof"] = None
-            verification["next_step"] = None
-        else:
-            report["kind"] = "pending_risk"
-            verification["status"] = "pending"
-        report["verification"] = verification
-        metadata["report"] = report
-        finding.metadata_json = metadata
-    finding.status = review.status
-    finding.review_note = review.note
-    invalidate_scan_materialized_summary(
-        session,
-        finding.scan_id,
-        reason="finding_human_review_changed",
-    )
-    session.commit()
-    session.refresh(finding)
-    return finding
+    except VerdictTransitionError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @router.patch("/scans/{scan_id}/agent-control", response_model=ScanDetail)

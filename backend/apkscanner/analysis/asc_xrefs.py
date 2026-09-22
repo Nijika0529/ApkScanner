@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ..core.config import Settings
-from ..platform.tools import TimeBudget, ToolRunner
+from ..infrastructure.tools import TimeBudget, ToolRunner
 
 QueryKind = Literal["string", "type", "method", "field"]
 

@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ..platform.tools import CommandResult
+from ..infrastructure.tools import CommandResult
 
 _SHELL_META = re.compile(r"[\x00\r\n;&|`$<>]")
 _DYNAMIC_CONTROL_META = re.compile(r"[\x00\r\n;|`<>]")

@@ -10,7 +10,9 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from .config import Settings
+from .migrations import SchemaMigration, SchemaMigrator
 from .permissions import create_private_file, ensure_private_directory, ensure_private_file
+from .startup_reconciliation import StartupReconciler
 
 
 class Base(DeclarativeBase):
@@ -103,19 +105,43 @@ class Database:
     def create_all(self) -> None:
         from . import models  # noqa: F401
 
+        migrator = self._schema_migrator()
         if self._sqlite_read_only:
-            self._validate_read_only_schema()
+            self._validate_read_only_schema(migrator)
         else:
             Base.metadata.create_all(self.engine)
-            self._ensure_runtime_schema_columns()
-            self._reconcile_legacy_direct_reachability_findings()
-            self._reconcile_duplicate_findings()
-            self._reconcile_unproven_dynamic_findings()
-            self._ensure_runtime_schema_guards()
-            self._recover_interrupted_runtime_records()
+            migrator.migrate()
+            StartupReconciler(self).reconcile()
         self._harden_sqlite_files()
 
-    def _validate_read_only_schema(self) -> None:
+    def _schema_migrator(self) -> SchemaMigrator:
+        return SchemaMigrator(
+            self.engine,
+            (
+                SchemaMigration(
+                    revision="20260921_01_entry_point_disposition",
+                    description="add entry-point disposition column and lookup index",
+                    checksum="sha256:8008cc3f0decb3f8d89e99c7315ef975b8257e76a342e620a81a42febad27310",
+                    upgrade=self._ensure_runtime_schema_columns,
+                    is_current=self._entry_disposition_schema_current,
+                ),
+                SchemaMigration(
+                    revision="20260921_02_finding_identity_guard",
+                    description="merge legacy duplicate findings and enforce scan identity",
+                    checksum="sha256:33f0eae886b6bfa1b9afbb17af146d799326911f32042e98be208450f86bf846",
+                    upgrade=self._upgrade_finding_identity_guard,
+                    is_current=lambda: self._findings_unique_guard_exists(
+                        inspect(self.engine)
+                    ),
+                ),
+            ),
+        )
+
+    def _upgrade_finding_identity_guard(self) -> None:
+        self._reconcile_duplicate_findings()
+        self._ensure_runtime_schema_guards()
+
+    def _validate_read_only_schema(self, migrator: SchemaMigrator) -> None:
         """Fail clearly when a legacy database needs a writable migration first."""
 
         inspector = inspect(self.engine)
@@ -134,6 +160,7 @@ class Database:
             inspector
         ):
             missing.append("findings.unique(scan_id,dedupe_key)")
+        missing.extend(migrator.validate_current())
         if missing:
             preview = ", ".join(missing[:10])
             suffix = " ..." if len(missing) > 10 else ""
@@ -169,17 +196,29 @@ class Database:
                     )
                 )
 
+    def _entry_disposition_schema_current(self) -> bool:
+        inspector = inspect(self.engine)
+        if not inspector.has_table("entry_points"):
+            return False
+        columns = {str(item["name"]) for item in inspector.get_columns("entry_points")}
+        if "disposition" not in columns:
+            return False
+        return any(
+            list(item.get("column_names") or []) == ["disposition"]
+            for item in inspector.get_indexes("entry_points")
+        )
+
     def _reconcile_duplicate_findings(self) -> None:
         """Merge legacy duplicates before installing the database uniqueness guard."""
 
         import hashlib
         import json
 
-        from ..runtime.finding_policy import (
+        from .enums import FINDING_STATUS_RANK
+        from .finding_policy import (
             evidence_backed_signal_tier,
             static_refutation_is_evidence_backed,
         )
-        from .enums import FINDING_STATUS_RANK
         from .models import (
             AdaptiveVerificationCheckpoint,
             DynamicExperimentCapsule,
@@ -842,11 +881,11 @@ class Database:
     def _reconcile_unproven_dynamic_findings(self) -> None:
         """Repair crash-boundary drift between platform proof receipts and Finding state."""
 
-        from ..runtime.finding_policy import (
+        from .enums import FindingStatus
+        from .finding_policy import (
             evidence_backed_signal_tier,
             static_refutation_is_evidence_backed,
         )
-        from .enums import FindingStatus
         from .models import Evidence, Finding, InvestigationTask, SecurityHypothesis
         from .proof_receipts import (
             attributable_refutation_attempts,

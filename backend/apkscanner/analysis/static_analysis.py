@@ -18,7 +18,7 @@ from defusedxml.common import DefusedXmlException
 
 from ..core.config import Settings
 from ..core.permissions import ensure_private_directory
-from ..platform.tools import CommandResult, TimeBudget, ToolRunner, discover_tools
+from ..infrastructure.tools import CommandResult, TimeBudget, ToolRunner, discover_tools
 from .android_chains import AndroidAttackChainAnalyzer
 from .fast_text_search import files_containing_any
 from .manifest import ManifestDocument, aapt2_xmltree_to_xml, parse_manifest

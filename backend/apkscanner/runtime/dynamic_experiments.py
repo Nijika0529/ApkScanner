@@ -19,13 +19,13 @@ from ..core.models import (
 )
 from ..core.repository import add_event, invalidate_scan_materialized_summary
 from ..core.schemas import DynamicExperimentStepSpec
+from ..core.signal_projection import project_runtime_observation_gap
 from .adb_gateway import (
     quote_dynamic_experiment_adb_args,
     validate_dynamic_experiment_adb_args,
     validate_dynamic_experiment_adb_template,
 )
 from .device import AdbDeviceAdapter, AdbDevicePool, DeviceLeaseCancelledError
-from .signal_projection import project_runtime_observation_gap
 
 _STATE_REFERENCE = re.compile(r"\$\{([A-Za-z][A-Za-z0-9_.-]{0,127})\}")
 

@@ -9,9 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..core.agent_execution import WorkspaceManifest, WorkspaceMount
 from ..core.config import Settings
 from ..core.permissions import ensure_private_directory
-from .agent_execution import WorkspaceManifest, WorkspaceMount
 
 _IDENTIFIER = re.compile(r"^[a-f0-9-]{8,64}$")
 _ROLE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
