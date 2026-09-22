@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+if os.name == "posix":
+    import fcntl
 
 from sqlalchemy import create_engine, event, inspect, select, text, update
 from sqlalchemy.engine import make_url
@@ -109,10 +114,36 @@ class Database:
         if self._sqlite_read_only:
             self._validate_read_only_schema(migrator)
         else:
-            Base.metadata.create_all(self.engine)
-            migrator.migrate()
-            StartupReconciler(self).reconcile()
+            # SQLite's schema check and DDL are not one atomic operation. Two
+            # server processes starting against the same legacy database can
+            # otherwise both observe a missing table/column and race while
+            # creating it. Keep all startup writes under one process-shared
+            # lock, including reconciliation, so the second starter validates
+            # the state established by the first one instead of replaying it.
+            with self._startup_write_lock():
+                Base.metadata.create_all(self.engine)
+                migrator.migrate()
+                StartupReconciler(self).reconcile()
         self._harden_sqlite_files()
+
+    @contextmanager
+    def _startup_write_lock(self) -> Generator[None, None, None]:
+        """Serialize SQLite startup DDL and repairs across local processes."""
+
+        if self._sqlite_path is None or os.name != "posix":
+            yield
+            return
+
+        lock_path = Path(f"{self._sqlite_path}.startup.lock")
+        create_private_file(lock_path)
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(lock_path, flags)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
 
     def _schema_migrator(self) -> SchemaMigrator:
         return SchemaMigrator(
