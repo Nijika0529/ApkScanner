@@ -181,6 +181,31 @@ def test_platform_materializes_a_request_scoped_binder_harness(settings, tmp_pat
     assert 'android:debuggable="true"' in manifest
 
 
+def test_platform_provider_harness_emits_the_row_count_protocol(settings, tmp_path) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    builder = PocBuilder(settings, ToolRunner(settings), ArtifactStore(settings))
+    request = AgentRequestedTest(
+        hypothesis_id="11111111-2222-4333-8444-555555555555",
+        entry_point_id="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        uri="content://com.example.target.secrets/secrets",
+        operation="query",
+        oracle=AgentOracleSpec(
+            kind="provider_rows", minimum_rows=1, impact="unauthorized_data_access"
+        ),
+        rationale="Read exported rows from an ordinary-app UID.",
+    )
+    spec = builder.materialize_proof_harness(
+        tmp_path,
+        request,
+        entry_kind="provider",
+        target_package_name="com.example.target",
+        provider_authority="com.example.target.secrets",
+    )
+    source_key = (str(tmp_path.resolve()), spec.project_path, spec.package_name)
+    source = builder._platform_proof_sources[source_key][1][0][1].decode()
+    assert 'result.put("row_count", cursor == null ? -1 : cursor.getCount())' in source
+
+
 def test_platform_proof_source_is_scoped_to_one_workspace(settings, tmp_path) -> None:  # noqa: ANN001
     settings.ensure_directories()
     builder = PocBuilder(settings, ToolRunner(settings), ArtifactStore(settings))

@@ -38,10 +38,27 @@ class Settings:
     adaptive_verifier_timeout_seconds: int = 3_600
     adaptive_verifier_prompt_max_chars: int = 400_000
     adaptive_verifier_resume_attempts: int = 1
-    adaptive_verifier_copy_host_ssh: bool = True
+    adaptive_verifier_copy_host_ssh: bool = False
     adaptive_verifier_ssh_source: Path | None = None
+    # A separate, read-only semantic judge may use an explicitly selected
+    # ChatGPT-authenticated Codex home. Never infer or copy account credentials
+    # into the DeepSeek worker's home or an agent workspace.
+    semantic_judge_enabled: bool = False
+    semantic_judge_model: str = "gpt-6-luna"
+    semantic_judge_timeout_seconds: int = 120
+    semantic_judge_codex_home: Path | None = None
     # Ports the authorized remote (Aliyun) host can expose to the public internet.
     ssh_public_port_range: tuple[int, int] | None = None
+    # Exact origins of operator-authorized HTML/callback/readback servers.
+    external_observer_origins: tuple[str, ...] = ()
+    # Optional public HTTPS Web observer, forwarded through a dedicated,
+    # loopback-bound SSH tunnel. Agent workspaces never receive this SSH config.
+    web_observer_remote_enabled: bool = False
+    web_observer_ssh_alias: str | None = None
+    web_observer_allowed_ssh_aliases: tuple[str, ...] = ()
+    web_observer_ssh_config: Path | None = None
+    web_observer_public_base_url: str | None = None
+    web_observer_remote_loopback_port: int = 15880
     agent_permission_profile: str = "personal_lab"
     investigator_backend: str = "codex"
     codex_enabled: bool = False
@@ -147,9 +164,7 @@ class Settings:
         validation_profile = (
             os.getenv("APKSCANNER_VALIDATION_PROFILE", "development").strip().lower()
         )
-        if configured_verifier_ssh is None:
-            verifier_ssh_source: Path | None = (Path.home() / ".ssh").resolve()
-        elif configured_verifier_ssh.strip():
+        if configured_verifier_ssh is not None and configured_verifier_ssh.strip():
             verifier_ssh_source = Path(configured_verifier_ssh.strip()).expanduser().resolve()
         else:
             verifier_ssh_source = None
@@ -218,9 +233,20 @@ class Settings:
                 ),
             ),
             adaptive_verifier_copy_host_ssh=_env_bool(
-                "APKSCANNER_ADAPTIVE_VERIFIER_COPY_HOST_SSH", True
+                "APKSCANNER_ADAPTIVE_VERIFIER_COPY_HOST_SSH", False
             ),
             adaptive_verifier_ssh_source=verifier_ssh_source,
+            semantic_judge_enabled=_env_bool("APKSCANNER_SEMANTIC_JUDGE_ENABLED"),
+            semantic_judge_model=os.getenv("APKSCANNER_SEMANTIC_JUDGE_MODEL", "gpt-6-luna"),
+            semantic_judge_timeout_seconds=max(
+                30,
+                min(600, int(os.getenv("APKSCANNER_SEMANTIC_JUDGE_TIMEOUT_SECONDS", 120))),
+            ),
+            semantic_judge_codex_home=(
+                Path(os.environ["APKSCANNER_SEMANTIC_JUDGE_CODEX_HOME"]).expanduser().resolve()
+                if os.getenv("APKSCANNER_SEMANTIC_JUDGE_CODEX_HOME")
+                else None
+            ),
             ssh_public_port_range=ssh_public_port_range,
             agent_permission_profile=os.getenv(
                 "APKSCANNER_AGENT_PERMISSION_PROFILE", "personal_lab"
@@ -373,6 +399,35 @@ class Settings:
                 "APKSCANNER_PROOF_REPLAY_BASE_URL",
                 "http://127.0.0.1:8000",
             ).rstrip("/"),
+            external_observer_origins=tuple(
+                value.strip().rstrip("/")
+                for value in os.getenv("APKSCANNER_EXTERNAL_OBSERVER_ORIGINS", "").split(",")
+                if value.strip()
+            ),
+            web_observer_remote_enabled=_env_bool("APKSCANNER_WEB_OBSERVER_REMOTE_ENABLED"),
+            web_observer_ssh_alias=(
+                os.getenv("APKSCANNER_WEB_OBSERVER_SSH_ALIAS") or ""
+            ).strip() or None,
+            web_observer_allowed_ssh_aliases=tuple(
+                dict.fromkeys(
+                    value.strip()
+                    for value in os.getenv(
+                        "APKSCANNER_WEB_OBSERVER_ALLOWED_SSH_ALIASES", ""
+                    ).split(",")
+                    if value.strip()
+                )
+            ),
+            web_observer_ssh_config=(
+                Path(os.environ["APKSCANNER_WEB_OBSERVER_SSH_CONFIG"]).expanduser().resolve()
+                if os.getenv("APKSCANNER_WEB_OBSERVER_SSH_CONFIG")
+                else None
+            ),
+            web_observer_public_base_url=(
+                os.getenv("APKSCANNER_WEB_OBSERVER_PUBLIC_BASE_URL") or ""
+            ).strip().rstrip("/") or None,
+            web_observer_remote_loopback_port=int(
+                os.getenv("APKSCANNER_WEB_OBSERVER_REMOTE_LOOPBACK_PORT", "15880")
+            ),
             validation_profile=validation_profile,
             device_min_api=max(
                 1,
@@ -431,6 +486,33 @@ class Settings:
 
         if self.investigator_backend not in {"codex", "none"}:
             raise ValueError("APKSCANNER_INVESTIGATOR_BACKEND must be codex or none")
+        if self.adaptive_verifier_copy_host_ssh and self.adaptive_verifier_ssh_source is None:
+            raise ValueError(
+                "SSH credential copying requires an explicit "
+                "APKSCANNER_ADAPTIVE_VERIFIER_SSH_SOURCE directory"
+            )
+        if self.web_observer_remote_enabled:
+            if (
+                self.web_observer_ssh_alias is None
+                or self.web_observer_ssh_alias not in self.web_observer_allowed_ssh_aliases
+                or self.web_observer_ssh_config is None
+                or self.web_observer_public_base_url is None
+            ):
+                raise ValueError(
+                    "remote Web observer requires an allowlisted SSH alias, dedicated "
+                    "SSH config, and public HTTPS origin"
+                )
+            if not 1 <= self.web_observer_remote_loopback_port <= 65535:
+                raise ValueError("remote Web observer loopback port is invalid")
+        if self.semantic_judge_enabled:
+            if self.semantic_judge_codex_home is None:
+                raise ValueError(
+                    "semantic judge requires an explicit APKSCANNER_SEMANTIC_JUDGE_CODEX_HOME"
+                )
+            if not self.semantic_judge_codex_home.is_dir():
+                raise ValueError("semantic judge Codex home must be an existing directory")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", self.semantic_judge_model):
+                raise ValueError("semantic judge model has an invalid identifier")
         if self.adaptive_verifier_min_severity not in {
             "critical",
             "high",

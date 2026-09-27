@@ -1,6 +1,7 @@
 {
   "schema_version": "1.0",
   "name": "APKScanner minimal vulnerable Android fixture",
+  "apk_sha256": "dea62187a36d9394c604c7523723b8068904c10add8fea58a53435677fa689a3",
   "quality_gate": {
     "minimum_precision": 1.0,
     "minimum_recall": 1.0,
@@ -47,7 +48,10 @@
       "severity": "high",
       "minimum_proof": "dynamic",
       "match": {
-        "entry_names": ["io.apkscanner.vulntest.SecretProvider"]
+        "entry_names": ["io.apkscanner.vulntest.SecretProvider"],
+        "oracle_kinds": ["provider_rows"],
+        "oracle_impacts": ["unauthorized_data_access"],
+        "observed_fact_types": ["provider_rows_returned"]
       }
     },
     {
@@ -57,7 +61,10 @@
       "severity": "high",
       "minimum_proof": "dynamic",
       "match": {
-        "entry_names": ["io.apkscanner.vulntest.CommandService"]
+        "entry_names": ["io.apkscanner.vulntest.CommandService"],
+        "oracle_kinds": ["binder_reply"],
+        "oracle_impacts": ["unauthorized_data_access"],
+        "observed_fact_types": ["binder_reply_matched"]
       }
     },
     {

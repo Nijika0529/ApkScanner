@@ -55,6 +55,9 @@ API、报告、质量指标和扫描收尾应消费 `project_findings`，不应�
 - `runtime/adaptive_verification.py`：候选合并、自适应验证和平台裁决投影。
 - `runtime/finalization.py`：最终 Finding 投影、入口 disposition、seal 和 final event。
 - `runtime/static_analysis_pipeline.py`：静态工具、入口、Finding seed、Evidence 和调查计划的物化流水线。
+- `core/investigation_loop.py`：只根据平台事实决定调查环继续或关闭，不执行 I/O。
+- `runtime/investigation_loop.py`：把模型结果归一为可比较的进展状态；不参与 Finding 裁决。
+- `runtime/task_execution_state.py`：持久化单轮 DAG 阶段与调查环的轻量状态投影。
 - `runtime/agent_audit.py::AgentAuditRecorder`：Agent request/response 审计以及 container/session/turn 生命周期。
 - `runtime/device_registry.py`：持久化设备注册、健康探测和运行时 device pool 同步。
 - `platform/dependencies.py`：无路由的 FastAPI 依赖和实体查找边界。

@@ -16,6 +16,7 @@ from ..core.models import (
     DynamicExperimentReceipt,
     Finding,
     RuntimeObservation,
+    ValidationFixture,
 )
 from ..core.repository import add_event, invalidate_scan_materialized_summary
 from ..core.schemas import DynamicExperimentStepSpec
@@ -36,6 +37,44 @@ def _now() -> datetime:
 
 class DynamicExperimentPolicyError(ValueError):
     """A persisted Capsule violates the platform-owned command policy."""
+
+
+def fixture_state_check(payload: dict[str, Any], fixture_id: str) -> DynamicExperimentStepSpec:
+    """Compile an operator fixture into a bounded, observable device precondition."""
+
+    raw = payload.get("state_check")
+    if not isinstance(raw, dict):
+        raise DynamicExperimentPolicyError(
+            f"fixture {fixture_id} has no executable state_check; instructions alone are not proof"
+        )
+    try:
+        step = DynamicExperimentStepSpec.model_validate(raw)
+        if step.phase != "assert" or not (step.stdout_contains or step.stdout_regex):
+            raise ValueError("state_check requires an assert step with an output predicate")
+        if step.continue_on_failure or step.capture_stdout_as is not None:
+            raise ValueError("state_check cannot continue on failure or capture state")
+        if any(_STATE_REFERENCE.search(argument) for argument in step.adb_args):
+            raise ValueError("state_check cannot depend on mutable experiment variables")
+        validate_dynamic_experiment_adb_template(step.adb_args)
+        args = step.adb_args
+        if (
+            len(args) < 3
+            or args[0] != "shell"
+            or args[1] not in {"dumpsys", "pm", "content", "pidof", "ps", "getprop", "uiautomator"}
+            or (args[1] == "pm" and args[2] not in {"dump", "get-app-links", "path"})
+            or (args[1] == "content" and args[2] != "query")
+            or (args[1] == "uiautomator" and args[2] != "dump")
+        ):
+            raise ValueError("state_check must read live device state, not a synthetic shell value")
+    except ValueError as exc:
+        raise DynamicExperimentPolicyError(f"fixture {fixture_id} state_check: {exc}") from exc
+    return step.model_copy(
+        update={
+            "id": f"fixture:{fixture_id}",
+            "title": f"Verify fixture {fixture_id}",
+            "observation_kind": "fixture.state_verified",
+        }
+    )
 
 
 class DynamicExperimentService:
@@ -214,6 +253,23 @@ class DynamicExperimentService:
                 ]
                 for step in all_steps:
                     validate_dynamic_experiment_adb_template(step.adb_args)
+                fixture_checks: list[dict[str, Any]] = []
+                for fixture_id in capsule.fixture_ids or []:
+                    fixture = session.get(ValidationFixture, fixture_id)
+                    if (
+                        fixture is None
+                        or fixture.status != "active"
+                        or fixture.scan_id != capsule.scan_id
+                        or (fixture.task_id is not None and fixture.task_id != capsule.task_id)
+                    ):
+                        raise DynamicExperimentPolicyError(
+                            f"fixture {fixture_id} is unavailable for this experiment"
+                        )
+                    fixture_checks.append(
+                        fixture_state_check(dict(fixture.payload or {}), fixture_id).model_dump(
+                            mode="json"
+                        )
+                    )
             except ValueError as exc:
                 raise DynamicExperimentPolicyError(str(exc)) from exc
             if preferred_serial is not None:
@@ -223,6 +279,10 @@ class DynamicExperimentService:
             capsule.error = None
             capsule.completed_at = None
             capsule.started_at = capsule.started_at or _now()
+            capsule.state_json = {
+                **dict(capsule.state_json or {}),
+                "fixture_checks": fixture_checks,
+            }
             add_event(
                 session,
                 capsule.scan_id,
@@ -245,9 +305,23 @@ class DynamicExperimentService:
             capsule = session.get(DynamicExperimentCapsule, capsule_id)
             assert capsule is not None
             main_steps = [DynamicExperimentStepSpec.model_validate(item) for item in capsule.steps]
+            fixture_checks = [
+                DynamicExperimentStepSpec.model_validate(item)
+                for item in dict(capsule.state_json or {}).get("fixture_checks", [])
+            ]
             cleanup_steps = [
                 DynamicExperimentStepSpec.model_validate(item) for item in capsule.cleanup_steps
             ]
+
+        for step in fixture_checks:
+            if cancel_event.is_set() or self._cancel_requested(capsule_id):
+                self._mark_canceled(capsule_id)
+                return
+            # A previously passed fixture does not survive a pause/resume: the
+            # authenticated session may have expired in the meantime.
+            if not self._execute_step(capsule_id, step, adapter):
+                self._mark_paused(capsule_id, [step.id])
+                return
 
         failures: list[str] = []
         for step in main_steps:

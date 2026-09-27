@@ -649,6 +649,7 @@ function Overview({ scan, health, coverage, quality }: { scan: Scan; health: Hea
 function QualityFunnel({ quality }: { quality: ScanQualitySummary }) {
   const oracleGap = quality.funnel.find((stage) => stage.key === "runtime_observed_unverified")
   const mainFunnel = quality.funnel.filter((stage) => stage.key !== "runtime_observed_unverified")
+  const webStages = quality.web_proof_funnel ?? []
   const formatCount = (value: number) => new Intl.NumberFormat("zh-CN").format(value)
   const formatMinutes = (seconds: number) => `${(seconds / 60).toFixed(seconds >= 600 ? 0 : 1)} 分钟`
   return <section className="space-y-4">
@@ -661,6 +662,13 @@ function QualityFunnel({ quality }: { quality: ScanQualitySummary }) {
       </div>)}
     </div>
     {oracleGap && <div className="flex flex-col gap-2 rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between"><div><p className="text-xs font-semibold text-cyan-950">旁路：{oracleGap.label}</p><p className="mt-1 text-xs leading-5 text-cyan-800">已观察到运行行为，但尚未由平台 Oracle 证明安全影响，因此不进入“危害已证明”主漏斗。</p></div><Badge tone="info">{formatCount(oracleGap.count)}</Badge></div>}
+    {webStages.some((stage) => stage.count > 0) && <div className="rounded-xl border border-violet-200 bg-violet-50/50 p-4">
+      <p className="text-sm font-semibold text-violet-950">Web / JSBridge 证据分层</p>
+      <p className="mt-1 text-xs leading-5 text-violet-800">页面回调与目标主帧、独立影响分别计数；只有正式证明一栏代表通过完整裁决。</p>
+      <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7">
+        {webStages.map((stage) => <div key={stage.key} className="rounded-lg border border-violet-100 bg-white px-3 py-2"><p className="text-[11px] text-slate-500">{stage.label}</p><p className="mt-1 text-lg font-bold tabular-nums text-slate-900">{formatCount(stage.count)}</p></div>)}
+      </div>
+    </div>}
     <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
       <QualityCost label="Agent 调用" value={formatCount(quality.cost.agent_calls)} detail={`${formatCount(quality.cost.completed_agent_calls)} 次完成`} />
       <QualityCost label="Agent 时长" value={formatMinutes(quality.cost.agent_seconds)} detail={`${quality.phase_usage.length} 个阶段`} />

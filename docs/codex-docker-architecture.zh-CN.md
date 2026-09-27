@@ -72,7 +72,7 @@ flowchart LR
 
 固定 Worker 镜像包含：
 
-- Python 3.13 与 `openai-codex==0.147.0`；
+- Python 3.13 与 `openai-codex==0.156.1`；
 - Codex CLI、Node.js 22.13、OpenJDK 17；
 - Android Platform 36 与 Build Tools 36.1；
 - JADX 1.5.6、Apktool 3.0.3、Smali、ripgrep、git、curl、jq、sqlite3；
@@ -111,7 +111,7 @@ Docker label 对账，不依据模糊容器名称删除其他实例。
 主调用链固定使用 Python SDK：
 
 ```text
-openai-codex==0.147.0
+openai-codex==0.156.1
 provider=deepseek
 model=deepseek-flash
 web_search=live
@@ -181,6 +181,11 @@ Worker 优先使用 `output_schema`。模型偶发在 JSON 前后添加说明或
 Primary 从平台分配的入口和 SecurityHypothesis 出发，读取完整反编译输入、使用 Bash/Web Search、
 生成 PoC，并将实验交给 Proof Gateway。每轮真实结果会回灌同一 Thread，直到假设闭环、没有新的
 实质动作、任务取消或生命周期结束。
+
+外层调查环由平台而不是 Thread 控制。单轮固定为 `plan → validate → execute → verify`；只有平台
+判定仍存在有效动作、执行环境可用、预算有效且尚未达到连续无进展阈值时才进入 `replan`。任务结果中的
+`investigation_loop` 是该控制状态的轻量投影，详细输入输出继续读取 Agent Turn、ProofAttempt 和
+Evidence，避免建立第二套证据账本。
 
 ### 7.2 Critic 与 Rescue
 

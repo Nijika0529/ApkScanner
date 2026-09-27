@@ -13,8 +13,10 @@ import xml.etree.ElementTree as ElementTree
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from ..core.config import Settings
 from ..core.models import EntryPoint
@@ -457,7 +459,7 @@ class AdbDeviceAdapter:
     def _probe_capability(self) -> dict[str, Any]:
         """Probe device health while the caller owns the command lock."""
         state = self._adb(["get-state"], timeout=30)
-        if state.exit_code != 0:
+        if state.exit_code != 0 or state.stdout.strip() != "device":
             verdict_metadata = {
                 **self.settings.verdict_metadata(None),
                 "verdict_scope": "unavailable",
@@ -467,12 +469,16 @@ class AdbDeviceAdapter:
                 "state": state.stdout.strip(),
                 "serial": self.serial,
                 "detail": state.stderr.strip() or "ADB device is unavailable",
+                "failure_category": "device_unavailable",
                 **verdict_metadata,
             }
             self._last_capability = dict(result)
             self._last_capability_at = time.monotonic()
             return result
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="adb-capability") as executor:
+        # getprop and shell can keep working while system_server's package or
+        # activity service is unavailable. Both services must answer a semantic
+        # read-only query before this device can issue a dynamic verdict.
+        with ThreadPoolExecutor(max_workers=5, thread_name_prefix="adb-capability") as executor:
             version_future = executor.submit(
                 self._adb, ["shell", "getprop", "ro.build.version.release"], 30
             )
@@ -480,21 +486,45 @@ class AdbDeviceAdapter:
                 self._adb, ["shell", "getprop", "ro.build.version.sdk"], 30
             )
             root_future = executor.submit(self._adb, ["shell", "id", "-u"], 30)
+            package_future = executor.submit(
+                self._adb, ["shell", "cmd", "package", "path", "android"], 30
+            )
+            activity_future = executor.submit(
+                self._adb, ["shell", "am", "get-current-user"], 30
+            )
             version = version_future.result()
             sdk = sdk_future.result()
             root = root_future.result()
+            package = package_future.result()
+            activity = activity_future.result()
         actual_api = sdk.stdout.strip()
         try:
             actual_api_number = int(actual_api)
         except ValueError:
             actual_api_number = None
+        package_ready = package.exit_code == 0 and any(
+            line.startswith("package:/") for line in package.stdout.splitlines()
+        )
+        activity_ready = activity.exit_code == 0 and activity.stdout.strip().isdigit()
+        framework_ready = package_ready and activity_ready
         ready = (
             state.exit_code == 0
             and actual_api_number is not None
             and self.settings.device_min_api <= actual_api_number <= self.settings.device_max_api
+            and framework_ready
         )
         detail = None
-        if not ready:
+        if not framework_ready:
+            unavailable = []
+            for label, result, healthy in (
+                ("package", package, package_ready),
+                ("activity", activity, activity_ready),
+            ):
+                if not healthy:
+                    diagnostic = (result.stderr or result.stdout).strip()[:300]
+                    unavailable.append(f"{label}: {diagnostic or 'no valid service response'}")
+            detail = "Android framework service unavailable (" + "; ".join(unavailable) + ")"
+        elif not ready:
             detail = (
                 f"expected Android API {self.settings.device_min_api}.."
                 f"{self.settings.device_max_api}, found {version.stdout.strip()} / API "
@@ -509,6 +539,17 @@ class AdbDeviceAdapter:
             "root": root.exit_code == 0 and root.stdout.strip() == "0",
             "serial": self.serial,
             "detail": detail,
+            "failure_category": (
+                "device_framework_unavailable"
+                if not framework_ready
+                else "device_profile_mismatch"
+                if not ready
+                else None
+            ),
+            "framework_services": {
+                "package": package_ready,
+                "activity": activity_ready,
+            },
             **{
                 key: value if ready else False
                 for key, value in verdict_metadata.items()
@@ -557,19 +598,11 @@ class AdbDeviceAdapter:
                 "APKSCANNER_DEVICE_INSTALL_POLICY must be replace, "
                 "install_or_reuse, or reuse_installed"
             )
-        if policy == "reuse_installed" and installed.exit_code == 0:
-            install = installed
-            commands.append(
-                (
-                    "device.install",
-                    install,
-                    {
-                        "package": package_name,
-                        "install_mode": "reuse_installed",
-                        "reuse_verified": True,
-                    },
-                )
-            )
+        reuse_existing = policy == "reuse_installed" and installed.exit_code == 0
+        install_mode = "reuse_installed" if reuse_existing else "replace"
+        install_error = ""
+        if reuse_existing:
+            attempted = installed
         else:
             attempted = self._adb_budget(
                 ["install", "-r", "-t", str(apk_path)],
@@ -577,7 +610,7 @@ class AdbDeviceAdapter:
                 300,
             )
             if (
-                attempted.exit_code != 0
+                not self._poc_install_diagnostics(attempted)["install_accepted"]
                 and policy == "install_or_reuse"
                 and installed.exit_code == 0
             ):
@@ -588,28 +621,46 @@ class AdbDeviceAdapter:
                         {"package": package_name, "fallback": "reuse_installed"},
                     )
                 )
-                install = installed
-                commands.append(
-                    (
-                        "device.install",
-                        install,
-                        {
-                            "package": package_name,
-                            "install_mode": "reuse_after_install_failure",
-                            "install_error": attempted.stderr[-4000:],
-                            "reuse_verified": True,
-                        },
-                    )
+                reuse_existing = True
+                install_mode = "reuse_after_install_failure"
+                install_error = attempted.stderr[-4000:]
+        if not reuse_existing and not self._poc_install_diagnostics(attempted)["install_accepted"]:
+            install = attempted
+            if install.exit_code == 0:
+                install = CommandResult(
+                    attempted.argv, 1, attempted.stdout, attempted.stderr or "adb install failed"
                 )
-            else:
-                install = attempted
-                commands.append(
-                    (
-                        "device.install",
-                        install,
-                        {"package": package_name, "install_mode": "replace"},
-                    )
-                )
+            commands.append(
+                ("device.install", install, {"package": package_name, "install_mode": install_mode})
+            )
+            return commands
+
+        identity_commands, identity = self._verify_installed_apk(apk_path, package_name, budget)
+        commands.extend(identity_commands)
+        if identity["verified"]:
+            install = attempted if not reuse_existing else CommandResult(
+                installed.argv, 0, installed.stdout, ""
+            )
+        else:
+            install = CommandResult(
+                attempted.argv,
+                1,
+                attempted.stdout,
+                f"installed APK identity could not be verified: {identity['reason']}",
+            )
+        commands.append(
+            (
+                "device.install",
+                install,
+                {
+                    "package": package_name,
+                    "install_mode": install_mode,
+                    "install_error": install_error,
+                    "reuse_verified": bool(reuse_existing and identity["verified"]),
+                    **identity,
+                },
+            )
+        )
         if install.exit_code != 0:
             return commands
         if self.settings.device_reset_policy != "never":
@@ -633,6 +684,55 @@ class AdbDeviceAdapter:
             )
         )
         return commands
+
+    def _verify_installed_apk(
+        self, apk_path: Path, package_name: str, budget: TimeBudget | None
+    ) -> tuple[list[tuple[str, CommandResult, dict]], dict[str, Any]]:
+        """Require the installed APK bytes to match the scan artifact exactly."""
+
+        commands: list[tuple[str, CommandResult, dict]] = []
+        metadata: dict[str, Any] = {"verified": False, "reason": "unknown"}
+        try:
+            digest = hashlib.sha256()
+            with apk_path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            metadata["expected_sha256"] = digest.hexdigest()
+        except OSError as exc:
+            metadata["reason"] = f"input APK unreadable: {exc}"
+            return commands, metadata
+
+        paths_result = self._adb_budget(["shell", "pm", "path", package_name], budget, 45)
+        commands.append(("device.apk_identity_paths", paths_result, {"package": package_name}))
+        paths = [
+            line.removeprefix("package:").strip()
+            for line in paths_result.stdout.splitlines()
+            if line.startswith("package:")
+        ]
+        if paths_result.exit_code != 0 or len(paths) != 1:
+            metadata["reason"] = "installed package path unavailable or split APKs present"
+            return commands, metadata
+        installed_path = paths[0]
+        if not installed_path.startswith("/") or "\x00" in installed_path:
+            metadata["reason"] = "invalid installed APK path"
+            return commands, metadata
+        metadata["installed_apk_path"] = installed_path
+        hash_result = self._adb_budget(
+            ["shell", "sha256sum", shlex.quote(installed_path)], budget, 45
+        )
+        commands.append(("device.apk_identity_hash", hash_result, {"package": package_name}))
+        hash_match = re.fullmatch(r"([a-fA-F0-9]{64})\s+(.+)", hash_result.stdout.strip())
+        if (
+            hash_result.exit_code != 0
+            or hash_match is None
+            or hash_match.group(2) != installed_path
+        ):
+            metadata["reason"] = "installed APK SHA-256 unavailable"
+            return commands, metadata
+        metadata["installed_sha256"] = hash_match.group(1).lower()
+        metadata["verified"] = metadata["installed_sha256"] == metadata["expected_sha256"]
+        metadata["reason"] = "match" if metadata["verified"] else "SHA-256 mismatch"
+        return commands, metadata
 
     def cleanup(self, package_name: str) -> list[tuple[str, CommandResult, dict]]:
         self._validate_package(package_name)
@@ -1030,6 +1130,7 @@ class AdbDeviceAdapter:
         oracle: AgentOracleSpec | None = None,
         test_case_id: str | None = None,
         build_metadata: dict[str, Any] | None = None,
+        ui_baseline_component: str | None = None,
     ) -> DeviceProbeResult:
         """Install and launch a dedicated PoC as an ordinary application UID."""
         if not self.configured:
@@ -1038,6 +1139,11 @@ class AdbDeviceAdapter:
         self._validate_package(target_package_name)
         if spec.package_name == target_package_name:
             raise ValueError("PoC package must differ from the target package")
+        if ui_baseline_component is not None and not (
+            ui_baseline_component.startswith(f"{target_package_name}.")
+            and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.$]+", ui_baseline_component)
+        ):
+            raise ValueError("UI baseline component must belong to the target package")
         if not apk_path.is_file():
             raise ValueError("platform-built PoC APK is unavailable")
         component = (
@@ -1211,6 +1317,8 @@ class AdbDeviceAdapter:
                             )
                         )
                     ui_baseline: CommandResult | None = None
+                    ui_baseline_valid = False
+                    ui_baseline_gap: str | None = None
                     if oracle is not None and oracle.kind == "ui_text":
                         ui_wake = self._adb_budget(
                             ["shell", "input", "keyevent", "KEYCODE_WAKEUP"],
@@ -1223,6 +1331,7 @@ class AdbDeviceAdapter:
                                 ui_wake,
                                 {
                                     **common,
+                                    "caller_identity": "adb_shell",
                                     "action": "wake_display",
                                 },
                             )
@@ -1238,6 +1347,7 @@ class AdbDeviceAdapter:
                                 ui_unlock,
                                 {
                                     **common,
+                                    "caller_identity": "adb_shell",
                                     "action": "dismiss_keyguard",
                                 },
                             )
@@ -1253,6 +1363,7 @@ class AdbDeviceAdapter:
                                 ui_prepare,
                                 {
                                     **common,
+                                    "caller_identity": "adb_shell",
                                     "action": "collapse_status_bar",
                                 },
                             )
@@ -1268,23 +1379,140 @@ class AdbDeviceAdapter:
                                 ui_home,
                                 {
                                     **common,
+                                    "caller_identity": "adb_shell",
                                     "action": "establish_neutral_baseline",
                                 },
                             )
                         )
-                        ui_baseline, baseline_attempts = self._dump_ui_hierarchy_with_retry(
-                            budget=budget,
-                            cap=45,
-                        )
+                        state_change_baseline = oracle.impact == "unauthorized_state_change"
+                        baseline_attempts = 0
+                        if state_change_baseline:
+                            if ui_baseline_component is None:
+                                ui_baseline_gap = "manifest_target_launcher_baseline_unavailable"
+                            else:
+                                benign_launch = self._adb_budget(
+                                    [
+                                        "shell",
+                                        "am",
+                                        "start",
+                                        "-W",
+                                        "-n",
+                                        f"{target_package_name}/{ui_baseline_component}",
+                                        "-a",
+                                        "android.intent.action.MAIN",
+                                        "-c",
+                                        "android.intent.category.LAUNCHER",
+                                    ],
+                                    budget,
+                                    30,
+                                )
+                                benign_launch_ok = self._poc_launch_diagnostics(benign_launch)[
+                                    "launch_accepted"
+                                ]
+                                commands.append(
+                                    (
+                                        "blackbox.poc_ui_baseline_launch",
+                                        benign_launch,
+                                        {
+                                            **common,
+                                            "caller_identity": "adb_shell",
+                                            "observation_role": "baseline_setup_only",
+                                            "target_component": ui_baseline_component,
+                                            "no_data_or_extras": True,
+                                            "launch_accepted": benign_launch_ok,
+                                        },
+                                    )
+                                )
+                                if not benign_launch_ok:
+                                    ui_baseline_gap = "manifest_target_launcher_baseline_launch_failed"
+                                else:
+                                    previous_views: dict[
+                                        tuple[tuple[str, str, str], ...], tuple[str, str]
+                                    ] | None = None
+                                    for sample in range(4):
+                                        ui_baseline = self._dump_ui_hierarchy(
+                                            budget=budget,
+                                            cap=12,
+                                        )
+                                        baseline_attempts += 1
+                                        native_views = (
+                                            self._target_native_ui_views(
+                                                ui_baseline.stdout,
+                                                target_package_name,
+                                            )
+                                            if ui_baseline.exit_code == 0
+                                            else {}
+                                        )
+                                        expected_present = bool(
+                                            ui_baseline.exit_code == 0
+                                            and self._ui_text_in_package(
+                                                ui_baseline.stdout,
+                                                oracle.expected_text or "",
+                                                target_package_name,
+                                            )
+                                        )
+                                        commands.append(
+                                            (
+                                                "blackbox.poc_ui_baseline_sample",
+                                                ui_baseline,
+                                                {
+                                                    **common,
+                                                    "caller_identity": "adb_shell",
+                                                    "observation_role": "baseline_setup_only",
+                                                    "target_component": ui_baseline_component,
+                                                    "sample_index": sample + 1,
+                                                    "target_native_view_count": len(native_views),
+                                                    "target_text_present": expected_present,
+                                                },
+                                            )
+                                        )
+                                        if expected_present:
+                                            ui_baseline_gap = "target_ui_result_preexisting"
+                                            break
+                                        if native_views and native_views == previous_views:
+                                            ui_baseline_valid = True
+                                            break
+                                        previous_views = native_views or None
+                                        if budget is not None and budget.expired:
+                                            break
+                                    if not ui_baseline_valid and ui_baseline_gap is None:
+                                        ui_baseline_gap = (
+                                            "uiautomator_baseline_timeout"
+                                            if ui_baseline is not None
+                                            and (ui_baseline.timed_out or ui_baseline.exit_code == 124)
+                                            else "target_native_baseline_unstable"
+                                        )
+                        else:
+                            ui_baseline, baseline_attempts = (
+                                self._dump_ui_hierarchy_with_retry(budget=budget, cap=45)
+                            )
+                            ui_baseline_valid = ui_baseline.exit_code == 0
+                        if ui_baseline is None:
+                            ui_baseline = CommandResult(
+                                argv=["platform", "ui_baseline"],
+                                exit_code=1,
+                                stdout="",
+                                stderr=ui_baseline_gap or "UI baseline unavailable",
+                            )
                         commands.append(
                             (
                                 "blackbox.poc_ui_baseline",
                                 ui_baseline,
                                 {
                                     **common,
+                                    "caller_identity": "adb_shell",
                                     "observation_role": "pre_action_baseline",
                                     "poll_attempts": baseline_attempts,
                                     "target_package": target_package_name,
+                                    "target_component": ui_baseline_component,
+                                    "baseline_valid": ui_baseline_valid,
+                                    "observer_gap": ui_baseline_gap,
+                                    "target_native_view_count": len(
+                                        self._target_native_ui_views(
+                                            ui_baseline.stdout,
+                                            target_package_name,
+                                        )
+                                    ) if ui_baseline_valid else 0,
                                     "target_text_present": self._ui_text_in_package(
                                         ui_baseline.stdout,
                                         oracle.expected_text or "",
@@ -1293,6 +1521,7 @@ class AdbDeviceAdapter:
                                 },
                             )
                         )
+                    launch_started_at = datetime.now(UTC).isoformat()
                     launch = self._adb_budget(
                         [
                             "shell",
@@ -1311,12 +1540,18 @@ class AdbDeviceAdapter:
                         budget,
                         spec.timeout_seconds,
                     )
+                    launch_completed_at = datetime.now(UTC).isoformat()
                     launch_diagnostics = self._poc_launch_diagnostics(launch)
                     commands.append(
                         (
                             "blackbox.poc_launch",
                             launch,
-                            {**common, **launch_diagnostics},
+                            {
+                                **common,
+                                **launch_diagnostics,
+                                "launch_started_at": launch_started_at,
+                                "launch_completed_at": launch_completed_at,
+                            },
                         )
                     )
                     oem_dismiss = self._dismiss_oem_jump_prompt(budget=budget)
@@ -1350,6 +1585,7 @@ class AdbDeviceAdapter:
                             {
                                 **common,
                                 "process_ids": sorted(poc_process_ids),
+                                "observed_at": datetime.now(UTC).isoformat(),
                             },
                         )
                     )
@@ -1560,8 +1796,9 @@ class AdbDeviceAdapter:
                                     ui_baseline.stdout if ui_baseline is not None else None
                                 ),
                                 baseline_valid=bool(
-                                    ui_baseline is not None and ui_baseline.exit_code == 0
+                                    ui_baseline_valid
                                 ),
+                                baseline_gap=ui_baseline_gap,
                                 timeout_seconds=(spec.timeout_seconds if launch.exit_code == 0 else 1),
                                 budget=budget,
                             )
@@ -1626,6 +1863,18 @@ class AdbDeviceAdapter:
                                 timeout_seconds=min(15, max(1, spec.timeout_seconds)),
                                 budget=budget,
                             )
+                        elif oracle.kind == "target_uid_log_contains":
+                            (
+                                target_log,
+                                target_log_poll_attempts,
+                                target_log_observation_seconds,
+                                target_log_window_complete,
+                            ) = self._poll_target_uid_log(
+                                expected_text=oracle.expected_text or "",
+                                target_uid=target_uid,
+                                timeout_seconds=min(12, spec.timeout_seconds),
+                                budget=budget,
+                            )
                         else:
                             target_log = self._adb_budget(
                                 (
@@ -1645,6 +1894,7 @@ class AdbDeviceAdapter:
                                     "poll_attempts": target_log_poll_attempts,
                                     "observation_window_seconds": target_log_observation_seconds,
                                     "observation_window_complete": target_log_window_complete,
+                                    "observed_at": datetime.now(UTC).isoformat(),
                                     **self._evaluate_target_log_oracle(
                                         oracle,
                                         target_log.stdout,
@@ -1680,9 +1930,35 @@ class AdbDeviceAdapter:
                 **install_diagnostics,
                 **launch_diagnostics,
                 "poc_result_observed": poc_result_observed,
+                "ui_baseline_gap": ui_baseline_gap if install_succeeded else None,
                 **runtime_diagnostics,
             },
         )
+
+    def _poll_target_uid_log(
+        self,
+        *,
+        expected_text: str,
+        target_uid: int | None,
+        timeout_seconds: int,
+        budget: TimeBudget | None,
+    ) -> tuple[CommandResult, int, float, bool]:
+        """Wait briefly for an asynchronous target-owned WebView/log effect."""
+
+        started = time.monotonic()
+        deadline = started + max(1, timeout_seconds)
+        attempts = 0
+        result = CommandResult(["adb", "logcat"], 124, "", "target log not polled")
+        while time.monotonic() < deadline and (budget is None or not budget.expired):
+            result = self._adb_budget(["logcat", "-d", "-v", "uid", "-t", "5000"], budget, 15)
+            attempts += 1
+            if result.exit_code == 0 and target_uid is not None and any(
+                expected_text in line and self._logcat_line_uid(line) == target_uid
+                for line in result.stdout.splitlines()
+            ):
+                return result, attempts, time.monotonic() - started, True
+            time.sleep(0.25)
+        return result, attempts, time.monotonic() - started, time.monotonic() >= deadline
 
     def _poll_poc_logcat(
         self,
@@ -1878,6 +2154,7 @@ class AdbDeviceAdapter:
         package_name: str,
         baseline_output: str | None,
         baseline_valid: bool,
+        baseline_gap: str | None = None,
         timeout_seconds: int,
         budget: TimeBudget | None,
     ) -> tuple[CommandResult, dict[str, Any], int, float]:
@@ -1893,19 +2170,46 @@ class AdbDeviceAdapter:
         metadata: dict[str, Any] = {}
         interception: dict[str, Any] | None = None
         interception_handled = False
+        consecutive_dump_failures = 0
+        observer_gap: str | None = None
         while True:
             attempts += 1
             remaining = max(1, int(deadline - time.monotonic()))
             last = self._dump_ui_hierarchy(
                 budget=budget,
-                cap=min(45, remaining),
+                # A single slow UIAutomator call must not consume the entire
+                # observation window before a retry or an explicit Oracle gap.
+                cap=min(15, max(5, remaining // 3)),
             )
+            if last.exit_code != 0 or not last.stdout.strip():
+                consecutive_dump_failures += 1
+                if time.monotonic() >= deadline or (budget is not None and budget.expired):
+                    observer_gap = (
+                        "uiautomator_dump_timeout"
+                        if last.timed_out or last.exit_code == 124
+                        else "uiautomator_dump_window_exhausted"
+                    )
+                elif consecutive_dump_failures >= 3:
+                    accessibility = self._adb_budget(
+                        ["shell", "service", "check", "accessibility"],
+                        budget,
+                        5,
+                    )
+                    if (
+                        accessibility.exit_code == 0
+                        and "Service accessibility: not found" in accessibility.stdout
+                    ):
+                        observer_gap = "accessibility_service_unavailable"
+                    else:
+                        observer_gap = "uiautomator_dump_repeated_failure"
+            else:
+                consecutive_dump_failures = 0
             prompt = (
                 self._parse_vivo_jump_prompt(last.stdout)
                 if last.exit_code == 0 and last.stdout
                 else {"detected": False}
             )
-            observation_valid = last.exit_code == 0
+            observation_valid = last.exit_code == 0 and bool(last.stdout.strip())
             if prompt.get("detected"):
                 # OEM behavior: launching a target Activity from an ordinary app
                 # can be gated behind a vendor confirmation dialog. The dialog is
@@ -1943,6 +2247,7 @@ class AdbDeviceAdapter:
                 baseline_output=baseline_output,
                 baseline_valid=baseline_valid,
                 observation_valid=observation_valid,
+                observer_gap=observer_gap or baseline_gap,
             )
             metadata["observation_policy"] = {
                 "mode": "adaptive_adb_latency",
@@ -1951,8 +2256,15 @@ class AdbDeviceAdapter:
             }
             if interception is not None:
                 metadata["platform_interception"] = interception
+            matched = bool((metadata.get("oracle") or {}).get("matched"))
+            # A matching label can be pre-existing or rendered by attacker HTML.
+            # Keep observing state-change claims until the same native view
+            # actually changes (or the bounded window expires).
             if (
-                bool((metadata.get("oracle") or {}).get("matched"))
+                metadata.get("security_impact_observed") is True
+                or (matched and oracle.impact != "unauthorized_state_change")
+                or (matched and baseline_gap is not None)
+                or observer_gap is not None
                 or time.monotonic() >= deadline
                 or (budget is not None and budget.expired)
             ):
@@ -2060,7 +2372,7 @@ class AdbDeviceAdapter:
         finally:
             self._adb(
                 ["shell", "rm", "-f", remote_path],
-                timeout=15,
+                timeout=min(5, cap),
                 respect_cancellation=False,
             )
             self._ui_dump_latencies.append(max(0.0, time.monotonic() - started))
@@ -2550,6 +2862,7 @@ class AdbDeviceAdapter:
         baseline_output: str | None = None,
         baseline_valid: bool = False,
         observation_valid: bool = True,
+        observer_gap: str | None = None,
     ) -> dict[str, Any]:
         if oracle is None or oracle.kind != "ui_text" or not oracle.expected_text:
             return {}
@@ -2572,9 +2885,28 @@ class AdbDeviceAdapter:
                 package_name,
             )
         )
-        target_transition = bool(
-            baseline_valid and observation_valid and target_match and not baseline_match
+        baseline_views = (
+            cls._target_native_ui_views(baseline_output, package_name)
+            if package_name and baseline_valid and baseline_output is not None
+            else {}
         )
+        observed_views = (
+            cls._target_native_ui_views(output, package_name)
+            if package_name and observation_valid
+            else {}
+        )
+        changed_view = next(
+            (
+                identity
+                for identity, after in observed_views.items()
+                if identity in baseline_views
+                and any(oracle.expected_text in value for value in after)
+                and not any(oracle.expected_text in value for value in baseline_views[identity])
+                and after != baseline_views[identity]
+            ),
+            None,
+        )
+        target_transition = changed_view is not None
         return cls._oracle_metadata(
             oracle,
             matched=target_match,
@@ -2584,40 +2916,52 @@ class AdbDeviceAdapter:
                 "target_text_present_before": baseline_match,
                 "target_text_present_after": target_match,
                 "target_text_transition": target_transition,
+                "same_target_native_view_changed": target_transition,
+                "native_view_identity": changed_view,
+                "baseline_target_native_view_count": len(baseline_views),
+                "observed_target_native_view_count": len(observed_views),
                 "baseline_valid": baseline_valid,
                 "observation_valid": observation_valid,
+                "observer_gap": observer_gap,
             },
-            impact_observed=(
-                target_transition
-                and oracle.impact
-                in {"unauthorized_data_access", "unauthorized_state_change"}
-            ),
+            impact_observed=(target_transition and oracle.impact == "unauthorized_state_change"),
         )
 
     @staticmethod
-    def _ui_text_in_package(
-        output: str,
-        expected_text: str,
-        package_name: str,
-    ) -> bool:
-        """Match UI text only when uiautomator attributes it to the target app."""
+    def _parse_ui_hierarchy(output: str) -> ElementTree.Element | None:
+        """Parse the XML portion of an ADB UI dump, ignoring command chatter."""
 
-        if not output or not expected_text or not package_name:
-            return False
+        if not output:
+            return None
         starts = [
             position
             for marker in ("<?xml", "<hierarchy", "<node")
             if (position := output.find(marker)) >= 0
         ]
         if not starts:
-            return False
+            return None
         fragment = output[min(starts) :]
         hierarchy_end = fragment.rfind("</hierarchy>")
         if hierarchy_end >= 0:
             fragment = fragment[: hierarchy_end + len("</hierarchy>")]
         try:
-            root = ElementTree.fromstring(fragment)
+            return ElementTree.fromstring(fragment)
         except ElementTree.ParseError:
+            return None
+
+    @classmethod
+    def _ui_text_in_package(
+        cls,
+        output: str,
+        expected_text: str,
+        package_name: str,
+    ) -> bool:
+        """Match UI text only when uiautomator attributes it to the target app."""
+
+        if not expected_text or not package_name:
+            return False
+        root = cls._parse_ui_hierarchy(output)
+        if root is None:
             return False
         for node in root.iter():
             if node.attrib.get("package") != package_name:
@@ -2627,6 +2971,72 @@ class AdbDeviceAdapter:
             if expected_text in node.attrib.get("content-desc", ""):
                 return True
         return False
+
+    @classmethod
+    def _target_native_ui_views(
+        cls,
+        output: str,
+        package_name: str,
+    ) -> dict[tuple[tuple[str, str, str], ...], tuple[str, str]]:
+        """Index native target views by their stable structural UI identity.
+
+        WebView accessibility descendants inherit the app package, so package
+        ownership alone cannot establish a native effect. Generic View nodes
+        are likewise ambiguous. A missing class or changed path fails closed.
+        """
+
+        root = cls._parse_ui_hierarchy(output)
+        if root is None:
+            return {}
+        views: dict[tuple[tuple[str, str, str], ...], tuple[str, str]] = {}
+        native_text_classes = {
+            "android.widget.TextView",
+            "android.widget.EditText",
+            "android.widget.Button",
+            "android.widget.CheckedTextView",
+            "android.widget.CheckBox",
+            "android.widget.RadioButton",
+            "android.widget.Switch",
+            "android.widget.ToggleButton",
+            "android.widget.AutoCompleteTextView",
+            "androidx.appcompat.widget.AppCompatTextView",
+            "androidx.appcompat.widget.AppCompatEditText",
+            "androidx.appcompat.widget.AppCompatButton",
+            "androidx.appcompat.widget.AppCompatCheckedTextView",
+            "androidx.appcompat.widget.AppCompatCheckBox",
+            "androidx.appcompat.widget.AppCompatRadioButton",
+            "androidx.appcompat.widget.SwitchCompat",
+            "com.google.android.material.textview.MaterialTextView",
+        }
+
+        def visit(
+            node: ElementTree.Element,
+            path: tuple[tuple[str, str, str], ...],
+            inside_webview: bool,
+            sibling_index: int,
+        ) -> None:
+            attributes = node.attrib
+            class_name = attributes.get("class", "")
+            inside_webview = inside_webview or class_name.endswith("WebView")
+            if attributes.get("package") == package_name:
+                segment = (
+                    class_name,
+                    attributes.get("resource-id", ""),
+                    attributes.get("index", str(sibling_index)),
+                )
+                path = (*path, segment)
+                if not inside_webview and class_name in native_text_classes:
+                    views[path] = (
+                        attributes.get("text", ""),
+                        attributes.get("content-desc", ""),
+                    )
+            else:
+                path = ()
+            for index, child in enumerate(node):
+                visit(child, path, inside_webview, index)
+
+        visit(root, (), False, 0)
+        return views
 
     @classmethod
     def _evaluate_target_log_oracle(
@@ -2735,6 +3145,79 @@ class AdbDeviceAdapter:
             validate_adb_args(args)
         with self._lease:
             return self._adb(args, timeout=max(1, min(120, timeout)))
+
+    def install_web_observer_reverse(self, port: int) -> CommandResult:
+        """Expose one platform-owned observer port to the leased device's loopback."""
+
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError("Web observer port is invalid")
+        with self._lease:
+            return self._adb(["reverse", f"tcp:{port}", f"tcp:{port}"], timeout=20)
+
+    def remove_web_observer_reverse(self, port: int) -> CommandResult:
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError("Web observer port is invalid")
+        with self._lease:
+            return self._adb(["reverse", "--remove", f"tcp:{port}"], timeout=20, respect_cancellation=False)
+
+    def launch_web_observer_browser_control(
+        self, url: str, *, allowed_https_origin: str | None = None
+    ) -> tuple[CommandResult, CommandResult, CommandResult]:
+        """Open a controlled page in Chrome as a platform-run negative control."""
+
+        parsed = urlsplit(url)
+        if parsed.username is not None or parsed.password is not None or parsed.fragment:
+            raise ValueError("browser control URL contains credentials or a fragment")
+        try:
+            local = (
+                parsed.scheme == "http"
+                and parsed.hostname == "127.0.0.1"
+                and parsed.port is not None
+                and 1 <= parsed.port <= 65535
+            )
+        except ValueError as exc:
+            raise ValueError("browser control URL has an invalid port") from exc
+        remote = False
+        if allowed_https_origin is not None:
+            allowed = urlsplit(allowed_https_origin)
+            try:
+                allowed_port_valid = allowed.port is None or 1 <= allowed.port <= 65535
+            except ValueError as exc:
+                raise ValueError("allowed HTTPS observer origin has an invalid port") from exc
+            if (
+                allowed.scheme != "https"
+                or not allowed.hostname
+                or not allowed_port_valid
+                or allowed.username is not None
+                or allowed.password is not None
+                or allowed.path not in {"", "/"}
+                or allowed.query
+                or allowed.fragment
+            ):
+                raise ValueError("allowed HTTPS observer must be an exact origin")
+            remote = parsed.scheme == "https" and parsed.netloc == allowed.netloc
+        if not (local or remote):
+            raise ValueError("browser control URL must target the approved platform observer")
+        if not re.fullmatch(r"/web-observer/[a-f0-9-]{36}/(?:control|quiet)/page", parsed.path):
+            raise ValueError("browser control URL is outside the observer route")
+        try:
+            query = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+        except ValueError as exc:
+            raise ValueError("browser control URL has an invalid nonce query") from exc
+        if (
+            set(query) != {"nonce"}
+            or len(query["nonce"]) != 1
+            or re.fullmatch(r"[A-Za-z0-9_-]{16,128}", query["nonce"][0]) is None
+        ):
+            raise ValueError("browser control URL requires one phase nonce")
+        with self._lease:
+            wake = self._adb(["shell", "input", "keyevent", "KEYCODE_WAKEUP"], timeout=15)
+            unlock = self._adb(["shell", "wm", "dismiss-keyguard"], timeout=15)
+            launch = self._adb(
+                ["shell", "am", "start", "-W", "-a", "android.intent.action.VIEW", "-d", shlex.quote(url), "-p", "com.android.chrome"],
+                timeout=30,
+            )
+            return wake, unlock, launch
 
     def _adb_budget(self, args: list[str], budget: TimeBudget | None, cap: int) -> CommandResult:
         timeout = cap if budget is None else budget.remaining(cap)
@@ -2897,6 +3380,7 @@ class AdbDevicePool:
     def capability(self, *, non_blocking: bool = False) -> dict[str, Any]:
         if not self.configured:
             snapshot = self.scheduler.snapshot()
+            unavailable = list(self.unavailable)
             return {
                 "available": False,
                 "detail": (
@@ -2906,6 +3390,11 @@ class AdbDevicePool:
                 ),
                 "serials": list(self.serials),
                 "draining": snapshot.get("draining", []),
+                "failure_category": "device_unavailable" if unavailable else None,
+                "failures": [
+                    {"serial": serial, "failure_category": "device_unavailable"}
+                    for serial in unavailable
+                ],
             }
         snapshot = self.scheduler.snapshot()
         active_serials = set(snapshot["active"])
@@ -2940,14 +3429,25 @@ class AdbDevicePool:
                 {
                     "serial": adapter.serial,
                     "detail": capability.get("detail"),
+                    "failure_category": capability.get("failure_category"),
                 }
             )
+        failure_categories = {
+            str(item.get("failure_category")) for item in failures if item.get("failure_category")
+        }
         return {
             "available": False,
             "busy": False,
             "detail": "No configured ADB device passed its capability check",
             "serials": list(self.serials),
             "failures": failures,
+            "failure_category": (
+                "device_framework_unavailable"
+                if "device_framework_unavailable" in failure_categories
+                else "device_unavailable"
+                if "device_unavailable" in failure_categories
+                else None
+            ),
         }
 
     @contextmanager

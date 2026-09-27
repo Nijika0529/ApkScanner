@@ -6,6 +6,7 @@ import re
 import shlex
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Literal
 
@@ -15,6 +16,14 @@ from ..infrastructure.tools import CommandResult
 
 _SHELL_META = re.compile(r"[\x00\r\n;&|`$<>]")
 _DYNAMIC_CONTROL_META = re.compile(r"[\x00\r\n;|`<>]")
+_PLATFORM_ONLY_FIXTURE_MARKERS = frozenset(
+    {
+        "io.apkscanner.adaptivecases.fixture",
+        "fixtureseedreceiver",
+        "fixture_set_web_canary",
+        "fixture_clear_web_canary",
+    }
+)
 _SAFE_COMPONENT = re.compile(
     r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*/(?:\.?[A-Za-z0-9_]+(?:[.$][A-Za-z0-9_]+)*)$"
 )
@@ -211,6 +220,17 @@ class AdbGatewayResponse(BaseModel):
         )
 
 
+def _reject_platform_fixture_controls(args: list[str]) -> None:
+    """Never expose the shell-only Web canary oracle to an Agent ADB session."""
+
+    if any(
+        marker in urllib.parse.unquote(value).lower()
+        for value in args
+        for marker in _PLATFORM_ONLY_FIXTURE_MARKERS
+    ):
+        raise ValueError("platform-owned Web canary fixture controls are unavailable")
+
+
 def validate_adb_args(args: list[str]) -> None:
     if not args:
         raise ValueError("ADB command cannot be empty")
@@ -219,6 +239,7 @@ def validate_adb_args(args: list[str]) -> None:
             raise ValueError("ADB argument is invalid")
         if _SHELL_META.search(value):
             raise ValueError("ADB shell metacharacters are not allowed")
+    _reject_platform_fixture_controls(args)
     if args[0].startswith("-"):
         raise ValueError("ADB transport selectors are controlled by the platform")
     if args[0] in {
@@ -282,6 +303,7 @@ def validate_adaptive_adb_args(args: list[str]) -> None:
     for value in args:
         if not isinstance(value, str) or not value or len(value) > 4096 or "\x00" in value:
             raise ValueError("ADB argument is invalid")
+    _reject_platform_fixture_controls(args)
     if args[0].startswith("-"):
         raise ValueError("ADB transport selectors are controlled by the platform")
     if args[0] in {

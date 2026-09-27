@@ -13,6 +13,8 @@ GATEWAY_ENVIRONMENT_NAMES = frozenset(
         "APKSCANNER_PROOF_TOKEN",
         "APKSCANNER_OBSERVATION_URL",
         "APKSCANNER_OBSERVATION_TOKEN",
+        "APKSCANNER_WEB_EXPERIMENT_URL",
+        "APKSCANNER_WEB_EXPERIMENT_TOKEN",
     }
 )
 
@@ -36,6 +38,10 @@ def task_gateway_environment(
             f"{base}/api/v1/internal/tasks/{task_id}/observations"
         ),
         "APKSCANNER_OBSERVATION_TOKEN": token,
+        "APKSCANNER_WEB_EXPERIMENT_URL": (
+            f"{base}/api/v1/internal/tasks/{task_id}/web-experiments"
+        ),
+        "APKSCANNER_WEB_EXPERIMENT_TOKEN": token,
     }
     if adb_policy is not None:
         values["APKSCANNER_ADB_POLICY"] = adb_policy

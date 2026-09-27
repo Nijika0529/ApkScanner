@@ -7,13 +7,9 @@ output_apk="$script_dir/adaptivecases.apk"
 test_keystore="$script_dir/vulntest-test-signing.jks"
 worker_image=${APKSCANNER_CODEX_DOCKER_IMAGE:-apk-scanner-codex-worker:0.2.0}
 
-docker run --rm \
-    --entrypoint /bin/sh \
-    --volume "$script_dir:/fixture" \
-    --workdir /fixture \
-    "$worker_image" \
-    -eu -c '
-source_dir=/fixture/adaptivecases-src
+builder_script='
+fixture_dir=$1
+source_dir=$fixture_dir/adaptivecases-src
 build_dir=$source_dir/build
 classes_dir=$build_dir/classes
 dex_dir=$build_dir/dex
@@ -21,8 +17,9 @@ android_jar=/usr/lib/android-sdk/platforms/android-36/android.jar
 build_tools=/usr/lib/android-sdk/build-tools/36.1.0
 unsigned_apk=$build_dir/adaptivecases-unsigned.apk
 aligned_apk=$build_dir/adaptivecases-aligned.apk
-output_apk=/fixture/adaptivecases.apk
+output_apk=$fixture_dir/adaptivecases.apk
 
+test "$build_dir" = "$source_dir/build"
 rm -rf "$build_dir"
 mkdir -p "$classes_dir" "$dex_dir"
 find "$source_dir/java" -name "*.java" -print | sort > "$build_dir/sources.list"
@@ -47,7 +44,7 @@ zip -X -q -j "$unsigned_apk" "$dex_dir/classes.dex"
     --v2-signing-enabled true \
     --v3-signing-enabled true \
     --v4-signing-enabled false \
-    --ks /fixture/vulntest-test-signing.jks \
+    --ks "$fixture_dir/vulntest-test-signing.jks" \
     --ks-key-alias vulntest \
     --ks-pass pass:android \
     --key-pass pass:android \
@@ -55,5 +52,23 @@ zip -X -q -j "$unsigned_apk" "$dex_dir/classes.dex"
     "$aligned_apk"
 "$build_tools/apksigner" verify --verbose "$output_apk"
 '
+
+if [ -f /usr/lib/android-sdk/platforms/android-36/android.jar ] && \
+   [ -x /usr/lib/android-sdk/build-tools/36.1.0/aapt2 ] && \
+   command -v javac >/dev/null 2>&1; then
+    apk_java_home=/usr/lib/jvm/java-17-openjdk-amd64
+    if [ ! -x "$apk_java_home/bin/java" ]; then
+        apk_java_home=/usr/lib/jvm/java-11-openjdk-amd64
+    fi
+    JAVA_HOME="$apk_java_home" PATH="$apk_java_home/bin:$PATH" \
+        /bin/sh -eu -c "$builder_script" sh "$script_dir"
+else
+    docker run --rm \
+        --entrypoint /bin/sh \
+        --volume "$script_dir:/fixture" \
+        --workdir /fixture \
+        "$worker_image" \
+        -eu -c "$builder_script" sh /fixture
+fi
 
 sha256sum "$output_apk"

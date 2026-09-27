@@ -14,34 +14,95 @@ jobs:
     # The runner label is intentionally explicit: a generic CI emulator must never
     # be counted as the API 36 release gate.
     runs-on: [self-hosted, linux, apkscanner-android16]
-    timeout-minutes: 240
+    timeout-minutes: 360
     env:
       APKSCANNER_VALIDATION_PROFILE: android16_release
       APKSCANNER_DEVICE_MIN_API: "36"
       APKSCANNER_ALLOW_LEGACY_DEVICE_SMOKE: "false"
+      APKSCANNER_DEVICE_INSTALL_POLICY: replace
+      APKSCANNER_DEVICE_RESET_POLICY: per_test
+      APKSCANNER_CODEX_ENABLED: "true"
+      APKSCANNER_INVESTIGATOR_BACKEND: codex
+      APKSCANNER_CODEX_ISOLATION: docker
       APKSCANNER_ADB_SERIAL: ${{ secrets.APKSCANNER_ANDROID16_ADB_SERIAL }}
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-      APKSCANNER_DATA_DIR: ${{ github.workspace }}/.regression-data
+      APKSCANNER_DATA_DIR: ${{ runner.temp }}/apkscanner-regression-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
       - name: Verify release device
         run: |
-          adb connect "$APKSCANNER_ADB_SERIAL"
-          test "$(adb -s "$APKSCANNER_ADB_SERIAL" shell getprop ro.build.version.sdk | tr -d '\r')" -ge 36
-      - name: Install project
-        run: python -m pip install --no-deps -e .
-      - name: Build signed regression APK
-        run: ./testapk/build-vulntest.sh
-      - name: Run formal benchmark
+          set -euo pipefail
+          test -n "$APKSCANNER_ADB_SERIAL"
+          # USB serials are already in `adb devices`; only TCP devices need connect.
+          if [[ "$APKSCANNER_ADB_SERIAL" == *:* ]]; then
+            adb connect "$APKSCANNER_ADB_SERIAL"
+          fi
+          timeout 60 adb -s "$APKSCANNER_ADB_SERIAL" wait-for-device
+          test "$(adb -s "$APKSCANNER_ADB_SERIAL" get-state | tr -d '\r')" = device
+          device_api=$(adb -s "$APKSCANNER_ADB_SERIAL" shell getprop ro.build.version.sdk | tr -d '\r\n')
+          [[ "$device_api" =~ ^[0-9]+$ ]] && (( device_api >= 36 ))
+          # TLS and experiment windows are invalid when the phone clock drifts.
+          device_epoch=$(adb -s "$APKSCANNER_ADB_SERIAL" shell date -u +%s | tr -d '\r\n')
+          [[ "$device_epoch" =~ ^[0-9]+$ ]]
+          host_epoch=$(date -u +%s)
+          drift=$(( host_epoch - device_epoch ))
+          if (( drift < 0 )); then drift=$(( -drift )); fi
+          if (( drift > 300 )); then
+            echo "device clock differs from runner by ${drift}s; synchronize before release validation" >&2
+            exit 1
+          fi
+      - name: Install locked project environment
         run: |
-          scanctl benchmark "$PWD/testapk/vulntest.apk" \
-            --truth "$PWD/testapk/vulntest-ground-truth.json" \
-            --investigator codex | tee android16-regression.json
+          command -v uv
+          uv sync --locked --extra dev
+      - name: Check scanner release capabilities
+        run: |
+          set -o pipefail
+          uv run --no-sync python -m apkscanner.runtime.startup_preflight | tee android16-preflight.json
+      - name: Build signed regression fixtures
+        run: |
+          ./testapk/build-vulntest.sh
+          ./testapk/build-adaptivecases.sh
+      - name: Verify fixture fingerprints and signatures
+        run: |
+          uv run --no-sync python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          for name in ("vulntest", "adaptivecases"):
+              apk = Path("testapk") / f"{name}.apk"
+              truth = json.loads((Path("testapk") / f"{name}-ground-truth.json").read_text())
+              expected = truth.get("apk_sha256")
+              actual = hashlib.sha256(apk.read_bytes()).hexdigest()
+              if not expected or actual != expected:
+                  raise SystemExit(f"{name} APK SHA-256 differs from its ground truth: {actual}")
+              print(f"{name}: {actual}")
+          PY
+          apksigner verify testapk/vulntest.apk
+          apksigner verify testapk/adaptivecases.apk
+      - name: Run positive and negative-control benchmarks
+        run: |
+          set -o pipefail
+          failures=0
+          for fixture in vulntest adaptivecases; do
+            if uv run --no-sync scanctl benchmark "$PWD/testapk/${fixture}.apk" \
+              --truth "$PWD/testapk/${fixture}-ground-truth.json" \
+              --investigator codex | tee "android16-${fixture}.json"; then
+              echo "${fixture} quality gate passed"
+            else
+              echo "${fixture} quality gate failed" >&2
+              failures=$(( failures + 1 ))
+            fi
+          done
+          test "$failures" -eq 0
       - name: Upload regression receipt
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: android16-regression-${{ github.run_id }}
           path: |
-            android16-regression.json
-            .regression-data/reports
+            android16-preflight.json
+            android16-vulntest.json
+            android16-adaptivecases.json
+            ${{ env.APKSCANNER_DATA_DIR }}/reports

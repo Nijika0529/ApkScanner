@@ -12,13 +12,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 SDK_DISTRIBUTION = "openai-codex"
 RUNTIME_DISTRIBUTION = "openai-codex-cli-bin"
-PINNED_SDK_VERSION = "0.147.0"
+PINNED_SDK_VERSION = "0.156.1"
 MINIMUM_DEEPSEEK_CODEX_VERSION = "0.144.0"
-VERIFIED_SOURCE_COMMIT = "025a88adbd7ae4d448fc938b28d0446eb1753317"
+VERIFIED_SOURCE_COMMIT = None
 # Bump whenever the host/worker protocol implementation changes without a
 # third-party SDK version change. The image capability gate prevents a stale
 # locally cached worker from silently speaking an older command schema.
-WORKER_REVISION = "20260910.1"
+WORKER_REVISION = "20260924.1"
 
 
 class SdkBaseline(BaseModel):
@@ -41,23 +41,27 @@ class SdkBaseline(BaseModel):
 
 
 def collect_sdk_baseline(source_root: Path = Path("/work/codex")) -> SdkBaseline:
+    from openai_codex.generated import v2_all
+
     source_commit: str | None = None
     source_commit_time: str | None = None
-    protocol_hash: str | None = None
+    # The installed, lockfile-pinned wheel is the runtime source of truth. A
+    # separately checked-out Codex tree may be at another revision and must
+    # not be mistaken for the SDK actually running in the worker.
+    protocol_hash = hashlib.sha256(Path(v2_all.__file__).read_bytes()).hexdigest()
     if (source_root / ".git").is_dir():
-        completed = subprocess.run(
-            ["git", "-C", str(source_root), "show", "-s", "--format=%H%n%cI"],
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=10,
-        )
-        lines = completed.stdout.splitlines() if completed.returncode == 0 else []
-        if len(lines) >= 2:
-            source_commit, source_commit_time = lines[0], lines[1]
         generated = source_root / "sdk/python/src/openai_codex/generated/v2_all.py"
-        if generated.is_file():
-            protocol_hash = hashlib.sha256(generated.read_bytes()).hexdigest()
+        if generated.is_file() and hashlib.sha256(generated.read_bytes()).hexdigest() == protocol_hash:
+            completed = subprocess.run(
+                ["git", "-C", str(source_root), "show", "-s", "--format=%H%n%cI"],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=10,
+            )
+            lines = completed.stdout.splitlines() if completed.returncode == 0 else []
+            if len(lines) >= 2:
+                source_commit, source_commit_time = lines[0], lines[1]
     return SdkBaseline(
         sdk_version=importlib.metadata.version(SDK_DISTRIBUTION),
         runtime_version=importlib.metadata.version(RUNTIME_DISTRIBUTION),

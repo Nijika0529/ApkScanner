@@ -7,7 +7,7 @@
 ![Android](https://img.shields.io/badge/Android-release%20baseline%20API%2036-3DDC84?logo=android&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.122%2B-009688?logo=fastapi&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=111)
-![Codex SDK](https://img.shields.io/badge/Codex%20SDK-0.147.0-111111)
+![Codex SDK](https://img.shields.io/badge/Codex%20SDK-0.156.1-111111)
 
 APKScanner 是一个面向授权 Android APK 的安全审计平台。它先用确定性分析枚举组件、
 Deep Link 和代码攻击面，再让 Codex Agent 沿真实调用链探索、生成 PoC，并通过独占 ADB
@@ -40,10 +40,10 @@ APKScanner 的核心设计是：**平台保证覆盖和事实，Agent 负责探�
 | 确定性攻击面 | 解析生效 Manifest，枚举 Activity、Service、Receiver、Provider、Alias、权限与 Deep Link；结合 Apktool/Smali、JADX 和归档规则生成 Security IR |
 | 产品资产图谱 | 递归拆解内嵌 APK 与 H5/JS 资源；连接宿主加载证据、内嵌 APK 与插件入口；枚举 SO 并生成 ELF、动态符号、JNI 摘要，连接 Java native 声明、`loadLibrary`、JNI 导出与具体 ABI 库 |
 | 目标感知规划 | 通用枚举之后应用显式目标 Profile；按同一实现和攻击链归并入口变体，保留全部入口 ID、合并原因与成本回执，并把插件、Web 和 Native 子链限制为少量高价值任务 |
-| 深度 Agent 调查 | `openai-codex==0.147.0` + DeepSeek-V4.1-Flash（`deepseek-flash`）Responses API；持久 Thread、多轮增量证据回灌、Critic/Rescue/Final 有界扇出，并按证据增量收敛无进展轮次 |
+| 深度 Agent 调查 | `openai-codex==0.156.1` + DeepSeek-V4.1-Flash（`deepseek-flash`）Responses API；持久 Thread、多轮增量证据回灌、Critic/Rescue/Final 有界扇出，并按证据增量收敛无进展轮次 |
 | Docker 隔离 | 一次扫描一个无密钥 keeper 容器；每个 `task + attempt + role` 使用独立 Unix UID、HOME、`CODEX_HOME`、临时目录和可写工作区 |
 | 真机验证 | ADB 设备池支持 USB 与 IP:Port 动态接入；仅安装、执行、观察、清理的短动态批次占用 serial，静态阅读、Agent 推理和构建阶段不占设备 |
-| 证据闭环 | 持久化 Hypothesis、Argument、ProofAttempt、Evidence、Oracle 和 Verdict；支持普通 App UID Harness、Agent PoC 与可断点恢复的多步骤 Dynamic Experiment，模型文字不能自证漏洞成立 |
+| 证据闭环 | 持久化 Hypothesis、Argument、ProofAttempt、Evidence、Oracle 和 Verdict；支持普通 App UID Harness、可验证状态 fixture、可断点恢复的实验，以及 Web Observer → 独立只读 Luna Judge → 平台证据门禁；模型文字不能自证漏洞成立 |
 | 版本演进 | 内容寻址复用 JADX/Apktool/代码索引，生成 Manifest、DEX、Native、资源语义 Diff，并在新版本重新构建和回放历史 PoC |
 | 审计控制台 | FastAPI + React/TypeScript；支持实时任务、结构化 Finding、平台 Operator、Artifact/PoC 索引、版本比较以及 JSON/HTML/SARIF 报告 |
 
@@ -80,6 +80,10 @@ flowchart LR
     D1 --> O[Platform Oracles]
     D2 --> O
     O --> E[(Evidence / Proof / Finding)]
+    O --> W[Web Observer: nonce / 页面 / 负对照]
+    W --> J[独立只读语义 Judge]
+    J --> PG[平台证据门禁]
+    PG --> E
     E --> U
 ```
 
@@ -91,7 +95,10 @@ flowchart LR
 4. **复用静态计算，不复用安全结论。** 新 APK 可以复用反编译结果或 PoC 配方，但必须生成自己的 Evidence 和 Verdict。
 
 完整设计背景见 [关键设计决策](docs/design-decisions.zh-CN.md) 和
-[架构与判定模型](docs/architecture.zh-CN.md)。
+[架构与判定模型](docs/architecture.zh-CN.md)。Web 证明硬门槛见
+[语义证明闭环](docs/semantic-proof-policy.zh-CN.md)，非游客状态前置条件见
+[可验证动态测试状态](docs/state-fixtures.zh-CN.md)，公网受控页面部署见
+[SSH 远端 Web Observer](docs/remote-web-observer.zh-CN.md)。
 
 ## 证据模型
 
@@ -110,6 +117,8 @@ flowchart LR
 以及 Web/网络/Socket/SSH 等标准化语义观察。Agent 也可提交由平台执行的多步骤实验，但必须提前
 声明具体 assertion step、观察类型和 ImpactContract；命令成功本身不等于危害成立。无法形成客观动态证据时，运行观察进入
 `runtime_observed_unverified`；纯静态结论只有通过完整攻击链硬门槛才保留为 `supported_static`，否则回落为原始候选或 `inconclusive`。
+
+Web 回调值在 Evidence 中只保留摘要与长度，但其他 Oracle 和 Evidence 下载尚无统一的敏感字段鉴权、密封及保留期；目前仅应使用合成账号和测试数据，勿让平台接收真实用户凭据。
 
 公开待验证项统一使用三层 `signal_tier`：`runtime_oracle_gap`（已有运行观察、缺危害 Oracle）、
 `static_chain`（完整且有证据的静态链）和 `raw_candidate`（其余原始或已关闭线索）。层级由平台按
@@ -211,6 +220,7 @@ PoC 的 compileSdk/targetSdk 始终保持 API 36+；开发 Profile 只降低 min
 | `vulntest.apk` | 导出组件、Deep Link、Intent 转发、WebView JSBridge、Provider、Binder、Receiver 基线 |
 | `rescuetest.apk` | PendingIntent 间接委托链与 Blind Rescue 负向关闭测试 |
 | `adaptivecases.apk` | Zip Slip、动态 Receiver、localhost、JSBridge Token、Binder 多值返回和安全对照组 |
+| `webobserverattacker.apk` | 独立普通 UID 的 Deep Link 攻击方和受保护 canary Oracle 的权限负对照 |
 | `specialcases.apk` | 大型特权应用常见语义边界的静态压力测试 |
 
 每个测试项都保留可复现源码和 ground truth。Benchmark 只统计平台确认的最终 Finding，默认要求动态
@@ -229,6 +239,11 @@ pytest -q
 ruff check backend
 npm run lint --prefix frontend
 npm run build --prefix frontend
+
+# 完整 Docker 模式启动前的只读预检；失败时不替换旧服务
+python -m apkscanner.runtime.startup_preflight
+# 服务启动后：health 只表示存活，ready 才表示当前配置可执行扫描
+curl -f http://127.0.0.1:8000/api/v1/ready
 
 # 可选：需要 Docker 和固定 Worker 镜像
 APKSCANNER_RUN_DOCKER_TESTS=1 pytest -q backend/tests/test_codex_executor.py

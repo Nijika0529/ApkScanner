@@ -1,7 +1,7 @@
 # APKScanner 文档索引
 
 本文档目录只保留当前实现规范、可复现评测和明确标注的能力边界。若文档与代码行为冲突，
-以根目录 `README.md`、`backend/apkscanner/config.py` 和自动化测试为准。
+以根目录 `README.md`、`backend/apkscanner/core/config.py` 和自动化测试为准。
 
 ## 开发方向
 
@@ -23,6 +23,9 @@
 | 文档 | 内容 | 状态 |
 | --- | --- | --- |
 | [Android 攻击链分析](android-attack-chain-analysis.zh-CN.md) | PendingIntent、文件导入、动态 Receiver、Socket、WebView/JSBridge 等 | 当前实现与扩展方法 |
+| [Web 语义证明门槛](semantic-proof-policy.zh-CN.md) | Observer、目标观测、独立影响证据与 Judge/Policy Gate | 当前实现及明确缺口 |
+| [状态 Fixture](state-fixtures.zh-CN.md) | 非游客状态的执行前提与核验 | 当前实现 |
+| [远端 HTTPS Observer](remote-web-observer.zh-CN.md) | SSH 反向隧道、健康回执和撤销边界 | 当前实现及运维限制 |
 | [Samsung 漏洞案例集覆盖分析](samsung-vulnerability-coverage-review.zh-CN.md) | 140 份详细案例的模式映射（历史研究，方向见「下一步开发 Spec」） | 历史研究 |
 | [AdaptiveCases 真机评测](adaptivecases-real-device-evaluation.zh-CN.md) | 合成 APK 的测试口径、已知限制与动态证明要求 | 评测记录 |
 | [私有已知漏洞集盲测计划](private-benchmark-plan.zh-CN.md) | Ground truth 隔离、验收分层和公开披露规则 | 验收计划 |

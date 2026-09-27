@@ -69,6 +69,17 @@ def build_scan_quality_summary(session: Session, scan_id: str) -> dict[str, Any]
             )
         )
     )
+    web_receipts = list(
+        session.execute(
+            select(Evidence.kind, Evidence.metadata_json, Evidence.created_at).where(
+                Evidence.scan_id == scan_id,
+                or_(
+                    Evidence.kind.like("web.experiment.%"),
+                    Evidence.kind == "semantic.proof_attestation",
+                ),
+            )
+        )
+    )
     turns = list(
         session.execute(
             select(
@@ -179,6 +190,42 @@ def build_scan_quality_summary(session: Session, scan_id: str) -> dict[str, Any]
         _stage("harm_proven", "危害已证明", len(harm_proven)),
         _stage("reproduced_findings", "动态 Finding", len(reproduced_findings)),
     ]
+    web_stages: dict[str, set[str]] = defaultdict(set)
+    for receipt in web_receipts:
+        metadata = receipt.metadata_json or {}
+        experiment_id = metadata.get("experiment_id")
+        if not isinstance(experiment_id, str) or not experiment_id:
+            continue
+        kind = receipt.kind
+        if kind == "web.experiment.plan":
+            web_stages["planned"].add(experiment_id)
+        elif kind == "web.experiment.event" and metadata.get("phase") == "attack":
+            if metadata.get("event_type") in {"page", "frame"}:
+                web_stages["page_received"].add(experiment_id)
+            if metadata.get("stage") == "callback" and metadata.get("event_type") == "bridge_return":
+                web_stages["bridge_callback"].add(experiment_id)
+        elif kind == "web.experiment.execution" and (
+            metadata.get("ordinary_app_uid_verified") is True
+            and metadata.get("webview_in_target_confirmed") is True
+        ):
+            web_stages["target_main_frame"].add(experiment_id)
+        elif kind == "web.experiment.snapshot" and metadata.get("controls_validated") is True:
+            web_stages["negative_controls"].add(experiment_id)
+        elif kind == "web.experiment.target_effect" and (
+            metadata.get("target_owned_effect_validated") is True
+        ):
+            web_stages["independent_effect"].add(experiment_id)
+        elif kind == "semantic.proof_attestation" and metadata.get("harm_demonstrated") is True:
+            web_stages["attested_proof"].add(experiment_id)
+    web_proof_funnel = [
+        _stage("planned", "Web 实验计划", len(web_stages["planned"])),
+        _stage("page_received", "受控页面请求", len(web_stages["page_received"])),
+        _stage("target_main_frame", "目标主帧确认", len(web_stages["target_main_frame"])),
+        _stage("bridge_callback", "Bridge 返回回调", len(web_stages["bridge_callback"])),
+        _stage("negative_controls", "负对照有效", len(web_stages["negative_controls"])),
+        _stage("independent_effect", "独立目标影响", len(web_stages["independent_effect"])),
+        _stage("attested_proof", "正式语义证明", len(web_stages["attested_proof"])),
+    ]
 
     phase_usage: dict[str, dict[str, float | int]] = defaultdict(
         lambda: {
@@ -253,7 +300,10 @@ def build_scan_quality_summary(session: Session, scan_id: str) -> dict[str, Any]
     )
 
     latest_event_at = max(
-        (item.created_at for item in events),
+        (
+            *(item.created_at for item in events),
+            *(item.created_at for item in web_receipts),
+        ),
         key=lambda value: value.isoformat(),
         default=datetime.fromtimestamp(0, UTC),
     )
@@ -265,6 +315,7 @@ def build_scan_quality_summary(session: Session, scan_id: str) -> dict[str, Any]
         # React rerender merely because this endpoint was read again.
         "generated_at": latest_event_at.isoformat(),
         "funnel": funnel,
+        "web_proof_funnel": web_proof_funnel,
         "task_statuses": dict(sorted(task_statuses.items())),
         "proof_statuses": dict(sorted(proof_statuses.items())),
         "failure_reasons": failures,

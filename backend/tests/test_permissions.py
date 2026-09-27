@@ -129,6 +129,24 @@ def test_ensure_directories_provisions_scratch_and_codex_home(settings) -> None:
         assert _mode(directory) == 0o700
 
 
+def test_ssh_credentials_and_subscription_auth_require_explicit_opt_in(
+    settings, tmp_path  # noqa: ANN001
+) -> None:
+    assert settings.adaptive_verifier_copy_host_ssh is False
+    assert settings.adaptive_verifier_ssh_source is None
+    with pytest.raises(ValueError, match="explicit"):
+        replace(settings, adaptive_verifier_copy_host_ssh=True).validate_codex_configuration()
+    with pytest.raises(ValueError, match="explicit"):
+        replace(settings, semantic_judge_enabled=True).validate_codex_configuration()
+    auth_home = tmp_path / "judge-auth"
+    auth_home.mkdir()
+    replace(
+        settings,
+        semantic_judge_enabled=True,
+        semantic_judge_codex_home=auth_home,
+    ).validate_codex_configuration()
+
+
 def test_sqlite_connections_pin_temp_directory_to_private_data_dir(settings) -> None:  # noqa: ANN001
     settings.ensure_directories()
     database = Database(settings)

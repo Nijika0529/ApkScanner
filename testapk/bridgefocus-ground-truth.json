@@ -1,0 +1,27 @@
+{
+  "schema_version": "1.0",
+  "name": "APKScanner focused Deep Link to JSBridge state-change fixture",
+  "apk_sha256": "da5c80ac60724e84fbe8689b3ad290e4dee18b423f30732833c3e3201a7b590d",
+  "required_dynamic_scope": "android16_release",
+  "quality_gate": {
+    "minimum_precision": 1.0,
+    "minimum_recall": 1.0,
+    "maximum_false_positives": 0
+  },
+  "vulnerabilities": [
+    {
+      "id": "BF-001",
+      "title": "Attacker-controlled Deep Link page changes native state through StateBridge",
+      "harm": "An ordinary app can send bridgefocus://web?url=<attacker page> to the exported BridgeActivity; the target WebView loads that page and exposes StateBridge.setEnabled(boolean), whose void call persistently changes target-owned configuration and its native state TextView from state:off to state:on.",
+      "severity": "high",
+      "minimum_proof": "dynamic",
+      "match": {
+        "entry_names": ["io.apkscanner.bridgefocus.BridgeActivity"],
+        "oracle_kinds": ["ui_text"],
+        "oracle_impacts": ["unauthorized_state_change"],
+        "observed_fact_types": ["target_ui_transition"]
+      }
+    }
+  ],
+  "negative_controls": []
+}

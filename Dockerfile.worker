@@ -21,7 +21,7 @@ ARG ANDROID_BUILD_TOOLS_ARCHIVE="build-tools_r36.1_linux.zip"
 ARG ANDROID_BUILD_TOOLS_SHA256="a7b5889e4a79fcf3b0976bef40d401f4240fb1eed891d9d91169da1111e11d78"
 
 LABEL io.apkscanner.version="0.2.0" \
-      io.apkscanner.sdk-version="0.147.0" \
+      io.apkscanner.sdk-version="0.156.1" \
       io.apkscanner.worker-protocol="3" \
       io.apkscanner.agent-backend="codex" \
       io.apkscanner.model-provider="deepseek" \
@@ -77,6 +77,9 @@ COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
+ARG PYPI_INDEX_URL="https://pypi.org/simple/"
+ENV PIP_INDEX_URL="${PYPI_INDEX_URL}"
+
 WORKDIR /opt/apk-scanner
 COPY pyproject.toml README.md ./
 COPY docker/install-project-dependencies.py /tmp/install-project-dependencies.py
@@ -90,6 +93,6 @@ RUN ln -s /usr/local/lib/python3.13/site-packages/codex_cli_bin/bin/codex \
     && test -x /usr/local/bin/apkscanner-adb-gateway \
     && ln -s /usr/local/bin/apkscanner-adb-gateway /usr/local/bin/adb
 
-LABEL io.apkscanner.worker-revision="20260910.1"
+LABEL io.apkscanner.worker-revision="20260924.1"
 
 ENTRYPOINT ["python", "-m", "apkscanner.runtime.codex_worker"]

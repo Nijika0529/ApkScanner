@@ -54,6 +54,31 @@ def test_gateway_rejects_transport_escape_and_platform_owned_mutations(args: lis
         AdbGatewayRequest(args=args)
 
 
+@pytest.mark.parametrize("policy", ["scoped", "adaptive"])
+@pytest.mark.parametrize(
+    "args",
+    [
+        [
+            "shell", "content", "query", "--uri",
+            "content://io.apkscanner.adaptivecases.fixture/web-canary",
+        ],
+        [
+            "shell", "content", "read", "--uri",
+            "content://io.apkscanner.adaptivecases%2Efixture/web-canary",
+        ],
+        [
+            "shell", "am", "broadcast", "-n",
+            "io.apkscanner.adaptivecases/.FixtureSeedReceiver",
+        ],
+    ],
+)
+def test_agent_gateway_cannot_use_platform_web_canary_oracle(
+    args: list[str], policy: str,
+) -> None:
+    with pytest.raises((ValueError, ValidationError), match="platform-owned Web canary"):
+        AdbGatewayRequest(args=args, policy=policy)
+
+
 def test_gateway_response_bounds_command_output() -> None:
     result = CommandResult(["adb", "-s", "serial", "logcat"], 0, "x" * 100, "")
     response = AdbGatewayResponse.from_command(result, max_bytes=16)

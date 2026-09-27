@@ -16,6 +16,7 @@
 
 - Docker Engine；
 - DeepSeek API Key；
+- 宿主上的 `aapt2`、`apksigner`、`apktool`、`jadx` 与 PoC Java/Android SDK 构建工具；
 - 按 [Worker 镜像准备](worker-image.zh-CN.md)生成的固定镜像。
 
 动态验证另外需要：
@@ -118,11 +119,15 @@ scanctl capabilities --deep
 ./start.sh
 ```
 
-`capabilities --deep` 会执行一次小额真实 Provider 请求。`start.sh` 自动构建前端、停止旧的
-`scanctl serve` 进程、探测真实 ADB 并启动后台服务。
+`capabilities --deep` 会执行一次小额真实 Provider 请求。`start.sh` 先用
+`python -m apkscanner.runtime.startup_preflight` 检查密钥、Docker Worker、构建工具和已配置设备，
+再构建前端；任一预检失败不会停止旧服务。新进程启动后必须通过 `/ready`，不能仅凭进程存活
+或 `/health` 的 `ok` 判定可扫描。开发模式未配置设备时仍可执行静态任务；发布 Profile 必须有
+符合要求的 Android 16 设备。
 
 ```bash
 curl http://127.0.0.1:8000/api/v1/health
+curl -f http://127.0.0.1:8000/api/v1/ready
 tail -f /tmp/apkscanner.log
 ```
 

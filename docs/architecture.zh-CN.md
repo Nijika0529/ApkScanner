@@ -41,6 +41,21 @@ scheme、host/authority 和 port；额外参数有数量、键名、类型和长
 辩论阶段反复扇出。每次扫描在创建时记录初始 `codex` 或 `none`；服务默认值的后续
 变更不会静默改变它，只有用户在扫描控制台显式调整才会影响后续任务。
 
+### 平台控制的任务调查环
+
+任务的执行 DAG 继续描述单轮内的先后依赖，不在 DAG 中添加回边。需要继续探索时，平台创建下一轮
+`plan → validate → execute → verify → replan`，并把轻量控制状态写入
+`InvestigationTask.result.investigation_loop`。该状态只保存 attempt、轮次、当前阶段、剩余预算、
+连续无进展次数和终止原因；Agent Turn、ProofAttempt、Evidence 与设备回执仍由各自现有台账保存，
+不复制事实，也不为进展判断额外生成内容摘要。
+
+是否开始下一轮由 `core/investigation_loop.py` 的纯状态决策决定。模型只能提出动作，不能决定循环
+是否越过平台边界。平台在以下任一条件成立时关闭调查环：全部假设已经获得平台 Proof、没有待执行
+动作、Agent 结果不可用、执行环境不可用、生命周期预算耗尽，或连续轮次没有平台可见的实质进展。
+`runtime/investigation_loop.py` 只比较结构化 Evidence、Proof、测试请求和假设判断；模型改写摘要或
+理由不会被当成新进展。Critic、Rescue 和 Final 是有界旁路，终局 Finding Policy 保持单向，不能
+自行重新打开已经关闭的调查环。
+
 扫描创建后的 Agent 控制分两层：`Scan.stats.agent_control` 是总开关和后端选择；
 `InvestigationTask.preconditions.agent_enabled` 是单任务覆盖。总开关关闭时所有任务只运行
 规则和确定性动态验证；总开关开启后，任务级开关仍可关闭某个入口的 AI。运行中的任务保留
@@ -170,8 +185,9 @@ Oracle 缺口层；静态正向结论必须通过完整攻击链硬门槛，缺�
 AI 审计；旧 Evidence 不删除。批量补扫仅允许在当前扫描已经 `final`/`failed` 时启动，避免
 与仍在运行的设备任务竞态。
 
-单任务默认预算为 20 分钟。任务进入 `timed_out` 后，Web 提供“继续深度探索”而不是普通
-重跑：控制面重新排队同一 `task_id`，分配一份新的 20 分钟预算，并将该任务历次静态、
+`Settings` 的单任务默认预算为 4 小时；`start.sh` 当前显式使用 3600 秒，均可由
+`APKSCANNER_TASK_TIMEOUT` 覆盖。任务进入 `timed_out` 后，Web 提供“继续深度探索”而不是普通
+重跑：控制面重新排队同一 `task_id`，分配一份同配置的新预算，并将该任务历次静态、
 ADB、Harness/PoC、Agent 请求/响应和平台校验 Evidence 一并装载给新一轮 Agent。续跑轮次
 记录在 `manual_continuation.continuation_number`，旧 thread/turn 仅作为关联信息保留，新轮
 仍产生独立可审计调用。显式续跑不受原扫描 24 小时截止时间或自动尝试次数限制，但每轮仍

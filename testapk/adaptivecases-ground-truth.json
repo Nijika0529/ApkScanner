@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
   "name": "APKScanner adaptive Android attack-chain fixture",
-  "apk_sha256": "64538a7792ff3d0b28ac00c779bcf8b566e16d3cc7627933b9df730a94acd755",
+  "apk_sha256": "0beb75fd3f90dfcb0459cb978368210e8ce52737eb790f5e3749f473531575d1",
   "quality_gate": {
     "minimum_precision": 1.0,
     "minimum_recall": 1.0,
@@ -49,7 +49,9 @@
       "minimum_proof": "dynamic",
       "match": {
         "entry_names": ["io.apkscanner.adaptivecases.BridgeActivity", "static://web_content_boundary"],
-        "title_contains": ["AccountBridge"]
+        "title_contains": ["AccountBridge"],
+        "oracle_impacts": ["unauthorized_data_access"],
+        "bridge_methods": ["AccountBridge.getSessionToken"]
       }
     },
     {
@@ -59,7 +61,33 @@
       "severity": "high",
       "minimum_proof": "dynamic",
       "match": {
-        "entry_names": ["io.apkscanner.adaptivecases.SecretBinderService"]
+        "entry_names": ["io.apkscanner.adaptivecases.SecretBinderService"],
+        "oracle_kinds": ["binder_reply"],
+        "oracle_impacts": ["unauthorized_data_access"],
+        "observed_fact_types": ["binder_reply_matched"]
+      }
+    }
+  ],
+  "negative_controls": [
+    {
+      "id": "AC-SAFE-001",
+      "title": "PendingIntent redirection does not disclose the private provider",
+      "match": {
+        "entry_names": ["io.apkscanner.adaptivecases.PendingIntentBrokerActivity"]
+      }
+    },
+    {
+      "id": "AC-SAFE-002",
+      "title": "Signature-protected immutable PendingIntent cannot be invoked by an ordinary app",
+      "match": {
+        "entry_names": ["io.apkscanner.adaptivecases.SafeCapabilityActivity"]
+      }
+    },
+    {
+      "id": "AC-SAFE-003",
+      "title": "External page loads without an account JavaScript bridge",
+      "match": {
+        "entry_names": ["io.apkscanner.adaptivecases.SafeBridgeActivity"]
       }
     }
   ]

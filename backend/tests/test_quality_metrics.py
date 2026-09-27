@@ -44,6 +44,66 @@ def test_failure_classifier_distinguishes_planning_and_runtime_receipt_gaps() ->
     assert _classify_failure("adb worker timed out while observing Oracle") == "timeout"
 
 
+def test_web_proof_funnel_separates_callbacks_from_independent_effects(settings) -> None:  # noqa: ANN001
+    database = Database(settings)
+    database.create_all()
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="web-quality.apk",
+            artifact_sha256="a" * 64,
+            artifact_path="web-quality.apk",
+        )
+        session.add(scan)
+        session.flush()
+        full = "11111111-1111-4111-8111-111111111111"
+        gap = "22222222-2222-4222-8222-222222222222"
+        receipts = [
+            ("web.experiment.plan", full, {}),
+            ("web.experiment.event", full, {"phase": "attack", "event_type": "page"}),
+            ("web.experiment.event", full, {
+                "phase": "attack", "stage": "callback", "event_type": "bridge_return",
+            }),
+            ("web.experiment.execution", full, {
+                "ordinary_app_uid_verified": True, "webview_in_target_confirmed": True,
+            }),
+            ("web.experiment.snapshot", full, {"controls_validated": True}),
+            ("web.experiment.target_effect", full, {"target_owned_effect_validated": True}),
+            ("semantic.proof_attestation", full, {"harm_demonstrated": True}),
+            ("web.experiment.plan", gap, {}),
+            ("web.experiment.event", gap, {"phase": "attack", "event_type": "page"}),
+            ("web.experiment.event", gap, {
+                "phase": "attack", "stage": "callback", "event_type": "bridge_return",
+            }),
+        ]
+        session.add_all(
+            Evidence(
+                scan_id=scan.id,
+                kind=kind,
+                sha256="b" * 64,
+                path="web-evidence.json",
+                metadata_json={"experiment_id": experiment_id, **metadata},
+            )
+            for kind, experiment_id, metadata in receipts
+        )
+        session.commit()
+        scan_id = scan.id
+
+    with database.session_factory() as session:
+        summary = build_scan_quality_summary(session, scan_id)
+
+    web = {item["key"]: item["count"] for item in summary["web_proof_funnel"]}
+    assert web == {
+        "planned": 2,
+        "page_received": 2,
+        "target_main_frame": 1,
+        "bridge_callback": 2,
+        "negative_controls": 1,
+        "independent_effect": 1,
+        "attested_proof": 1,
+    }
+    assert summary["generated_at"] != datetime.fromtimestamp(0, UTC).isoformat()
+
+
 def test_quality_summary_tracks_funnel_cost_and_failures(settings) -> None:  # noqa: ANN001
     database = Database(settings)
     database.create_all()

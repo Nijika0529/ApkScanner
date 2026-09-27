@@ -8,10 +8,18 @@ from sqlalchemy import select
 
 from ..core.config import Settings
 from ..core.db import Database
-from ..core.enums import FindingStatus, ScanStatus
+from ..core.enums import FindingStatus, ScanStatus, TaskStatus
 from ..core.finding_policy import partition_findings
-from ..core.models import BenchmarkEvaluation, EntryPoint, Finding, Scan
-from ..core.schemas import BenchmarkSpec, GroundTruthVulnerability
+from ..core.models import (
+    BenchmarkEvaluation,
+    EntryPoint,
+    Finding,
+    InvestigationTask,
+    ProofAttempt,
+    Scan,
+)
+from ..core.proof_receipts import attributable_harm_attempts_by_finding
+from ..core.schemas import BenchmarkSpec, GroundTruthMatch, GroundTruthVulnerability
 
 _PROOF_RANK = {
     FindingStatus.SUPPORTED_STATIC.value: 1,
@@ -42,7 +50,8 @@ class BenchmarkEvaluator:
                 )
             )
             confirmed, signals = partition_findings(session, findings)
-            result = self._score(spec, confirmed, entries, signals)
+            proof_attempts = attributable_harm_attempts_by_finding(session, confirmed)
+            result = self._score(spec, confirmed, entries, signals, proof_attempts)
             control = scan.stats.get("agent_control")
             if not isinstance(control, dict):
                 control = {}
@@ -268,6 +277,31 @@ class BenchmarkEvaluator:
             raise ValueError("scan not found")
         if scan.status != ScanStatus.FINAL.value:
             raise ValueError("benchmark evaluation requires a completed final scan")
+        stats = scan.stats if isinstance(scan.stats, dict) else {}
+        execution_control = stats.get("execution_control")
+        if (
+            isinstance(execution_control, dict)
+            and execution_control.get("state") in {"stopping", "stopped"}
+        ):
+            raise ValueError("benchmark evaluation requires an uninterrupted scan")
+        runtime_integrity = stats.get("runtime_integrity")
+        if (
+            isinstance(runtime_integrity, dict)
+            and runtime_integrity.get("status") == "invalid"
+        ):
+            raise ValueError("benchmark evaluation requires valid runtime integrity")
+        canceled_task_id = session.scalar(
+            select(InvestigationTask.id)
+            .where(
+                InvestigationTask.scan_id == scan_id,
+                InvestigationTask.status.in_(
+                    {TaskStatus.CANCEL_REQUESTED.value, TaskStatus.CANCELED.value}
+                ),
+            )
+            .limit(1)
+        )
+        if canceled_task_id is not None:
+            raise ValueError("benchmark evaluation requires no canceled investigation tasks")
         if spec.apk_sha256 and spec.apk_sha256 != scan.artifact_sha256:
             raise ValueError("ground truth APK SHA-256 does not match the selected scan")
         return scan
@@ -285,6 +319,7 @@ class BenchmarkEvaluator:
         findings: list[Finding],
         entries: list[EntryPoint],
         signals: list[Finding],
+        proof_attempts: dict[str, list[ProofAttempt]],
     ) -> dict[str, Any]:
         entry_names = {entry.id: entry.name for entry in entries}
         confirmed = findings
@@ -305,6 +340,23 @@ class BenchmarkEvaluator:
         findings_by_id = {
             finding.id: finding for finding in [*confirmed, *static_candidates]
         }
+        negative_control_violations = [
+            {
+                "negative_control_id": control.id,
+                "negative_control_title": control.title,
+                "finding_id": finding.id,
+                "finding_title": finding.title,
+                "evidence_ids": list(finding.evidence_ids or []),
+            }
+            for control in spec.negative_controls
+            for finding in confirmed
+            if cls._selector_matches(
+                control.match, finding, entry_names, proof_attempts.get(finding.id, [])
+            )
+        ]
+        negative_finding_ids = {
+            violation["finding_id"] for violation in negative_control_violations
+        }
         candidate_ids_by_truth: list[list[str]] = []
         for truth in spec.vulnerabilities:
             pool = (
@@ -315,11 +367,13 @@ class BenchmarkEvaluator:
             candidates = [
                 finding
                 for finding in pool
+                if finding.id not in negative_finding_ids
                 if cls._matches(
                     truth,
                     finding,
                     entry_names,
                     required_dynamic_scope=spec.required_dynamic_scope,
+                    proof_attempts=proof_attempts.get(finding.id, []),
                 )
             ]
             candidates.sort(
@@ -423,6 +477,7 @@ class BenchmarkEvaluator:
                 precision >= spec.quality_gate.minimum_precision
                 and recall >= spec.quality_gate.minimum_recall
                 and false_positive_count <= spec.quality_gate.maximum_false_positives
+                and not negative_control_violations
             ),
             "minimum_precision": spec.quality_gate.minimum_precision,
             "minimum_recall": spec.quality_gate.minimum_recall,
@@ -430,6 +485,7 @@ class BenchmarkEvaluator:
             "observed_precision": round(precision, 6),
             "observed_recall": round(recall, 6),
             "observed_false_positives": false_positive_count,
+            "observed_negative_control_violations": len(negative_control_violations),
         }
         return {
             "schema_version": "1.0",
@@ -454,11 +510,14 @@ class BenchmarkEvaluator:
                 "f0_5": round(f_half, 6),
                 "score_100": round(f_half * 100, 2),
                 "unproven_ai_noise": len(ai_noise),
+                "negative_control_count": len(spec.negative_controls),
+                "negative_control_violations": len(negative_control_violations),
             },
             "quality_gate": quality_gate,
             "matches": matches,
             "missed": missed,
             "false_positives": false_positives,
+            "negative_control_violations": negative_control_violations,
             "unproven_ai_noise": [
                 {
                     "finding_id": finding.id,
@@ -477,6 +536,7 @@ class BenchmarkEvaluator:
         entry_names: dict[str, str],
         *,
         required_dynamic_scope: str = "android16_release",
+        proof_attempts: list[ProofAttempt] | None = None,
     ) -> bool:
         required_rank = _MINIMUM_PROOF_RANK[truth.minimum_proof]
         if _PROOF_RANK.get(finding.status, 0) < required_rank:
@@ -488,23 +548,97 @@ class BenchmarkEvaluator:
         if (
             truth.minimum_proof == "dynamic"
             and required_dynamic_scope == "android16_release"
-            and finding.metadata_json.get("release_gate_eligible") is False
+            and finding.metadata_json.get("release_gate_eligible") is not True
         ):
             return False
-        selector = truth.match
+        eligible_attempts = proof_attempts or []
+        if truth.minimum_proof == "dynamic" and required_dynamic_scope == "android16_release":
+            eligible_attempts = [
+                attempt for attempt in eligible_attempts
+                if (attempt.oracle or {}).get("release_gate_eligible") is True
+            ]
+            if proof_attempts is not None and not eligible_attempts:
+                return False
+        return BenchmarkEvaluator._selector_matches(
+            truth.match, finding, entry_names, eligible_attempts
+        )
+
+    @staticmethod
+    def _selector_matches(
+        selector: GroundTruthMatch,
+        finding: Finding,
+        entry_names: dict[str, str],
+        proof_attempts: list[ProofAttempt] | None = None,
+    ) -> bool:
         if selector.rule_ids and finding.rule_id not in selector.rule_ids:
             return False
         if selector.cwes and finding.cwe not in selector.cwes:
             return False
         actual_entries = {
-            entry_names[value] for value in finding.entry_point_ids if value in entry_names
+            entry_names[value]
+            for value in (finding.entry_point_ids or [])
+            if value in entry_names
         }
         if selector.entry_names and not actual_entries.intersection(selector.entry_names):
             return False
         searchable = f"{finding.title}\n{finding.description}".lower()
-        return not selector.title_contains or all(
+        if selector.title_contains and not all(
             token.lower() in searchable for token in selector.title_contains
-        )
+        ):
+            return False
+        if not any((
+            selector.oracle_kinds,
+            selector.oracle_impacts,
+            selector.bridge_methods,
+            selector.observed_fact_types,
+        )):
+            return True
+        for attempt in proof_attempts or []:
+            if attempt.status != "proven" or attempt.harm_demonstrated is not True:
+                continue
+            receipt = attempt.oracle if isinstance(attempt.oracle, dict) else {}
+            if receipt.get("security_impact_observed") is not True:
+                continue
+            plan = attempt.plan if isinstance(attempt.plan, dict) else {}
+            if attempt.prover == "platform_semantic_attestation":
+                attestation_id = receipt.get("attestation_evidence_id")
+                if (
+                    receipt.get("policy") != "independent_semantic_judge_and_platform_gate"
+                    or receipt.get("release_gate_eligible") is not True
+                    or receipt.get("harm_demonstrated") is not True
+                    or not isinstance(attestation_id, str)
+                    or attestation_id not in (attempt.evidence_ids or [])
+                    or not isinstance(plan.get("experiment_id"), str)
+                    or plan["experiment_id"] != receipt.get("experiment_id")
+                ):
+                    continue
+                oracle_kind = None
+                oracle_impact = plan.get("impact")
+                bridge_method = plan.get("bridge_method")
+            else:
+                plan_oracle = plan.get("oracle")
+                if not isinstance(plan_oracle, dict):
+                    continue
+                oracle_kind = plan_oracle.get("kind")
+                oracle_impact = plan_oracle.get("impact")
+                bridge_method = None
+            if selector.oracle_kinds and oracle_kind not in selector.oracle_kinds:
+                continue
+            if selector.oracle_impacts and oracle_impact not in selector.oracle_impacts:
+                continue
+            if selector.bridge_methods and bridge_method not in selector.bridge_methods:
+                continue
+            facts = receipt.get("observed_facts")
+            matched_fact_types = {
+                fact.get("fact_type")
+                for fact in facts if isinstance(fact, dict) and fact.get("matched") is True
+            } if isinstance(facts, list) else set()
+            if selector.observed_fact_types and not matched_fact_types.intersection(
+                selector.observed_fact_types
+            ):
+                continue
+            return True
+        return False
 
     @staticmethod
     def _ratio(numerator: int, denominator: int) -> float:

@@ -59,15 +59,23 @@ load_env_file() {
 }
 
 load_env_file
+cd "$PROJECT_DIR"
+SCANCTL_BIN="$PROJECT_DIR/.venv/bin/scanctl"
+PYTHON_BIN="$PROJECT_DIR/.venv/bin/python"
+if [ ! -x "$SCANCTL_BIN" ] || [ ! -x "$PYTHON_BIN" ]; then
+  echo "project environment is missing; run uv sync --locked in $PROJECT_DIR" >&2
+  exit 1
+fi
 RUNTIME_DIR="${APKSCANNER_RUNTIME_DIR:-$PROJECT_DIR/.data/run}"
 DATA_DIR="${APKSCANNER_DATA_DIR:-$PROJECT_DIR/.data}"
+if [[ "$RUNTIME_DIR" != /* ]]; then
+  RUNTIME_DIR="$PROJECT_DIR/$RUNTIME_DIR"
+fi
 if [[ "$DATA_DIR" != /* ]]; then
   DATA_DIR="$PROJECT_DIR/$DATA_DIR"
 fi
+export APKSCANNER_DATA_DIR="$DATA_DIR"
 PID_FILE="$RUNTIME_DIR/scanctl.pid"
-
-mkdir -p "$RUNTIME_DIR"
-chmod 700 "$RUNTIME_DIR"
 
 build_frontend() {
   local frontend_dir="$PROJECT_DIR/frontend"
@@ -166,8 +174,9 @@ detect_adb_serials() {
   echo "no ADB device became ready during startup; device tasks will use static-only mode" >&2
 }
 
-# Build before stopping the running service. A failed frontend build therefore
-# cannot replace a working process or silently leave FastAPI serving an old bundle.
+# Resolve the real host ADB before checking device capabilities. Development
+# mode without a device remains intentionally static-only; an explicitly
+# configured but unavailable device fails the preflight below.
 if resolved_host_adb="$(resolve_host_adb)"; then
   export APKSCANNER_HOST_ADB="$resolved_host_adb"
   echo "host adb: $APKSCANNER_HOST_ADB"
@@ -178,14 +187,7 @@ else
   export APKSCANNER_HOST_ADB="/nonexistent/apkscanner-host-adb"
   echo "real host adb was not found; device tasks will use static-only mode" >&2
 fi
-build_frontend
-stop_existing
-
-if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
-  echo "DEEPSEEK_API_KEY is not set in the caller environment." >&2
-  echo "export DEEPSEEK_API_KEY=sk-... before running start.sh" >&2
-  exit 1
-fi
+export DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}"
 export APKSCANNER_CODEX_ENABLED="${APKSCANNER_CODEX_ENABLED:-true}"
 export APKSCANNER_INVESTIGATOR_BACKEND="${APKSCANNER_INVESTIGATOR_BACKEND:-codex}"
 export APKSCANNER_CODEX_ISOLATION="${APKSCANNER_CODEX_ISOLATION:-docker}"
@@ -198,6 +200,24 @@ export APKSCANNER_DEVICE_INSTALL_POLICY="install_or_reuse"
 export APKSCANNER_DEVICE_RESET_POLICY="${APKSCANNER_DEVICE_RESET_POLICY:-never}"
 export APKSCANNER_FRONTEND_DIST="$PROJECT_DIR/frontend/dist"
 export APKSCANNER_TASK_TIMEOUT="${APKSCANNER_TASK_TIMEOUT:-3600}"
+
+# Do not take down a working service because credentials, Docker, the pinned
+# worker image, Android SDK, or an explicitly selected phone are unavailable.
+# The Python gate shares these requirements with the Android release CI.
+if ! "$PYTHON_BIN" -m apkscanner.runtime.startup_preflight; then
+  echo "startup preflight failed; the existing service was not stopped" >&2
+  exit 1
+fi
+if ! command -v curl >/dev/null 2>&1; then
+  echo "curl is required for the API readiness check; the existing service was not stopped" >&2
+  exit 1
+fi
+
+# A failed frontend build also leaves the running service untouched.
+build_frontend
+mkdir -p "$RUNTIME_DIR"
+chmod 700 "$RUNTIME_DIR"
+stop_existing
 
 nohup setsid env \
   DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
@@ -214,33 +234,35 @@ nohup setsid env \
   APKSCANNER_DEVICE_RESET_POLICY="$APKSCANNER_DEVICE_RESET_POLICY" \
   APKSCANNER_FRONTEND_DIST="$APKSCANNER_FRONTEND_DIST" \
   APKSCANNER_TASK_TIMEOUT="$APKSCANNER_TASK_TIMEOUT" \
-  scanctl serve \
+  "$SCANCTL_BIN" serve \
   </dev/null >/tmp/apkscanner.log 2>&1 &
 
 SERVICE_PID=$!
 umask 077
 printf '%s\n' "$SERVICE_PID" >"$PID_FILE"
 echo "started PID=$SERVICE_PID"
-# Cold start can be slow (SDK/worker image validation, ADB capability probe).
-# Give the service up to 30s; if it is merely slow we keep it running and
-# only warn, because killing a healthy-but-slow boot is worse than waiting.
-for i in $(seq 1 30); do
+# The new endpoint is a readiness gate; /health is liveness only. A process
+# that stays alive but never becomes ready is not reported as a successful boot.
+ready=false
+for i in $(seq 1 60); do
   sleep 1
   if ! kill -0 "$SERVICE_PID" 2>/dev/null; then
     echo "startup failed: process exited early; see /tmp/apkscanner.log" >&2
     rm -f "$PID_FILE"
     exit 1
   fi
-  result=$(curl -s --connect-timeout 1 --max-time 3 \
-    http://127.0.0.1:8000/api/v1/health 2>/dev/null || true)
-  if [ -n "$result" ]; then
-    echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'status={d[\"status\"]} enabled={d[\"enabled_investigators\"]}')" 2>/dev/null && break
-  fi
-  if [ "$i" -eq 30 ]; then
-    echo "health check did not pass within 30s; service is still running, check /tmp/apkscanner.log" >&2
+  if curl --fail --silent --show-error --connect-timeout 1 --max-time 3 \
+    http://127.0.0.1:8000/api/v1/ready >/dev/null 2>&1; then
+    ready=true
+    break
   fi
 done
-echo "http://$(hostname -I | awk '{print $1}'):8000"
+if [ "$ready" != true ]; then
+  echo "readiness did not pass within 60s; PID $SERVICE_PID remains running for diagnosis, see /tmp/apkscanner.log" >&2
+  exit 1
+fi
+echo "service readiness passed"
+echo "http://127.0.0.1:8000"
 
 # If the caller provided an explicit device pool that the ADB server already
 # knows, print a registration hint when the platform reports none online.

@@ -68,6 +68,10 @@ def developer_instructions(
         "`apkscanner-proof <proof-replay.json>`; the command replays it inside the current task's "
         "device lease, captures evidence, and evaluates an independent Oracle. Do not submit the "
         "same action again through requested_tests. "
+        "For a platform-controlled Web canary fixture, prepare the PoC before beginning the Web "
+        "experiment. From begin until snapshot/cleanup, the Agent ADB gateway is paused so the "
+        "shell identity cannot inspect the target-only canary; trigger the ordinary-app attack "
+        "through platform ProofReplay instead. Never query the fixture control Provider directly. "
         if adb_enabled
         else "ADB is unavailable; request device checks through requested_tests. "
     )
@@ -86,7 +90,15 @@ def developer_instructions(
         "localhost/Unix-socket client, SSH remote log, or another semantic experiment produces "
         "a fact, POST its JSON observation to $APKSCANNER_OBSERVATION_URL with header "
         "X-APKScanner-Proof-Token: $APKSCANNER_OBSERVATION_TOKEN. An observation is durable "
-        "evidence for semantic review, not an automatic reproduced verdict. "
+        "evidence for semantic review, not an automatic reproduced verdict. For a Deep Link to "
+        "JavaScript bridge experiment, POST {finding_id,hypothesis_id,bridge_name,method,arguments,frame} "
+        "to $APKSCANNER_WEB_EXPERIMENT_URL with X-APKScanner-Proof-Token: "
+        "$APKSCANNER_WEB_EXPERIMENT_TOKEN. The platform returns an attack_url with a frozen "
+        "experiment_id and nonce; launch that URL through an ordinary-app PoC. Then POST "
+        "{launch_evidence_id,process_evidence_id,target_evidence_id} to "
+        "$APKSCANNER_WEB_EXPERIMENT_URL/<experiment_id>/snapshot. The platform runs Chrome "
+        "negative controls and records page/callback receipts. A callback remains a client "
+        "report, so cite independent target-side evidence before claiming impact. "
     )
     exploration_discipline = (
         "The assigned coverage seed is a hard workflow scope. Do not use a broad glob, directory "
@@ -121,8 +133,16 @@ def developer_instructions(
         "platform_context.proof_capabilities.ephemeral_app_harness first. When it is true, use the "
         "platform binder_transact replay instead of authoring a Binder PoC; the platform builds, "
         "installs, executes, and removes a one-shot ordinary-app Harness for that request. When it "
-        "is false, use an Agent-built ordinary-app PoC if further app-UID evidence is useful. After preparing "
-        "the smallest supported replay, submit a live proof replay rather than continuing equivalent "
+        "is false, use an Agent-built ordinary-app PoC if further app-UID evidence is useful. "
+        "For a simple Activity or Deep Link replay whose attack input fits a manifest-valid URI "
+        "and extras, prefer a requested test without poc when "
+        "platform_context.proof_capabilities.ephemeral_app_harness is true: the platform will "
+        "build and launch the ordinary-app-UID Harness even if raw ADB or live proof_replay is "
+        "unavailable. Provide an independent typed Oracle; a ui_text state-change claim needs "
+        "a target-owned native view transition, not attacker page text or a PoC log. Author a "
+        "custom PoC only when the platform request cannot express the required JavaScript, "
+        "callback, or multi-step behavior. "
+        "After preparing the smallest supported replay, submit a live proof replay rather than continuing equivalent "
         "raw ADB exploration. Keep a primary strategy, materially distinct fallback strategies, "
         "and a disconfirming test; "
         "an inconclusive receipt may justify another materially changed strategy. "
@@ -246,8 +266,20 @@ evidence only.
 For every candidate, record concrete actions and observations. A semantic verdict may rely on
 ADB output, application behavior, an ordinary-app PoC, a remote callback, SSH-visible server logs,
 or a combination. The platform will preserve your structured response and tool timeline; it will
-not reinterpret returned values with a fixed Oracle. Use reproduced_blackbox only after an actual
-runtime observation establishes the claimed impact. Use not_reproduced only when a relevant
+not reinterpret returned values with a fixed Oracle. For a WebView, JSBridge, or network-callback
+claim of reproduced_blackbox, fill semantic_proof using the platform-issued experiment_id and
+hypothesis_id. Cite exact Evidence IDs and verbatim excerpts for ordinary-app execution, the
+observed effect, target-owned source or independent readback, and negative controls. Explain why
+the effect came from the target rather than a page echo, a direct Observer request, stale data, or
+your own PoC log. Record every unresolved obligation instead of treating page_loaded or a void
+JavaScript call as impact. A separate read-only judge and platform gate will review the frozen
+record; this answer alone cannot create a harm-demonstrating ProofAttempt. A data-access claim
+requires a platform target-owned effect receipt; a Bridge
+callback and static source alone are insufficient. For a controlled canary fixture, build the
+ordinary-app PoC before beginning the experiment. The Agent ADB gateway is paused while the
+canary is active; use platform ProofReplay to launch the PoC and snapshot to close the window.
+Do not use the shell-only fixture Provider as attacker evidence. Use reproduced_blackbox
+only after an actual runtime observation establishes the claimed impact. Use not_reproduced only when a relevant
 runtime attempt produced meaningful counterevidence. Keep supported_static when the static chain
 remains credible but execution is blocked or inconclusive. Use refuted_static only when usable
 static Evidence proves a specific guard or unreachable call edge: put that exact blocked edge in
@@ -832,6 +864,12 @@ def investigation_prompt(
         "ordinary-app replay. requested_tests remains available only when the platform must build "
         "a Harness or execute a stateful multi-step experiment; never submit the same action through "
         "both paths. "
+        "For a simple Activity/Deep Link attack expressible as a validated URI and extras, "
+        "prefer a requested_test with poc omitted when "
+        "proof_capabilities.ephemeral_app_harness=true; the platform builds a separate ordinary-UID "
+        "app and correlates its execution. Do not author a custom PoC merely because raw ADB or "
+        "proof_replay is unavailable. Keep ui_text impact dependent on target-owned native UI "
+        "before/after evidence; a page or PoC success message is insufficient. "
         "The proof JSON contains mandatory hypothesis_id and entry_point_id plus oracle and "
         "rationale. It contains either poc for a custom app, operation=binder_transact, or "
         "operation=binder_script with "
@@ -849,6 +887,9 @@ def investigation_prompt(
         "oracle.kind=reachability, oracle.impact=none, reset=preserve, and all legacy URI/extra/Binder "
         "fields empty. experiment.steps must contain at least one action and one assert step. Its "
         "proof.assertion_step_ids must name assert steps that emit one of proof.observation_kinds. "
+        "For an operator-provisioned logged-in state, set state=fixture and state_fixture_id to an "
+        "active validation_fixtures ID; the platform reruns its state_check before the attack and "
+        "will leave a gap if the check fails. Never label an unverified guest run authenticated. "
         "Generic Dynamic Experiment stdout/regex assertions are diagnostic execution receipts, not an "
         "independent platform Oracle, so they cannot by themselves confirm or refute a vulnerability; "
         "use a typed ordinary-app PoC Oracle when the result must close the verdict. Assertions must "

@@ -158,6 +158,8 @@ def test_agent_adb_policy_keeps_full_access_with_hard_safety_boundary() -> None:
     assert "never reconstruct a task UUID" in instructions
     assert "Avoid redundant existence/path checks for unchanged PoC sources" in instructions
     assert "prefer a dedicated PoC or platform-generated proof Harness" in instructions
+    assert "prefer a requested test without poc" in instructions
+    assert "target-owned native view transition" in instructions
     assert "materially distinct fallback strategies" in instructions
     assert "submit a live proof replay" in instructions
     assert "without discovering or invoking an Android SDK toolchain" in instructions

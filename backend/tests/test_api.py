@@ -20,7 +20,7 @@ from apkscanner.core.models import (
     Scan,
     SecurityHypothesis,
 )
-from apkscanner.core.schemas import AgentInvestigationResult
+from apkscanner.core.schemas import AgentInvestigationResult, Capability, HealthResponse
 from apkscanner.main import create_app
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -70,6 +70,70 @@ def test_local_api_requires_console_marker_for_mutations(settings) -> None:  # n
         assert health["default_investigator"] == "codex"
         assert health["max_upload_bytes"] == settings.max_upload_bytes
         assert {item["name"] for item in health["capabilities"]} >= {"codex"}
+
+
+def test_readiness_rejects_a_disabled_configured_investigator(settings, monkeypatch) -> None:  # noqa: ANN001
+    app = create_app(settings)
+    monkeypatch.setattr(
+        api_module,
+        "health",
+        lambda _orchestrator: HealthResponse(
+            version="test",
+            max_upload_bytes=settings.max_upload_bytes,
+            default_investigator="codex",
+            capabilities=[
+                Capability(name=name, available=True)
+                for name in ("aapt2", "apksigner", "apktool", "jadx", "codex")
+            ],
+        ),
+    )
+    with TestClient(app) as client:
+        assert client.get("/api/v1/health").status_code == 200
+        response = client.get("/api/v1/ready")
+
+    assert response.status_code == 503
+    assert response.json()["status"] == "not_ready"
+    assert response.json()["unavailable_capabilities"] == [
+        "codex", "agent_poc_builder", "agent_poc_source_builder"
+    ]
+
+
+def test_readiness_requires_a_configured_device_but_allows_static_only_mode(
+    settings, monkeypatch,
+) -> None:  # noqa: ANN001
+    static_settings = replace(settings, investigator_backend="none", poc_enabled=False)
+    app = create_app(static_settings)
+    capability_state = {"device_available": False}
+
+    def fake_health(_orchestrator):  # noqa: ANN001, ANN202
+        capabilities = [
+            Capability(name=name, available=True)
+            for name in ("aapt2", "apksigner", "apktool", "jadx", "adb")
+        ]
+        capabilities.append(
+            Capability(
+                name="remote_android_device",
+                available=capability_state["device_available"],
+            )
+        )
+        return HealthResponse(
+            version="test",
+            max_upload_bytes=static_settings.max_upload_bytes,
+            default_investigator="none",
+            capabilities=capabilities,
+        )
+
+    monkeypatch.setattr(api_module, "health", fake_health)
+    with TestClient(app) as client:
+        static_only = client.get("/api/v1/ready")
+        assert static_only.status_code == 200
+        assert static_only.json()["status"] == "ready"
+
+        app.state.orchestrator.settings = replace(static_settings, adb_serial="offline-device")
+        configured = client.get("/api/v1/ready")
+
+    assert configured.status_code == 503
+    assert configured.json()["unavailable_capabilities"] == ["remote_android_device"]
 
 
 def test_platform_operator_session_api_and_supervisor_dispatch(settings, monkeypatch) -> None:  # noqa: ANN001
@@ -2367,6 +2431,7 @@ def test_hypothesis_and_private_evaluation_endpoints(settings) -> None:  # noqa:
                 hypothesis_id=hypothesis.id,
                 test_case_id="evaluation-proof",
                 status="proven",
+                oracle={"release_gate_eligible": True},
                 evidence_ids=[probe_evidence.id, log_evidence.id],
                 harm_demonstrated=True,
             )
@@ -2385,9 +2450,10 @@ def test_hypothesis_and_private_evaluation_endpoints(settings) -> None:  # noqa:
                     status="reproduced_blackbox",
                     entry_point_ids=[entry.id],
                     evidence_ids=[probe_evidence.id, log_evidence.id],
-                    metadata_json={
-                        "harm_demonstrated": True,
-                        "hypothesis_id": hypothesis.id,
+                        metadata_json={
+                            "harm_demonstrated": True,
+                            "release_gate_eligible": True,
+                            "hypothesis_id": hypothesis.id,
                         "proof_attempt_ids": [proof.id],
                     },
                 )

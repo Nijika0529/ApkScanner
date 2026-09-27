@@ -18,7 +18,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
-from sqlalchemy import case, desc, or_, select
+from sqlalchemy import case, desc, or_, select, text
 from sqlalchemy.orm import Session, selectinload
 
 from .. import __version__
@@ -80,6 +80,7 @@ from ..core.schemas import (
     InvestigationBriefOut,
     InvestigationTaskOut,
     PatternMatchOut,
+    ReadinessResponse,
     RegressionCaseCreate,
     RuntimeArtifactCaptureRequest,
     RuntimeArtifactOut,
@@ -485,6 +486,13 @@ def create_validation_fixture(
     payload: ValidationFixtureCreate,
     session: Session = Depends(get_session),
 ) -> ValidationFixture:
+    if "state_check" in payload.payload:
+        from ..runtime.dynamic_experiments import fixture_state_check
+
+        try:
+            fixture_state_check(payload.payload, "new")
+        except ValueError as exc:
+            raise HTTPException(422, f"invalid fixture state_check: {exc}") from exc
     if session.get(Scan, payload.scan_id) is None:
         raise HTTPException(404, "scan not found")
     if payload.task_id is not None:
@@ -571,16 +579,26 @@ def create_dynamic_experiment(
         if finding is None or finding.scan_id != scan_id:
             raise HTTPException(409, "dynamic experiment finding is outside this scan")
     if payload.fixture_ids:
-        fixture_ids = set(
+        from ..runtime.dynamic_experiments import fixture_state_check
+
+        fixtures = list(
             session.scalars(
-                select(ValidationFixture.id).where(
+                select(ValidationFixture).where(
                     ValidationFixture.scan_id == scan_id,
                     ValidationFixture.id.in_(payload.fixture_ids),
+                    ValidationFixture.status == "active",
                 )
             )
         )
-        if fixture_ids != set(payload.fixture_ids):
-            raise HTTPException(409, "dynamic experiment references an unknown fixture")
+        if {fixture.id for fixture in fixtures} != set(payload.fixture_ids):
+            raise HTTPException(409, "dynamic experiment references an inactive or unknown fixture")
+        for fixture in fixtures:
+            if fixture.task_id is not None and fixture.task_id != payload.task_id:
+                raise HTTPException(409, "dynamic experiment fixture is outside this task")
+            try:
+                fixture_state_check(dict(fixture.payload or {}), fixture.id)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
     capsule = DynamicExperimentCapsule(
         scan_id=scan_id,
         task_id=payload.task_id,
@@ -1022,6 +1040,16 @@ def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> Health
             detail=poc_builder.get("detail"),
         )
     )
+    capabilities.append(
+        Capability(
+            name="agent_poc_source_builder",
+            available=bool(poc_builder.get("source_build_available")),
+            detail=(
+                ", ".join(str(item) for item in poc_builder.get("source_build_missing", []))
+                or None
+            ),
+        )
+    )
     return HealthResponse(
         version=__version__,
         max_upload_bytes=orchestrator.settings.max_upload_bytes,
@@ -1031,6 +1059,66 @@ def health(orchestrator: ScanOrchestrator = Depends(get_orchestrator)) -> Health
         ],
         capabilities=capabilities,
     )
+
+
+@router.get("/ready", response_model=ReadinessResponse)
+def ready(
+    orchestrator: ScanOrchestrator = Depends(get_orchestrator),
+) -> ReadinessResponse | JSONResponse:
+    """Fail closed when the configured scan profile cannot run.
+
+    ``/health`` remains a liveness endpoint. A configured-but-unavailable
+    investigator or release device must not be mistaken for scan readiness.
+    """
+
+    live = health(orchestrator)
+    capabilities = list(live.capabilities)
+    try:
+        with orchestrator.database.session_factory() as session:
+            session.execute(text("SELECT 1"))
+        database_capability = Capability(name="database", available=True)
+    except Exception as exc:  # database failure must not turn readiness into HTTP 500
+        database_capability = Capability(
+            name="database",
+            available=False,
+            detail=f"database check failed: {type(exc).__name__}",
+        )
+    capabilities.append(database_capability)
+
+    settings = orchestrator.settings
+    required = ["database", "aapt2", "apksigner", "apktool", "jadx"]
+    if settings.investigator_backend == "codex":
+        required.append("codex")
+        if not settings.codex_enabled:
+            capabilities = [
+                item.model_copy(
+                    update={
+                        "available": False,
+                        "detail": "Codex is the configured investigator but is disabled",
+                    }
+                ) if item.name == "codex" else item
+                for item in capabilities
+            ]
+    if settings.poc_enabled:
+        required.extend(("agent_poc_builder", "agent_poc_source_builder"))
+    if settings.configured_adb_serials or settings.validation_profile == "android16_release":
+        required.extend(("adb", "remote_android_device"))
+
+    by_name = {item.name: item for item in capabilities}
+    unavailable = [
+        name for name in required
+        if name not in by_name or not by_name[name].available
+    ]
+    response = ReadinessResponse(
+        status="not_ready" if unavailable else "ready",
+        validation_profile=settings.validation_profile,
+        required_capabilities=required,
+        unavailable_capabilities=unavailable,
+        capabilities=capabilities,
+    )
+    if unavailable:
+        return JSONResponse(status_code=503, content=response.model_dump(mode="json"))
+    return response
 
 
 @router.post("/scans", response_model=ScanSummary, status_code=202)

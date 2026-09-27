@@ -33,6 +33,8 @@ from apkscanner.core.schemas import (
     AdaptiveVerificationResult,
     AdbDeviceOut,
     AgentInvestigationResult,
+    AgentOracleSpec,
+    AgentRequestedTest,
     AgentRuntimeObservation,
 )
 from apkscanner.platform.artifacts import ArtifactStore
@@ -65,6 +67,184 @@ VALID_STATIC_GATE = {
     "static_evidence_ids": ["static-evidence"],
     "suppression_reasons": [],
 }
+
+
+def test_ui_baseline_component_comes_only_from_matching_manifest_launcher() -> None:
+    package = "com.example.target"
+    owner = f"{package}.BridgeActivity"
+    requested = EntryPoint(
+        id="a" * 36,
+        kind="deep_link",
+        name="bridgefocus://web",
+        owner_component=owner,
+        exported=True,
+        permission=None,
+    )
+    launcher = EntryPoint(
+        id="b" * 36,
+        kind="activity",
+        name=owner,
+        owner_component=owner,
+        exported=True,
+        permission=None,
+        intent_filters=[
+            {
+                "actions": ["android.intent.action.MAIN"],
+                "categories": ["android.intent.category.LAUNCHER"],
+                "data": [],
+            }
+        ],
+    )
+    request = AgentRequestedTest(
+        hypothesis_id="c" * 36,
+        entry_point_id=requested.id,
+        oracle=AgentOracleSpec(
+            kind="ui_text",
+            expected_text="state:on",
+            impact="unauthorized_state_change",
+        ),
+        rationale="Observe a target-native state change",
+    )
+
+    choose = ScanOrchestrator._manifest_ui_baseline_component
+    assert choose(request, [requested, launcher], package) == owner
+    assert choose(
+        request.model_copy(update={"entry_point_id": "d" * 36}),
+        [requested, launcher],
+        package,
+    ) is None
+    assert choose(request, [requested], package) is None
+    assert choose(request, [requested, launcher], "com.example.other") is None
+    assert choose(
+        request.model_copy(
+            update={"oracle": AgentOracleSpec(kind="reachability", impact="none")}
+        ),
+        [requested, launcher],
+        package,
+    ) is None
+
+    requested.exported = False
+    assert choose(request, [requested, launcher], package) is None
+    requested.exported = True
+    requested.permission = "com.example.target.PRIVATE"
+    assert choose(request, [requested, launcher], package) is None
+    requested.permission = None
+    launcher.permission = "com.example.target.PRIVATE"
+    assert choose(request, [requested, launcher], package) is None
+    launcher.permission = None
+    launcher.intent_filters = []
+    assert choose(request, [requested, launcher], package) is None
+
+
+def test_device_runtime_outage_invalidates_scan_with_audit_receipt(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="interrupted.apk",
+            artifact_sha256="a" * 64,
+            artifact_path=str(settings.data_dir / "interrupted.apk"),
+        )
+        task = InvestigationTask(scan=scan, task_type="component", status="running")
+        session.add_all([scan, task])
+        session.commit()
+        scan_id, task_id = scan.id, task.id
+
+    # An ordinary target/PoC failure while Android services still respond is
+    # evidence about that test, not a platform-wide scoring failure.
+    orchestrator._record_device_runtime_failure(
+        scan_id=scan_id,
+        task_id=task_id,
+        phase="device_lease_release",
+        capability={"available": True, "failure_category": None},
+    )
+    orchestrator._record_device_runtime_failure(
+        scan_id=scan_id,
+        task_id=task_id,
+        phase="poc_install",
+        capability={"available": True, "failure_category": "adb_install_failed"},
+    )
+    with database.session_factory() as session:
+        assert (session.get(Scan, scan_id).stats or {}).get("runtime_integrity") is None
+
+    outage = {
+        "available": False,
+        "serial": "cloud-device:5555",
+        "failure_category": "device_framework_unavailable",
+        "framework_services": {"package": False, "activity": True},
+        "detail": "Android framework service unavailable",
+    }
+    orchestrator._record_device_runtime_failure(
+        scan_id=scan_id,
+        task_id=task_id,
+        phase="device_lease_release",
+        capability=outage,
+    )
+    orchestrator._record_device_runtime_failure(
+        scan_id=scan_id,
+        task_id=task_id,
+        phase="device_lease_release",
+        capability=outage,
+    )
+
+    with database.session_factory() as session:
+        scan = session.get(Scan, scan_id)
+        assert scan is not None
+        integrity = scan.stats["runtime_integrity"]
+        assert integrity["status"] == "invalid"
+        assert integrity["reason"] == "device_framework_unavailable"
+        assert integrity["phase"] == "device_lease_release"
+        receipt = session.get(Evidence, integrity["evidence_id"])
+        assert receipt is not None and receipt.kind == "scan.runtime_integrity"
+        events = list(
+            session.scalars(
+                select(ScanEvent).where(
+                    ScanEvent.scan_id == scan_id,
+                    ScanEvent.event_type == "scan.runtime_integrity.invalid",
+                )
+            )
+        )
+        assert len(events) == 1
+
+
+def test_static_review_does_not_invalidate_scoring_for_an_unused_device(settings) -> None:  # noqa: ANN001
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    orchestrator = ScanOrchestrator(settings, database, ArtifactStore(settings))
+    with database.session_factory() as session:
+        scan = Scan(
+            status="investigating",
+            filename="static.apk",
+            artifact_sha256="b" * 64,
+            artifact_path=str(settings.data_dir / "static.apk"),
+        )
+        task = InvestigationTask(scan=scan, task_type="static_review", status="running")
+        session.add_all([scan, task])
+        session.commit()
+        scan_id, task_id = scan.id, task.id
+
+    orchestrator._record_device_runtime_failure(
+        scan_id=scan_id,
+        task_id=task_id,
+        phase="initial_device_capability",
+        capability={
+            "available": False,
+            "failure_category": "device_framework_unavailable",
+            "serial": "unused-device:5555",
+        },
+    )
+
+    with database.session_factory() as session:
+        scan = session.get(Scan, scan_id)
+        assert scan is not None
+        assert (scan.stats or {}).get("runtime_integrity") is None
+        assert session.scalar(
+            select(Evidence.id).where(Evidence.scan_id == scan_id)
+        ) is None
 
 
 @pytest.mark.parametrize(
@@ -3465,6 +3645,11 @@ def test_rejected_agent_test_is_handed_to_next_exploration_round(
             "exploration_round",
         ]
         assert history[0]["test_validation"]["accepted"] == []
+        loop = completed_task.result["investigation_loop"]
+        assert loop["status"] == "closed"
+        assert loop["phase"] == "closed"
+        assert loop["round_index"] == 1
+        assert loop["termination_reason"] == "no_pending_action"
         if rejection_mode == "model_schema":
             assert len(history[0]["model_validation"]["rejected_requested_tests"]) == 1
 
@@ -4547,9 +4732,13 @@ def test_continuation_context_includes_prior_task_evidence(settings) -> None:  #
     }
 
 
+@pytest.mark.parametrize("manual_kind", ["manual_continuation", "manual_rerun"])
+@pytest.mark.parametrize("with_expired_automatic_task", [False, True])
 def test_manual_continuation_gets_a_fresh_budget_after_scan_deadline(
     settings,
     monkeypatch,
+    manual_kind,
+    with_expired_automatic_task,
 ) -> None:  # noqa: ANN001
     settings.ensure_directories()
     database = Database(settings)
@@ -4566,12 +4755,22 @@ def test_manual_continuation_gets_a_fresh_budget_after_scan_deadline(
             scan=scan,
             task_type="component",
             status="queued",
-            result={"manual_continuation": {"continuation_number": 1}},
+            result={manual_kind: {"requested_at": datetime.now(UTC).isoformat()}},
         )
         session.add_all([scan, task])
+        automatic = None
+        if with_expired_automatic_task:
+            automatic = InvestigationTask(
+                scan=scan,
+                task_type="component",
+                status="queued",
+                priority=1000,
+            )
+            session.add(automatic)
         session.commit()
         scan_id = scan.id
         task_id = task.id
+        automatic_id = automatic.id if automatic is not None else None
 
     dispatched: list[tuple[str, str, int | None]] = []
 
@@ -4586,6 +4785,16 @@ def test_manual_continuation_gets_a_fresh_budget_after_scan_deadline(
     monkeypatch.setattr(orchestrator, "_run_task", run_task)
     orchestrator._run_tasks(scan_id)
     assert dispatched == [(scan_id, task_id, settings.task_timeout_seconds)]
+    if automatic_id is not None:
+        with database.session_factory() as session:
+            assert session.get(InvestigationTask, automatic_id).status == "timed_out"
+            event = session.scalar(
+                select(ScanEvent).where(
+                    ScanEvent.scan_id == scan_id,
+                    ScanEvent.event_type == "scan.deadline_exhausted",
+                )
+            )
+            assert event.data["remaining_tasks"] == 1
 
 
 def test_orchestrator_persists_audit_evidence_for_every_ai_call(settings, fixture_apk) -> None:  # noqa: ANN001
@@ -5344,9 +5553,11 @@ def test_canceled_task_selected_before_dispatch_is_not_restarted(settings) -> No
         assert task.attempts == 0
 
 
+@pytest.mark.parametrize("failure_stage", ["static", "initialization"])
 def test_unexpected_scan_failure_terminalizes_transient_tasks(
     settings,
     monkeypatch,
+    failure_stage,
 ) -> None:  # noqa: ANN001
     database = Database(settings)
     database.create_all()
@@ -5382,8 +5593,8 @@ def test_unexpected_scan_failure_terminalizes_transient_tasks(
 
     orchestrator = ScanOrchestrator(settings, database, store)
     monkeypatch.setattr(
-        orchestrator,
-        "_run_static",
+        orchestrator if failure_stage == "static" else orchestrator.agent_audits,
+        "_run_static" if failure_stage == "static" else "ensure_scan_container",
         lambda _scan_id: (_ for _ in ()).throw(RuntimeError("unexpected failure")),
     )
     orchestrator._run_sync(identifiers["scan"])

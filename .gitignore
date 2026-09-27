@@ -28,6 +28,9 @@ testapk/*
 !testapk/build-rescuetest.sh
 !testapk/build-version-evolution-fixtures.sh
 !testapk/build-adaptivecases.sh
+!testapk/build-bridgefocus.sh
+!testapk/build-webobserverattacker.sh
+!testapk/run-web-observer-smoke.py
 !testapk/build-copilotfixture.sh
 !testapk/build-nativecases.sh
 !testapk/version-evolution-manifest.xml
@@ -44,6 +47,13 @@ testapk/*
 !testapk/adaptivecases-ground-truth.json
 !testapk/adaptivecases-src/
 !testapk/adaptivecases-src/**
+!testapk/bridgefocus.apk
+!testapk/bridgefocus-ground-truth.json
+!testapk/bridgefocus-src/
+!testapk/bridgefocus-src/**
+!testapk/webobserverattacker.apk
+!testapk/webobserverattacker-src/
+!testapk/webobserverattacker-src/**
 !testapk/copilotfixture.apk
 !testapk/copilotfixture-src/
 !testapk/copilotfixture-src/**
@@ -61,6 +71,9 @@ testapk/vulntest-src/build/
 testapk/vulntest-src/dist/
 testapk/adaptivecases-src/build/
 testapk/adaptivecases-src/dist/
+testapk/bridgefocus-src/build/
+testapk/webobserverattacker-src/build/
+testapk/webobserverattacker-src/dist/
 testapk/rescuetest-src/build/
 testapk/rescuetest-src/dist/
 testapk/copilotfixture-src/build/

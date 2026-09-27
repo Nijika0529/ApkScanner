@@ -248,6 +248,7 @@ export function Tasks({ scan, tasks, entries, audits, subscribeEvents, health, o
         const continuation = recordValue(task.result.manual_continuation)
         const continuationNumber = numberValue(continuation?.continuation_number)
         const independent = recordValue(task.result.independent_reanalysis)
+        const investigationLoop = recordValue(task.result.investigation_loop)
         return (
           <article key={task.id} className={cn("content-auto overflow-hidden rounded-xl border bg-white shadow-sm", visualState.card)}>
             <div className={cn("flex flex-col gap-2 border-b px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-5", visualState.banner)}>
@@ -267,6 +268,7 @@ export function Tasks({ scan, tasks, entries, audits, subscribeEvents, health, o
                     <Badge>priority {task.priority}</Badge>
                     {backend && <Badge tone="info">{backend}{model ? ` · ${model}` : ""}</Badge>}
                     {Boolean(auditCounts.get(task.id)) && <Badge tone="info">AI 调用 {auditCounts.get(task.id)}</Badge>}
+                    {investigationLoop && <Badge tone={textValue(investigationLoop.status) === "closed" ? "neutral" : "info"}>{investigationLoopLabel(investigationLoop)}</Badge>}
                     {continuationNumber && <Badge tone="warning">深度续跑 {continuationNumber}</Badge>}
                     {independent && <Badge tone="info">独立复核 · 不继承上下文</Badge>}
                   </div>
@@ -356,6 +358,30 @@ function taskVisualState(task: InvestigationTask) {
 
 function taskAgentEnabled(task: InvestigationTask) {
   return booleanValue(task.preconditions.agent_enabled) ?? true
+}
+
+function investigationLoopLabel(loop: Record<string, unknown>) {
+  const round = numberValue(loop.round_index) ?? 0
+  if (textValue(loop.status) === "closed") {
+    const reason = textValue(loop.termination_reason)
+    return `探索环已结束 · ${{
+      proof_complete: "证明已闭环",
+      result_unavailable: "结果不可用",
+      no_pending_action: "没有后续动作",
+      executor_unavailable: "执行环境不可用",
+      budget_exhausted: "预算已用尽",
+      no_progress: "连续无实质进展",
+    }[reason ?? ""] ?? reason ?? "已收敛"}`
+  }
+  const phase = textValue(loop.phase)
+  const phaseLabel = {
+    plan: "规划",
+    validate: "边界校验",
+    execute: "执行验证",
+    verify: "证据评估",
+    replan: "重新规划",
+  }[phase ?? ""] ?? phase ?? "准备"
+  return `探索轮 ${round + 1} · ${phaseLabel}`
 }
 
 function taskNeedsSupplementalRerun(task: InvestigationTask) {

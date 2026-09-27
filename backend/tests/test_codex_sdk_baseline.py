@@ -23,6 +23,7 @@ def test_checked_sdk_baseline_matches_runtime_and_reviewed_protocol() -> None:
     assert checked.sdk_version == PINNED_SDK_VERSION
     assert checked.runtime_version == PINNED_SDK_VERSION
     assert checked.source_commit == VERIFIED_SOURCE_COMMIT
+    assert runtime.source_commit == checked.source_commit
     assert runtime.sdk_version == PINNED_SDK_VERSION
     assert runtime.runtime_version == PINNED_SDK_VERSION
     # /work/codex is intentionally updated when reviewing upstream changes. The

@@ -54,8 +54,10 @@ class CodexDockerExecutor:
             if existing is not None and self._is_running(existing):
                 return existing
             if existing is not None:
-                self._containers.pop(scan_id, None)
+                # Keep ownership until Docker confirms removal. A daemon error
+                # must not let a second container replace an orphaned one.
                 self._remove_container(existing.container_id)
+                self._containers.pop(scan_id, None)
             if len(self._containers) >= self.settings.codex_max_containers:
                 raise RuntimeError("global Codex scan-container limit is exhausted")
             generation = self._generations.get(scan_id, 0) + 1
@@ -252,26 +254,43 @@ class CodexDockerExecutor:
 
     def close_scan(self, scan_id: str) -> None:
         with self._lock:
-            container = self._containers.pop(scan_id, None)
-        if container is None:
-            return
-        self._remove_container(container.container_id)
+            container = self._containers.get(scan_id)
+            if container is None:
+                return
+            self._remove_container(container.container_id)
+            self._containers.pop(scan_id, None)
 
     def _remove_container(self, container_id: str) -> None:
-        subprocess.run(
+        completed = subprocess.run(
             [self._docker(), "rm", "-f", container_id],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             check=False,
+            text=True,
             timeout=30,
         )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "docker rm failed").strip()
+            # Docker also returns nonzero when an externally removed container
+            # is already absent; that is the one safe idempotent success case.
+            if f"No such container: {container_id}" not in detail:
+                raise RuntimeError(f"could not remove Codex scan container: {detail[-3000:]}")
 
     def shutdown(self) -> None:
         with self._lock:
             scan_ids = list(self._containers)
+        failures: list[tuple[str, Exception]] = []
         for scan_id in scan_ids:
-            with suppress(Exception):
+            try:
                 self.close_scan(scan_id)
+            except Exception as exc:
+                failures.append((scan_id, exc))
+        if failures:
+            first_scan, first_error = failures[0]
+            raise RuntimeError(
+                f"could not close {len(failures)} Codex scan container(s); "
+                f"first scan {first_scan}: {first_error}"
+            ) from first_error
 
     def snapshot(self) -> list[dict[str, Any]]:
         with self._lock:

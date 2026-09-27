@@ -34,6 +34,7 @@ export interface ScanQualitySummary {
   scan_id: string
   generated_at: string
   funnel: Array<{ key: string; label: string; count: number }>
+  web_proof_funnel: Array<{ key: string; label: string; count: number }>
   task_statuses: Record<string, number>
   proof_statuses: Record<string, number>
   failure_reasons: Array<{

@@ -563,6 +563,117 @@ def test_worker_exec_injects_only_key_name_for_one_uid(settings, monkeypatch) ->
     assert "unit-test-secret-must-not-enter-argv" not in rendered
 
 
+def test_failed_docker_remove_keeps_scan_container_owned_for_retry(settings, monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(CodexDockerExecutor, "_docker", staticmethod(lambda: "docker"))
+    executor = CodexDockerExecutor(settings)
+    container = ScanContainer(
+        scan_id=SCAN_ID,
+        generation=1,
+        container_id="a" * 64,
+        name="apk-scanner-test",
+        scan_workspace=settings.data_dir,
+        sessions_root=settings.data_dir,
+    )
+    executor._containers[SCAN_ID] = container
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 1, "", "daemon temporarily unavailable"),
+            subprocess.CompletedProcess([], 0, container.container_id, ""),
+        ]
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: next(responses))
+
+    with pytest.raises(RuntimeError, match="daemon temporarily unavailable"):
+        executor.close_scan(SCAN_ID)
+    assert executor.snapshot()[0]["container_id"] == container.container_id[:12]
+
+    executor.close_scan(SCAN_ID)
+    assert executor.snapshot() == []
+
+
+def test_shutdown_reports_remove_failure_and_can_be_retried(settings, monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(CodexDockerExecutor, "_docker", staticmethod(lambda: "docker"))
+    executor = CodexDockerExecutor(settings)
+    container = ScanContainer(
+        scan_id=SCAN_ID,
+        generation=1,
+        container_id="d" * 64,
+        name="apk-scanner-retry",
+        scan_workspace=settings.data_dir,
+        sessions_root=settings.data_dir,
+    )
+    executor._containers[SCAN_ID] = container
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 1, "", "daemon unreachable"),
+            subprocess.CompletedProcess([], 0, container.container_id, ""),
+        ]
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: next(responses))
+
+    with pytest.raises(RuntimeError, match="could not close 1 Codex scan container"):
+        executor.shutdown()
+    assert executor.snapshot()[0]["name"] == container.name
+
+    executor.shutdown()
+    assert executor.snapshot() == []
+
+
+def test_stale_container_remove_failure_does_not_start_replacement(settings, monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(CodexDockerExecutor, "_docker", staticmethod(lambda: "docker"))
+    executor = CodexDockerExecutor(settings)
+    container = ScanContainer(
+        scan_id=SCAN_ID,
+        generation=1,
+        container_id="b" * 64,
+        name="apk-scanner-stale",
+        scan_workspace=settings.data_dir,
+        sessions_root=settings.data_dir,
+    )
+    executor._containers[SCAN_ID] = container
+    monkeypatch.setattr(executor, "_is_running", lambda _container: False)
+    commands: list[list[str]] = []
+
+    def docker_run(command, **_kwargs):  # noqa: ANN001, ANN202
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 1, "", "temporary remove failure")
+
+    monkeypatch.setattr(subprocess, "run", docker_run)
+    with pytest.raises(RuntimeError, match="temporary remove failure"):
+        executor.ensure_scan_container(
+            scan_id=SCAN_ID,
+            scan_workspace=settings.data_dir,
+            sessions_root=settings.data_dir,
+        )
+    assert executor.snapshot()[0]["container_id"] == container.container_id[:12]
+    assert len(commands) == 1
+    assert commands[0][1:3] == ["rm", "-f"]
+
+
+def test_externally_removed_container_can_close_idempotently(settings, monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(CodexDockerExecutor, "_docker", staticmethod(lambda: "docker"))
+    executor = CodexDockerExecutor(settings)
+    container = ScanContainer(
+        scan_id=SCAN_ID,
+        generation=1,
+        container_id="c" * 64,
+        name="apk-scanner-removed",
+        scan_workspace=settings.data_dir,
+        sessions_root=settings.data_dir,
+    )
+    executor._containers[SCAN_ID] = container
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 1, "", f"Error response from daemon: No such container: {container.container_id}"
+        ),
+    )
+
+    executor.close_scan(SCAN_ID)
+    assert executor.snapshot() == []
+
+
 @pytest.mark.skipif(
     os.getenv("APKSCANNER_RUN_DOCKER_TESTS") != "1"
     or os.geteuid() != 0
@@ -578,7 +689,9 @@ def test_real_scan_container_shares_input_but_isolates_session_uids(settings) ->
     )
     configured = replace(
         settings,
-        codex_docker_image="apk-scanner-codex-worker:0.2.0",
+        codex_docker_image=os.getenv(
+            "APKSCANNER_CODEX_DOCKER_IMAGE", "apk-scanner-codex-worker:0.2.0"
+        ),
         codex_uid_min=21_300,
         codex_uid_max=21_310,
         adaptive_verifier_copy_host_ssh=True,
@@ -715,7 +828,9 @@ def test_real_worker_protocol_opens_and_resumes_persistent_codex_thread(
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-only-key-without-provider-request")
     configured = replace(
         settings,
-        codex_docker_image="apk-scanner-codex-worker:0.2.0",
+        codex_docker_image=os.getenv(
+            "APKSCANNER_CODEX_DOCKER_IMAGE", "apk-scanner-codex-worker:0.2.0"
+        ),
         codex_uid_min=21_400,
         codex_uid_max=21_410,
     )

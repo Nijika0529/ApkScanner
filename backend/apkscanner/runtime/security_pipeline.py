@@ -25,6 +25,26 @@ from ..core.schemas import AgentRequestedTest
 from .proof_recipes import plan_with_proof_recipe
 
 
+def typed_poc_oracle_trusted(
+    item: dict[str, Any], *, prover: str | None = None
+) -> bool:
+    """Only platform-authored code may attest Provider/Binder return values.
+
+    A request ID proves that an ordinary PoC ran; it cannot authenticate values
+    that the PoC chose to write to logcat or its own private receipt file.
+    """
+
+    if item.get("kind") not in {"blackbox.poc_logcat", "blackbox.poc_durable_receipt"}:
+        return True
+    metadata = item.get("metadata") or {}
+    oracle = metadata.get("oracle") or {}
+    if oracle.get("kind") not in {"provider_rows", "binder_reply"}:
+        return True
+    return metadata.get("caller_identity") == "platform_generated_poc" and (
+        prover is None or prover == "platform_ephemeral_harness"
+    )
+
+
 class HypothesisLedger:
     """Persistent claim, counterargument, and proof lineage for AI investigations."""
 
@@ -352,6 +372,10 @@ class HypothesisLedger:
     ) -> None:
         if proof_attempt_id is None:
             return
+        with self.database.session_factory() as session:
+            attempt_prover = session.scalar(
+                select(ProofAttempt.prover).where(ProofAttempt.id == proof_attempt_id)
+            )
         evidence_ids = [item["id"] for item in evidence if isinstance(item.get("id"), str)]
         request_ids = {
             item.get("metadata", {}).get("request_id")
@@ -415,8 +439,11 @@ class HypothesisLedger:
 
         def platform_oracle_eligible(item: dict[str, Any]) -> bool:
             return (
-                item.get("kind") != "dynamic_experiment.adb"
-                or item.get("metadata", {}).get("platform_oracle_validated") is True
+                typed_poc_oracle_trusted(item, prover=attempt_prover)
+                and (
+                    item.get("kind") != "dynamic_experiment.adb"
+                    or item.get("metadata", {}).get("platform_oracle_validated") is True
+                )
             )
 
         unvalidated_agent_assertion_ids = [

@@ -94,6 +94,52 @@ def test_adaptive_fixture_has_five_positive_cases_and_reproducible_identity() ->
     assert "--v1-signing-enabled false" in build_script
 
 
+def test_bridgefocus_fixture_has_one_dynamic_ui_transition() -> None:
+    apk = FIXTURE_ROOT / "bridgefocus.apk"
+    assert apk.is_file()
+    assert apk.stat().st_size < 64 * 1024
+    with zipfile.ZipFile(apk) as archive:
+        assert {"AndroidManifest.xml", "classes.dex"} <= set(archive.namelist())
+
+    truth = BenchmarkSpec.model_validate(
+        json.loads((FIXTURE_ROOT / "bridgefocus-ground-truth.json").read_text())
+    )
+    assert hashlib.sha256(apk.read_bytes()).hexdigest() == truth.apk_sha256
+    assert truth.required_dynamic_scope == "android16_release"
+    assert len(truth.vulnerabilities) == 1
+    assert not truth.negative_controls
+    case = truth.vulnerabilities[0]
+    assert case.minimum_proof == "dynamic"
+    assert case.match.entry_names == ["io.apkscanner.bridgefocus.BridgeActivity"]
+    assert case.match.oracle_kinds == ["ui_text"]
+    assert case.match.oracle_impacts == ["unauthorized_state_change"]
+    assert case.match.observed_fact_types == ["target_ui_transition"]
+
+    source = FIXTURE_ROOT / "bridgefocus-src"
+    manifest = ElementTree.parse(source / "AndroidManifest.xml").getroot()
+    android = "{http://schemas.android.com/apk/res/android}"
+    assert manifest.get("package") == "io.apkscanner.bridgefocus"
+    uses_sdk = manifest.find("uses-sdk")
+    assert uses_sdk is not None
+    assert uses_sdk.get(f"{android}targetSdkVersion") == "36"
+    application = manifest.find("application")
+    assert application is not None
+    activities = application.findall("activity")
+    assert len(activities) == 1
+    assert activities[0].get(f"{android}exported") == "true"
+    bridge = (
+        source / "java/io/apkscanner/bridgefocus/BridgeActivity.java"
+    ).read_text()
+    assert 'getQueryParameter("url")' in bridge
+    assert 'addJavascriptInterface(new StateBridge(), "StateBridge")' in bridge
+    assert "@JavascriptInterface" in bridge
+    assert "void setEnabled(boolean value)" in bridge
+    assert 'getPreferences(MODE_PRIVATE).getBoolean("enabled", false)' in bridge
+    assert 'putBoolean("enabled", value).apply()' in bridge
+    assert 'stateView.setText("state:" + (enabled ? "on" : "off"))' in bridge
+    assert 'stateView.setText("state:off")' not in bridge
+
+
 def test_vulntest_source_contains_real_attack_paths_and_safe_control() -> None:
     manifest = ElementTree.parse(SOURCE_ROOT / "AndroidManifest.xml").getroot()
     android = "{http://schemas.android.com/apk/res/android}"

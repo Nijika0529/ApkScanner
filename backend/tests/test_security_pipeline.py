@@ -55,6 +55,121 @@ def _complete_proof_with_persisted_evidence(
     ledger.complete_proof(proof_id, evidence)
 
 
+@pytest.mark.parametrize("oracle_kind", ["provider_rows", "binder_reply"])
+@pytest.mark.parametrize(
+    ("platform_owned", "caller_identity", "expected_harm"),
+    [
+        (False, "agent_poc_app", False),
+        (False, "platform_generated_poc", False),
+        (True, "platform_generated_poc", True),
+    ],
+)
+def test_typed_poc_proof_requires_platform_authored_measurement(
+    settings,  # noqa: ANN001
+    oracle_kind: str,
+    platform_owned: bool,
+    caller_identity: str,
+    expected_harm: bool,
+) -> None:
+    settings.ensure_directories()
+    database = Database(settings)
+    database.create_all()
+    entry_id = "00000000-0000-0000-0000-000000000001"
+    with database.session_factory() as session:
+        scan = Scan(
+            filename="typed-poc.apk",
+            artifact_sha256="b" * 64,
+            artifact_path=str(settings.data_dir / "typed-poc.apk"),
+        )
+        task = InvestigationTask(
+            scan=scan,
+            task_type="component",
+            target_entry_ids=[entry_id],
+            hypotheses=["A target entry may return private data."],
+        )
+        session.add_all([scan, task])
+        session.commit()
+        scan_id = scan.id
+        task_id = task.id
+
+    ledger = HypothesisLedger(database)
+    hypothesis_id = ledger.ensure_task_hypotheses(task)[0].id
+    request = AgentRequestedTest(
+        hypothesis_id=hypothesis_id,
+        entry_point_id=entry_id,
+        state="guest",
+        uri=("content://com.example.provider/items" if oracle_kind == "provider_rows" else None),
+        operation=(
+            "query"
+            if oracle_kind == "provider_rows"
+            else "binder_transact"
+            if platform_owned
+            else "auto"
+        ),
+        binder_transaction_code=(1 if oracle_kind == "binder_reply" and platform_owned else None),
+        binder_reply_type=(
+            "string" if oracle_kind == "binder_reply" and platform_owned else None
+        ),
+        oracle=(
+            {"kind": "provider_rows", "minimum_rows": 1, "impact": "unauthorized_data_access"}
+            if oracle_kind == "provider_rows"
+            else {
+                "kind": "binder_reply",
+                "expected_text": "private-token",
+                "impact": "unauthorized_data_access",
+            }
+        ),
+        rationale="Read data across the ordinary-app boundary.",
+        poc=(
+            None
+            if platform_owned
+            else {
+                "project_path": "poc/custom-typed",
+                "package_name": "io.apkscanner.poc.customtyped",
+                "launch_component": ".MainActivity",
+            }
+        ),
+    )
+    proof_id = ledger.plan_proof(task_id=task_id, test_case_id="typed-poc", request=request)
+    ledger.start_proof(proof_id)
+    _complete_proof_with_persisted_evidence(
+        ledger,
+        database,
+        scan_id=scan_id,
+        task_id=task_id,
+        proof_id=proof_id,
+        evidence=[
+            {
+                "id": "typed-launch",
+                "kind": "blackbox.poc_launch",
+                "exit_code": 0,
+                "metadata": {"request_id": "typed-request", "caller_identity": caller_identity},
+            },
+            {
+                "id": "typed-log",
+                "kind": "blackbox.poc_logcat",
+                "exit_code": 0,
+                "metadata": {
+                    "request_id": "typed-request",
+                    "caller_identity": caller_identity,
+                    "request_observed": True,
+                    "poc_success": True,
+                    "impact_contract_satisfied": True,
+                    "oracle": {"kind": oracle_kind, "matched": True},
+                },
+            },
+        ],
+    )
+
+    with database.session_factory() as session:
+        attempt = session.get(ProofAttempt, proof_id)
+        assert attempt is not None
+        assert attempt.oracle["execution_demonstrated"] is True
+        assert attempt.oracle["security_impact_observed"] is expected_harm
+        assert attempt.harm_demonstrated is expected_harm
+        assert attempt.status == ("proven" if expected_harm else "inconclusive")
+
+
 def test_hypothesis_ledger_tracks_arguments_and_concrete_proof(settings) -> None:  # noqa: ANN001
     settings.ensure_directories()
     database = Database(settings)

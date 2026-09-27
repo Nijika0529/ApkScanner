@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+import subprocess
 
 import pytest
 from apkscanner.core.models import Scan
@@ -11,7 +12,22 @@ from apkscanner.platform.capabilities import CapabilityManifest, CapabilityRegis
 from fastapi.testclient import TestClient
 
 
-@pytest.mark.skipif(shutil.which("docker") is None, reason="requires Docker capability isolation")
+def _docker_daemon_available() -> bool:
+    docker = shutil.which("docker")
+    if docker is None:
+        return False
+    try:
+        return subprocess.run(
+            [docker, "info", "--format", "{{.ServerVersion}}"],
+            capture_output=True,
+            check=False,
+            timeout=5,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+@pytest.mark.skipif(not _docker_daemon_available(), reason="requires a running Docker daemon")
 def test_registry_invokes_hash_pinned_python_script_without_inheriting_secrets(
     settings,
     monkeypatch,

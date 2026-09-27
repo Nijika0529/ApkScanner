@@ -11,6 +11,7 @@ _RUNTIME_OBSERVATION_FLAGS = (
     "dynamic_experiment_execution_demonstrated",
     "runtime_package_observed",
     "runtime_crash_observed",
+    "external_observation_captured",
 )
 
 
@@ -31,6 +32,7 @@ def evidence_supports_runtime_observation(evidence: Evidence) -> bool:
     if not (
         evidence.kind.startswith("blackbox.")
         or evidence.kind.startswith("dynamic_experiment.")
+        or evidence.kind == "external.observation.capture"
     ):
         return False
     metadata = (

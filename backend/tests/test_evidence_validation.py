@@ -202,6 +202,88 @@ def test_agent_poc_can_supply_the_correlated_ordinary_app_execution_pair() -> No
     assert payload["evidence_ids"] == ["launch", "log", "oracle"]
 
 
+@pytest.mark.parametrize("oracle_kind", ["provider_rows", "binder_reply"])
+@pytest.mark.parametrize(
+    ("caller_identity", "expected_result"),
+    [
+        ("agent_poc_app", "inconclusive"),
+        ("platform_generated_poc", "reproduced_blackbox"),
+    ],
+)
+def test_typed_poc_log_requires_platform_harness_for_final_verdict(
+    oracle_kind: str, caller_identity: str, expected_result: str
+) -> None:
+    evidence = [
+        {
+            "id": "launch",
+            "kind": "blackbox.poc_launch",
+            "exit_code": 0,
+            "metadata": {
+                "caller_identity": caller_identity,
+                "request_id": "request-typed",
+                "test_case_id": "agent-r1-1",
+            },
+        },
+        {
+            "id": "log",
+            "kind": "blackbox.poc_logcat",
+            "exit_code": 0,
+            "metadata": {
+                "caller_identity": caller_identity,
+                "request_id": "request-typed",
+                "request_observed": True,
+                "poc_success": True,
+                "test_case_id": "agent-r1-1",
+                "impact_contract_satisfied": True,
+                "oracle": {"kind": oracle_kind, "matched": True},
+            },
+        },
+    ]
+
+    _payload_out, result = ScanOrchestrator._validated_agent_payload(
+        _payload("reproduced_blackbox", ["launch", "log"]), evidence
+    )
+
+    assert result == expected_result
+
+
+@pytest.mark.parametrize("oracle_kind", ["provider_rows", "binder_reply"])
+def test_agent_authored_typed_poc_receipt_cannot_refute(oracle_kind: str) -> None:
+    evidence = [
+        {
+            "id": "launch",
+            "kind": "blackbox.poc_launch",
+            "exit_code": 0,
+            "metadata": {
+                "caller_identity": "agent_poc_app",
+                "request_id": "request-typed",
+                "test_case_id": "agent-r1-1",
+            },
+        },
+        {
+            "id": "receipt",
+            "kind": "blackbox.poc_durable_receipt",
+            "exit_code": 0,
+            "metadata": {
+                "caller_identity": "agent_poc_app",
+                "request_id": "request-typed",
+                "request_observed": True,
+                "receipt_terminal": True,
+                "poc_success": True,
+                "test_case_id": "agent-r1-1",
+                "oracle_refuted": True,
+                "oracle": {"kind": oracle_kind, "matched": False},
+            },
+        },
+    ]
+
+    _payload_out, result = ScanOrchestrator._validated_agent_payload(
+        _payload("not_reproduced", ["launch", "receipt"]), evidence
+    )
+
+    assert result == "inconclusive"
+
+
 def test_terminal_durable_receipt_can_supply_the_poc_execution_pair() -> None:
     evidence = [
         {
@@ -1080,6 +1162,87 @@ def test_service_request_preserves_platform_binder_transaction() -> None:
     assert gaps == []
     assert accepted == [request]
     assert accepted[0].operation == "binder_transact"
+
+
+@pytest.mark.parametrize("impact", ["none", "unauthorized_data_access"])
+def test_provider_rows_rejects_agent_authored_poc_measurements(impact: str) -> None:
+    entry = EntryPoint(
+        id="11111111-1111-1111-1111-111111111111",
+        scan_id="scan",
+        kind="provider",
+        name="com.example.ExportedProvider",
+        owner_component="com.example.ExportedProvider",
+        exported=True,
+        metadata_json={"authorities": "com.example.provider"},
+    )
+    request = AgentRequestedTest(
+        hypothesis_id="22222222-2222-2222-2222-222222222222",
+        entry_point_id=entry.id,
+        state="guest",
+        uri="content://com.example.provider/items",
+        operation="query",
+        oracle={
+            "kind": "provider_rows",
+            "minimum_rows": 1,
+            "impact": impact,
+            "refute_on_miss": True,
+        },
+        rationale="Query provider from an ordinary app.",
+        poc={
+            "project_path": "poc/custom-provider",
+            "package_name": "io.apkscanner.poc.customprovider",
+            "launch_component": ".MainActivity",
+        },
+    )
+
+    accepted, gaps = ScanOrchestrator._validate_requested_tests(
+        [request], [entry], hypothesis_ids={request.hypothesis_id}
+    )
+
+    assert accepted == []
+    assert any("requires a platform-generated proof Harness" in gap for gap in gaps)
+
+
+def test_binder_reply_rejects_auto_operation_and_custom_poc() -> None:
+    entry = EntryPoint(
+        id="11111111-1111-1111-1111-111111111111",
+        scan_id="scan",
+        kind="service",
+        name="com.example.SecretService",
+        owner_component="com.example.SecretService",
+        exported=True,
+    )
+    shared = {
+        "hypothesis_id": "22222222-2222-2222-2222-222222222222",
+        "entry_point_id": entry.id,
+        "state": "guest",
+        "operation": "auto",
+        "oracle": {
+            "kind": "binder_reply",
+            "expected_text": "service-secret=hunter2",
+            "impact": "unauthorized_data_access",
+        },
+        "rationale": "Read a secret Binder reply.",
+    }
+    auto_request = AgentRequestedTest(**shared)
+    custom_request = AgentRequestedTest(
+        **shared,
+        poc={
+            "project_path": "poc/custom-binder",
+            "package_name": "io.apkscanner.poc.custombinder",
+            "launch_component": ".MainActivity",
+        },
+    )
+
+    accepted, gaps = ScanOrchestrator._validate_requested_tests(
+        [auto_request, custom_request],
+        [entry],
+        hypothesis_ids={auto_request.hypothesis_id},
+    )
+
+    assert accepted == []
+    assert any("requires a Binder transaction operation" in gap for gap in gaps)
+    assert any("requires a platform-generated proof Harness" in gap for gap in gaps)
 
 
 def test_service_request_preserves_platform_binder_script() -> None:

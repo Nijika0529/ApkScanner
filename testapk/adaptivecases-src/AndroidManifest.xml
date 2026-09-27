@@ -39,6 +39,28 @@
         </activity>
 
         <activity
+            android:name=".SafeBridgeActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="adaptivecases" android:host="safeweb" />
+            </intent-filter>
+        </activity>
+
+        <!-- Shell-only test fixture control. DUMP is defense in depth: the
+             provider itself checks Binder caller UID because ADB may grant
+             this development permission to ordinary APKs. -->
+        <provider
+            android:name=".FixtureCanaryProvider"
+            android:authorities="io.apkscanner.adaptivecases.fixture"
+            android:exported="true"
+            android:grantUriPermissions="false"
+            android:readPermission="android.permission.DUMP"
+            android:writePermission="android.permission.DUMP" />
+
+        <activity
             android:name=".ImportActivity"
             android:exported="true">
             <intent-filter>

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -594,6 +595,93 @@ def test_non_blocking_device_health_reuses_recent_failure(settings) -> None:  # 
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("failed_service", ["package", "activity"])
+def test_device_capability_rejects_missing_android_framework_service(
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_service: str,
+) -> None:  # noqa: ANN001
+    class AvailableRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        AvailableRunner(),  # type: ignore[arg-type]
+    )
+
+    def fake_adb(args, timeout=30):  # noqa: ANN001, ANN202, ARG001
+        command = tuple(args)
+        if command == ("get-state",):
+            return CommandResult(args, 0, "device\n", "")
+        if command == ("shell", "getprop", "ro.build.version.sdk"):
+            return CommandResult(args, 0, "36\n", "")
+        if command == ("shell", "getprop", "ro.build.version.release"):
+            return CommandResult(args, 0, "16\n", "")
+        if command == ("shell", "id", "-u"):
+            return CommandResult(args, 0, "2000\n", "")
+        if command == ("shell", "cmd", "package", "path", "android"):
+            if failed_service == "package":
+                # Some ADB versions return exit 0 despite a service error.
+                return CommandResult(args, 0, "Can't find service: package\n", "")
+            return CommandResult(args, 0, "package:/system/framework/framework-res.apk\n", "")
+        if command == ("shell", "am", "get-current-user"):
+            if failed_service == "activity":
+                return CommandResult(args, 1, "", "Can't find service: activity")
+            return CommandResult(args, 0, "0\n", "")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(adapter, "_adb", fake_adb)
+
+    capability = adapter.capability(non_blocking=False)
+
+    assert capability["available"] is False
+    assert capability["failure_category"] == "device_framework_unavailable"
+    assert capability["framework_services"][failed_service] is False
+    assert capability["release_gate_eligible"] is False
+    assert capability["verdict_scope"] == "unavailable"
+    assert AdbDevicePool([adapter]).capability(non_blocking=False)["failure_category"] == (
+        "device_framework_unavailable"
+    )
+
+
+def test_device_capability_accepts_healthy_framework_services(
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # noqa: ANN001
+    class AvailableRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        AvailableRunner(),  # type: ignore[arg-type]
+    )
+    responses = {
+        ("get-state",): "device\n",
+        ("shell", "getprop", "ro.build.version.sdk"): "36\n",
+        ("shell", "getprop", "ro.build.version.release"): "16\n",
+        ("shell", "id", "-u"): "2000\n",
+        ("shell", "cmd", "package", "path", "android"): (
+            "package:/system/framework/framework-res.apk\n"
+        ),
+        ("shell", "am", "get-current-user"): "0\n",
+    }
+    monkeypatch.setattr(
+        adapter,
+        "_adb",
+        lambda args, timeout=30: CommandResult(args, 0, responses[tuple(args)], ""),  # noqa: ARG005
+    )
+
+    capability = adapter.capability(non_blocking=False)
+
+    assert capability["available"] is True
+    assert capability["failure_category"] is None
+    assert capability["framework_services"] == {"package": True, "activity": True}
+
+
 def test_device_prepare_stops_after_failed_install(settings) -> None:  # noqa: ANN001
     calls: list[list[str]] = []
 
@@ -624,8 +712,12 @@ def test_device_prepare_stops_after_failed_install(settings) -> None:  # noqa: A
 
 
 def test_device_prepare_reuses_an_installed_system_package_after_install_failure(
-    settings,
+    settings, tmp_path: Path,
 ) -> None:  # noqa: ANN001
+    apk_path = tmp_path / "system.apk"
+    apk_path.write_bytes(b"matching installed system APK")
+    expected_sha256 = hashlib.sha256(apk_path.read_bytes()).hexdigest()
+
     class SystemPackageRunner:
         @staticmethod
         def available(_name: str) -> bool:
@@ -637,6 +729,8 @@ def test_device_prepare_reuses_an_installed_system_package_after_install_failure
                 return CommandResult(argv, 0, "device", "")
             if argv[-3:] == ["pm", "path", "com.vendor.system"]:
                 return CommandResult(argv, 0, "package:/system/app/System.apk", "")
+            if "sha256sum" in argv:
+                return CommandResult(argv, 0, f"{expected_sha256}  /system/app/System.apk", "")
             if "install" in argv:
                 return CommandResult(argv, 1, "", "INSTALL_FAILED_UPDATE_INCOMPATIBLE")
             return CommandResult(argv, 0, "", "")
@@ -651,13 +745,70 @@ def test_device_prepare_reuses_an_installed_system_package_after_install_failure
         SystemPackageRunner(),  # type: ignore[arg-type]
     )
 
-    commands = adapter.prepare(Path("/tmp/system.apk"), "com.vendor.system")
+    commands = adapter.prepare(apk_path, "com.vendor.system")
     by_kind = {kind: (result, metadata) for kind, result, metadata in commands}
 
     assert by_kind["device.install_attempt"][0].exit_code == 1
     assert by_kind["device.install"][0].exit_code == 0
     assert by_kind["device.install"][1]["install_mode"] == "reuse_after_install_failure"
+    assert by_kind["device.install"][1]["reuse_verified"] is True
     assert "device.clear" in by_kind
+
+
+@pytest.mark.parametrize(
+    ("install_succeeds", "installed_paths", "installed_hash", "expected_reason"),
+    [
+        (False, ["/data/app/target/base.apk"], "other", "SHA-256 mismatch"),
+        (True, ["/data/app/target/base.apk"], "other", "SHA-256 mismatch"),
+        (False, ["/data/app/target/base.apk", "/data/app/target/split.apk"], "match", "split APKs"),
+        (False, [], "match", "path unavailable"),
+    ],
+)
+def test_device_prepare_rejects_unverified_target_apk(
+    settings, tmp_path: Path, install_succeeds: bool, installed_paths: list[str],
+    installed_hash: str, expected_reason: str,
+) -> None:  # noqa: ANN001
+    apk_path = tmp_path / "target.apk"
+    apk_path.write_bytes(b"current scan artifact")
+    actual_digest = hashlib.sha256(apk_path.read_bytes()).hexdigest()
+    wrong_digest = hashlib.sha256(b"another build").hexdigest()
+    calls: list[list[str]] = []
+
+    class Runner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @staticmethod
+        def run(argv, **_kwargs):  # noqa: ANN001, ANN205
+            calls.append(argv)
+            if argv[-1] == "get-state":
+                return CommandResult(argv, 0, "device", "")
+            if argv[-3:] == ["pm", "path", "com.example.target"]:
+                paths = "\n".join(f"package:{path}" for path in installed_paths)
+                return CommandResult(argv, 0, paths, "")
+            if "install" in argv:
+                if install_succeeds:
+                    return CommandResult(argv, 0, "Success", "")
+                return CommandResult(argv, 1, "", "INSTALL_FAILED_UPDATE_INCOMPATIBLE")
+            if "sha256sum" in argv:
+                digest = actual_digest if installed_hash == "match" else wrong_digest
+                return CommandResult(argv, 0, f"{digest}  {installed_paths[0]}", "")
+            return CommandResult(argv, 0, "", "")
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555", device_install_policy="install_or_reuse"),
+        Runner(),  # type: ignore[arg-type]
+    )
+
+    commands = adapter.prepare(apk_path, "com.example.target")
+    by_kind = {kind: (result, metadata) for kind, result, metadata in commands}
+
+    assert by_kind["device.install"][0].exit_code != 0
+    assert expected_reason in by_kind["device.install"][1]["reason"]
+    assert by_kind["device.install"][1]["verified"] is False
+    assert not any(kind in {"device.clear", "device.logcat_clear"} for kind, *_ in commands)
+    assert not any("uninstall" in argv for argv in calls)
 
 
 def test_default_device_policy_preserves_target_application_data(settings) -> None:  # noqa: ANN001
@@ -1071,6 +1222,15 @@ def test_execute_poc_rejects_target_package_collision_before_adb(
             state="guest",
         )
 
+    with pytest.raises(ValueError, match="UI baseline component must belong"):
+        adapter.execute_poc(
+            apk,
+            spec,
+            target_package_name="com.example.target",
+            state="guest",
+            ui_baseline_component="com.attacker.FakeActivity",
+        )
+
     assert calls == []
 
 
@@ -1469,6 +1629,166 @@ def test_poll_poc_ui_dismisses_vendor_prompt_and_then_matches(settings) -> None:
     assert any("input" in argv and "tap" in argv for argv in InterceptionRunner.calls)
 
 
+def test_poll_poc_ui_keeps_waiting_after_attacker_dom_matches(
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # noqa: ANN001
+    class AvailableRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        AvailableRunner(),  # type: ignore[arg-type]
+    )
+    baseline = (
+        '<hierarchy><node package="com.example.target" '
+        'class="android.widget.TextView" resource-id="com.example.target:id/status" '
+        'text="transfer:off" /></hierarchy>'
+    )
+    webview_match = (
+        '<hierarchy><node package="com.example.target" '
+        'class="android.widget.TextView" resource-id="com.example.target:id/status" '
+        'text="transfer:off" />'
+        '<node package="com.example.target" class="android.webkit.WebView">'
+        '<node package="com.example.target" class="android.view.View" '
+        'text="transfer:on" /></node></hierarchy>'
+    )
+    observations = [webview_match, baseline.replace("transfer:off", "transfer:on")]
+
+    def next_dump(*, budget, cap):  # noqa: ANN001, ANN202, ARG001
+        return CommandResult(["uiautomator", "dump"], 0, observations.pop(0), "")
+
+    monkeypatch.setattr(adapter, "_dump_ui_hierarchy", next_dump)
+    monkeypatch.setattr("apkscanner.runtime.device.time.sleep", lambda _seconds: None)
+    oracle = AgentOracleSpec(
+        kind="ui_text",
+        expected_text="transfer:on",
+        impact="unauthorized_state_change",
+    )
+
+    _result, metadata, attempts, _seconds = adapter._poll_poc_ui(
+        oracle=oracle,
+        package_name="com.example.target",
+        baseline_output=baseline,
+        baseline_valid=True,
+        timeout_seconds=5,
+        budget=None,
+    )
+
+    assert attempts == 2
+    assert metadata["security_impact_observed"] is True
+
+
+@pytest.mark.parametrize(
+    ("accessibility_response", "expected_gap"),
+    [
+        ("Service accessibility: not found", "accessibility_service_unavailable"),
+        ("Service accessibility: found", "uiautomator_dump_repeated_failure"),
+    ],
+)
+def test_poll_poc_ui_stops_after_repeated_observer_failures(
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+    accessibility_response: str,
+    expected_gap: str,
+) -> None:  # noqa: ANN001
+    class FrameworkRunner:
+        checks = 0
+
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+        @classmethod
+        def run(cls, argv, **_kwargs):  # noqa: ANN001, ANN206
+            assert argv[-3:] == ["service", "check", "accessibility"]
+            cls.checks += 1
+            return CommandResult(argv, 0, accessibility_response, "")
+
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        FrameworkRunner(),  # type: ignore[arg-type]
+    )
+    calls = 0
+
+    def failed_dump(*, budget, cap):  # noqa: ANN001, ANN202, ARG001
+        nonlocal calls
+        calls += 1
+        return CommandResult(["uiautomator", "dump"], 124, "", "command timed out", timed_out=True)
+
+    monkeypatch.setattr(adapter, "_dump_ui_hierarchy", failed_dump)
+    monkeypatch.setattr("apkscanner.runtime.device.time.sleep", lambda _seconds: None)
+    oracle = AgentOracleSpec(
+        kind="ui_text",
+        expected_text="state:on",
+        impact="unauthorized_state_change",
+    )
+
+    _result, metadata, attempts, _seconds = adapter._poll_poc_ui(
+        oracle=oracle,
+        package_name="com.example.target",
+        baseline_output=(
+            '<hierarchy><node package="com.example.target" '
+            'class="android.widget.TextView" text="state:off" /></hierarchy>'
+        ),
+        baseline_valid=True,
+        timeout_seconds=60,
+        budget=None,
+    )
+
+    assert attempts == calls == 3
+    assert FrameworkRunner.checks == 1
+    assert metadata["oracle"]["observation"]["observer_gap"] == expected_gap
+    assert metadata["security_impact_observed"] is False
+    assert metadata["oracle_refuted"] is False
+
+
+def test_poll_poc_ui_reports_one_dump_timeout_that_consumes_window(
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # noqa: ANN001
+    adapter = AdbDeviceAdapter(
+        replace(settings, adb_serial="cloud-device:5555"),
+        object(),  # type: ignore[arg-type]
+    )
+    clock = [0.0]
+    caps: list[int] = []
+
+    def timed_out_dump(*, budget, cap):  # noqa: ANN001, ANN202, ARG001
+        caps.append(cap)
+        clock[0] += 20
+        return CommandResult(["uiautomator", "dump"], 124, "", "timed out", timed_out=True)
+
+    monkeypatch.setattr(adapter, "_dump_ui_hierarchy", timed_out_dump)
+    monkeypatch.setattr("apkscanner.runtime.device.time.monotonic", lambda: clock[0])
+    oracle = AgentOracleSpec(
+        kind="ui_text",
+        expected_text="state:on",
+        impact="unauthorized_state_change",
+        refute_on_miss=True,
+    )
+
+    _result, metadata, attempts, _elapsed = adapter._poll_poc_ui(
+        oracle=oracle,
+        package_name="com.example.target",
+        baseline_output=(
+            '<hierarchy><node package="com.example.target" '
+            'class="android.widget.TextView" text="state:off" /></hierarchy>'
+        ),
+        baseline_valid=True,
+        timeout_seconds=5,
+        budget=None,
+    )
+
+    assert attempts == 1
+    assert caps == [5]
+    assert metadata["oracle"]["observation"]["observer_gap"] == "uiautomator_dump_timeout"
+    assert metadata["security_impact_observed"] is False
+    assert metadata["oracle_refuted"] is False
+
+
 def test_android13_device_is_local_verdict_but_not_release_gate_eligible(
     settings,
     tmp_path,
@@ -1546,14 +1866,55 @@ def test_android13_device_is_local_verdict_but_not_release_gate_eligible(
     assert metadata["compatibility_smoke_only"] is False
 
 
+@pytest.mark.parametrize(
+    ("baseline_component", "baseline_mode", "expected_gap", "expected_impact"),
+    [
+        (
+            "com.example.target.BridgeActivity",
+            "stable_off",
+            None,
+            True,
+        ),
+        (
+            None,
+            "stable_off",
+            "manifest_target_launcher_baseline_unavailable",
+            False,
+        ),
+        (
+            "com.example.target.BridgeActivity",
+            "preexisting",
+            "target_ui_result_preexisting",
+            False,
+        ),
+        (
+            "com.example.target.BridgeActivity",
+            "unstable",
+            "target_native_baseline_unstable",
+            False,
+        ),
+        (
+            "com.example.target.BridgeActivity",
+            "launch_failed",
+            "manifest_target_launcher_baseline_launch_failed",
+            False,
+        ),
+    ],
+)
 def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
     settings,
     tmp_path,
     monkeypatch,
+    baseline_component: str | None,
+    baseline_mode: str,
+    expected_gap: str | None,
+    expected_impact: bool,
 ) -> None:  # noqa: ANN001
     class PocRunner:
         request_id = ""
         ui_dump_count = 0
+        poc_launched = False
+        calls: list[list[str]] = []
 
         @staticmethod
         def available(_name: str) -> bool:
@@ -1561,8 +1922,15 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
 
         @classmethod
         def run(cls, argv, **_kwargs):  # noqa: ANN001, ANN206
+            cls.calls.append(argv)
+            if (
+                baseline_mode == "launch_failed"
+                and "com.example.target/com.example.target.BridgeActivity" in argv
+            ):
+                return CommandResult(argv, 1, "", "Permission Denial")
             if "apkscanner_request_id" in argv:
                 cls.request_id = argv[argv.index("apkscanner_request_id") + 1]
+                cls.poc_launched = True
             if "getprop" in argv:
                 stdout = "36\n"
             elif "APKSCANNER_POC:V" in argv:
@@ -1574,13 +1942,17 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
                 cls.ui_dump_count += 1
                 stdout = "UI hierarchy dumped"
             elif "cat" in argv and any("apkscanner-ui-" in item for item in argv):
+                state_text = (
+                    "transfer:on"
+                    if cls.poc_launched or baseline_mode == "preexisting"
+                    else "transfer:pending"
+                    if baseline_mode == "unstable" and cls.ui_dump_count % 2 == 0
+                    else "transfer:off"
+                )
                 stdout = (
-                    '<hierarchy><node package="com.example.target" text="" /></hierarchy>'
-                    if cls.ui_dump_count < 3
-                    else (
-                        '<hierarchy><node package="com.example.target" '
-                        'text="Imported secret" /></hierarchy>'
-                    )
+                    '<hierarchy><node package="com.example.target" '
+                    'class="android.widget.TextView" resource-id="com.example.target:id/status" '
+                    f'text="{state_text}" /></hierarchy>'
                 )
             else:
                 stdout = ""
@@ -1601,8 +1973,8 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
     )
     oracle = AgentOracleSpec(
         kind="ui_text",
-        expected_text="Imported secret",
-        impact="unauthorized_data_access",
+        expected_text="transfer:on",
+        impact="unauthorized_state_change",
     )
     logcat_poll_timeouts = []
     original_poll_poc_logcat = adapter._poll_poc_logcat
@@ -1621,6 +1993,7 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
         oracle=oracle,
         test_case_id="agent-r1-1",
         build_metadata={"compile_api": 23, "min_api": 26, "target_api": 36},
+        ui_baseline_component=baseline_component,
     )
     by_kind = {kind: metadata for kind, _command_result, metadata in result.commands}
 
@@ -1633,16 +2006,42 @@ def test_dedicated_poc_collects_an_independent_platform_ui_oracle(
     assert by_kind["blackbox.device_profile"]["poc_runtime_compatible"] is True
     assert "blackbox.poc_pre_uninstall" in by_kind
     assert "security_impact_observed" not in by_kind["blackbox.poc_logcat"]
-    assert by_kind["blackbox.poc_ui_baseline"]["target_text_present"] is False
+    assert by_kind["blackbox.poc_ui_baseline"]["baseline_valid"] is expected_impact
+    assert by_kind["blackbox.poc_ui_baseline"]["observer_gap"] == expected_gap
     assert by_kind["blackbox.poc_ui_wake"]["action"] == "wake_display"
     assert by_kind["blackbox.poc_ui_unlock"]["action"] == "dismiss_keyguard"
-    assert by_kind["blackbox.poc_ui_dump"]["security_impact_observed"] is True
+    assert by_kind["blackbox.poc_ui_dump"]["security_impact_observed"] is expected_impact
+    assert by_kind["blackbox.poc_ui_dump"]["oracle_refuted"] is False
+    assert by_kind["blackbox.poc_ui_dump"]["oracle"]["observation"]["observer_gap"] == expected_gap
     assert by_kind["blackbox.poc_system_logcat"]["background_activity_start_blocked"] is False
     assert by_kind["blackbox.poc_ui_dump"]["oracle"]["matched"] is True
     assert by_kind["blackbox.poc_ui_dump"]["poll_attempts"] == 1
     assert (
-        by_kind["blackbox.poc_ui_dump"]["oracle"]["observation"]["target_text_transition"] is True
+        by_kind["blackbox.poc_ui_dump"]["oracle"]["observation"]["target_text_transition"]
+        is expected_impact
     )
+    assert result.summary["ui_baseline_gap"] == expected_gap
+    benign_launch_calls = [
+        argv for argv in PocRunner.calls
+        if "com.example.target/com.example.target.BridgeActivity" in argv
+    ]
+    assert len(benign_launch_calls) == int(baseline_component is not None)
+    if benign_launch_calls:
+        benign_launch = benign_launch_calls[0]
+        assert benign_launch[-4:] == [
+            "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER"
+        ]
+        assert "-d" not in benign_launch and "--es" not in benign_launch
+        home_index = next(
+            index for index, argv in enumerate(PocRunner.calls)
+            if "KEYCODE_HOME" in argv
+        )
+        benign_index = PocRunner.calls.index(benign_launch)
+        poc_index = next(
+            index for index, argv in enumerate(PocRunner.calls)
+            if "apkscanner_request_id" in argv
+        )
+        assert home_index < benign_index < poc_index
 
 
 def test_ui_hierarchy_retry_recovers_from_android_null_root(
@@ -1971,10 +2370,11 @@ def test_preexisting_target_ui_text_is_not_a_new_impact() -> None:
     oracle = AgentOracleSpec(
         kind="ui_text",
         expected_text="Imported secret",
-        impact="unauthorized_data_access",
+        impact="unauthorized_state_change",
     )
     target_ui = (
-        '<hierarchy><node package="com.example.target" text="Imported secret" /></hierarchy>'
+        '<hierarchy><node package="com.example.target" '
+        'class="android.widget.TextView" text="Imported secret" /></hierarchy>'
     )
 
     metadata = AdbDeviceAdapter._evaluate_ui_oracle(
@@ -2001,16 +2401,174 @@ def test_new_target_ui_text_can_prove_unauthorized_state_change() -> None:
         oracle,
         (
             '<hierarchy><node package="com.example.target" '
+            'class="android.widget.TextView" resource-id="com.example.target:id/status" '
             'text="Imported entries: [../shared_prefs/session.xml]" /></hierarchy>'
         ),
         package_name="com.example.target",
-        baseline_output='<hierarchy><node package="com.example.target" text="Ready" /></hierarchy>',
+        baseline_output=(
+            '<hierarchy><node package="com.example.target" '
+            'class="android.widget.TextView" resource-id="com.example.target:id/status" '
+            'text="Ready" /></hierarchy>'
+        ),
         baseline_valid=True,
     )
 
     assert metadata["oracle"]["matched"] is True
     assert metadata["oracle"]["observation"]["target_text_transition"] is True
+    assert metadata["oracle"]["observation"]["same_target_native_view_changed"] is True
     assert metadata["security_impact_observed"] is True
+
+
+def test_unidentified_native_text_view_uses_stable_structural_path() -> None:
+    oracle = AgentOracleSpec(
+        kind="ui_text",
+        expected_text="transfer:on",
+        impact="unauthorized_state_change",
+    )
+    before = (
+        '<hierarchy><node index="0" package="com.example.target" '
+        'class="android.widget.FrameLayout">'
+        '<node index="0" package="com.example.target" class="android.widget.LinearLayout">'
+        '<node index="0" package="com.example.target" class="android.widget.TextView" '
+        'text="transfer:off" /></node></node></hierarchy>'
+    )
+
+    metadata = AdbDeviceAdapter._evaluate_ui_oracle(
+        oracle,
+        before.replace("transfer:off", "transfer:on"),
+        package_name="com.example.target",
+        baseline_output=before,
+        baseline_valid=True,
+    )
+
+    assert metadata["oracle"]["observation"]["same_target_native_view_changed"] is True
+    assert metadata["security_impact_observed"] is True
+
+
+@pytest.mark.parametrize(
+    ("baseline_ui", "after_ui"),
+    [
+        pytest.param(
+            '<hierarchy><node package="com.android.launcher" '
+            'class="android.widget.TextView" text="transfer:off" /></hierarchy>',
+            '<hierarchy><node package="com.example.target" '
+            'class="android.widget.TextView" resource-id="com.example.target:id/status" '
+            'text="transfer:on" /></hierarchy>',
+            id="baseline-owned-by-other-package",
+        ),
+        pytest.param(
+            '<hierarchy><node package="com.example.target" '
+            'class="android.widget.TextView" resource-id="com.example.target:id/status" '
+            'text="transfer:off" /></hierarchy>',
+            '<hierarchy><node package="com.example.target" '
+            'class="android.widget.TextView" resource-id="com.example.target:id/other" '
+            'text="transfer:on" /></hierarchy>',
+            id="different-native-view",
+        ),
+        pytest.param(
+            '<hierarchy><node package="com.example.target" '
+            'class="android.widget.TextView" resource-id="com.example.target:id/status" '
+            'text="transfer:off" /></hierarchy>',
+            '<hierarchy><node package="com.example.target" '
+            'class="android.widget.TextView" resource-id="com.example.target:id/status" '
+            'text="transfer:off" />'
+            '<node package="com.example.target" class="android.webkit.WebView">'
+            '<node package="com.example.target" class="android.widget.TextView" '
+            'text="transfer:on" /></node></hierarchy>',
+            id="attacker-controlled-webview-dom",
+        ),
+        pytest.param(
+            '<hierarchy><node package="com.example.target" '
+            'class="android.view.View" text="transfer:off" /></hierarchy>',
+            '<hierarchy><node package="com.example.target" '
+            'class="android.view.View" text="transfer:on" /></hierarchy>',
+            id="ambiguous-generic-view",
+        ),
+        pytest.param(
+            '<hierarchy><node package="com.example.target" '
+            'class="android.widget.LinearLayout" resource-id="com.example.target:id/old">'
+            '<node package="com.example.target" class="android.widget.TextView" '
+            'resource-id="com.example.target:id/status" text="transfer:off" />'
+            "</node></hierarchy>",
+            '<hierarchy><node package="com.example.target" '
+            'class="android.widget.LinearLayout" resource-id="com.example.target:id/new">'
+            '<node package="com.example.target" class="android.widget.TextView" '
+            'resource-id="com.example.target:id/status" text="transfer:on" />'
+            "</node></hierarchy>",
+            id="different-native-view-path",
+        ),
+    ],
+)
+def test_ui_text_without_same_target_native_view_is_reachability_only(
+    baseline_ui: str,
+    after_ui: str,
+) -> None:
+    oracle = AgentOracleSpec(
+        kind="ui_text",
+        expected_text="transfer:on",
+        impact="unauthorized_state_change",
+    )
+
+    metadata = AdbDeviceAdapter._evaluate_ui_oracle(
+        oracle,
+        after_ui,
+        package_name="com.example.target",
+        baseline_output=baseline_ui,
+        baseline_valid=True,
+    )
+
+    assert metadata["oracle"]["matched"] is True
+    assert metadata["oracle"]["observation"]["same_target_native_view_changed"] is False
+    assert metadata["security_impact_observed"] is False
+
+
+def test_ui_text_requires_valid_baseline_for_state_change() -> None:
+    oracle = AgentOracleSpec(
+        kind="ui_text",
+        expected_text="transfer:on",
+        impact="unauthorized_state_change",
+    )
+    before = (
+        '<hierarchy><node package="com.example.target" class="android.widget.TextView" '
+        'resource-id="com.example.target:id/status" text="transfer:off" /></hierarchy>'
+    )
+    after = before.replace("transfer:off", "transfer:on")
+
+    metadata = AdbDeviceAdapter._evaluate_ui_oracle(
+        oracle,
+        after,
+        package_name="com.example.target",
+        baseline_output=before,
+        baseline_valid=False,
+    )
+
+    assert metadata["oracle"]["matched"] is True
+    assert metadata["security_impact_observed"] is False
+
+
+def test_ui_text_cannot_prove_data_access_without_independent_provenance() -> None:
+    oracle = AgentOracleSpec(
+        kind="ui_text",
+        expected_text="session-token",
+        impact="unauthorized_data_access",
+    )
+    before = (
+        '<hierarchy><node package="com.example.target" class="android.widget.TextView" '
+        'resource-id="com.example.target:id/status" text="ready" /></hierarchy>'
+    )
+    after = before.replace("ready", "session-token")
+
+    metadata = AdbDeviceAdapter._evaluate_ui_oracle(
+        oracle,
+        after,
+        package_name="com.example.target",
+        baseline_output=before,
+        baseline_valid=True,
+    )
+
+    assert metadata["oracle"]["matched"] is True
+    assert metadata["oracle"]["observation"]["same_target_native_view_changed"] is True
+    assert metadata["security_impact_observed"] is False
 
 
 def test_target_file_hash_transition_proves_unauthorized_state_change() -> None:
@@ -2208,3 +2766,25 @@ def test_pool_capacity_follows_probe_availability(settings) -> None:  # noqa: AN
     assert pool.remove("device-0") is True
     assert pool.capacity == 2
     assert pool.unavailable == ()
+
+
+def test_pool_distinguishes_no_configured_device_from_disconnected_device(settings) -> None:  # noqa: ANN001
+    class AvailableRunner:
+        @staticmethod
+        def available(_name: str) -> bool:
+            return True
+
+    assert AdbDevicePool([]).capability(non_blocking=True)["failure_category"] is None
+    pool = AdbDevicePool(
+        [
+            AdbDeviceAdapter(
+                settings,
+                AvailableRunner(),  # type: ignore[arg-type]
+                serial="cloud-device:5555",
+            )
+        ]
+    )
+    assert pool.mark_unavailable("cloud-device:5555") is True
+    capability = pool.capability(non_blocking=True)
+    assert capability["failure_category"] == "device_unavailable"
+    assert capability["failures"][0]["serial"] == "cloud-device:5555"

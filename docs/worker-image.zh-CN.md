@@ -8,7 +8,7 @@ JADX 和 Apktool 作为本地 vendored 资产放在 `docker/vendor/`；该目录
 
 | 工具 | 版本 | 镜像内位置 |
 | --- | --- | --- |
-| Codex SDK | `0.147.0` | Python package / bundled Codex CLI |
+| Codex SDK | `0.156.1` | Python package / bundled Codex CLI |
 | JADX | `1.5.6` | `/opt/jadx` |
 | Apktool | `3.0.3` | `/opt/apktool/apktool.jar` |
 | Android Platform | API 36 `platform-36_r02` | `/usr/lib/android-sdk/platforms/android-36` |
@@ -67,6 +67,17 @@ docker image inspect apk-scanner-codex-worker:0.2.0 \
   --format '{{json .Config.Labels}}'
 ```
 
+默认 PyPI 索引使用官方源：本次构建验证了阿里云镜像尚未同步
+`openai-codex==0.156.1`，旧索引在那次构建中返回找不到包。网络环境确实需要
+镜像时可用 `PYPI_INDEX_URL` 显式覆盖，但必须确认它已有锁定版本；构建参数
+不会携带运行时凭据：
+
+```bash
+docker build -f Dockerfile.worker -t apk-scanner-codex-worker:candidate .
+```
+
+先用候选标签运行镜像能力预检和 Docker 契约测试，确认后再决定是否更新默认标签。
+
 当前镜像约 650 MB，首次构建还需要下载 Android Platform 与 Build Tools。仅修改宿主控制面或
 前端时通常不需要重建 Worker；修改 `Dockerfile.worker`、`pyproject.toml`、
 `backend/apkscanner/runtime/codex_worker.py`、容器包装器、`config/deepseek-models.json` 或固定
@@ -79,9 +90,13 @@ docker image inspect apk-scanner-codex-worker:0.2.0 \
 使用不同的模型目录。
 
 ```bash
+APKSCANNER_CODEX_DOCKER_IMAGE=apk-scanner-codex-worker:candidate \
 APKSCANNER_RUN_DOCKER_TESTS=1 \
   pytest -q backend/tests/test_codex_executor.py backend/tests/test_codex_worker_contract.py
 ```
+
+镜像契约测试只验证容器能力和密钥边界；它不能代替带固定 APK、真值、设备 Profile
+和正负对照的真机 benchmark。候选镜像测试通过后，再以不可变 digest 记录发布回执并更新默认标签。
 
 上述 Docker 门禁会实际启动打包的 App Server，验证持久 Thread 创建、Worker 重启后的 Thread
 恢复、失败 Turn 的错误传递、每角色 UID/工作区隔离，以及 Provider Key 不进入镜像配置或 Agent

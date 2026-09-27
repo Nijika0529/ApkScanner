@@ -5,10 +5,12 @@ import json
 import re
 import secrets
 import threading
+import time
 import uuid
 from collections import Counter, defaultdict
 from copy import deepcopy
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -17,6 +19,8 @@ from sqlalchemy import select, update
 from ..core.enums import (
     FINDING_STATUS_RANK,
     FindingStatus,
+    HypothesisStatus,
+    ProofAttemptStatus,
     ScanStatus,
     TaskStatus,
     TaskType,
@@ -67,6 +71,9 @@ from .finding_reports import (
 )
 from .live_proof import LiveProofContext
 from .runtime_contracts import task_gateway_environment
+from .semantic_judge import load_semantic_judge_decision, run_semantic_judge
+from .semantic_proof_policy import evaluate_semantic_proof, semantic_proposal_digest
+from .static_source_receipts import capture_static_source_excerpt
 
 
 class AdaptiveVerificationMixin:
@@ -2049,6 +2056,12 @@ class AdaptiveVerificationMixin:
                     if receipt.get("response_evidence_id")
                 )
             )
+            semantic_judge_receipts = self._review_semantic_proposals(
+                scan_id=scan_id,
+                task_id=task_id,
+                result=combined_result,
+                timeout_seconds=max(1, budget.remaining()),
+            )
             self._apply_adaptive_verifier_result(
                 scan_id=scan_id,
                 task_id=task_id,
@@ -2071,6 +2084,8 @@ class AdaptiveVerificationMixin:
                 dynamic_verdict_eligible=bool(device_context.get("dynamic_verdict_eligible")),
                 release_gate_eligible=bool(device_context.get("release_gate_eligible")),
                 verdict_scope=str(device_context.get("verdict_scope") or "non_verdict_smoke"),
+                semantic_judge_receipts=semantic_judge_receipts,
+                device_serial=str(device_context.get("serial") or "") or None,
             )
         finally:
             if device_session is not None:
@@ -2088,6 +2103,299 @@ class AdaptiveVerificationMixin:
         """Resolve attributable platform Oracle receipts that disproved an attempt."""
         return attributable_refutation_attempts(session, finding)
 
+    def _review_semantic_proposals(
+        self,
+        *,
+        scan_id: str,
+        task_id: str,
+        result: AdaptiveVerificationResult,
+        timeout_seconds: int,
+    ) -> dict[str, str]:
+        """Ask a separate read-only model to review only frozen evidence."""
+
+        if (
+            not self.settings.semantic_judge_enabled
+            or self.settings.semantic_judge_codex_home is None
+        ):
+            return {}
+        proposals = [
+            item for item in result.assessments
+            if item.semantic_proof is not None
+            and item.verdict == FindingStatus.REPRODUCED_BLACKBOX.value
+        ]
+        if not proposals:
+            return {}
+        with self.database.session_factory() as session:
+            evidence_by_id = {
+                item.id: item
+                for item in session.scalars(select(Evidence).where(Evidence.scan_id == scan_id))
+            }
+        receipts: dict[str, str] = {}
+        deadline = time.monotonic() + timeout_seconds
+        for proposal_item in proposals:
+            remaining = int(deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            proposal = proposal_item.semantic_proof
+            if proposal is None:
+                continue
+            source_receipts = self._materialize_semantic_source_receipts(
+                scan_id=scan_id,
+                task_id=task_id,
+                finding_id=proposal_item.finding_id,
+                hypothesis_id=proposal.hypothesis_id,
+            )
+            evidence_by_id.update({item.id: item for item in source_receipts})
+            source_receipt_ids = {item.id for item in source_receipts}
+            citation_ids = {
+                citation.evidence_id
+                for citation in [*proposal.execution, *proposal.effect, *proposal.controls]
+            }
+            # The author of a proposal must not be able to hide same-experiment
+            # counterevidence simply by omitting its Evidence ID. Freeze the
+            # platform-owned Web receipt set before the separate judge runs.
+            experiment_receipts = [
+                evidence for evidence in evidence_by_id.values()
+                if evidence.task_id == task_id
+                and evidence.kind.startswith("web.experiment.")
+                and (evidence.metadata_json or {}).get("source") == "platform_web_observer"
+                and (evidence.metadata_json or {}).get("experiment_id")
+                == proposal.experiment_id
+                and (evidence.metadata_json or {}).get("finding_id")
+                == proposal_item.finding_id
+                and (evidence.metadata_json or {}).get("hypothesis_id")
+                == proposal.hypothesis_id
+            ]
+            experiment_receipt_ids = {item.id for item in experiment_receipts}
+            platform_source_ids = set(citation_ids)
+            for receipt in experiment_receipts:
+                if receipt.kind != "web.experiment.execution":
+                    continue
+                metadata = receipt.metadata_json or {}
+                platform_source_ids.update(
+                    value for field in (
+                        "launch_evidence_id", "process_evidence_id",
+                        "webview_confirmation_evidence_id", "target_process_evidence_id",
+                    )
+                    if isinstance((value := metadata.get(field)), str)
+                )
+            related = [
+                evidence for evidence in evidence_by_id.values()
+                if evidence.id in platform_source_ids
+                or evidence.id in source_receipt_ids
+                or evidence.id in experiment_receipt_ids
+            ]
+            priority = {
+                "web.experiment.plan": 0,
+                "web.experiment.fixture_state": 1,
+                "web.experiment.canary_seed": 2,
+                "web.experiment.execution": 3,
+                "web.experiment.target_effect": 4,
+                "static.source_excerpt": 5,
+                "blackbox.poc_launch": 6,
+                "blackbox.poc_process": 6,
+                "blackbox.poc_target_logcat": 6,
+                "web.experiment.target_process": 6,
+                "web.experiment.snapshot": 7,
+                "web.experiment.remote_receipt": 8,
+                "web.experiment.event": 9,
+            }
+            related.sort(key=lambda item: (
+                priority.get(item.kind, 10),
+                item.created_at.isoformat(),
+            ))
+            frozen: list[dict[str, Any]] = []
+            remaining_chars = 160_000
+            for evidence in related:
+                try:
+                    artifact_path = Path(evidence.path)
+                    if (
+                        artifact_path.is_symlink()
+                        or not artifact_path.is_file()
+                        or artifact_path.stat().st_size > 2 * 1024 * 1024
+                    ):
+                        continue
+                    raw = artifact_path.read_bytes()
+                    if hashlib.sha256(raw).hexdigest() != evidence.sha256:
+                        continue
+                    content = raw.decode("utf-8")
+                except (OSError, UnicodeError):
+                    continue
+                excerpt = content[:min(24_000, remaining_chars)]
+                remaining_chars -= len(excerpt)
+                frozen.append({
+                    "id": evidence.id,
+                    "kind": evidence.kind,
+                    "task_id": evidence.task_id,
+                    "created_at": evidence.created_at.isoformat(),
+                    "metadata": evidence.metadata_json,
+                    "artifact_content": excerpt,
+                    "artifact_truncated": len(excerpt) < len(content),
+                })
+                if remaining_chars <= 0:
+                    break
+            if not frozen:
+                continue
+            try:
+                review = run_semantic_judge(
+                    settings=self.settings,
+                    finding_id=proposal_item.finding_id,
+                    proposal_digest=semantic_proposal_digest(proposal),
+                    proposed_assessment=proposal,
+                    frozen_evidence=frozen,
+                    timeout_seconds=remaining,
+                )
+            except Exception as exc:
+                with self.database.session_factory() as session:
+                    add_event(
+                        session,
+                        scan_id,
+                        "semantic_judge.failed",
+                        "独立只读语义审查未完成；保留 Oracle gap",
+                        {
+                            "task_id": task_id,
+                            "finding_id": proposal_item.finding_id,
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                    session.commit()
+                continue
+            with self.database.session_factory() as session:
+                evidence = self.evidence.json(
+                    session,
+                    scan_id=scan_id,
+                    task_id=task_id,
+                    kind="semantic.judge.response",
+                    value={
+                        "schema_version": "1.0",
+                        "decision": review.decision.model_dump(mode="json"),
+                        "thread_id": review.thread_id,
+                        "turn_id": review.turn_id,
+                        "usage": review.usage,
+                    },
+                    summary=f"Read-only semantic review of {proposal_item.finding_id}",
+                    metadata={
+                        "source": "platform_semantic_judge",
+                        "read_only": True,
+                        "finding_id": proposal_item.finding_id,
+                        "hypothesis_id": proposal.hypothesis_id,
+                        "experiment_id": proposal.experiment_id,
+                        "proposal_digest": semantic_proposal_digest(proposal),
+                        "accepted": review.decision.accepted,
+                        "frozen_evidence_ids": [item["id"] for item in frozen],
+                        "model": review.model,
+                        "thread_id": review.thread_id,
+                        "turn_id": review.turn_id,
+                    },
+                )
+                receipts[proposal_item.finding_id] = evidence.id
+                session.commit()
+        return receipts
+
+    def _materialize_semantic_source_receipts(
+        self,
+        *,
+        scan_id: str,
+        task_id: str,
+        finding_id: str,
+        hypothesis_id: str,
+    ) -> list[Evidence]:
+        """Freeze bounded target-code excerpts for the independent judge."""
+
+        workspace = self.settings.data_dir / "workspaces" / scan_id
+        if not workspace.is_dir():
+            return []
+        with self.database.session_factory() as session:
+            finding = session.get(Finding, finding_id)
+            if finding is None or finding.scan_id != scan_id:
+                return []
+            entry_ids = [
+                value for value in (finding.entry_point_ids or [])
+                if isinstance(value, str)
+            ]
+            entries = list(session.scalars(
+                select(EntryPoint).where(
+                    EntryPoint.scan_id == scan_id,
+                    EntryPoint.id.in_(entry_ids),
+                )
+            )) if entry_ids else []
+            selectors: list[tuple[dict[str, Any], str | None]] = [
+                (anchor, entry.id)
+                for entry in entries
+                for anchor in (entry.code_anchors or [])[:8]
+                if isinstance(anchor, dict)
+            ]
+            selectors.extend(
+                (location, None)
+                for location in (finding.locations or [])[:8]
+                if isinstance(location, dict)
+            )
+            receipts: list[Evidence] = []
+            seen: set[tuple[str, int]] = set()
+            for selector, entry_id in selectors:
+                path = selector.get("path") or selector.get("file")
+                line_start = selector.get("line_start") or selector.get("line")
+                if not isinstance(path, str) or not isinstance(line_start, int):
+                    continue
+                key = (path, line_start)
+                if key in seen:
+                    continue
+                seen.add(key)
+                expected_sha256 = selector.get("sha256")
+                excerpt = capture_static_source_excerpt(
+                    scan_workspace=workspace,
+                    relative_path=path,
+                    line_start=line_start,
+                    line_end=(
+                        selector.get("line_end")
+                        if isinstance(selector.get("line_end"), int)
+                        else None
+                    ),
+                    expected_sha256=(
+                        expected_sha256 if isinstance(expected_sha256, str) else None
+                    ),
+                )
+                if excerpt is None:
+                    continue
+                usable = not any(marker in excerpt.text for marker in (
+                    "JADX ERROR", "Method not decompiled", "Method dump skipped",
+                ))
+                receipt = self.evidence.json(
+                    session,
+                    scan_id=scan_id,
+                    task_id=task_id,
+                    kind="static.source_excerpt",
+                    value={
+                        "schema_version": "1.0",
+                        "relative_path": excerpt.relative_path,
+                        "source_sha256": excerpt.source_sha256,
+                        "line_start": excerpt.line_start,
+                        "line_end": excerpt.line_end,
+                        "text": excerpt.text,
+                        "truncated": excerpt.truncated,
+                    },
+                    summary=(
+                        f"Target source {excerpt.relative_path}:"
+                        f"{excerpt.line_start}-{excerpt.line_end}"
+                    ),
+                    metadata={
+                        "source": "platform_static_source",
+                        "finding_id": finding_id,
+                        "hypothesis_id": hypothesis_id,
+                        "entry_point_id": entry_id,
+                        "relative_path": excerpt.relative_path,
+                        "source_sha256": excerpt.source_sha256,
+                        "line_start": excerpt.line_start,
+                        "line_end": excerpt.line_end,
+                        "static_output_usable": usable,
+                    },
+                )
+                receipts.append(receipt)
+                if len(receipts) >= 4:
+                    break
+            session.commit()
+            return receipts
+
     def _apply_adaptive_verifier_result(
         self,
         *,
@@ -2104,9 +2412,12 @@ class AdaptiveVerificationMixin:
         verdict_scope: str | None = None,
         response_evidence_ids_by_finding: dict[str, str] | None = None,
         batch_receipts: list[dict[str, Any]] | None = None,
+        semantic_judge_receipts: dict[str, str] | None = None,
+        device_serial: str | None = None,
     ) -> None:
         response_evidence_ids_by_finding = response_evidence_ids_by_finding or {}
         batch_receipts = batch_receipts or []
+        semantic_judge_receipts = semantic_judge_receipts or {}
         if dynamic_verdict_eligible is None:
             dynamic_verdict_eligible = android16_verdict_eligible
         if release_gate_eligible is None:
@@ -2269,6 +2580,138 @@ class AdaptiveVerificationMixin:
                 candidate_verdict_scope = str(
                     candidate_execution.get("verdict_scope") or verdict_scope
                 )
+                semantic_gate: dict[str, Any] | None = None
+                semantic_runtime_observed = any(
+                    evidence.kind == "web.experiment.execution"
+                    and (evidence.metadata_json or {}).get("finding_id") == finding.id
+                    and (evidence.metadata_json or {}).get("ordinary_app_uid_verified") is True
+                    for evidence in evidence_records
+                )
+                if (
+                    assessment.semantic_proof is not None
+                    and assessment.verdict == FindingStatus.REPRODUCED_BLACKBOX.value
+                    and not preserve_human_closure
+                ):
+                    proposal = assessment.semantic_proof
+                    judge_evidence = evidence_by_id.get(
+                        semantic_judge_receipts.get(finding_id, "")
+                    )
+                    judge_decision = load_semantic_judge_decision(judge_evidence)
+                    reviewed = (
+                        judge_decision.assessment
+                        if judge_decision is not None and judge_decision.accepted
+                        else None
+                    )
+                    gate = evaluate_semantic_proof(
+                        finding=finding,
+                        hypothesis=session.get(SecurityHypothesis, proposal.hypothesis_id),
+                        proposal=proposal,
+                        reviewed=reviewed,
+                        review_evidence=judge_evidence,
+                        evidence_by_id=evidence_by_id,
+                        verifier_task_id=task_id,
+                        device_serial=device_serial,
+                        dynamic_verdict_eligible=candidate_dynamic_eligible,
+                    )
+                    semantic_gate = {
+                        "eligible": gate.eligible,
+                        "reasons": list(gate.reasons),
+                        "experiment_id": gate.experiment_id,
+                        "judge_evidence_id": judge_evidence.id if judge_evidence else None,
+                        "evidence_ids": list(gate.evidence_ids),
+                    }
+                    if gate.eligible and reviewed is not None:
+                        semantic_test_case_id = (
+                            "semantic:"
+                            + hashlib.sha256(gate.experiment_id.encode()).hexdigest()[:24]
+                        )
+                        prior_semantic_attempt = session.scalar(
+                            select(ProofAttempt).where(
+                                ProofAttempt.scan_id == scan_id,
+                                ProofAttempt.hypothesis_id == reviewed.hypothesis_id,
+                                ProofAttempt.prover == "platform_semantic_attestation",
+                                ProofAttempt.test_case_id == semantic_test_case_id,
+                                ProofAttempt.status == ProofAttemptStatus.PROVEN.value,
+                            )
+                        )
+                        if prior_semantic_attempt is None:
+                            attestation = self.evidence.json(
+                                session,
+                                scan_id=scan_id,
+                                task_id=task_id,
+                                kind="semantic.proof_attestation",
+                                value={
+                                    "schema_version": "1.0",
+                                    "finding_id": finding.id,
+                                    "hypothesis_id": reviewed.hypothesis_id,
+                                    "experiment_id": gate.experiment_id,
+                                    "nonce": gate.nonce,
+                                    "device_serial": gate.device_serial,
+                                    "policy_evidence_ids": list(gate.evidence_ids),
+                                    "semantic_assessment": reviewed.model_dump(mode="json"),
+                                    "bridge_method": gate.bridge_method,
+                                    "judge_evidence_id": judge_evidence.id if judge_evidence else None,
+                                    "platform_gate": "passed",
+                                },
+                                summary=f"Platform semantic proof attestation: {gate.experiment_id}",
+                                metadata={
+                                    "source": "platform_semantic_policy",
+                                    "finding_id": finding.id,
+                                    "hypothesis_id": reviewed.hypothesis_id,
+                                    "experiment_id": gate.experiment_id,
+                                    "nonce": gate.nonce,
+                                    "device_serial": gate.device_serial,
+                                    "harm_demonstrated": True,
+                                },
+                            )
+                            semantic_attempt = ProofAttempt(
+                                scan_id=scan_id,
+                                task_id=task_id,
+                                hypothesis_id=reviewed.hypothesis_id,
+                                test_case_id=semantic_test_case_id,
+                                prover="platform_semantic_attestation",
+                                status=ProofAttemptStatus.PROVEN.value,
+                                plan={
+                                    "schema_version": "1.0",
+                                    "experiment_id": gate.experiment_id,
+                                    "attacker": reviewed.attacker,
+                                    "impact": reviewed.impact,
+                                    "bridge_method": gate.bridge_method,
+                                    "claim": reviewed.claim,
+                                },
+                                oracle={
+                                    "schema_version": "1.0",
+                                    "policy": "independent_semantic_judge_and_platform_gate",
+                                    "execution_demonstrated": True,
+                                    "security_impact_observed": True,
+                                    "harm_demonstrated": True,
+                                    "evidence_receipt_valid": True,
+                                    "dynamic_verdict_eligible": candidate_dynamic_eligible,
+                                    "android16_verdict_eligible": candidate_android16_eligible,
+                                    "release_gate_eligible": candidate_release_eligible,
+                                    "verdict_scope": candidate_verdict_scope,
+                                    "experiment_id": gate.experiment_id,
+                                    "attestation_evidence_id": attestation.id,
+                                },
+                                evidence_ids=[*gate.evidence_ids, attestation.id],
+                                harm_demonstrated=True,
+                                started_at=attestation.created_at,
+                                completed_at=now(),
+                            )
+                            session.add(semantic_attempt)
+                            hypothesis = session.get(SecurityHypothesis, reviewed.hypothesis_id)
+                            if hypothesis is not None:
+                                hypothesis.status = HypothesisStatus.PROVEN.value
+                                hypothesis.support_evidence_ids = list(dict.fromkeys([
+                                    *(hypothesis.support_evidence_ids or []),
+                                    *gate.evidence_ids,
+                                    attestation.id,
+                                ]))
+                            session.flush()
+                            proven_attempts.append(semantic_attempt)
+                            proven_attempt_ids.append(semantic_attempt.id)
+                            proven_evidence_ids.extend(semantic_attempt.evidence_ids)
+                            semantic_gate["proof_attempt_id"] = semantic_attempt.id
                 verdict = model_verdict
                 verdict_override_reason: str | None = None
                 negative_verdict = model_verdict in {
@@ -2277,6 +2720,7 @@ class AdaptiveVerificationMixin:
                 }
                 runtime_context = (
                     platform_runtime_observed
+                    or semantic_runtime_observed
                     or existing_signal_tier == "runtime_oracle_gap"
                 )
                 if preserve_human_closure:
@@ -2339,7 +2783,7 @@ class AdaptiveVerificationMixin:
                         "A later model-only assessment cannot erase an existing runtime Oracle "
                         "gap; platform proof or refutation is still required."
                     )
-                elif platform_runtime_observed:
+                elif platform_runtime_observed or semantic_runtime_observed:
                     verdict = FindingStatus.RUNTIME_OBSERVED_UNVERIFIED.value
                     verdict_override_reason = (
                         "A linked platform runtime observation exists, but no attributable "
@@ -2401,10 +2845,13 @@ class AdaptiveVerificationMixin:
                     "confidence": assessment.confidence,
                     "runtime_observed": bool(
                         platform_runtime_observed
+                        or semantic_runtime_observed
                         or existing_signal_tier == "runtime_oracle_gap"
                     ),
                     "model_runtime_observed": assessment.runtime_observed,
-                    "runtime_claim_accepted": platform_runtime_observed,
+                    "runtime_claim_accepted": bool(
+                        platform_runtime_observed or semantic_runtime_observed
+                    ),
                     "duplicate_of_finding_id": assessment.duplicate_of_finding_id,
                     "summary": assessment.summary,
                     "attack_chain": assessment.attack_chain,
@@ -2419,6 +2866,8 @@ class AdaptiveVerificationMixin:
                     "response_evidence_id": candidate_response_evidence_id,
                     "previous_status": existing_status,
                 }
+                if semantic_gate is not None:
+                    history_entry["semantic_proof_gate"] = semantic_gate
                 if model_verdict == FindingStatus.REFUTED_STATIC.value:
                     history_entry["platform_static_refutation_gate"] = (
                         static_refutation_gate

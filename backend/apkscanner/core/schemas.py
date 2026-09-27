@@ -73,6 +73,7 @@ class ScanQualitySummary(BaseModel):
     scan_id: str
     generated_at: datetime
     funnel: list[ScanQualityFunnelStage]
+    web_proof_funnel: list[ScanQualityFunnelStage] = Field(default_factory=list)
     task_statuses: dict[str, int]
     proof_statuses: dict[str, int]
     failure_reasons: list[ScanQualityFailure]
@@ -356,6 +357,20 @@ class HealthResponse(BaseModel):
     max_upload_bytes: int = Field(gt=0)
     default_investigator: Literal["codex", "none"] = "codex"
     enabled_investigators: list[Literal["codex"]] = Field(default_factory=list)
+    capabilities: list[Capability]
+
+
+class ReadinessResponse(BaseModel):
+    """Whether this instance can execute its configured scan profile now.
+
+    Health is intentionally just liveness. Readiness is a separate, fail-closed
+    decision over the capabilities required by the active configuration.
+    """
+
+    status: Literal["ready", "not_ready"]
+    validation_profile: Literal["development", "android16_release"]
+    required_capabilities: list[str]
+    unavailable_capabilities: list[str]
     capabilities: list[Capability]
 
 
@@ -731,7 +746,8 @@ class AgentRequestedTest(BaseModel):
 
     hypothesis_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
     entry_point_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
-    state: Literal["guest"] = "guest"
+    state: Literal["guest", "fixture"] = "guest"
+    state_fixture_id: StrictStr | None = Field(default=None, pattern=r"^[a-f0-9-]{36}$")
     uri: str | None = Field(default=None, max_length=4096)
     extras: dict[str, StrictStr | StrictInt | StrictBool] = Field(
         default_factory=dict,
@@ -779,6 +795,8 @@ class AgentRequestedTest(BaseModel):
 
     @model_validator(mode="after")
     def validate_action(self) -> Self:
+        if (self.state == "fixture") != (self.state_fixture_id is not None):
+            raise ValueError("fixture state requires exactly one state_fixture_id")
         if self.experiment is not None:
             if self.operation != "auto":
                 raise ValueError("dynamic experiments require operation=auto")
@@ -937,6 +955,47 @@ class AgentProofReplay(BaseModel):
         return self
 
 
+class ExternalObservationCapture(BaseModel):
+    """Fetch original experiment data from an operator-authorized HTTP server."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(min_length=1, max_length=4096)
+    experiment_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
+    stage: Literal["page", "callback", "readback", "control"]
+    nonce: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{24,128}$")
+
+
+class WebExperimentRequest(BaseModel):
+    """Freeze a platform-hosted bridge experiment before opening the page."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    finding_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
+    hypothesis_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
+    bridge_name: str = Field(pattern=r"^[A-Za-z_$][A-Za-z0-9_$]{0,127}$")
+    method: str = Field(pattern=r"^[A-Za-z_$][A-Za-z0-9_$]{0,127}$")
+    arguments: list[str | int | float | bool | None] = Field(default_factory=list, max_length=8)
+    frame: Literal["top", "iframe", "redirect"] = "top"
+    entry_scheme: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9+.-]{0,63}$")
+    entry_host: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
+    entry_path: str | None = Field(default=None, max_length=1024)
+    entry_query_keys: list[str] = Field(default_factory=list, max_length=32)
+    victim_state: str = Field(default="guest", min_length=1, max_length=128)
+    fixture_id: str | None = Field(default=None, pattern=r"^[a-f0-9-]{36}$")
+
+
+class WebExperimentSnapshotRequest(BaseModel):
+    """Optional platform PoC receipts used to join an observer event to app-UID execution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    launch_evidence_id: str | None = Field(default=None, pattern=r"^[a-f0-9-]{36}$")
+    process_evidence_id: str | None = Field(default=None, pattern=r"^[a-f0-9-]{36}$")
+    target_evidence_id: str | None = Field(default=None, pattern=r"^[a-f0-9-]{36}$")
+    run_controls: bool = True
+
+
 class AgentRuntimeObservation(BaseModel):
     """A normalized semantic fact collected during free-form Agent validation."""
 
@@ -957,6 +1016,7 @@ class AgentRuntimeObservation(BaseModel):
     evidence_ids: list[str] = Field(default_factory=list, max_length=64)
     payload: dict[str, Any] = Field(default_factory=dict)
     environment: dict[str, Any] = Field(default_factory=dict)
+    capture: ExternalObservationCapture | None = None
 
 
 class AgentHypothesisAssessment(BaseModel):
@@ -1364,6 +1424,41 @@ class AdaptiveVerifierExperiment(BaseModel):
     conclusion: str = Field(min_length=1, max_length=8000)
 
 
+class SemanticEvidenceCitation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
+    excerpt: str = Field(min_length=8, max_length=4000)
+
+
+class SemanticProofAssessment(BaseModel):
+    """Explicit, auditable semantic review of collected runtime evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hypothesis_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
+    experiment_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
+    claim: str = Field(min_length=12, max_length=4000)
+    attacker: Literal["remote_web", "ordinary_app", "local_network", "physical_user"]
+    victim_state: str = Field(min_length=3, max_length=2000)
+    preconditions: list[str] = Field(default_factory=list, max_length=32)
+    boundary: str = Field(min_length=12, max_length=4000)
+    impact: Literal[
+        "unauthorized_data_access", "unauthorized_state_change",
+        "privileged_action", "denial_of_service",
+    ]
+    # Explains why observed data/effects came from the target, not an echo or
+    # attacker-authored success marker. Platform validates excerpts, not semantics.
+    provenance: str = Field(min_length=24, max_length=8000)
+    alternatives_considered: str = Field(min_length=24, max_length=8000)
+    execution: list[SemanticEvidenceCitation] = Field(min_length=1, max_length=16)
+    effect: list[SemanticEvidenceCitation] = Field(min_length=1, max_length=16)
+    controls: list[SemanticEvidenceCitation] = Field(default_factory=list, max_length=16)
+    replay_steps: list[str] = Field(min_length=1, max_length=32)
+    limitations: list[str] = Field(default_factory=list, max_length=32)
+    unresolved_obligations: list[str] = Field(default_factory=list, max_length=32)
+
+
 class AdaptiveVerifierAssessment(BaseModel):
     """A semantic verdict for one previously persisted candidate finding."""
 
@@ -1402,6 +1497,7 @@ class AdaptiveVerifierAssessment(BaseModel):
     remaining_gaps: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
     experiments: list[AdaptiveVerifierExperiment] = Field(default_factory=list)
+    semantic_proof: SemanticProofAssessment | None = None
 
     @model_validator(mode="after")
     def validate_runtime_verdict(self) -> Self:
@@ -1490,10 +1586,25 @@ class GroundTruthMatch(BaseModel):
     cwes: list[str] = Field(default_factory=list, max_length=32)
     entry_names: list[str] = Field(default_factory=list, max_length=64)
     title_contains: list[str] = Field(default_factory=list, max_length=32)
+    oracle_kinds: list[str] = Field(default_factory=list, max_length=16)
+    oracle_impacts: list[
+        Literal[
+            "unauthorized_data_access",
+            "unauthorized_state_change",
+            "privileged_action",
+            "denial_of_service",
+        ]
+    ] = Field(default_factory=list, max_length=16)
+    bridge_methods: list[str] = Field(default_factory=list, max_length=32)
+    observed_fact_types: list[str] = Field(default_factory=list, max_length=16)
 
     @model_validator(mode="after")
     def require_selector(self) -> Self:
-        if not any((self.rule_ids, self.cwes, self.entry_names, self.title_contains)):
+        if not any((
+            self.rule_ids, self.cwes, self.entry_names, self.title_contains,
+            self.oracle_kinds, self.oracle_impacts, self.bridge_methods,
+            self.observed_fact_types,
+        )):
             raise ValueError("at least one ground-truth matching selector is required")
         return self
 
@@ -1506,6 +1617,14 @@ class GroundTruthVulnerability(BaseModel):
     harm: str = Field(min_length=1, max_length=4000)
     severity: Literal["critical", "high", "medium", "low", "info"]
     minimum_proof: Literal["static", "dynamic"] = "dynamic"
+    match: GroundTruthMatch
+
+
+class BenchmarkNegativeControl(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=128)
+    title: str = Field(min_length=1, max_length=1000)
     match: GroundTruthMatch
 
 
@@ -1525,13 +1644,14 @@ class BenchmarkSpec(BaseModel):
     apk_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     required_dynamic_scope: Literal["android16_release", "any_dynamic"] = "android16_release"
     vulnerabilities: list[GroundTruthVulnerability] = Field(min_length=1, max_length=500)
+    negative_controls: list[BenchmarkNegativeControl] = Field(default_factory=list, max_length=500)
     quality_gate: BenchmarkQualityGate = Field(default_factory=BenchmarkQualityGate)
 
     @model_validator(mode="after")
     def require_unique_vulnerability_ids(self) -> Self:
-        identifiers = [item.id for item in self.vulnerabilities]
+        identifiers = [item.id for item in [*self.vulnerabilities, *self.negative_controls]]
         if len(identifiers) != len(set(identifiers)):
-            raise ValueError("ground-truth vulnerability IDs must be unique")
+            raise ValueError("ground-truth and negative-control IDs must be unique")
         return self
 
 
@@ -1597,6 +1717,17 @@ class ValidationFixtureCreate(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     setup_instructions: list[StrictStr] = Field(default_factory=list, max_length=64)
     cleanup_instructions: list[StrictStr] = Field(default_factory=list, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_state_check(self) -> Self:
+        if "state_check" not in self.payload:
+            return self
+        check = DynamicExperimentStepSpec.model_validate(self.payload["state_check"])
+        if check.phase != "assert" or not (check.stdout_contains or check.stdout_regex):
+            raise ValueError("fixture state_check requires an assert step with an output predicate")
+        if check.continue_on_failure or check.capture_stdout_as is not None:
+            raise ValueError("fixture state_check cannot continue on failure or capture state")
+        return self
 
 
 class ValidationFixtureOut(ApiModel):

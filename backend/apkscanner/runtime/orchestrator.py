@@ -45,6 +45,11 @@ from ..core.finding_policy import (
     evidence_backed_signal_tier,
     static_evidence_is_usable,
 )
+from ..core.investigation_loop import (
+    InvestigationLoopDecision,
+    InvestigationLoopState,
+    decide_investigation_loop,
+)
 from ..core.models import (
     AgentRuntimeEventRecord,
     CoverageItem,
@@ -72,6 +77,7 @@ from ..infrastructure.artifacts import ArtifactStore
 from ..infrastructure.tools import CommandResult, TimeBudget, ToolRunner
 from .adaptive_verification import AdaptiveVerificationMixin
 from .adb_gateway import (
+    quote_dynamic_experiment_adb_args,
     validate_dynamic_experiment_adb_template,
 )
 from .agent_audit import AgentAuditRecorder, normalization_repairs, rejected_requested_tests
@@ -81,13 +87,14 @@ from .codex_runner import CodexInvestigator, CodexRunResult
 from .concurrency import ResizableSemaphore
 from .device import AdbDeviceAdapter, DeviceLeaseCancelledError
 from .device_registry import DeviceRegistry
-from .dynamic_experiments import DynamicExperimentService
+from .dynamic_experiments import DynamicExperimentService, fixture_state_check
 from .finalization import ScanFinalizer
 from .finding_reports import (
     build_finding_report,
     render_finding_description,
     render_finding_remediation,
 )
+from .investigation_loop import agent_progress_state
 from .live_proof import LiveProofContext
 from .live_proof_gateway import LiveProofGatewayMixin
 from .planner import InvestigationPlanner
@@ -95,8 +102,9 @@ from .poc import PocBuilder, PocBuildResult
 from .proof_recipes import ProofRecipe, bind_proof_recipe, proof_recipe_from_plan
 from .runtime_artifacts import RuntimeArtifactService
 from .runtime_contracts import task_gateway_environment
-from .security_pipeline import HypothesisLedger
+from .security_pipeline import HypothesisLedger, typed_poc_oracle_trusted
 from .static_analysis_pipeline import StaticAnalysisPipeline
+from .task_execution_state import TaskExecutionStateMixin
 from .versioning import SecurityEvolutionService
 
 # Temporary import compatibility for integrations written before LiveProofContext
@@ -104,7 +112,11 @@ from .versioning import SecurityEvolutionService
 _LiveProofContext = LiveProofContext
 
 
-class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
+class ScanOrchestrator(
+    TaskExecutionStateMixin,
+    LiveProofGatewayMixin,
+    AdaptiveVerificationMixin,
+):
     def __init__(self, settings: Settings, database: Database, store: ArtifactStore):
         self.settings = settings
         self.database = database
@@ -360,6 +372,9 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
         for cancellation in cancellations:
             cancellation.set()
         proof_server = self._live_proof_server
+        remote_adapter = getattr(self, "_web_observer_remote_adapter", None)
+        if remote_adapter is not None:
+            remote_adapter.backend.close()
         if proof_server is not None:
             proof_server.shutdown()
             proof_server.server_close()
@@ -504,8 +519,8 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
             session.commit()
 
     def _run_sync(self, scan_id: str) -> None:
-        self.agent_audits.ensure_scan_container(scan_id)
         try:
+            self.agent_audits.ensure_scan_container(scan_id)
             self._run_static(scan_id)
             task_outcome = self._run_tasks(scan_id)
             if task_outcome == "shutdown":
@@ -776,105 +791,6 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
         self.codex.set_scan_session_limit(scan_id, None)
 
     @staticmethod
-    def _default_execution_dag() -> dict[str, Any]:
-        return {
-            "schema_version": "1.0",
-            "nodes": {
-                "seed_analysis": {
-                    "status": "pending",
-                    "depends_on": [],
-                    "resources": ["analysis"],
-                },
-                "adversarial_review": {
-                    "status": "optional",
-                    "depends_on": ["seed_analysis"],
-                    "resources": ["analysis"],
-                },
-                "rescue_review": {
-                    "status": "optional",
-                    "depends_on": ["seed_analysis"],
-                    "resources": ["analysis"],
-                },
-                "poc_build": {
-                    "status": "pending",
-                    "depends_on": ["seed_analysis"],
-                    "resources": ["build"],
-                },
-                "device_execution": {
-                    "status": "pending",
-                    "depends_on": ["poc_build"],
-                    "resources": ["device"],
-                },
-                "adaptive_analysis": {
-                    "status": "optional",
-                    "depends_on": ["device_execution"],
-                    "resources": ["analysis"],
-                },
-                "impact_evaluation": {
-                    "status": "pending",
-                    "depends_on": ["device_execution", "adaptive_analysis"],
-                    "resources": ["platform"],
-                },
-                "final_synthesis": {
-                    "status": "pending",
-                    "depends_on": ["impact_evaluation"],
-                    "resources": ["analysis"],
-                },
-            },
-        }
-
-    @classmethod
-    def _ensure_task_execution_dag(cls, task: InvestigationTask) -> dict[str, Any]:
-        result = dict(task.result or {})
-        dag = result.get("execution_dag")
-        if not isinstance(dag, dict) or not isinstance(dag.get("nodes"), dict):
-            dag = cls._default_execution_dag()
-            result["execution_dag"] = dag
-            task.result = result
-        return dag
-
-    def _set_task_stage(
-        self,
-        scan_id: str,
-        task_id: str,
-        stage: str,
-        status: str,
-        **metadata: Any,
-    ) -> None:
-        with self.database.session_factory() as session:
-            task = session.get(InvestigationTask, task_id)
-            if task is None or task.scan_id != scan_id:
-                return
-            dag = deepcopy(self._ensure_task_execution_dag(task))
-            nodes = dag["nodes"]
-            node = dict(nodes.get(stage) or {})
-            node["status"] = status
-            if status == "running" and not node.get("started_at"):
-                node["started_at"] = now().isoformat()
-            if status in {"completed", "failed", "skipped", "inconclusive"}:
-                node["completed_at"] = now().isoformat()
-            if metadata:
-                node["metadata"] = {**dict(node.get("metadata") or {}), **metadata}
-            nodes[stage] = node
-            dag["current_stage"] = stage
-            dag["updated_at"] = now().isoformat()
-            task.result = {**dict(task.result or {}), "execution_dag": dag}
-            add_event(
-                session,
-                scan_id,
-                "task.stage.updated",
-                f"任务阶段 {stage} 更新为 {status}",
-                {
-                    "task_id": task_id,
-                    "stage": stage,
-                    "status": status,
-                    "resources": node.get("resources", []),
-                    **metadata,
-                },
-            )
-            session.commit()
-
-    @staticmethod
     def _scheduler_score(task: InvestigationTask) -> tuple[int, dict[str, int]]:
         text = " ".join(str(value).lower() for value in task.hypotheses or [])
         risk_terms = {
@@ -906,79 +822,6 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
             "entry_cost": -entry_cost,
         }
         return sum(breakdown.values()), breakdown
-
-    @staticmethod
-    def _agent_progress_signature(
-        result: AgentInvestigationResult,
-        *,
-        evidence_summaries: list[dict[str, Any]],
-        proven_hypotheses: dict[str, list[str]],
-    ) -> str:
-        """Hash platform-visible progress, excluding free-form model wording."""
-
-        requested_tests = [
-            {
-                "hypothesis_id": request.hypothesis_id,
-                "entry_point_id": request.entry_point_id,
-                "state": request.state,
-                "operation": request.operation,
-                "extras": request.extras,
-                "binder_transaction_code": request.binder_transaction_code,
-                "binder_interface_descriptor": request.binder_interface_descriptor,
-                "binder_reply_type": request.binder_reply_type,
-                "binder_script": (
-                    [item.model_dump(mode="json") for item in request.binder_script]
-                    if request.binder_script
-                    else None
-                ),
-                "poc": request.poc.model_dump(mode="json") if request.poc else None,
-                "oracle": request.oracle.model_dump(mode="json"),
-            }
-            for request in result.requested_tests
-        ]
-        assessments = [
-            {
-                "hypothesis_id": assessment.hypothesis_id,
-                "verdict": assessment.verdict,
-                "evidence_ids": sorted(assessment.evidence_ids),
-                "source": assessment.source,
-                "control": assessment.control,
-                "sink": assessment.sink,
-                "reachable_path": assessment.reachable_path,
-                "boundary": assessment.boundary,
-                "security_impact": assessment.security_impact,
-                "missing_control": assessment.missing_control,
-                "has_counterevidence": bool(assessment.counterevidence),
-                "has_proof_gaps": bool(assessment.proof_gaps),
-            }
-            for assessment in result.hypothesis_assessments
-        ]
-        payload = {
-            "result": result.result,
-            "evidence_ids": sorted(
-                {
-                    *result.evidence_ids,
-                    *(str(item["id"]) for item in evidence_summaries if item.get("id")),
-                }
-            ),
-            "proven_hypotheses": {
-                hypothesis_id: sorted(evidence_ids)
-                for hypothesis_id, evidence_ids in sorted(proven_hypotheses.items())
-            },
-            "requested_tests": requested_tests,
-            "assessments": sorted(
-                assessments,
-                key=lambda item: (item["hypothesis_id"], item["verdict"]),
-            ),
-        }
-        return hashlib.sha256(
-            json.dumps(
-                payload,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
 
     def _has_queued_tasks(self, scan_id: str) -> bool:
         with self.database.session_factory() as session:
@@ -1071,7 +914,16 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                         )
                     )
                 )
-                for pending in pending_tasks:
+                # Explicit reruns/continuations own a fresh task budget, even
+                # when an expired automatic task wins this admission round.
+                expired_tasks = [
+                    pending for pending in pending_tasks
+                    if not (
+                        (pending.result or {}).get("manual_rerun")
+                        or (pending.result or {}).get("manual_continuation")
+                    )
+                ]
+                for pending in expired_tasks:
                     pending.status = TaskStatus.TIMED_OUT.value
                     pending.error = "whole-scan deadline exhausted before task dispatch"
                     pending.completed_at = now()
@@ -1080,7 +932,7 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                     scan_id,
                     "scan.deadline_exhausted",
                     "Whole-scan deadline exhausted; remaining tasks were not dispatched",
-                    {"remaining_tasks": len(pending_tasks)},
+                    {"remaining_tasks": len(expired_tasks)},
                 )
                 session.commit()
                 return None
@@ -1793,6 +1645,12 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
             "blackbox_attempted": False,
         }
         device_capability = self.device_pool.capability(non_blocking=True)
+        self._record_device_runtime_failure(
+            scan_id=scan_id,
+            task_id=task_id,
+            phase="initial_device_capability",
+            capability=device_capability,
+        )
         task_device: AdbDeviceAdapter | None = None
         device_lease_owned = False
         device_lease_acquired = False
@@ -1846,6 +1704,29 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                 cleanup = task_device.cleanup(package_name)
                 self._record_commands(scan_id, task_id, cleanup, None)
                 target_installed = False
+            # ADB shell/getprop can remain live after system_server services die.
+            # Check again at every lease boundary, including failed preparation
+            # and PoC batches, so a partial run cannot later be benchmarked.
+            if (
+                task_device is not None
+                and not self._shutting_down.is_set()
+                and not cancel_event.is_set()
+            ):
+                try:
+                    final_capability = task_device.capability(non_blocking=False)
+                except Exception as exc:
+                    final_capability = {
+                        "available": False,
+                        "serial": task_device.serial,
+                        "failure_category": "device_health_probe_failed",
+                        "detail": f"device health probe raised {type(exc).__name__}",
+                    }
+                self._record_device_runtime_failure(
+                    scan_id=scan_id,
+                    task_id=task_id,
+                    phase="device_lease_release",
+                    capability=final_capability,
+                )
             final_device_session = device_session
             device_session = None
             final_device_session.__exit__(None, None, None)
@@ -1870,15 +1751,25 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                     }
                 )
             elif device_lease_acquired:
+                device_failed_after_lease = sticky_device_serial in self.device_pool.unavailable
                 capability.update(
                     {
-                        "available": True,
+                        "available": not device_failed_after_lease,
                         "busy": False,
                         "lease_owned_by_current_task": False,
                         "lease_completed_by_current_task": True,
                         "active_task_id": None,
                         "serial": sticky_device_serial,
-                        "detail": "当前任务的独占设备会话已完成并释放。",
+                        "detail": (
+                            "设备会话已释放，但健康复检失败；本轮不能再执行动态证明。"
+                            if device_failed_after_lease
+                            else "当前任务的独占设备会话已完成并释放。"
+                        ),
+                        **(
+                            {"verdict_scope": "unavailable", "release_gate_eligible": False}
+                            if device_failed_after_lease
+                            else {}
+                        ),
                     }
                 )
             return capability
@@ -1924,7 +1815,7 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
         phase_counts: dict[str, int] = {}
         phase_usage_seconds: dict[str, float] = defaultdict(float)
         agent_runtime_workspaces: dict[str, Path] = {}
-        last_progress_signature: str | None = None
+        last_progress_state: dict[str, Any] | None = None
         agent_no_progress_rounds = 0
         single_pass_phases = {
             "adversarial_review",
@@ -1966,7 +1857,7 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
             round_index: int = 0,
             blind_rescue: bool = False,
         ):  # noqa: ANN202
-            nonlocal agent_capability_gap, last_progress_signature, agent_no_progress_rounds
+            nonlocal agent_capability_gap, last_progress_state, agent_no_progress_rounds
             audit_id: str | None = None
             runtime_events: list[dict[str, Any]] = []
             phase_bucket, phase_limit_seconds = phase_budget(phase)
@@ -2558,18 +2449,19 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                         "test_validation": None,
                     }
                 )
-                progress_signature = self._agent_progress_signature(
+                progress_state = agent_progress_state(
                     result.result,
                     evidence_summaries=evidence_summaries,
                     proven_hypotheses=(self.hypothesis_ledger.task_proven_hypotheses(task_id)),
                 )
-                if progress_signature == last_progress_signature:
-                    agent_no_progress_rounds += 1
-                else:
+                progress_changed = progress_state != last_progress_state
+                if progress_changed:
                     agent_no_progress_rounds = 0
-                    last_progress_signature = progress_signature
+                    last_progress_state = progress_state
+                else:
+                    agent_no_progress_rounds += 1
                 agent_round_history[-1]["progress"] = {
-                    "signature": progress_signature,
+                    "changed": progress_changed,
                     "consecutive_no_progress_rounds": agent_no_progress_rounds,
                 }
                 self._set_task_stage(
@@ -2667,6 +2559,51 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                     },
                 )
                 return None, str(exc)
+
+        def record_loop_phase(
+            phase: str,
+            *,
+            round_index: int,
+            decision: InvestigationLoopDecision | None = None,
+        ) -> None:
+            self._set_task_investigation_loop(
+                scan_id,
+                task_id,
+                phase=phase,
+                round_index=round_index,
+                no_progress_rounds=agent_no_progress_rounds,
+                budget_remaining_seconds=budget.remaining(),
+                decision=decision,
+            )
+
+        def decide_next_round(
+            current_result,
+            *,
+            executor_ready: bool,
+            round_index: int,
+            result_available: bool | None = None,
+        ) -> InvestigationLoopDecision:  # noqa: ANN001
+            has_result = current_result is not None
+            if result_available is not None:
+                has_result = result_available
+            decision = decide_investigation_loop(
+                InvestigationLoopState(
+                    has_result=has_result,
+                    has_pending_action=(
+                        current_result is not None
+                        and self._has_requested_test_work(current_result.result)
+                    ),
+                    proof_complete=self.hypothesis_ledger.task_all_hypotheses_proven(
+                        task_id
+                    ),
+                    executor_ready=executor_ready,
+                    budget_expired=budget.expired,
+                    no_progress_rounds=agent_no_progress_rounds,
+                    no_progress_limit=self.settings.agent_no_progress_limit,
+                )
+            )
+            record_loop_phase("validate", round_index=round_index, decision=decision)
+            return decision
 
         def run_negative_rescue(current_result, *, round_index: int):  # noqa: ANN202
             """Review only material negatives plus a deterministic quality sample."""
@@ -2880,6 +2817,8 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
 
             return current_result
 
+        record_loop_phase("plan", round_index=0)
+
         # A busy non-blocking snapshot remains eligible for the device queue, but
         # an explicit unavailable result should degrade directly to static AI.
         device_ready = bool(
@@ -2915,6 +2854,7 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                     testable_entries,
                     hypothesis_ids=hypothesis_ids,
                     permission_profile=self.settings.agent_permission_profile,
+                    fixture_ids=self._active_fixture_ids(scan_id, task_id),
                 )
                 request_gaps = [
                     *self._rejected_requested_test_gaps(model_rejections),
@@ -2986,6 +2926,7 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                 phase="static_only",
             )
             agent_result = run_negative_rescue(agent_result, round_index=0)
+            decide_next_round(agent_result, executor_ready=False, round_index=0)
         else:
             try:
                 acquire_dynamic_device()
@@ -3005,9 +2946,11 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                 agent_result = run_negative_rescue(agent_result, round_index=0)
                 device_session = None
                 task_device = None
+                decide_next_round(agent_result, executor_ready=False, round_index=0)
             if device_session is not None:
                 prepared = False
                 target_installed = False
+                completed_rounds = 0
                 try:
                     if prepare_dynamic_target():
                         prepared = True
@@ -3167,16 +3110,16 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                             "Adversarial review could not start because the parent task "
                             "lifecycle had already ended."
                         )
-                    completed_rounds = 0
-                    while (
-                        agent_result
-                        and self._has_requested_test_work(agent_result.result)
-                        and not self.hypothesis_ledger.task_all_hypotheses_proven(task_id)
-                        and prepared
-                        and not budget.expired
-                        and agent_no_progress_rounds < self.settings.agent_no_progress_limit
-                    ):
+                    while True:
+                        loop_decision = decide_next_round(
+                            agent_result,
+                            executor_ready=prepared,
+                            round_index=completed_rounds,
+                        )
+                        if not loop_decision.should_execute:
+                            break
                         planning_result = agent_result
+                        assert planning_result is not None
                         planning_turn_id = planning_result.turn_id
                         prebuilt = prebuilt_plans.pop(planning_turn_id, None)
                         if prebuilt is not None:
@@ -3203,6 +3146,7 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                                 testable_entries,
                                 hypothesis_ids=hypothesis_ids,
                                 permission_profile=self.settings.agent_permission_profile,
+                                fixture_ids=self._active_fixture_ids(scan_id, task_id),
                             )
                             request_gaps = [
                                 *self._rejected_requested_test_gaps(model_rejections),
@@ -3268,6 +3212,10 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                         execution_gaps: list[str] = []
                         executed_this_round: list[dict[str, Any]] = []
                         if requested and not budget.expired:
+                            record_loop_phase(
+                                "execute",
+                                round_index=completed_rounds,
+                            )
                             if not device_lease_owned:
                                 acquire_dynamic_device()
                                 prepared = prepare_dynamic_target()
@@ -3301,6 +3249,10 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                             )
                             coverage_gaps.extend(execution_gaps)
 
+                        record_loop_phase(
+                            "verify",
+                            round_index=completed_rounds,
+                        )
                         self.agent_audits.record_test_validation(
                             task_id=task_id,
                             turn_id=planning_turn_id,
@@ -3340,13 +3292,17 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                                     ],
                                 },
                             )
-                            break
+                            continue
                         if budget.expired:
-                            break
+                            continue
                         # Model analysis and any next-round PoC build run without
                         # occupying a scarce device. The next accepted dynamic
                         # batch reacquires the same serial when it is available.
                         release_dynamic_device()
+                        record_loop_phase(
+                            "replan",
+                            round_index=completed_rounds,
+                        )
                         next_result, next_error = invoke_agent(
                             phase="exploration_round",
                             executed_tests=executed_agent_tests,
@@ -3356,6 +3312,12 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                             coverage_gaps.append(
                                 "Adaptive AI exploration round failed; retained prior result: "
                                 f"{next_error}"
+                            )
+                            decide_next_round(
+                                agent_result,
+                                executor_ready=prepared,
+                                round_index=completed_rounds,
+                                result_available=False,
                             )
                             break
                         agent_result = next_result
@@ -3426,6 +3388,11 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                         agent_result, agent_error = invoke_agent(
                             phase="recovery_evaluation",
                         )
+                    decide_next_round(
+                        agent_result,
+                        executor_ready=False,
+                        round_index=completed_rounds,
+                    )
                 finally:
                     release_dynamic_device()
 
@@ -4156,6 +4123,7 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
         *,
         hypothesis_ids: set[str] | None = None,
         permission_profile: str = "personal_lab",
+        fixture_ids: set[str] | None = None,
     ) -> tuple[list[AgentRequestedTest], list[str]]:
         entries_by_id = {entry.id: entry for entry in entries}
         accepted: list[AgentRequestedTest] = []
@@ -4209,6 +4177,8 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                 and request.hypothesis_id not in hypothesis_ids
             ):
                 reason = "hypothesis is outside this task"
+            elif request.state == "fixture" and request.state_fixture_id not in (fixture_ids or set()):
+                reason = "state fixture is inactive or outside this task"
             elif any(not re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", key) for key in request.extras):
                 reason = "an extra key is unsafe"
             elif any(
@@ -4228,6 +4198,19 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                 "query",
             }:
                 reason = "provider_rows Oracle requires a provider query operation"
+            elif request.poc is not None and request.oracle.kind in {
+                "provider_rows",
+                "binder_reply",
+            }:
+                reason = (
+                    f"{request.oracle.kind} Oracle requires a platform-generated proof Harness; "
+                    "an Agent PoC cannot attest its own returned data"
+                )
+            elif request.oracle.kind == "binder_reply" and request.operation not in {
+                "binder_transact",
+                "binder_script",
+            }:
+                reason = "binder_reply Oracle requires a Binder transaction operation"
             elif (
                 request.operation in {"binder_transact", "binder_script"}
                 and entry.kind != "service"
@@ -4435,6 +4418,7 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
             entries,
             hypothesis_ids=hypothesis_ids,
             permission_profile=self.settings.agent_permission_profile,
+            fixture_ids=self._active_fixture_ids(scan_id, task_id),
         )
         gaps.extend(validation_gaps)
         if not accepted:
@@ -4794,6 +4778,57 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
             return None
         return "URI overrides are allowed only for deep links and providers"
 
+    @staticmethod
+    def _manifest_ui_baseline_component(
+        request: AgentRequestedTest,
+        entries: list[EntryPoint],
+        package_name: str,
+    ) -> str | None:
+        """Select a benign launcher for the requested entry's actual owner.
+
+        This is derived exclusively from parsed manifest entries. A model's PoC
+        component, URI, and extras must never become a pre-attack UI baseline.
+        """
+
+        if (
+            request.oracle.kind != "ui_text"
+            or request.oracle.impact != "unauthorized_state_change"
+        ):
+            return None
+        requested = next((entry for entry in entries if entry.id == request.entry_point_id), None)
+        if (
+            requested is None
+            or requested.kind not in {"activity", "activity_alias", "deep_link"}
+            or not requested.exported
+            or requested.permission is not None
+            or (requested.metadata_json or {}).get("effective_enabled") is False
+        ):
+            return None
+        owner = requested.owner_component or (
+            requested.name if requested.kind in {"activity", "activity_alias"} else None
+        )
+        if not owner or not owner.startswith(f"{package_name}."):
+            return None
+        candidates = {
+            entry.name
+            for entry in entries
+            if entry.kind in {"activity", "activity_alias"}
+            and entry.owner_component == owner
+            and entry.exported
+            and entry.permission is None
+            and (entry.metadata_json or {}).get("effective_enabled") is not False
+            and entry.name.startswith(f"{package_name}.")
+            and any(
+                isinstance(intent_filter, dict)
+                and "android.intent.action.MAIN" in intent_filter.get("actions", [])
+                and "android.intent.category.LAUNCHER"
+                in intent_filter.get("categories", [])
+                and not intent_filter.get("data")
+                for intent_filter in (entry.intent_filters or [])
+            )
+        }
+        return next(iter(candidates)) if len(candidates) == 1 else None
+
     def _execute_requested_tests(
         self,
         *,
@@ -4825,12 +4860,19 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
         }
         device_api_level = device_profile.get("api_level")
         poc_artifacts = poc_artifacts or {}
+        # The request catalog can omit statically closed sibling entries. A
+        # benign launcher must still come from the complete parsed Manifest,
+        # never from an agent-supplied component or an incomplete task slice.
+        with self.database.session_factory() as session:
+            manifest_entries = list(
+                session.scalars(select(EntryPoint).where(EntryPoint.scan_id == scan_id))
+            )
         indexed = [
             (f"agent-r{round_index}-{index + 1}", request) for index, request in enumerate(requests)
         ]
         executed: list[dict[str, Any]] = []
         gaps: list[str] = []
-        for state in ("guest",):
+        for state in ("guest", "fixture"):
             state_requests = [item for item in indexed if item[1].state == state]
             if not state_requests or budget.expired:
                 continue
@@ -4838,6 +4880,18 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                 if budget.expired:
                     gaps.append("Task budget expired before all agent-requested tests ran.")
                     break
+                if request.state_fixture_id is not None and request.experiment is None:
+                    fixture_gap = self._verify_requested_fixture(
+                        scan_id=scan_id,
+                        task_id=task_id,
+                        fixture_id=request.state_fixture_id,
+                        test_case_id=test_case_id,
+                        device=active_device,
+                        evidence_summaries=evidence_summaries,
+                    )
+                    if fixture_gap is not None:
+                        gaps.append(fixture_gap)
+                        continue
                 requested_reset = request.reset
                 if self.settings.device_reset_policy == "never" and request.reset != "preserve":
                     # ``never`` is a hard operator policy: model-authored Proof requests cannot
@@ -4971,6 +5025,11 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                         oracle=request.oracle,
                         test_case_id=test_case_id,
                         build_metadata=artifact.metadata,
+                        ui_baseline_component=self._manifest_ui_baseline_component(
+                            request,
+                            manifest_entries,
+                            package_name,
+                        ),
                     )
                     for index, (kind, result, metadata) in enumerate(probe.commands):
                         probe.commands[index] = (
@@ -4997,6 +5056,32 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                         gaps.append(
                             f"Agent-requested test {test_case_id} executed but could not close "
                             f"the ordinary-app execution receipt: {receipt_gap}."
+                        )
+                    baseline_gap = (
+                        probe_summary.get("ui_baseline_gap")
+                        if isinstance(probe_summary, dict)
+                        else None
+                    )
+                    if isinstance(baseline_gap, str) and baseline_gap:
+                        gaps.append(
+                            f"Agent-requested test {test_case_id} has a UI Oracle gap: "
+                            f"{baseline_gap}."
+                        )
+                    ui_observer_gaps = {
+                        str(observation_gap)
+                        for kind, _result, metadata in probe.commands
+                        if kind == "blackbox.poc_ui_dump"
+                        for observation_gap in [
+                            ((metadata.get("oracle") or {}).get("observation") or {}).get(
+                                "observer_gap"
+                            )
+                        ]
+                        if observation_gap and observation_gap != baseline_gap
+                    }
+                    for ui_observer_gap in sorted(ui_observer_gaps):
+                        gaps.append(
+                            f"Agent-requested test {test_case_id} has a UI Oracle gap: "
+                            f"{ui_observer_gap}."
                         )
                 except Exception as exc:
                     execution_error = exc
@@ -5082,6 +5167,11 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                 name=plan.name,
                 objective=plan.objective,
                 preferred_serial=device.serial,
+                fixture_ids=(
+                    [request.state_fixture_id]
+                    if request.state_fixture_id is not None
+                    else []
+                ),
                 preconditions=list(plan.preconditions),
                 impact_contract=contract,
                 steps=[item.model_dump(mode="json") for item in plan.steps],
@@ -5718,6 +5808,73 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
             for fixture in fixtures
         ]
 
+    def _active_fixture_ids(self, scan_id: str, task_id: str) -> set[str]:
+        return {
+            str(item["id"])
+            for item in self._validation_fixture_context(scan_id, task_id)
+        }
+
+    def _verify_requested_fixture(
+        self,
+        *,
+        scan_id: str,
+        task_id: str,
+        fixture_id: str,
+        test_case_id: str,
+        device: AdbDeviceAdapter,
+        evidence_summaries: list[dict[str, Any]],
+    ) -> str | None:
+        """Check a non-guest state immediately before the ordinary-app attack."""
+
+        with self.database.session_factory() as session:
+            fixture = session.get(ValidationFixture, fixture_id)
+            if (
+                fixture is None
+                or fixture.status != "active"
+                or fixture.scan_id != scan_id
+                or (fixture.task_id is not None and fixture.task_id != task_id)
+            ):
+                return f"Fixture {fixture_id} is no longer active for test {test_case_id}."
+            payload = dict(fixture.payload or {})
+        try:
+            step = fixture_state_check(payload, fixture_id)
+            result = device.execute_gateway(
+                quote_dynamic_experiment_adb_args(step.adb_args),
+                timeout=step.timeout_seconds,
+                policy="adaptive",
+            )
+        except (ValueError, RuntimeError) as exc:
+            return f"Fixture {fixture_id} could not be verified for test {test_case_id}: {exc}"
+        checks_passed = bool(
+            result.exit_code == step.expected_exit_code
+            and not result.timed_out
+            and not result.canceled
+            and all(value in result.stdout for value in step.stdout_contains)
+            and (step.stdout_regex is None or re.search(step.stdout_regex, result.stdout))
+        )
+        self._record_commands(
+            scan_id,
+            task_id,
+            [
+                (
+                    "fixture.state_check",
+                    result,
+                    {
+                        "fixture_id": fixture_id,
+                        "test_case_id": test_case_id,
+                        "device_serial": device.serial,
+                        "fixture_state_verified": checks_passed,
+                        "platform_oracle_validated": False,
+                        "impact_contract_satisfied": False,
+                    },
+                )
+            ],
+            evidence_summaries,
+        )
+        if not checks_passed:
+            return f"Fixture {fixture_id} state predicate failed before test {test_case_id}."
+        return None
+
     @staticmethod
     def _is_static_review_context(
         platform_context: dict[str, Any] | None,
@@ -5977,6 +6134,88 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
                     },
                 )
             session.commit()
+
+    def _record_device_runtime_failure(
+        self,
+        *,
+        scan_id: str,
+        task_id: str,
+        phase: str,
+        capability: dict[str, Any],
+    ) -> None:
+        """Invalidate scoring only for an attributable platform/device outage."""
+        reason = str(capability.get("failure_category") or "")
+        if reason not in {
+            "device_unavailable",
+            "device_framework_unavailable",
+            "device_health_probe_failed",
+        }:
+            return
+        failed_serials = [
+            str(item["serial"])
+            for item in capability.get("failures", [])
+            if isinstance(item, dict)
+            and item.get("serial")
+            and item.get("failure_category") in {
+                "device_unavailable",
+                "device_framework_unavailable",
+                "device_health_probe_failed",
+            }
+        ]
+        if capability.get("serial"):
+            failed_serials.append(str(capability["serial"]))
+        failed_serials = list(dict.fromkeys(failed_serials))
+        recorded_at = now()
+        with self.database.session_factory() as session:
+            scan = session.get(Scan, scan_id)
+            if scan is None:
+                return
+            task = session.get(InvestigationTask, task_id)
+            if (
+                task is None
+                or task.scan_id != scan_id
+                or task.task_type == TaskType.STATIC_REVIEW.value
+            ):
+                return
+            existing = dict((scan.stats or {}).get("runtime_integrity") or {})
+            if existing.get("status") != "invalid":
+                receipt = {
+                    "schema_version": "1.0",
+                    "status": "invalid",
+                    "reason": reason,
+                    "phase": phase,
+                    "task_id": task_id,
+                    "device_serials": failed_serials,
+                    "framework_services": capability.get("framework_services"),
+                    "detail": str(capability.get("detail") or "")[:500],
+                    "detected_at": recorded_at.isoformat(),
+                }
+                evidence = self.evidence.json(
+                    session,
+                    scan_id=scan_id,
+                    task_id=task_id,
+                    kind="scan.runtime_integrity",
+                    value=receipt,
+                    summary=f"Scan scoring invalid: {reason}",
+                    metadata={"reason": reason, "phase": phase},
+                )
+                scan.stats = {
+                    **dict(scan.stats or {}),
+                    "runtime_integrity": {
+                        **receipt,
+                        "evidence_id": evidence.id,
+                    },
+                }
+                add_event(
+                    session,
+                    scan_id,
+                    "scan.runtime_integrity.invalid",
+                    "Device infrastructure failed; scan is ineligible for benchmark scoring",
+                    {**receipt, "evidence_id": evidence.id},
+                )
+                session.commit()
+        for serial in failed_serials:
+            self.device_pool.mark_unavailable(serial)
 
     @staticmethod
     def _evidence_summary(item: Evidence) -> dict[str, Any]:
@@ -6473,7 +6712,7 @@ class ScanOrchestrator(LiveProofGatewayMixin, AdaptiveVerificationMixin):
             )
 
         def oracle_verdict_eligible(item: dict[str, Any]) -> bool:
-            return dynamic_verdict_eligible(item) and (
+            return dynamic_verdict_eligible(item) and typed_poc_oracle_trusted(item) and (
                 item.get("kind") != "dynamic_experiment.adb"
                 or item.get("metadata", {}).get("platform_oracle_validated") is True
             )

@@ -15,7 +15,6 @@ from fastapi import UploadFile
 
 from ..core.config import Settings
 from ..core.permissions import (
-    PRIVATE_FILE_MODE,
     ensure_private_directory,
     ensure_private_file,
 )
@@ -64,17 +63,12 @@ class ArtifactStore:
             ensure_private_directory(final_dir)
             self._verify_directory(final_dir, artifact_root)
             final_path = final_dir / f"{sha256}.apk"
-            if final_path.exists() or final_path.is_symlink():
-                self._verify_existing(final_path, sha256)
-                temp_path.unlink(missing_ok=True)
-            else:
-                temp_path.replace(final_path)
+            self._publish_complete(temp_path, final_path, sha256)
             ensure_private_file(final_path)
             return sha256, final_path, total
-        except Exception:
+        finally:
             temporary.close()
             temp_path.unlink(missing_ok=True)
-            raise
 
     @staticmethod
     async def _read_chunks(upload: UploadFile) -> AsyncIterator[bytes]:
@@ -101,21 +95,16 @@ class ArtifactStore:
         if path.exists() or path.is_symlink():
             self._verify_existing(path, digest)
         else:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix="write-", suffix=".part", dir=root,
+            )
+            temp_path = Path(temporary_name)
             try:
-                descriptor = os.open(
-                    path,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                    PRIVATE_FILE_MODE,
-                )
-            except FileExistsError:
-                self._verify_existing(path, digest)
-            else:
-                try:
-                    with os.fdopen(descriptor, "wb") as stream:
-                        stream.write(content)
-                except Exception:
-                    path.unlink(missing_ok=True)
-                    raise
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(content)
+                self._publish_complete(temp_path, path, digest)
+            finally:
+                temp_path.unlink(missing_ok=True)
         ensure_private_file(path)
         return digest, path
 
@@ -160,17 +149,25 @@ class ArtifactStore:
             ensure_private_directory(directory)
             self._verify_directory(directory, root)
             path = directory / f"{sha256}{actual_suffix}"
-            if path.exists() or path.is_symlink():
-                self._verify_existing(path, sha256)
-                temp_path.unlink(missing_ok=True)
-            else:
-                temp_path.replace(path)
+            self._publish_complete(temp_path, path, sha256)
             ensure_private_file(path)
             return sha256, path, total
-        except Exception:
+        finally:
             temporary.close()
             temp_path.unlink(missing_ok=True)
-            raise
+
+    def _publish_complete(self, temporary: Path, destination: Path, digest: str) -> None:
+        """Publish a closed file atomically without replacing an existing artifact.
+
+        Both paths are on the store's filesystem. A hard link makes the complete
+        content visible in one operation; concurrent publishers validate the
+        winner, never a partially written file. The caller removes the temporary
+        name in its finally block, including on cancellation.
+        """
+        try:
+            os.link(temporary, destination)
+        except FileExistsError:
+            self._verify_existing(destination, digest)
 
     @staticmethod
     def stream_file(path: Path, chunk_size: int = 1024 * 1024) -> BinaryIO:

@@ -1710,7 +1710,7 @@ public final class PlatformProofActivity extends Activity {
       Cursor cursor = getContentResolver().query(uri, null, null, null, null);
       try {
         result.put("delivered", true);
-        result.put("rowCount", cursor == null ? -1 : cursor.getCount());
+        result.put("row_count", cursor == null ? -1 : cursor.getCount());
         if (cursor != null) {
           result.put("columns", join(cursor.getColumnNames()));
         }
